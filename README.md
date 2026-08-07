@@ -39,7 +39,7 @@ Official Windows binaries are cross-compiled from Linux with `scripts/build-wind
 
 ## Downloads
 
-Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/dl/](https://patanyx.edgexene.io/dl/). Releases here are marked prerelease while PATANYX is pre-1.0.
+Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/download/](https://patanyx.edgexene.io/download/). Releases here are marked prerelease while PATANYX is pre-1.0.
 
 Every published binary carries a [Sigstore](https://www.sigstore.dev/) bundle. Verify a download before running it:
 
