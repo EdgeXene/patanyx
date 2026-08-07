@@ -1,0 +1,67 @@
+PATANYX Browser
+Copyright 2026 EdgeXene LLC
+
+This product includes software developed at EdgeXene LLC.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use
+this product except in compliance with the License. A copy of the License is
+included in the LICENSE file and is also available at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------------
+Third-Party Acknowledgements
+------------------------------------------------------------------------------
+
+1. Phishing.Database (bundled malicious-host list)
+   Copyright (c) 2018-2025 Mitchell Krog, Nissar Chababy, and contributors
+   Licensed under the MIT License.
+   (The full MIT text is preserved in crates/app/src/blocklist.txt, so it
+   travels with the data itself. The shipped artifact is 128-bit hashes of
+   those hosts; the plaintext source remains in the repository so additions
+   are reviewable.)
+
+2. phishunt.io (bundled malicious-host list)
+   Released into the public domain under Creative Commons CC0 1.0 Universal.
+   From phishunt.io's terms: "The data distributed through phishunt.io (JSON,
+   CSV, TXT feeds, and API responses) is released into the public domain under
+   Creative Commons CC0 1.0." Attribution is not required; it is given because
+   a browser that ships someone else's work should say so.
+   (Merged with entry 1 into crates/app/src/blocklist.txt by
+   scripts/build-blocklist.sh. Their own accuracy statement -- "False
+   positives and false negatives occur routinely" -- is why the blocked
+   banner says a site was REPORTED rather than that it is known malicious.)
+
+3. PP-OCR detection and recognition models (bundled, compiled into the binary)
+   Copyright (c) Baidu, Inc.
+   Licensed under the Apache License 2.0, code and weights.
+   (Model files and provenance: models/ocr/)
+
+4. Mozilla Public Suffix List (bundled, compiled into the binary)
+   Copyright (c) the Mozilla Foundation and contributors
+   Licensed under the Mozilla Public License 2.0.
+   Source: https://publicsuffix.org/list/public_suffix_list.dat
+   (Redistributed unmodified apart from normalising its 459 Unicode rules to
+   punycode, which scripts/build-psl.py does and documents; the readable list
+   is kept at crates/app/src/public_suffix_list.txt so changes are reviewable
+   in a diff, and the shipped artifact is 128-bit hashes of those rules. Used
+   to decide which saved password a page may be offered -- see
+   crates/app/src/psl.rs.)
+
+5. WebKitGTK (Linux) -- NOT distributed with this software
+   Copyright (c) the WebKit contributors
+   LGPL-2.1-or-later and BSD-2-Clause, dynamically linked against the system
+   library so a user may substitute their own build.
+
+6. Microsoft Edge WebView2 Runtime (Windows) -- NOT distributed with this
+   software
+   Copyright (c) Microsoft Corporation
+   Supplied by Microsoft under its own terms. PATANYX links the loader and
+   calls the runtime; it neither contains nor redistributes it.
+
+7. Rust crate dependencies (466 packages)
+   Copyright (c) their respective authors
+   All permissive. Five are MPL-2.0 (cssparser, cssparser-macros, dtoa-short,
+   option-ext, selectors), used unmodified.
+
+See THIRD_PARTY_LICENSES.md for the full inventory.

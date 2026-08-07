@@ -1,0 +1,142 @@
+# PATANYX Browser, Flatpak manifest.
+#
+# WHY FLATPAK IS THE PRIMARY LINUX CHANNEL
+# ----------------------------------------
+# A browser is only as safe as its engine, and a native package inherits
+# whatever WebKitGTK the host happens to carry. Debian 12 makes the problem
+# concrete: its webkit2gtk is END-OF-LIFE at 2.50.6, so it will never receive
+# the WSA-2026-0004 fixes, and a native install there is permanently below the
+# floor `platform::MIN_WEBKITGTK` enforces. Flatpak turns the engine into a
+# declared, versioned dependency instead of a property of the user's machine.
+#
+# RUNTIME CHOICE
+# --------------
+# org.gnome.Platform 50. Probed rather than assumed, because the GTK4
+# migration could easily have removed what this app needs:
+#
+#   branch 49 : webkit2gtk-4.1 2.52.5 | gtk+-3.0 3.24.52 | glib 2.86.5
+#   branch 50 : webkit2gtk-4.1 2.52.5 | gtk+-3.0 3.24.52 | glib 2.88.2
+#
+# Both carry the GTK3 webkit2gtk-4.1 this app links against, at exactly the
+# 2.52.5 floor. 50 is chosen for the longer remaining support window: picking
+# a branch near end-of-life would recreate the Debian 12 problem in a nicer
+# wrapper.
+app-id: io.edgexene.Patanyx
+runtime: org.gnome.Platform
+runtime-version: "50"
+sdk: org.gnome.Sdk
+command: patanyx
+
+finish-args:
+  # A browser fetches the web, and chat needs mDNS on the LAN.
+  - --share=network
+  # Wayland first, X11 only as a fallback.
+  - --socket=wayland
+  - --socket=fallback-x11
+  # WebKit compositing.
+  - --device=dri
+  - --share=ipc
+  # DELIBERATELY ABSENT: --filesystem=home and --filesystem=host.
+  #
+  # Everything the browser stores (vault.rbv, store.rbs, content filters)
+  # lives under XDG_DATA_HOME, which Flatpak maps into
+  # ~/.var/app/io.edgexene.Patanyx/data. Nothing else needs to be reachable.
+  # Downloads, vault backup destinations and imports go through the portal,
+  # so the user picks a file and the sandbox is handed that one file rather
+  # than the whole home directory.
+  #
+  # MIGRATION: an existing native install keeps its vault outside the
+  # sandbox. That needs a deliberate one-time import through the portal, NOT
+  # a broadened filesystem permission. Do not "fix" a migration complaint by
+  # adding --filesystem=home; that would hand a browser read access to every
+  # document the user owns and undo the point of shipping this way.
+
+modules:
+  - name: patanyx
+    buildsystem: simple
+    build-options:
+      # NO --share=network. The build has no network access at all, which is
+      # what Flathub requires and, more usefully, what makes the result
+      # reproducible: every input is a source with a checksum rather than
+      # whatever the network served that day.
+      #
+      # Two things used to need the network. The toolchain is now a
+      # checksummed archive source below, pinned to the same 1.96.0 that
+      # rust-toolchain.toml pins so published build hashes keep verifying.
+      # The crates come from cargo-sources.json, generated from Cargo.lock by
+      # flatpak-cargo-generator.py (vendored beside it).
+      # cargo shells out to `rustc` by name, so the pinned toolchain has to be
+      # on PATH and not merely invoked by absolute path.
+      append-path: /run/build/patanyx/rust/bin
+      env:
+        CARGO_HOME: /run/build/patanyx/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      # The pinned toolchain, NOT org.freedesktop.Sdk.Extension.rust-stable:
+      # that would silently drift off 1.96.0 and break every published
+      # reproducible-build hash with nothing in the repo to explain why.
+      - ./rust-toolchain/install.sh --prefix=/run/build/patanyx/rust
+        --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu
+        --disable-ldconfig
+      # --frozen, not --locked: --locked still lets cargo touch the network to
+      # confirm the index. --frozen forbids it outright, so this fails loudly
+      # if a source was missed rather than quietly reaching out.
+      - /run/build/patanyx/rust/bin/cargo build --release --frozen --offline
+      - install -Dm755 target/release/patanyx /app/bin/patanyx
+      # OCR models. Installed beside the binary because ocr_support.rs
+      # resolves them from current_exe()/models/ocr, which inside the sandbox
+      # is /app/bin/models/ocr. Apache-2.0 weights; provenance and the
+      # conversion recipe are in models/ocr/README.md. Absent models are not
+      # an error -- the feature reports itself unavailable and its controls
+      # stay hidden.
+      - install -Dm644 models/ocr/det.onnx /app/bin/models/ocr/det.onnx
+      - install -Dm644 models/ocr/rec.onnx /app/bin/models/ocr/rec.onnx
+      - install -Dm644 models/ocr/rec_dict.txt /app/bin/models/ocr/rec_dict.txt
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx.desktop
+        /app/share/applications/io.edgexene.Patanyx.desktop
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx.metainfo.xml
+        /app/share/metainfo/io.edgexene.Patanyx.metainfo.xml
+      # appstreamcli compose FAILS the build without a READABLE icon, which
+      # is the right behaviour: a desktop entry pointing at a missing icon
+      # ships a blank square in the launcher.
+      #
+      # PNG rather than SVG: appstreamcli in the GNOME 50 SDK has no
+      # rasteriser available to it and reports `file-read-error` on an SVG.
+      # io.edgexene.Patanyx.svg stays in the repo as the SOURCE of the mark
+      # and is deliberately NOT installed, so nothing can prefer it and fail.
+      #
+      # 16px is shipped because the mark was designed to survive it (the
+      # bowl is elliptical, rx 32 / ry 22, so the counter stays open) and a
+      # tab favicon is rendered at exactly that size.
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-16.png
+        /app/share/icons/hicolor/16x16/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-24.png
+        /app/share/icons/hicolor/24x24/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-32.png
+        /app/share/icons/hicolor/32x32/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-48.png
+        /app/share/icons/hicolor/48x48/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-64.png
+        /app/share/icons/hicolor/64x64/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-128.png
+        /app/share/icons/hicolor/128x128/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-256.png
+        /app/share/icons/hicolor/256x256/apps/io.edgexene.Patanyx.png
+      - install -Dm644 packaging/flatpak/io.edgexene.Patanyx-512.png
+        /app/share/icons/hicolor/512x512/apps/io.edgexene.Patanyx.png
+    sources:
+      - type: dir
+        path: ../..
+      # Every crate in Cargo.lock, each with its own checksum. Regenerate
+      # after any dependency change:
+      #   python3 packaging/flatpak/flatpak-cargo-generator.py Cargo.lock \
+      #     -o packaging/flatpak/cargo-sources.json
+      - cargo-sources.json
+      # The toolchain itself, checksummed. Bumping this means bumping
+      # rust-toolchain.toml in the same commit, and it CHANGES EVERY
+      # PUBLISHED HASH.
+      - type: archive
+        url: https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz
+        sha256: c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680
+        dest: rust-toolchain
+        strip-components: 1

@@ -1,0 +1,18 @@
+[package]
+name = "patanyx-integrity"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+# Note: sha2 is listed as already present in the workspace, but its
+# version does not appear in the vault manifest I was shown (the vault does
+# not use sha2). 0.10 is the current line and pairs with hmac 0.12; adjust if
+# the workspace pins something else.
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+# Used only by the tests, so it stays out of the shipped dependency graph.
+serde_json = "1"

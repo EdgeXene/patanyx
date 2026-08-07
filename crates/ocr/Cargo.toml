@@ -1,0 +1,26 @@
+[package]
+name = "patanyx-ocr"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# Pure-Rust ONNX inference. NOT `ort`/onnxruntime: that links a native C++
+# library, and a dependency whose build script needs a native toolchain has
+# already cost this project the Windows cross-compile once. tract has no build
+# script and no native lib.
+#
+# Verified 2026-07-27 against the real converted models: both PP-OCR graphs
+# load, optimize and become runnable here. The conversion recipe and the
+# three traps in it are kept in OCR-MODEL-CONVERSION.md with the private
+# build notes.
+tract-onnx = "0.21"
+# Decode and resize only. default-features off so no format we do not need
+# drags in a decoder; png and jpeg cover scans and phone photos, and both
+# resolve to pure-Rust backends (miniz_oxide, zune-jpeg).
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+
+# Deliberately absent: no regex crate. The leak patterns are small enough to
+# hand-write and each one is unit-tested, which is cheaper than another
+# dependency in a tree that is kept deliberately short.

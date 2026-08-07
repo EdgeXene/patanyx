@@ -1,0 +1,23 @@
+[package]
+name = "patanyx-vault"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+# Recovery-key slots derive with HKDF rather than Argon2: the input is already
+# 256 random bits, so a slow KDF would cost the owner time and buy nothing.
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# One live process per vault. flock(2) on unix; the Windows side needs no
+# crate at all (exclusive share mode is in std). Already in the tree via
+# other dependencies, so this adds nothing new to the build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
