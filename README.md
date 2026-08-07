@@ -52,9 +52,7 @@ cosign verify-blob PATANYX.exe \
 
 Windows binaries are also Authenticode-signed, so Windows will name the publisher in the file's Properties.
 
-The browser updates itself from `patanyx.edgexene.io` over its own signed update channel, independently of this repository: each update is described by an Ed25519-signed manifest that the browser verifies against a key compiled into the binary, and nothing installs without your say-so. Releases here are a mirror for people who would rather fetch from GitHub.
-
-Two builds are published, both free: `PATANYX` is the browser, and `PATANYX-Premium` adds the chat stack. Neither is behind a paywall.
+The browser updates itself from `patanyx.edgexene.io` over its own signed update channel, independently of this repository: each update is described by an Ed25519-signed manifest that the browser verifies against a key compiled into the binary, and nothing installs without your say-so.
 
 ## Testing
 
