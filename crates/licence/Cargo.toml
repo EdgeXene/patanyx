@@ -1,0 +1,27 @@
+[package]
+name = "patanyx-licence"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The only two dependencies. ed25519-dalek is the whole point of the crate:
+# a token is trusted because a compiled-in EdgeXene key signed it, never
+# because it parsed, decoded, or arrived from the expected host. thiserror
+# keeps the one error enum terse.
+ed25519-dalek = "2"
+thiserror = "2"
+
+# Deliberately absent: no network, no filesystem, no clock, no RNG, no
+# serde, no base64 crate, no crc32 crate, no chrono. The current day is
+# always a parameter (`today_utc`), never read, so every gate decision is
+# reproducible in a test; tests derive signing keys from fixed 32-byte
+# seeds; the vault stores the text form as a plain string in P2, so nothing
+# here serializes; and base64url / CRC-32 / hex are hand-written in-crate
+# because signer and verifier sharing one tiny codec is worth more than the
+# lines a dependency would save (the update crate hand-writes its hex for
+# the same reason). Also no `zeroize`: this crate holds public keys and
+# bearer tokens, never our own key material -- the SigningKey is the
+# caller's -- so redaction at Debug, not wiping, is the boundary that
+# matters.

@@ -1,0 +1,38 @@
+[package]
+name = "patanyx-tunnel"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+# Cloudflare's userspace WireGuard. Userspace is not a compromise here, it is
+# the only design that works: the Flatpak has `--share=network` and no
+# `/dev/net/tun` (packaging/flatpak/io.edgexene.Patanyx.yml), and a kernel TUN
+# would need elevation on both platforms — which nothing in this product has
+# ever asked for and which would make Authenticode mandatory rather than
+# pending.
+#
+# Its crypto is RustCrypto/dalek, all of which the workspace already carries:
+# x25519-dalek, chacha20poly1305, blake2, poly1305, zeroize are in Cargo.lock
+# before this crate exists. The "ring breaks the Windows cross-compile" claim
+# still written in crates/chat/Cargo.toml is DEAD -- disproven and re-verified
+# by linking, see scripts/build-windows.sh:4-13.
+boringtun = { version = "0.7", default-features = false }
+
+# smoltcp: the TCP/IP stack that sits between the SOCKS5 listener's byte
+# streams and the raw IP packets WireGuard carries. boringtun has no network
+# stack of its own (`Tunn` consumes and yields raw IP packets), and the layer
+# a kernel would normally provide via TUN is exactly what the no-elevation /
+# Flatpak constraint forbids. Pure Rust, no native toolchain in its build
+# script, so the Windows cross-compile is untouched. default-features = false
+# and only what this crate uses: IPv4 over an IP-medium device, TCP sockets,
+# and DNS queries (for SOCKS5 DOMAIN requests) resolved INSIDE the tunnel.
+smoltcp = { version = "0.13", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-dns", "socket-tcp", "socket-dns"] }
+
+# zeroize: already in the workspace (vault pins the same major). The 32-byte
+# key arrays this crate decodes exist only inside Session::start and are
+# zeroized there; boringtun's own copy is an x25519-dalek StaticSecret, which
+# zeroizes itself on drop behind x25519-dalek's default "zeroize" feature
+# (boringtun does not disable x25519-dalek's defaults; verified in its
+# manifest).
+zeroize = "1"

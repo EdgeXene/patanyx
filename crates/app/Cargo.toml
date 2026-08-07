@@ -1,0 +1,167 @@
+[package]
+name = "patanyx"
+version = "0.9.61"
+license = "Apache-2.0"
+edition = "2021"
+
+# Two builds from one source tree. The published browser is the default build
+# and does not contain the chat code at all — this is a compile-time feature,
+# not a runtime toggle, so the public binary carries none of its attack surface.
+#   public : cargo build --release
+#   private: cargo build --release --features chat
+[features]
+# `updater-net` is ON by default.
+#
+# This comment used to justify that with "there are no scheduled checks... not
+# a callback the browser makes on its own". That stopped being true on
+# 2026-07-28: the browser now checks on a jittered schedule (schedule.rs),
+# because an install nobody clicks never learns a security fix exists.
+#
+# The justification is therefore different and worth stating plainly. A
+# scheduled check is one unconditional GET to a URL identical for every install
+# -- no token, no version, no validator -- so the server learns an IP and a
+# timestamp and nothing that distinguishes one user from another. It downloads
+# nothing and installs nothing; only the user's explicit accept does that.
+# Trading that disclosure for "users find out about security fixes" is the
+# right trade, but it IS a trade, and defaulting it on is a decision rather
+# than a freebie.
+default = ["updater-net"]
+chat = ["dep:patanyx-chat"]
+# Reachable-beyond-the-LAN chat. Implies `chat` (a relay without the chat
+# stack is dead weight) and forwards to the flag crates/chat declares —
+# chat_panel.rs gates on THIS name via cfg!(feature = "relay-client").
+#
+# OFF by default as a POLICY choice: the published binary is the one that
+# must never carry the chat stack. It is NOT a build constraint. This comment
+# used to say ring's build script breaks the Windows cross-compile, which was
+# false -- ring's C compiled all along and the real failure was a missing
+# llvm-lib (see scripts/build-windows.sh). Both flags cross-compile and link.
+relay-client = ["chat", "patanyx-chat/relay-client"]
+# The updater's network half. Signature verification always compiles
+# (patanyx-update); this flag compiles the fetch path in updater.rs, without
+# which there is no build configuration that can enable update checking at
+# all.
+#
+# It was OFF by default for the same false `ring` constraint as above, and
+# unlike relay-client it was never rescued when that was disproven -- so the
+# browser had no update mechanism for a reason that had stopped being true.
+# Verified 2026-07-27 by building AND LINKING for x86_64-pc-windows-msvc.
+#
+# patanyx-update declares no features of its own — the verification half is
+# unconditional there and has no network code to gate — so this forwards
+# only to the HTTP client.
+updater-net = ["dep:ureq"]
+
+[dependencies]
+wry = "0.55"
+tao = "0.35"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+patanyx-vault = { path = "../vault" }
+patanyx-integrity = { path = "../integrity" }
+patanyx-corroborate = { path = "../corroborate" }
+patanyx-store = { path = "../store" }
+patanyx-update = { path = "../update" }
+patanyx-ocr = { path = "../ocr" }
+# UNCONDITIONAL, like patanyx-ocr and for the same reason the vault's
+# `tunnel` field is: a build that cannot bring a tunnel up must still be the
+# same binary shape as one that can, and feature-gating a privacy control is
+# how a "works on my build" split ships. Engine wiring lands in the P4 phase;
+# the dependency lands with the crate so the attribution and Flatpak source
+# manifests change exactly once.
+patanyx-tunnel = { path = "../tunnel" }
+# Unconditional, like patanyx-tunnel: the licence record is in the vault
+# schema in EVERY build, the Premium row ships in both builds, and a build
+# that cannot gate premium features must still be the same binary shape as
+# one that can.
+patanyx-licence = { path = "../licence" }
+# Download provenance hashes the finished file before recording it.
+sha2 = "0.10"
+# The tunnel_import IPC arm reads a WireGuard config -- private key included
+# -- into a String it must wipe before dropping; same major the vault pins.
+zeroize = "1"
+# The divergence session token: 64 bytes of OS randomness drawn once per app
+# start (privacy.rs). Same version chacha20poly1305's OsRng already resolves
+# in Cargo.lock, so this adds a direct edge, not a new crate.
+getrandom = "0.2"
+patanyx-chat = { path = "../chat", optional = true }
+# The updater's HTTP GET, behind `updater-net`. default-features = false
+# drops gzip/cookies/json/charset; `tls` is ureq 2.x's rustls backend, and
+# it resolves the SAME rustls 0.23 patanyx-chat's relay-client pins, so a
+# build with both features on links one TLS stack rather than two.
+# socks-proxy: the updater routes through the tunnel's loopback SOCKS front
+# when one is imported (fail closed on its dead port), so background update
+# traffic can never leave outside a tunnel the user chose. Pure Rust.
+ureq = { version = "2.12", default-features = false, features = ["tls", "socks-proxy"], optional = true }
+
+# Same versions wry 0.55 itself resolves, so there is one COM binding in the
+# tree. Needed to reach ICoreWebView2Settings8 and turn SmartScreen off; see
+# harden_privacy in src/platform/windows.rs.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "0.38"
+# The feature list is EXPLICIT from here on. Every windows-crate module this
+# app used before came in by accident, through Cargo feature unification with
+# wry, tao and webview2-com -- so the set was whatever those three happened to
+# ask for, and could shrink under us on any of their updates without a line of
+# our code changing. These two are ours:
+#   Win32_System_RemoteDesktop -- WTSRegisterSessionNotification, for the
+#     workstation-lock signal the idle timer structurally cannot see.
+#   Win32_System_Power         -- RegisterSuspendResumeNotification, same
+#     reasoning for suspend.
+#   Win32_UI_Shell             -- SetWindowSubclass. Those two messages are
+#     SENT straight to the window procedure rather than posted to the thread
+#     queue, so tao's message hook never sees them; a subclass does.
+#   Win32_System_DataExchange  -- the clipboard itself, and
+#   Win32_System_Memory        -- the moveable HGLOBAL it takes ownership of,
+#     for set_clipboard_text. Copying used to be done by the chrome webview
+#     with navigator.clipboard and could not work from an unfocused document.
+#   The next three are for the hover readout, which draws itself: before it
+#     there was no native drawing code in this crate at all, so all three
+#     arrived only by feature unification from tao/wry -- exactly the accident
+#     this note is about.
+#   Win32_Graphics_Gdi         -- BeginPaint/DrawTextW/CreateFontIndirectW/
+#     FillRect/GetTextExtentPoint32W, the readout's paint and measure calls.
+#   Win32_UI_WindowsAndMessaging -- RegisterClassW/CreateWindowExW/
+#     SetWindowPos/ShowWindow and the WM_* constants its wndproc answers.
+#   Win32_System_LibraryLoader -- GetModuleHandleW, for the class's hInstance.
+windows = { version = "0.61", features = [
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Power",
+  "Win32_UI_Shell",
+  "Win32_System_DataExchange",
+  "Win32_System_Memory",
+  "Win32_Graphics_Gdi",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_System_LibraryLoader",
+] }
+
+# GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
+# them. All uses live in src/platform/unix.rs.
+[target.'cfg(unix)'.dependencies]
+gtk = "0.18"
+# Same crate+features wry itself uses; needed for the Response policy
+# handler wry does not expose (see fix_downloads in src/platform/unix.rs).
+webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
+# Raw FFI, pinned to match the safe bindings above. Needed only for
+# WebKitUserContentFilterStore, which compiles ad-block rules and which the safe
+# crate does not wrap. See compile_filter in src/platform/unix.rs.
+webkit2gtk-sys = "=2.0.2"
+# The sys layer's signatures are in terms of raw glib/gobject/gio types, so
+# those crates have to be nameable here too.
+glib-sys = "0.18"
+gobject-sys = "0.18"
+gio-sys = "0.18"
+
+[dev-dependencies]
+# Test-only: the delta tests GENERATE patches. Shipping code only APPLIES
+# them, via patanyx-update, so the diff half never enters the binary.
+bsdiff = "0.2"
+# The updater tests sign their own manifests so the verification path is
+# exercised end to end rather than against a fixture. Dev-only: the shipped
+# binary verifies signatures, it never makes them.
+ed25519-dalek = "2"
+
+# build.rs compiles src/blocklist.txt into sorted hashes; it shares
+# hostrules.rs with the crate and therefore needs the same hasher.
+[build-dependencies]
+sha2 = "0.10"

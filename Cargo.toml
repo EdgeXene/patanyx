@@ -1,0 +1,11 @@
+[workspace]
+resolver = "2"
+# crates/relay is ABSENT on purpose (OSS split, 2026-08-05): the relay is
+# proprietary server infrastructure and lives in its own repository at
+# ../patanyx-relay, consuming the open chat and licence crates by path. The
+# wire protocol it speaks stays open here, in crates/chat.
+members = ["crates/vault", "crates/app", "crates/ocr", "crates/chat", "crates/integrity", "crates/store", "crates/corroborate", "crates/update", "crates/tunnel", "crates/licence"]
+
+[profile.release]
+lto = true
+strip = true

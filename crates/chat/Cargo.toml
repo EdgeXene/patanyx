@@ -1,0 +1,49 @@
+[package]
+name = "patanyx-chat"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[features]
+default = []
+# The relay CLIENT, and with it the entire TLS stack. OFF by default, because
+# the shipped browser is mDNS-only: no relay is deployed and none is ever
+# configured. Keeping it off is not merely tidy —
+#
+#   1. rustls pulls `ring`, whose build script needs a C/asm toolchain for the
+#      target, which fails when cross-compiling to Windows even under
+#      cargo-xwin. With the feature off, `--features chat` cross-compiles.
+#   2. A LAN-only build then carries no TLS code at all, which is a smaller
+#      claim to have to defend than "it has a relay client but never uses it".
+relay-client = ["dep:tungstenite", "dep:rustls", "dep:webpki-roots"]
+
+[dependencies]
+# Same AEAD the vault uses, so the workspace carries one cipher implementation.
+chacha20poly1305 = "0.10"
+x25519-dalek = { version = "2", features = ["getrandom", "zeroize", "static_secrets"] }
+hkdf = "0.12"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+# --- transport layer ---------------------------------------------------------
+# hmac stays at 0.12: it pairs with digest 0.10, which is what sha2 0.10 uses.
+# Moving to 0.13 would drag sha2 to 0.11 and split the hash implementation.
+hmac = "0.12"
+# Relay client only — see the `relay-client` feature above. `hmac` stays
+# unconditional: wire.rs's registration helpers use it and the relay SERVER
+# crate compiles them.
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"], optional = true }
+webpki-roots = { version = "1", optional = true }
+# Pure Rust, no system daemon, works on Windows as well as Linux.
+mdns-sd = "0.20"
+# mdns-sd hands back a flume Receiver; its RecvTimeoutError has to be nameable
+# to tell a poll timeout apart from the daemon going away. `select` lets the
+# discovery loop wait on the browse stream and its control channel at once
+# without a second thread or an async runtime; the feature pulls in no extra
+# dependency (it is defined as `select = []`).
+flume = { version = "0.12", default-features = false, features = ["select"] }

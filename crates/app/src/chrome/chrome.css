@@ -1,0 +1,2798 @@
+/* PATANYX chrome UI — dark, minimal, no external resources (CSP forbids). */
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  height: 100%;
+  /* THE CHROME DOCUMENT NEVER SCROLLS. It is a fixed-height strip whose height
+     Rust is told; there is nothing below the fold to reach, so a scrollbar
+     here is not a way to see more, it is a defect that eats horizontal space
+     and draws a grey bar down the side of the toolbar. Seen on Windows, where
+     Segoe UI made the two rows a few pixels taller than the height the chrome
+     had asked for.
+     Panels are `position: fixed` with their own `overflow-y: auto`, so they
+     keep scrolling normally -- this clips nothing that has anywhere to go.
+     The real guard against clipping is `closedChromePx()`, which measures the
+     rows rather than asserting a number. */
+  overflow: hidden;
+}
+
+body {
+  position: relative; /* positioning context for #toasts */
+  display: flex;
+  flex-direction: column;
+  background: var(--sf-body);
+  color: var(--tx);
+  font:
+    13px/1.45 system-ui,
+    "Segoe UI",
+    sans-serif;
+}
+
+/* ---- tab strip (class names kept clear of the vault panel's .tab) ---- */
+
+/* THE STRIP WAS LEFT BEHIND BY THE TOOLBAR REDESIGN, and it showed.
+ *
+ * Everything below it moved to 9px pills, 12px sheets and 14px cards; this
+ * kept 4px corners, a 1px slab border on every chip and a bright blue outline
+ * on the active one. The result was two design languages stacked directly on
+ * top of each other, with the older one on top.
+ *
+ * The active tab is now identified by MERGING into the toolbar -- same fill,
+ * no seam -- plus a 2px accent along its top edge, which is how every
+ * mainstream browser answers "which one am I on". The full blue outline it
+ * used to wear is gone: #4f8cff (now var(--accent)) is this chrome's FOCUS colour (see #url:focus),
+ * and spending it on a persistent selected-state meant the keyboard ring and
+ * the active tab were the same signal in two places. */
+#tabstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  padding: 7px 8px 0;
+  background: var(--sf-tabstrip);
+}
+#tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.tab-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  max-width: 200px;
+  padding: 6px 8px 6px 12px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-bottom: none;
+  border-radius: 9px 9px 0 0;
+  color: var(--tx-chip);
+  cursor: pointer;
+  font-size: 12px;
+}
+.tab-chip:hover {
+  background: var(--sf-raised);
+  color: var(--tx-chip-hover);
+}
+.tab-chip.active {
+  background: var(--sf-strip); /* merges into the toolbar below */
+  border-color: var(--ln-strong);
+  color: var(--tx-bright);
+  /* Accent on the top edge only. Placed where a focus ring never goes, so the
+     two cannot be confused, and it reads as "you are here" rather than as a
+     state of the page. */
+  box-shadow: inset 0 2px 0 var(--accent-bright);
+}
+.chip-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.chip-close {
+  padding: 1px 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  border-radius: 6px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--tx-chipx);
+}
+.chip-close:hover {
+  background: var(--sf-chipx-hover);
+  color: var(--tx-bright);
+}
+#btn-newtab {
+  padding: 4px 11px;
+  margin-bottom: 5px;
+  border-radius: 8px;
+}
+
+#toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px;
+  background: var(--sf-strip);
+  border-bottom: 1px solid var(--ln-soft2);
+  /* THE SECOND ROW FILLS FROM THE RIGHT.
+   *
+   * `justify-content` applies to every row of a wrapping flex container, but
+   * it has no effect on the first: `#url` is the only `flex: 1` in the row, so
+   * it eats all the free space and there is none left to distribute. The pills
+   * on the second row have no grow factor, so the free space is real there and
+   * this is what pushes them to the right-hand edge -- under the address bar's
+   * end rather than under the back button.
+   *
+   * One property, one row affected, and no wrapper div to keep in step with
+   * update.js and integrity.js appending at the end. */
+  justify-content: flex-end;
+}
+
+/* Forces everything after it onto a second line. `flex-basis: 100%` with no
+   height takes a full row of zero thickness; the `gap` above supplies the
+   space between the two rows.
+
+   ABOVE the break: the address bar, and the three things reached most often --
+   bookmark, quarantine and About. BELOW it: state and everything else, filled
+   from the right.
+
+   The pills all live on that second row so every one of them is visible
+   without opening anything, which is why this browser has no overflow menu. */
+.toolbar-break {
+  flex-basis: 100%;
+  height: 0;
+  margin: 0;
+  padding: 0;
+}
+
+/* ---- modal panels ----
+   A panel used to be a strip that grew under the toolbar. It is now a card
+   over a covered window, which is what makes "one thing at a time" legible.
+
+   THE SCRIM IS SOLID BY DEFAULT, and that is a correctness decision rather
+   than a taste one. The chrome and the page are sibling OS windows that do
+   not alpha-composite, so a translucent scrim here cannot show the page
+   through it -- it would show this chrome's own background and nothing else,
+   while *implying* the page is still there underneath. Solid tells the
+   truth: the page is covered.
+
+   The `translucent-backdrop` body class is the ONE exception, and it is set
+   only after the backend has said so (`chrome_caps`): on Windows the chrome
+   is lifted above the content with a genuinely transparent background during
+   a modal, the page keeps its normal rectangle and keeps rendering, and a
+   translucent scrim there is finally telling the truth -- a dimmed, live
+   page. The body must also go transparent in that mode or its own opaque
+   background repaints exactly the cover the lift removed; the strip and
+   toolbar carry their own opaque backgrounds and are unaffected. */
+body.modal-open::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  background: var(--sf-scrim);
+  z-index: 30;
+}
+body.translucent-backdrop.modal-open {
+  background: transparent;
+}
+
+/* THE 12px NOBODY PAINTS, AND WHY IT BECAME A BAND.
+   `closedChromePx()` reports max(148, tabstrip + toolbar). On a real Windows
+   build the two rows measure ~136, so the FLOOR wins and Rust sizes the chrome
+   strip to 148 -- twelve logical pixels taller than anything that draws in it.
+   Opaque, that slack is invisible. Transparent, it is a window onto whatever
+   is behind the chrome, and the page is not behind it: the page starts at 148,
+   so what shows through is the native window background. At 2x scale that is
+   ~24 device pixels of pale grey directly under the toolbar, on every modal.
+   It was reported three times while three different geometry theories
+   were tried and discarded; the diagnostic log is what finally showed
+   chrome_height=148 against a toolbar that ends at 136.
+   Backs the whole strip rather than the 12px, so it cannot drift again if the
+   rows change height. Above the scrim (30) and the panel (40) -- the panel
+   starts at 148 + 12 and never reaches here -- and below the toolbar (50). */
+body.translucent-backdrop.modal-open::before {
+  content: "";
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: var(--chrome-closed-px, 148px);
+  background: var(--sf-strip);
+  z-index: 45;
+}
+body.translucent-backdrop.modal-open::after {
+  background: rgba(13, 14, 18, 0.62);
+}
+
+/* The strip stays above the scrim and stays clickable, so a feature button can
+   switch panels directly instead of forcing a close-then-open. The dismissal
+   handler in chrome.js exempts these two for the same reason. */
+body.modal-open #tabstrip,
+body.modal-open #toolbar {
+  position: relative;
+  z-index: 50;
+}
+
+.panel-modal {
+  position: fixed;
+  left: 50%;
+  transform: translateX(-50%);
+  /* Below the MEASURED chrome, not a constant. This was 96px while the
+     two-row toolbar is 148, so every panel's first line rendered under the
+     toolbar (z-index 50 beats 40) and the title was unreadable. The variable
+     is kept current by the same ResizeObserver that feeds closedChromePx. */
+  top: calc(var(--chrome-closed-px, 148px) + 12px);
+  z-index: 40;
+  /* `flex: 1` is what these panels use as in-flow strips; it does nothing when
+     fixed, but the width and height caps have to be restated or the card
+     inherits the full window. */
+  width: min(600px, calc(100vw - 32px));
+  max-height: calc(100vh - var(--chrome-closed-px, 148px) - 24px);
+  overflow-y: auto;
+  /* THE CARD PAINTS ITS OWN SURFACE, and must: it used to have no background
+     at all and simply showed whatever was behind it. That was invisible for
+     as long as the thing behind it was the opaque body or the solid scrim.
+     Under `translucent-backdrop` the body is deliberately transparent (see
+     the block above) and the scrim is 0.62 alpha, so the card became a
+     dimmed window onto the live page and every panel's text sat on top of
+     the site's own text. Windows only, which is why the Linux pass did not
+     see it. A token, never a literal: three chrome themes. */
+  background: var(--sf-panel);
+  border: 1px solid var(--ln-strong);
+  border-radius: 14px;
+  box-shadow: 0 20px 56px rgba(0, 0, 0, 0.55);
+  padding: 16px 18px;
+}
+
+/* Escape and a click on the scrim both close a panel, and neither is
+   discoverable. Every panel gets a real control that says so. */
+.panel-close {
+  position: absolute;
+  top: 10px;
+  right: 12px;
+  padding: 4px 8px;
+  line-height: 1;
+  background: transparent;
+  border-color: transparent;
+  color: var(--tx-dim);
+}
+.panel-close:hover {
+  background: var(--sf-btn);
+  color: var(--tx-bright);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  /* The card is centred with a translate, so its keyframe has to carry that
+     translate on every frame -- a plain translateY would fight the centring
+     and snap the card to the left as the animation began. */
+  .panel-modal {
+    animation: card-in 120ms ease-out;
+  }
+  @keyframes card-in {
+    from {
+      opacity: 0;
+      transform: translateX(-50%) translateY(-4px);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(-50%) translateY(0);
+    }
+  }
+}
+
+button {
+  font: inherit;
+  color: var(--tx);
+  background: var(--sf-btn);
+  border: 1px solid var(--ln);
+  border-radius: 4px;
+  padding: 5px 10px;
+  cursor: pointer;
+}
+button:hover {
+  background: var(--sf-btn-hover);
+}
+button:active {
+  background: var(--sf-btn-active);
+}
+button:disabled {
+  opacity: 0.6;
+  cursor: default;
+}
+button.small {
+  padding: 2px 8px;
+  font-size: 12px;
+}
+/* The CHOSEN one in a row of mutually exclusive small buttons (the resolver
+   picker uses this in both its mirrors).
+   This rule was missing when the picker shipped: chrome.js toggled `.active`
+   on the selected button and nothing in this file gave `.active` an
+   appearance, so all three rendered identically and the user could not see
+   which resolver was in force. A setting you cannot read back is not a
+   setting.
+   Blue rather than the green used for `.is-active`, on purpose: green in this
+   chrome means "a protection is on", and choosing a resolver is a choice
+   between parties, not a protection level. */
+/* Zoom indicator. Quiet -- it is a status readout that happens to be
+   clickable, not a control competing with the feature buttons. */
+#zoom-chip {
+  flex: none;
+  color: #9fb4d8;
+  border-color: #3a4557;
+  font-variant-numeric: tabular-nums;
+}
+#zoom-chip[hidden] {
+  display: none;
+}
+
+button.small.active {
+  background: var(--accent-choice-bg);
+  border-color: var(--accent-choice-border);
+  color: var(--accent-choice-text);
+}
+button.danger {
+  color: var(--st-err);
+  border-color: var(--st-err-bg);
+}
+button.danger:hover {
+  background: var(--st-err-hover);
+}
+
+/* ---- toolbar icons and feature buttons ----
+   Icons are inline SVG stroked in currentColor, so they inherit the dark
+   theme and any state colour below without a second asset. The CSP forbids
+   external resources, so an icon font or sprite sheet is not an option
+   anyway. */
+
+.ico {
+  width: 15px;
+  height: 15px;
+  flex: none;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.nav-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 5px 7px;
+}
+
+/* Icon AND label: the label is what makes the control self-explanatory, the
+   icon is what makes it findable at a glance. Neither alone does both. */
+/* [hidden] MUST WIN over every display rule below.
+   .feature-btn sets `display: flex`, and a class rule beats the UA
+   stylesheet's `[hidden] { display: none }` -- so the hidden attribute did
+   nothing on these buttons. #btn-chat is `hidden` in index.html and is
+   revealed only by chat.js, which is evaluated only in chat builds; its markup
+   says "the button must not be visible there or it would do nothing when
+   clicked". It was visible in every public build, and clicking it did nothing,
+   because this rule silently outranked the attribute.
+   #zoom-chip[hidden] already carried the same guard locally. This one is
+   general, so the next hidden control does not have to rediscover it. */
+[hidden] {
+  display: none !important;
+}
+
+/* PER-FEATURE IDENTITY, AND WHY IT ONLY TOUCHES THE OUTLINE AND THE ICON.
+ *
+ * Three things want to be visible on one control, and they are not equals:
+ *
+ *   1. WHICH feature this is        -- identity, always true
+ *   2. Whether its panel is OPEN    -- aria-pressed
+ *   3. Whether the protection is ON -- .is-active, green
+ *
+ * State outranks identity. Green means "you are protected" and the rule
+ * below it exists so that can never be confused with hover or focus; giving
+ * eight buttons eight colours would have quietly reintroduced exactly that
+ * confusion if the colour reached the label or the fill. So identity is
+ * carried by the BORDER and the ICON only, at low saturation, and both
+ * `.is-active` and `[aria-pressed]` override it -- they are later in the
+ * cascade and more specific, so state always wins.
+ *
+ * The label stays neutral on purpose. Eight coloured words in a row is a
+ * rainbow; eight coloured icons with quiet outlines is a palette.
+ */
+.feature-btn {
+  --pill: #7a8194;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  border-radius: 9px;
+  position: relative;
+  background: transparent;
+  /* Barely tinted. The reference has NEUTRAL outlines on almost every pill and
+     spends colour on the icon instead -- and on exactly one border, the pill
+     that wants attention. A row of eight coloured outlines reads as
+     decoration; a row of neutral ones reads as a toolbar, and then a single
+     coloured one MEANS something. */
+  border-color: color-mix(in srgb, var(--pill) 16%, var(--ln));
+}
+.feature-btn .ico {
+  stroke: var(--pill);
+}
+.feature-btn:hover {
+  background: var(--sf-btn);
+  border-color: color-mix(in srgb, var(--pill) 34%, var(--ln-btn));
+}
+
+/* One line per feature, and nothing but the token. A colour set anywhere else
+ * would have to be re-reasoned against the two state rules above.
+ *
+ * THE THREE TOOLBAR CONTROLS ARE ABSENT FROM THIS LIST, on purpose. #btn-privacy,
+ * #btn-freeze and #btn-menu keep the neutral default, so the only colour that
+ * can appear in that row is state: green confirmed, amber refused. In a row of
+ * three, an identity tint is not helping anyone find anything -- it is just
+ * one more thing competing with the two colours that carry meaning.
+ *
+ * The tokens below now describe MENU rows, where they do earn their place: a
+ * vertical list of nine is scanned by icon, and the stylesheet's original
+ * objection was specifically to a horizontal row of coloured outlines reading
+ * as decoration. Menu rows have no outline. */
+#btn-dns {
+  --pill: #4fc9d6;
+}
+/* Sage: an unclaimed hue slot, deliberately NOT any accent's hue -- the one
+ * button whose job is choosing colours must not itself look chosen. */
+#btn-theme {
+  --pill: #a8c090;
+}
+/* The blue the shield used to wear, free now that the toolbar spends no colour
+ * on identity. Not green: green is "confirmed on" everywhere else in this
+ * chrome, and quarantine is an action you can take, not a state you are in. */
+#btn-quarantine-menu {
+  --pill: var(--accent-bright);
+}
+/* Neutral. About is a reference, not a state, so it takes no identity tint.
+ *
+ * THIS RULE ONCE CARRIED `order: 99`, AND THAT IS WORTH RECORDING. In the
+ * menu-sheet layout About was pinned to the bottom of a flex COLUMN, and
+ * `order` was used rather than markup position because update.js and
+ * integrity.js append their buttons at runtime -- written last in index.html,
+ * About would still have ended up above Integrity and Updates once those two
+ * scripts ran.
+ *
+ * That reasoning died with the sheet, but the declaration outlived it, and
+ * because `order` reorders across the whole flex container it silently
+ * dragged About past `.toolbar-break` -- onto row two -- no matter where the
+ * markup put it. Moving the button in index.html looked like it had simply
+ * failed. The separator styling went the same way: a top border and
+ * bottom-only corners read as a divider in a column and as a stray line in a
+ * row.
+ *
+ * Nothing replaces the ordering, because nothing needs to: About sits on row
+ * one and the two runtime appends land at the end of row two, so source order
+ * already gives the arrangement `order` was compensating for. */
+#btn-about {
+  --pill: #8a8f9c;
+}
+#btn-vault {
+  --pill: #e0b25c;
+}
+#btn-chat {
+  --pill: #a78bfa;
+}
+#btn-tab {
+  --pill: #8fa3bf;
+}
+#btn-library {
+  --pill: #d99a54;
+}
+#btn-integrity {
+  --pill: #e07bd4;
+}
+/* Sky rather than the teal the mockup shows: the mockup's teal sits close to
+ * the #9fd6ac that means "protected", and two greens on one row is the one
+ * confusion this whole scheme is built to avoid. */
+#btn-update {
+  --pill: #56c8e8;
+}
+
+.feature-label {
+  white-space: nowrap;
+}
+
+/* Pressed = this panel is open. Distinct from "protection is on" below, so
+   opening the privacy panel never looks like enabling something. */
+.feature-btn[aria-pressed="true"] {
+  background: color-mix(in srgb, var(--pill) 22%, var(--sf-btn));
+  border-color: color-mix(in srgb, var(--pill) 70%, var(--ln-btn));
+  color: var(--tx-max);
+}
+
+/* Protections are ACTIVE. Green rather than the usual accent because the
+   question this answers is "am I protected", and it must not be confusable
+   with focus or hover. */
+.feature-btn.is-active {
+  border-color: var(--st-ok-dim);
+  color: var(--st-ok);
+}
+.feature-btn.is-active .ico {
+  stroke: var(--st-ok);
+}
+
+/* The engine REFUSED something that was asked of it.
+ *
+ * This class was already being written -- chrome.js toggles it on the freeze
+ * chip when the engine could not install the block, which is the case where
+ * the tab is STILL MAKING REQUESTS while the user believes it is frozen --
+ * and the stylesheet had no rule for it. One writer, one comment claiming it
+ * "owns the failed-freeze case", and nothing on screen: the chip rendered
+ * identically to a healthy one and only the label text said otherwise.
+ *
+ * Amber, not red, and the distinction is the honest one. Red says "this is
+ * broken"; the browser is working exactly as designed, and what it is doing
+ * is telling you a protection did not take. That is a warning about the
+ * ENGINE, not a fault in the application, so it gets the same #d8b46a the
+ * state dot already uses rather than an alarm colour of its own.
+ *
+ * Ranked ABOVE `.is-active` deliberately, by source order at equal
+ * specificity: a control can be both on and refused -- ephemeral requested,
+ * ephemeral not granted -- and in that pairing the refusal is the fact the
+ * user needs. Green over amber there would report the request as the
+ * outcome, which is the single failure mode this whole scheme exists to
+ * prevent. */
+.feature-btn.is-warning {
+  border-color: var(--st-warn-border);
+  color: var(--st-warn);
+}
+.feature-btn.is-warning .ico {
+  stroke: var(--st-warn);
+}
+
+/* The badge shows one of two different numbers -- requests blocked on this
+ * page where that is observed, otherwise protections enabled -- and it is
+ * worth them not looking identical.
+ *
+ * A blocked count of zero is the case to be careful with. It is honest (the
+ * page had nothing to stop) but it is not an achievement, and a bright green
+ * "0" beside a shield reads as a score. Muted at zero, green above it. */
+.badge.badge-count {
+  font-variant-numeric: tabular-nums;
+}
+.badge.badge-count:not(.badge-some) {
+  background: var(--ln-strong);
+  color: var(--tx-chip);
+}
+
+/* Count of active protections, on the shield. */
+.badge {
+  min-width: 16px;
+  padding: 0 4px;
+  border-radius: 8px;
+  background: var(--st-ok-dim);
+  color: var(--st-ok-badge-text);
+  font-size: 11px;
+  line-height: 16px;
+  text-align: center;
+}
+
+/* Small state dot for vault-unlocked / chat-connected. */
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--st-ok);
+}
+.dot.warn {
+  background: var(--st-warn);
+}
+
+#url {
+  flex: 1;
+  min-width: 0;
+  font: inherit;
+  color: var(--tx-bright);
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-input);
+  border-radius: 4px;
+  padding: 6px 10px;
+  outline: none;
+}
+#url:focus {
+  border-color: var(--accent);
+}
+/* loading indicator driven by the load_state event */
+body.loading #url {
+  border-color: var(--accent);
+}
+
+/* ---- download toasts ------------------------------------------------------ */
+
+/* The browser's own confirmation dialog, replacing window.confirm(). The
+   engine's version is titled with the page that raised it, which meant every
+   delete prompt announced our internal rbchrome:// URL and looked like a
+   different program.
+
+   z-index above the panels (which is what it asks about) and above the
+   scrim, but below nothing else here. Tokens only: three background themes
+   and nine accents render this. */
+#confirm-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 40;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.45);
+}
+#confirm-overlay[hidden] {
+  display: none;
+}
+#confirm-card {
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 8px;
+  padding: 16px 18px;
+  max-width: 380px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.45);
+}
+#confirm-text {
+  color: var(--tx-bright);
+  margin-bottom: 14px;
+  line-height: 1.5;
+  /* A long bookmark title or URL must wrap rather than stretch the card off
+     the side of a 1100px chrome. */
+  overflow-wrap: anywhere;
+}
+#confirm-card .form-buttons {
+  justify-content: flex-end;
+}
+
+#toasts {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 6px;
+  pointer-events: none; /* never block the toolbar */
+}
+.toast {
+  max-width: 320px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  background: var(--sf-raised);
+  border: 1px solid var(--ln);
+  border-left: 3px solid var(--accent);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 12px;
+  color: var(--tx);
+}
+.toast.error {
+  border-left-color: var(--st-err-strong);
+  color: var(--st-err);
+}
+
+/* EVERY panel, and the list is the point. Three of the five were in this rule
+   and two were not: Tab Activity and Library rendered with no padding, no
+   background and no flex, so their text sat flush against the window edge on a
+   transparent strip while the other three were inset on #1a1b20. Shipped that
+   way, and found by looking at a screenshot rather than by any gate -- there is
+   nothing in the suite that compares one panel's computed style to another's.
+   A panel added later belongs HERE, not in a rule of its own. */
+#vault-panel,
+#privacy-panel,
+#dns-panel,
+#tunnel-panel,
+#tab-panel,
+#library-panel,
+#about-panel,
+#palette-panel,
+#onboarding-panel,
+/* Built in update.js rather than index.html, which is exactly how it stayed
+   out of this list -- and it is the one panel whose overflow hides a privacy
+   disclosure rather than a list item. It keeps its own inline padding. */
+#update-panel {
+  flex: 1;
+  overflow-y: auto;
+  padding: 10px 12px;
+  background: var(--sf-panel);
+}
+
+/* ---- About ----
+   Reading matter rather than controls, so it is set for reading: a narrower
+   measure than the panel allows, and paragraphs with room between them. */
+.about-head {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tx-head);
+  margin: 18px 0 6px;
+  padding-top: 12px;
+  border-top: 1px solid var(--ln-soft);
+}
+#about-description {
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+  margin: 10px 0 4px;
+}
+.about-para {
+  max-width: 62ch;
+  color: var(--tx-soft);
+  line-height: 1.55;
+}
+
+/* The opening line does the work a hero line does: it is the one sentence
+   somebody reads if they read nothing else. */
+.about-lede {
+  font-size: 14px;
+  line-height: 1.5;
+  color: var(--tx-head);
+}
+
+/* Feature and limit rows. Same geometry for both on purpose -- the limits are
+   the other half of the same answer, not a footnote in smaller type. */
+.about-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 10px 0 4px;
+}
+.about-row {
+  padding: 10px 12px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 9px;
+}
+.about-row-head {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 3px;
+}
+.about-row-head strong {
+  font-weight: 600;
+  color: var(--tx-bright);
+}
+.about-row-body {
+  max-width: 60ch;
+  color: var(--tx-body);
+  line-height: 1.5;
+}
+
+/* Automatic / Opt-in / On demand. Deliberately NEUTRAL: this says whether you
+   have to do something, not whether you are protected, and the greens and
+   ambers in this chrome are spoken for by state. A tag that borrowed one would
+   read as a verdict on the feature beside it. */
+.about-when {
+  flex: none;
+  padding: 1px 7px;
+  border: 1px solid var(--ln-card);
+  border-radius: 999px;
+  background: var(--sf-when);
+  color: var(--tx-dim);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+/* The tri-state promise, given its own weight because it is the sentence the
+   whole product is arranged around. */
+.about-honesty {
+  margin-top: 12px;
+  padding: 10px 12px;
+  border-left: 2px solid var(--st-ok-dim);
+  background: var(--st-ok-bg);
+  color: var(--st-ok-bg-text);
+  max-width: 62ch;
+}
+
+/* Limits carry a muted amber edge -- not red. Nothing here is broken; these
+   are the things this browser does not do, stated so a reader cannot mistake
+   the list above for a complete one. */
+.about-limits .about-row {
+  border-left: 2px solid var(--st-warn-border);
+}
+#about-license-line,
+#about-third-party-line {
+  max-width: 62ch;
+  margin-bottom: 8px;
+}
+
+/* The licence and attribution bodies. Monospace because they are documents
+   with their own line breaks, and `pre-wrap` so long lines fold instead of
+   forcing the whole card to scroll sideways.
+
+   Capped and scrollable on purpose: the third-party text is around 300 KB for
+   the Windows build. Unbounded, it would push the panel to tens of thousands
+   of pixels and bury everything below it -- and the section under this one is
+   how a reader gets back out. */
+.about-text {
+  max-height: 320px;
+  overflow: auto;
+  margin-top: 8px;
+  padding: 10px 12px;
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-soft);
+  border-radius: 8px;
+  color: var(--tx-note);
+  font:
+    11px/1.5 ui-monospace,
+    "Cascadia Mono",
+    Consolas,
+    monospace;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  /* Selectable and copyable: someone auditing a licence needs to get the text
+     out, and this is the only copy they have without the source tree. */
+  user-select: text;
+}
+
+/* ---- privacy panel ---- */
+
+#privacy-panel h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.panel-intro {
+  color: var(--tx-dim);
+  margin-bottom: 10px;
+}
+
+/* What the passphrase gets you, in the Credentials pane. Boxed rather than
+   left as a `.panel-intro` aside: that token is --tx-dim, the chrome's colour
+   for supporting copy, so the answer to "why is this pane empty" and "why did
+   chat sign me out" was styled as something a reader may skip.
+
+   Same geometry as .destructive-warning below, so it reads as native panel
+   furniture rather than something bolted on, but deliberately NOT its amber,
+   NOT .error's red, and NOT --accent: this chrome assigns those three
+   "destructive", "failed" and "focused", and this list is none of them. It is
+   ordinary text that simply must not be skimmed.
+
+   TOKENS ONLY, never literal hex. Three background themes and nine accents
+   (the theme packs) render this panel; a colour written against one of them
+   is wrong in the other eleven. */
+/* The Premium row's headline ("Premium Time Left: 43 days" / "PATANYX
+   Free" / "Premium ended March 12."). It carried .panel-intro's --tx-dim,
+   which styles supporting copy a reader may skip -- and the project owner's
+   direction (2026-08-05) is the exact opposite: this line must be
+   impossible to miss. Same prominence tool as #needs-passphrase below:
+   bright, bigger, boxed. Deliberately NOT --accent, NOT amber, NOT red --
+   this chrome assigns those "focused", "destructive" and "failed", and a
+   countdown is none of them. TOKENS ONLY: three background themes and nine
+   accents render this. The id outranks the .panel-intro class it also
+   carries. */
+#premium-head {
+  color: var(--tx-bright);
+  background: var(--sf-row);
+  border: 1px solid var(--ln-soft2);
+  border-radius: 4px;
+  padding: 9px 11px;
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+#needs-passphrase {
+  color: var(--tx);
+  background: var(--sf-row);
+  border: 1px solid var(--ln-soft2);
+  border-radius: 4px;
+  padding: 9px 11px 9px 26px;
+  margin: 0 0 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  list-style: disc;
+}
+#needs-passphrase li + li {
+  margin-top: 3px;
+}
+
+/* Destructive-action warning. Amber, not red: red is this chrome's colour for
+   "this failed" (.error), and reusing it for "this is about to work, and it
+   will destroy something" would make a warning look like a failure the user
+   can ignore. Boxed and bordered so it is read as a block, not skimmed as
+   another paragraph of intro copy. */
+.destructive-warning {
+  color: var(--st-warn-text);
+  background: var(--st-warn-bg);
+  border: 1px solid var(--st-warn-border2);
+  border-radius: 4px;
+  padding: 9px 11px;
+  margin-bottom: 10px;
+  line-height: 1.5;
+}
+.destructive-warning strong {
+  color: var(--st-warn-strong);
+}
+
+/* Whole row is the label, so the clickable target is the sentence rather
+   than a 13px checkbox. */
+.toggle-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  padding: 8px 9px;
+  margin-bottom: 6px;
+  background: var(--sf-row);
+  border: 1px solid var(--ln-soft2);
+  border-radius: 5px;
+  cursor: pointer;
+}
+.toggle-row:hover {
+  background: var(--sf-row-hover);
+}
+
+.toggle-row input[type="checkbox"] {
+  margin-top: 2px;
+  width: 15px;
+  height: 15px;
+  flex: none;
+  accent-color: var(--st-ok-strong);
+  cursor: pointer;
+}
+
+.toggle-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.toggle-title {
+  color: var(--tx-title);
+}
+
+/* The honest half: what the switch actually does, in plain words. */
+.toggle-note {
+  color: var(--tx-faint);
+  font-size: 12px;
+}
+
+/* A protection this engine cannot enforce. Shown, disabled, and explained —
+   never silently absent, and never a switch that does nothing. */
+.toggle-row.unsupported {
+  opacity: 0.55;
+  cursor: default;
+}
+.toggle-row.unsupported:hover {
+  background: var(--sf-row);
+}
+.toggle-row.unsupported input {
+  cursor: default;
+}
+.toggle-row.unsupported .toggle-note {
+  color: var(--st-warn);
+}
+
+.panel-foot {
+  color: var(--tx-faint);
+  font-size: 12px;
+  margin-top: 10px;
+  padding-top: 8px;
+  border-top: 1px solid var(--ln-soft2);
+}
+
+/* A warning the user must read BEFORE acting, not a footnote about what just
+ * happened. Uses the same amber the state rows use for "refused", because this
+ * is the same class of signal: something here will cost you if you ignore it.
+ * No border-top -- it is not a footer, it sits above the controls it warns
+ * about. */
+.panel-warn {
+  color: var(--st-warn);
+  font-size: 12px;
+  margin-top: 10px;
+}
+
+.vault-state h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+
+form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 480px;
+}
+
+input,
+textarea {
+  font: inherit;
+  color: var(--tx-bright);
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-input);
+  border-radius: 4px;
+  padding: 6px 10px;
+  outline: none;
+  width: 100%;
+}
+input:focus,
+textarea:focus {
+  border-color: var(--accent);
+}
+input[readonly] {
+  background: var(--sf-ro);
+  color: var(--st-ok-alt);
+}
+textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.error {
+  color: var(--st-err-plain);
+  font-size: 12px;
+  min-height: 15px;
+}
+
+/* ---- selectors the markup and the renderers were already using ----
+ *
+ * Every rule in this block is new; every selector in it was already in the
+ * product. An audit of "classes written by JS or markup" against "classes the
+ * stylesheet defines" turned up eight with no rule at all, and they were not
+ * decorative leftovers -- they are the section headings, the status lines and
+ * the form bodies of panels that ship.
+ *
+ * `.is-warning` was the first found and the worst: chrome.js sets it when the
+ * engine REFUSES to freeze a tab, meaning the page is still making requests,
+ * and it rendered nothing. The rest are here because the same question, asked
+ * once, answered for all of them.
+ *
+ * The pattern to notice is that the stylesheet had drifted from the markup in
+ * exactly one direction: `.error` was styled and `.ok` was not, so a panel
+ * could tell you loudly that something failed and silently that it worked. */
+
+/* Success counterpart to `.error` above, and matched to it deliberately --
+ * same size, same reserved height -- so a status line does not shift the
+ * layout when it flips between the two. */
+.ok {
+  color: var(--st-ok);
+  font-size: 12px;
+  min-height: 15px;
+}
+
+/* Evidence lists. `#engine-list` ("What the engine confirmed") and
+ * `#leakcheck-list` both render into these, and both were drawing UA-default
+ * bullets at UA-default spacing inside a panel that styles everything else. */
+.entry-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 8px 0 0;
+}
+.entry {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  padding: 7px 9px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 8px;
+  font-size: 12px;
+}
+.entry strong {
+  font-weight: 600;
+  color: var(--tx-head);
+}
+
+/* Secondary text: present, true, and not the thing to read first. Used for the
+ * "confirmed by the engine" half of every engine row, where the LABEL is the
+ * subject and the state is the answer. */
+.muted {
+  color: var(--tx-dim);
+}
+
+/* Panel forms: the vault's credential and note editors, both import forms, and
+ * the backup export form. Five forms, no rule, so every field sat flush
+ * against its neighbour. */
+.entry-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* One field with an action beside it, inside a form that is otherwise a
+   single column. The input keeps the column's full behaviour via flex:1, so
+   it still lines up with every field above and below it; only the button is
+   new width. `align-items: stretch` rather than center so the button matches
+   the input's height instead of floating in the middle of it. */
+.field-row {
+  display: flex;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.field-row input {
+  flex: 1;
+  /* Without this an input in a flex row refuses to shrink below its intrinsic
+     width, which pushes the button out of the panel on the narrowest layout
+     rather than letting the field give up space. */
+  min-width: 0;
+}
+
+.field-row button {
+  flex: none;
+  white-space: nowrap;
+}
+
+/* The host a credential will actually be offered on, under its username.
+   Green when there is one, muted and italic when there is not -- see
+   `.cred-origin.none`, which is the case that used to be invisible. */
+.cred-origin {
+  color: var(--st-ok-cred);
+  font-size: 11px;
+  letter-spacing: 0.01em;
+}
+
+.cred-origin.none {
+  color: var(--tx-dim);
+  font-style: italic;
+}
+
+/* The certificate line in the tab-activity panel. */
+.tls-text {
+  color: var(--tx-dim);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* Chat message body. Chat is a private-build feature and its panel is built at
+ * runtime, which is how this one escaped: nothing in index.html mentions it,
+ * so a search of the markup never turned it up. */
+.msg-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.tabs {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+
+/* KEEP CLEAR OF THE CLOSE BUTTON.
+ *
+ * `.panel-close` is injected into every panel and pinned to the card's
+ * top-right corner. Three panels put their own content in that corner: the
+ * vault's Lock button, and the tab rows in the library and chat. In the vault
+ * the two landed exactly on top of each other -- "Lock" and "Close" rendered
+ * as one illegible smudge, and the Lock button was unclickable underneath.
+ *
+ * Reserving the space on the row is the fix that scales: any panel that grows
+ * a top-right control later inherits it, rather than each one discovering the
+ * collision separately. Scoped to modal panels because the strip layout this
+ * chrome used before had no floating Close to avoid. */
+.panel-modal .tabs,
+.panel-modal .chat-presence-row {
+  padding-right: 62px;
+}
+
+/* The chat panel's own padding, restated for the card.
+ *
+ * `#chat-panel` sets 10px 12px -- correct for the in-flow strip it was written
+ * for, and an id, so it outranks `.panel-modal`'s 16px 18px and left chat as
+ * the one panel with tighter margins than every other. `.panel-modal#chat-panel`
+ * is (1,1,0) against (1,0,0), which is the smallest change that puts it back in
+ * line without editing the strip rule that still describes the other layout.
+ *
+ * `overflow: hidden` is deliberately NOT overridden here. It looks like a
+ * clipping bug and is not: the panel is bounded by `max-height`, and the
+ * `.chat-state` inside it is a flex child with `min-height: 0` and its own
+ * `overflow-y: auto`, so a long contact list or conversation scrolls INSIDE
+ * the card while the presence bar stays put. Verified with forty contacts --
+ * the card stops at its max height and the list scrolls 3543px of content
+ * through a 526px window. */
+.panel-modal#chat-panel {
+  padding: 16px 18px;
+}
+.tabs .spacer {
+  flex: 1;
+}
+.tab.active {
+  border-color: var(--accent);
+  color: var(--accent-text);
+}
+
+.items {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-width: 640px;
+  margin-bottom: 12px;
+}
+.item {
+  background: var(--sf-item);
+  border: 1px solid var(--ln-item);
+  border-radius: 4px;
+  padding: 6px 8px;
+}
+.item-head {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  margin-bottom: 4px;
+}
+.item-title {
+  font-weight: 600;
+}
+.item-sub {
+  color: var(--tx-dim2);
+  font-size: 12px;
+}
+.item-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.item-row .pw {
+  flex: 1;
+}
+
+.form-buttons {
+  display: flex;
+  gap: 6px;
+}
+
+/* Recovery key: shown once, transcribed by hand from the screen onto paper, so
+   it needs a monospace face and generous spacing rather than the compact
+   treatment the rest of the panel uses. */
+.recovery-key {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.9;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  white-space: pre-wrap;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid var(--ln-code);
+  border-radius: 6px;
+  background: var(--sf-code);
+  color: var(--tx-code);
+  user-select: all;
+}
+
+/* ---- chat panel ------------------------------------------------------------
+   Mirrors the vault panel's structure (one section, mutually exclusive
+   .chat-state divs). The panel is taller than the vault panel and its height
+   is fixed by the chrome window, so the conversation scrolls internally
+   instead of growing the window. */
+
+#chat-panel {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+  padding: 10px 12px;
+  background: var(--sf-panel);
+}
+
+/* These elements set display:flex below, which would otherwise override the
+   UA stylesheet's [hidden] rule — the vault panel never needed this because
+   it sets no display on its states. */
+#chat-panel[hidden],
+.chat-state[hidden],
+#chat-cred-picker[hidden] {
+  display: none;
+}
+
+.chat-state {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+#chat-locked,
+#chat-intro,
+#chat-contacts {
+  overflow-y: auto;
+}
+.chat-state h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.chat-state p {
+  max-width: 480px;
+}
+
+.chat-note {
+  color: var(--tx-dim2);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+
+/* Hash numbers are read aloud and hand-copied between devices, so they get
+   the same select-all monospace treatment as the recovery key. */
+.hash-number {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  word-break: break-all;
+  white-space: pre-wrap;
+  margin: 6px 0 10px;
+  padding: 8px 10px;
+  border: 1px solid var(--ln-code);
+  border-radius: 6px;
+  background: var(--sf-code);
+  color: var(--st-ok-alt);
+  user-select: all;
+}
+
+.chat-st-offline {
+  color: var(--tx-dim2);
+}
+.chat-st-online {
+  color: var(--st-ok-alt);
+}
+.chat-st-connected {
+  color: var(--st-link);
+}
+
+.item.selected {
+  border-color: var(--accent);
+}
+
+/* ---- command palette ----
+   #palette-query reaches everything from the base input rule above; only
+   what is specific to the palette lives here. */
+#palette-query {
+  margin: 10px 0 12px;
+}
+.palette-item {
+  cursor: pointer;
+}
+.palette-item:hover {
+  border-color: var(--ln-card);
+}
+/* `.selected` already means "the keyboard's current choice" on `.item`
+   elsewhere (the tab-activity ledger); reused rather than a second class for
+   the same idea. Arrow keys move it, Enter activates it, a mouse hover moves
+   it too so the two input methods can never disagree about which row Enter
+   would run. */
+
+.chat-peer-name {
+  font-weight: 600;
+}
+
+#chat-messages {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--sf-body);
+  border: 1px solid var(--ln-soft2);
+  border-radius: 4px;
+}
+
+.msg {
+  max-width: 78%;
+  padding: 6px 10px;
+  border-radius: 6px;
+  background: var(--sf-raised);
+  border: 1px solid var(--ln-msg);
+  white-space: pre-wrap;
+  word-break: break-word;
+  align-self: flex-start;
+}
+.msg.out {
+  align-self: flex-end;
+  background: var(--st-msg-out-bg);
+  border-color: var(--st-msg-out-border);
+}
+.msg.sys {
+  align-self: center;
+  max-width: 92%;
+  background: transparent;
+  border: none;
+  color: var(--tx-dim2);
+  font-size: 12px;
+  text-align: center;
+}
+.msg.offer {
+  max-width: 92%;
+}
+/* Delivery state, on out-messages only. Quiet by default: the normal case is
+   a message that arrived, and shouting about it every time would train the
+   user to stop reading the line exactly when it matters. */
+.msg-state {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--tx-dim2);
+}
+.msg.out[data-state="delivered"] .msg-state {
+  color: var(--st-ok-msg);
+}
+.msg.out[data-state="failed"] {
+  border-color: var(--st-err-border);
+}
+.msg.out[data-state="failed"] .msg-state {
+  color: var(--st-err-text);
+}
+.msg .form-buttons {
+  margin-top: 6px;
+}
+.offer-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+.offer-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  margin: 2px 0;
+}
+.offer-key {
+  color: var(--tx-dim2);
+  font-size: 12px;
+  min-width: 70px;
+}
+
+/* A received URL is shown as plain selectable text, never as a link. */
+.chat-url {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-input);
+  border-radius: 4px;
+  padding: 6px 8px;
+  margin: 4px 0;
+  user-select: all;
+}
+
+#chat-send-form {
+  max-width: none;
+  margin-top: 8px;
+}
+.chat-send-row {
+  display: flex;
+  gap: 6px;
+}
+.chat-send-row input {
+  flex: 1;
+}
+
+/* ---- emoji ----
+   NO WEBFONT AND NO SPRITE. The CSP forbids fetching either, and neither is
+   wanted: an emoji is text, and naming the platform's own emoji face means a
+   Windows user sees Windows emoji rather than one vendor's artwork pasted into
+   someone else's desktop. The stack lists the three that actually ship, then
+   falls back to whatever the system has. */
+.emoji-glyph,
+.chat-emoji {
+  font-family:
+    "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+  /* Emoji have no useful baseline against Latin text; a fixed line-height stops
+     the button growing taller than the input beside it. */
+  line-height: 1;
+}
+
+#chat-emoji-panel {
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  max-height: 190px;
+  overflow-y: auto;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 9px;
+}
+#chat-emoji-panel[hidden] {
+  display: none;
+}
+.chat-emoji-label {
+  color: var(--tx-dim);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  margin: 6px 0 4px;
+}
+.chat-emoji-label:first-child {
+  margin-top: 0;
+}
+/* auto-fill rather than a fixed column count, so the grid reflows with the
+   card instead of clipping when the panel is narrow. */
+.chat-emoji-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(30px, 1fr));
+  gap: 2px;
+}
+.chat-emoji {
+  font-size: 19px;
+  padding: 3px 0;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.chat-emoji:hover {
+  background: var(--sf-btn-alt);
+}
+/* The picker is reachable by keyboard like everything else in this panel, and
+   a transparent-bordered button gives focus nothing to land on without this. */
+.chat-emoji:focus-visible {
+  border-color: var(--accent);
+  outline: none;
+}
+#chat-cred-picker {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+#chat-cred-picker select {
+  font: inherit;
+  color: var(--tx-bright);
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-input);
+  border-radius: 4px;
+  padding: 6px 10px;
+  outline: none;
+}
+
+/* Note — READ BEFORE APPLYING.
+   The current chrome.css was not provided to the drafter, so this file
+   cannot be the complete file. APPEND every rule below to the existing
+   crates/app/src/chrome/chrome.css; do NOT replace the file with this
+   content. All colours come from the established palette in
+   shared-context.md §3. The rules reuse existing class hooks (.ico,
+   .feature-btn, .feature-label, .items/.item-*) wherever possible. */
+
+/* TLS interception warning: full-width banner directly under the toolbar,
+   danger palette, no dismiss control. It is part of the chrome document, so
+   chrome.js adds its measured height to the strip while it is visible. */
+#tls-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-err-bg);
+  color: var(--st-err);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#tls-warning[hidden] {
+  display: none;
+}
+
+/* A site was blocked. DANGER palette, like the TLS interception banner and
+   unlike the resolver one: this is the browser saying a third party means the
+   user harm, which is the same class of statement as "someone is reading your
+   traffic". The resolver banner is amber because it only means the browser
+   cannot get online. */
+#blocked-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-err-bg);
+  color: var(--st-err);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#blocked-warning[hidden] {
+  display: none;
+}
+#blocked-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+/* "Open anyway" is styled as the dangerous choice it is, and sits SECOND so
+   Dismiss is not the reflexive click. */
+#blocked-warning .banner-actions button.danger {
+  color: var(--st-err-text2);
+  border-color: var(--st-err-border2);
+  background: var(--st-err-bg2);
+}
+
+/* A newer version is available. NEUTRAL palette: this is news, not a warning.
+   Using the amber or red treatment would spend the user's alarm budget on
+   "there is an update", and the day a real warning appears they would have
+   learned to skim past that colour. */
+#update-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-upd-bg);
+  color: var(--st-upd-text);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#update-banner[hidden] {
+  display: none;
+}
+#update-banner .ico {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* The vault is about to lock. Takes the AMBER warning palette rather than the
+   blue of the update notice: this one has a deadline and something will be
+   taken away if it is ignored, which the update notice never does. Not red --
+   nothing is wrong, the browser is doing exactly what it was asked to. */
+#lock-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-warn-bg);
+  color: var(--st-warn-text);
+  border-bottom: 1px solid var(--st-warn-border3);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#lock-warning[hidden] {
+  display: none;
+}
+#lock-warning .ico {
+  flex: none;
+  margin-top: 1px;
+  stroke: var(--st-warn);
+}
+
+/* The idle-timeout picker, laid out like the resolver picker so the two
+   settings that offer a choice read the same way. */
+#autolock-choices,
+#warn-choices,
+#theme-choices {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 6px;
+}
+
+/* A setting nested under another setting. Smaller than the <h2> above it so
+   the warning reads as belonging to the timeout rather than competing with
+   it -- they are one decision made in two parts. */
+.setting-sub {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--tx-soft);
+  margin-top: 14px;
+}
+
+/* Resolver unreachable. Shares the TLS banner's shape but takes the WARNING
+   palette rather than the danger one: interception means someone is reading
+   traffic the user believes is private, whereas this means the browser cannot
+   get online. Both matter; only one is an adversary. Giving them the same
+   colour would flatten that distinction, and the red one is the one that must
+   keep its force. */
+#resolver-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-warn-bg2);
+  color: var(--st-warn);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#resolver-warning[hidden] {
+  display: none;
+}
+#resolver-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+.banner-text {
+  flex: 1;
+  min-width: 0;
+}
+.banner-title {
+  display: block;
+  color: var(--tx-bright);
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+/* The actions must not be pushed off the edge by long copy, and must not
+   wrap into the text column. */
+.banner-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+  align-self: center;
+}
+#tls-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+#tls-warning .tls-title {
+  display: block;
+  color: var(--tx-bright);
+  font-weight: 600;
+  margin-bottom: 2px;
+}
+
+/* The freeze chip's label used to turn BLUE when frozen, while `.is-active`
+   turned its border and icon green -- one control saying "on" in two colours,
+   and the only toolbar button that did not obey the chrome's one rule: grey is
+   not active, green is active. The override is gone, so a frozen tab reads
+   green throughout. `is-warning` still owns the failed-freeze case, which is a
+   different axis (it went wrong) rather than a different degree of on. */
+.feature-btn[disabled] {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/* Per-tab panel. It can exceed its height budget with a long ledger, so it
+   scrolls internally. */
+
+/* A subsection heading inside a panel -- Tab Activity's Network requests /
+   Storage / Connection / Cookies, and the first-run tour's three topics.
+   Scoped to `#tab-panel` alone until the tour reused it: found by looking at
+   a screenshot where the tour's three headings rendered as plain paragraph
+   text, exactly the class of defect this project's own gates cannot catch,
+   because nothing asserts a class actually has a rule -- panel-audit's
+   `[UNSTYLED]` check is keyed on panel IDs, not on classes used inside one. */
+.section-label {
+  display: block;
+  color: var(--tx-faint);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 14px 0 4px;
+}
+#tab-panel .panel-note,
+#dns-panel .panel-note,
+#tunnel-panel .panel-note,
+#dns-choice .panel-note {
+  color: var(--tx-faint);
+  font-size: 12px;
+  margin: 6px 0 0;
+}
+
+/* Resolver panel. Heading and the choice row want breathing room the privacy
+   panel's dense toggle list does not. */
+#dns-panel h1,
+#tunnel-panel h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+#dns-panel .form-buttons,
+#tunnel-panel .form-buttons {
+  margin-top: 10px;
+}
+
+/* The tunnel panel's chosen mode, marked by chrome.js with `active` on a
+   button.small. This rule existing is the entire point: the resolver picker
+   once shipped the class with NO css rule and all choices rendered
+   identically (scripts/dns-ui-gate.js). Scoped to the panel so the tunnel
+   gate checks THIS picker rather than passing on the resolver's rule.
+   `outline` is used so this composes with any shared active treatment
+   instead of fighting it. */
+#tunnel-panel button.small.active {
+  outline: 2px solid currentColor;
+  outline-offset: 1px;
+}
+#dns-panel .section-head {
+  display: block;
+  color: var(--tx-faint);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin: 16px 0 6px;
+}
+
+/* Three-way comparison. A definition list rather than a table: the entries are
+   uneven prose, and a table would either truncate them into cells that say less
+   than the user needs or scroll sideways in a 300px-tall panel. */
+#dns-compare {
+  font-size: 12px;
+  line-height: 1.45;
+}
+#dns-compare dt {
+  color: var(--tx-bright);
+  font-weight: 600;
+  margin-top: 10px;
+}
+#dns-compare dt:first-child {
+  margin-top: 0;
+}
+#dns-compare dd {
+  color: var(--tx-dim);
+  margin-top: 2px;
+}
+/* The one-phrase verdict, so the three can be told apart at a glance without
+   reading three paragraphs. Blue for the same reason the selected choice is
+   blue: this is orientation, not a claim that anything is protecting you. */
+.dns-tag {
+  color: var(--accent-tag);
+  font-weight: 600;
+}
+#tab-panel h2 {
+  color: var(--tx-bright);
+  font-size: 14px;
+  font-weight: 600;
+  margin: 18px 0 6px;
+}
+
+/* Ledger counts: blocked (where the platform observes it) reads in the
+   good/active colour — a stopped request is a good event. */
+#ledger-list .blocked {
+  color: var(--st-ok);
+}
+#ledger-list .allowed {
+  color: var(--tx-faint);
+}
+
+/* Ephemeral marker on tab chips: closing an ephemeral tab discards its site
+   data, which must not come as a surprise. */
+.chip-badge {
+  flex: none;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 2px 3px;
+  margin-left: 6px;
+}
+
+/* ---- toolbar crowding ----
+   Ten feature buttons plus an address bar. Integrity and updates are icon-only
+   already; the rule below decides which of the rest get a word.
+
+   MEASURED, not estimated. Rendered in Chrome with the URL field pinned at its
+   260px floor, summing every toolbar child plus gaps and padding:
+
+     everything labelled                       1213px
+     Bookmark/Tab/Library icon-only (SHIPPED)  1061px
+       ...plus the two live-state chips         972px
+       ...plus the product's three              844px
+
+   WHAT THIS FIXES. The only threshold used to be 1000px, which was correct for
+   NINE feature buttons and wrong the moment the resolver chip made it ten:
+   between 1001px and 1212px the row overflowed and the last button — page
+   integrity — was cut off the right edge, with the update button entirely
+   off-screen. Not degraded, GONE, at ordinary laptop widths, and silently,
+   because nothing in the gates measures toolbar fit.
+
+   Every breakpoint sits ABOVE the measured figure it relieves. `system-ui`
+   resolves to Segoe UI on Windows and to something else on Linux, so a
+   threshold tuned to the pixel on the machine that measured it would cut a
+   button off on the machine that ships. Re-measure the same way, on both, if
+   this row changes. */
+/* ---- WHICH BUTTONS EARN A WORD, AND THE RULE FOR THE NEXT ONE ----
+   The row reached ten feature buttons and the honest reading is that it was
+   growing without a policy: every new control arrived with a label because
+   every existing one had a label. That is how a toolbar balloons -- not in one
+   decision, in ten reasonable ones.
+
+   So the rule, and it is a RULE rather than this week's arrangement. A button
+   carries a word only if:
+
+     it reports LIVE STATE the user needs at a glance   (Freeze, DNS), or
+     it is one of the product's own surfaces            (Privacy, Vault, Chat), or
+     its ICON IS AMBIGUOUS against another in the row   (Integrity, Updates).
+
+   The third clause is a late addition that earns its place: both of
+   those buttons wear a symbol that already means something else here. The
+   Integrity shield is the Privacy shield two buttons along, and the Updates
+   glyph WAS the reload button's, at a different scale, until 99254d5. An icon
+   that collides is not an icon, and a word is the cheapest fix.
+
+   A WORD IS THE CHEAPEST FIX, BUT NOT ALWAYS THE RIGHT ONE. Quarantine was a
+   third shield in that same set and it got a new icon instead of leaning on
+   its label, because the collision was between the PICTURES and a label only
+   works once you have stopped to read it. Redraw first; spend a word when the
+   glyph is genuinely unambiguous and still unfamiliar.
+
+   TWO controls stay icon-only, and both are the two most expensive words the
+   row could carry:
+
+     Quarantine 129px   Bookmark 72px
+
+   A star has meant "bookmark" in every browser since before tabs existed. The
+   mask is the newer of the two and holds for the same reason: it is the only
+   face in the row and it reads at 16px. Library was exempted alongside
+   Bookmark on the same reasoning and the reasoning did not hold; see the rule
+   further down.
+
+   Everything not covered by the three clauses ships icon-only with a `title`
+   and an `aria-label`, however obvious a label would feel while writing it. A
+   NEW BUTTON DEFAULTS TO ICON-ONLY.
+
+   Measured cost of each label:
+
+     Integrity 65px   Updates 67px   DNS 57px   Privacy 53px
+     Vault 39px   Chat 37px   Freeze 33px   TA 23px
+
+   Labelled row: 1152px with the address bar at its 220px floor.
+
+   THE BUDGET STILL BINDS EVEN THOUGH THE PILLS HAVE THEIR OWN ROW, and the
+   reason is not width -- it is HEIGHT. `CHROME_CLOSED_PX` is a fixed number
+   handed to Rust, and a wrapping toolbar that spills onto a third line is not
+   given more room: it is clipped. Measured at 1180px with every label shown,
+   the pills wrapped to three rows and the strip came to 185px against the 148
+   the chrome had asked for -- the bottom row simply gone.
+   
+   So these rules keep the pill row to ONE line. That is what makes the strip's
+   height predictable, and predictable is what a fixed height requires. */
+/* LIBRARY GOT ITS WORD BACK, and the reason it lost it is worth keeping.
+   Both labels were dropped together to buy width, on the argument that a star
+   and a stack of books are each unmistakable. Half of that was true. A star
+   has meant "bookmark" since before tabs existed and still does. A shelf of
+   books at 16px, sitting in a row of nine pills, is a small dark shape -- the
+   operator's question on first sight of this row was literally "what is that
+   one pill that doesn't have a name?", which is the only test that matters and
+   it failed.
+
+   The width came back from elsewhere: About's label went from "About PATANYX"
+   to "About". Measured 900-1600px with Library labelled, the row still holds
+   at two lines and the strip at 136px against the 148 budget.
+
+   QUARANTINE WENT THE OTHER WAY, at the project owner's direction, and it is the
+   rule working rather than an exception to it. That button carried a word for
+   one reason: its shield collided with Privacy's and Integrity's. Redrawing it
+   as a mask removed the collision, and once the glyph is unambiguous the
+   default applies -- icon-only, with the full name in `aria-label` and the
+   behaviour in `title`. It was also the widest label in the row at 129px.
+
+   Both buttons here are icon-only ONLY because their glyphs carry themselves.
+   Neither is an argument for hiding a label that is doing work. */
+#btn-bookmark .feature-label,
+#btn-quarantine-menu .feature-label {
+  display: none;
+}
+
+/* Tab Activity keeps a mark, at the project owner's direction: "TA" rather than the
+   full name, about 20px against the 60px the words would cost.
+
+   THIS IS AN EXCEPTION AND NOT A LOOPHOLE. The rule above is that a button
+   earns a WORD by carrying live state or being a product surface; abbreviating
+   is not a way to smuggle a button into the labelled set. Two initials tell a
+   first-time user nothing an icon does not, which is the argument the rule
+   exists to make -- so the full name has to be somewhere they will find it,
+   and it is in three: `aria-label`, `title`, and the panel heading. If a
+   second "XY" ever appears in this row the rule has stopped working. */
+#btn-tab .feature-label {
+  /* Same colour as every other label, deliberately. A first draft dimmed this
+     to mark it as an abbreviation rather than a word; sitting next to five
+     full-strength labels it just read as disabled, which is the one thing a
+     live control must never look like. Letter-spacing only, so two capitals
+     do not look cramped. */
+  letter-spacing: 0.03em;
+}
+
+/* ORDER OF SACRIFICE, widest first. Each figure is what the row ACTUALLY needs
+   in that band, read back from the rendered layout rather than derived by
+   subtracting label widths -- a first pass did the subtraction and put the
+   floor 33px too low, because a collapsing label does not free its whole width
+   (the button keeps its icon and padding):
+
+     all labels                              1152px    (band above 1220px)
+     - Integrity, Updates    (secondary)     1031px    (band above 1080px)
+     - DNS, Freeze           (live state)     965px    (band above  980px)
+     - Privacy, Vault, Chat  (the product)    834px    (narrowest that fits)
+
+   Integrity and Updates go first because they are things you go LOOKING for --
+   the original comment in this file said exactly that, and it had been vacuous
+   since it was written, because neither button had a label to collapse. Now
+   they do, and it means something.
+
+   Live state goes second: those two labels are the only ones carrying
+   information rather than a name. The product's own three go last.
+
+   THE BREAKPOINTS MOVED DOWN with the pills onto their own row: 1220/1080/980
+   were sized for a single row where every label was taken out of the address
+   bar's width. Nothing competes now, and the row WRAPS rather than clipping,
+   so the cost of keeping a label too long is a third line -- not a control
+   pushed off the edge. The order of sacrifice is unchanged; only the widths
+   where it starts. */
+@media (max-width: 940px) {
+  #btn-integrity .feature-label,
+  #btn-update .feature-label {
+    display: none;
+  }
+}
+
+@media (max-width: 1080px) {
+  #btn-dns .feature-label,
+  #btn-freeze .feature-label {
+    display: none;
+  }
+}
+
+/* Genuinely narrow: even that row no longer fits, so the product's own three
+   give up their words too rather than let a control be pushed off the edge.
+   834px is then the narrowest window with nothing cut off, found by bisecting
+   the rendered layout. Below it something must still go; that is narrower than
+   any browser window in normal use, and the alternative — an address bar too
+   small to read a domain in — is worse. */
+@media (max-width: 980px) {
+  #btn-privacy .feature-label,
+  #btn-vault .feature-label,
+  #btn-chat .feature-label {
+    display: none;
+  }
+}
+
+/* The address bar must never collapse below something you can read a domain
+   in, whatever else is competing for the row.
+   260px -> 220px, to buy labels for Integrity and Updates. MEASURED against
+   real text at this chrome's own font rather than chosen by feel:
+     placeholder "Search or enter address"   157px
+     www.nationalgeographic.com              193px
+     example.com                              88px
+   The field carries 22px of padding and border, so 220px leaves 198px of text
+   and a typical full domain still reads end to end. 200px does not -- that is
+   where an ordinary domain starts truncating, which is why the floor stopped
+   here rather than going lower for more button room. */
+#url {
+  min-width: 220px;
+}
+
+/* ---- contact presence and notes ----
+   Green online, red offline, orange away. The dot sits on the hash number's
+   row because the hash IS the address, and "can I reach this person" is the
+   question the contact list exists to answer. */
+.presence {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  flex: none;
+  margin-right: 2px;
+}
+.presence-online {
+  background: var(--st-ok);
+}
+.presence-offline {
+  background: var(--st-err-strong);
+}
+.presence-away {
+  background: var(--st-warn);
+}
+
+.item-note {
+  margin-top: 4px;
+}
+.note-text {
+  color: var(--tx-dim);
+  font-size: 12px;
+  cursor: text;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.note-text:hover {
+  color: var(--tx);
+}
+/* Distinguishable from a real note, so an empty one never reads as content. */
+.note-empty {
+  font-style: italic;
+  color: var(--tx-empty);
+}
+.note-input {
+  width: 100%;
+  font: inherit;
+  font-size: 12px;
+  color: var(--tx-bright);
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-input);
+  border-radius: 4px;
+  padding: 5px 8px;
+  resize: vertical;
+}
+.note-input:focus {
+  border-color: var(--accent);
+  outline: none;
+}
+
+/* ---- chat presence and relay surface (built at runtime by chat.js) ---- */
+.chat-presence {
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--ln);
+}
+.chat-presence-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.chat-presence-text {
+  color: var(--tx);
+  font-size: 12px;
+  flex: 1;
+}
+.chat-presence-buttons {
+  display: flex;
+  gap: 6px;
+}
+.chat-relay {
+  margin-top: 8px;
+  padding: 8px;
+  background: var(--sf-row);
+  border: 1px solid var(--ln);
+  border-radius: 4px;
+}
+.chat-relay-title {
+  color: var(--tx-bright);
+  font-weight: 600;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+.chat-relay-note {
+  color: var(--tx-faint);
+  font-size: 11.5px;
+  margin: 4px 0;
+}
+.chat-relay-state {
+  color: var(--tx);
+  font-size: 12px;
+  margin: 6px 0;
+}
+.chat-relay-label {
+  color: var(--tx-faint);
+  font-size: 11.5px;
+  margin-top: 6px;
+}
+.chat-relay-enable {
+  color: var(--tx);
+  font-size: 12px;
+  display: block;
+  margin-top: 6px;
+}
+.chat-relay-url,
+.chat-relay-identity {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--sf-btn);
+  color: var(--tx);
+  border: 1px solid var(--ln);
+  border-radius: 4px;
+  padding: 4px 6px;
+  margin-top: 2px;
+}
+.chat-relay-save {
+  margin-top: 8px;
+}
+/* presence colours per the project owner spec — ONLY if these two are absent;
+   green online / red offline are already built: */
+.chat-st-away {
+  color: var(--st-warn);
+}
+
+/* Brand mark in the toolbar. Filled, not stroked, so it cannot share .ico
+   (which sets fill:none and strokes currentColor — that would render this
+   as an outline of the letterform).
+
+   The mark is 49x88 in its own units, so height drives the size and the
+   width follows the aspect ratio. Sized to the cap height of the controls
+   beside it rather than to their box, or it reads as oversized next to the
+   nav glyphs. Accent-coloured to tie it to the app icon, and given the same
+   right margin as the toolbar gap so it groups with nothing. */
+#brand-mark {
+  height: 17px;
+  width: auto;
+  flex: none;
+  fill: var(--accent);
+  margin: 0 4px 0 2px;
+  /* Purely decorative: never a click target, never a focus stop. */
+  pointer-events: none;
+  user-select: none;
+}
+
+/* ---- find bar ----
+   Sits in the banner band, styled like one: same padding rhythm, same
+   border seam. display:flex would beat the UA [hidden] rule, so the
+   [hidden] override is load-bearing -- without it, `hidden` stops hiding
+   the bar and the chrome height lies. */
+#findbar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 14px;
+  background: var(--sf-findbar);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+}
+#findbar[hidden] {
+  display: none;
+}
+#find-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--sf-find-input);
+  color: var(--tx-find);
+  border: 1px solid var(--ln);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-size: 13px;
+}
+#find-input:focus {
+  outline: none;
+  border-color: #5b6b82;
+}
+#find-count {
+  white-space: nowrap;
+  color: var(--tx-find-dim);
+  min-width: 72px;
+  text-align: right;
+}
+#find-unsupported {
+  flex: 1;
+  color: var(--tx-find-dim);
+}
+#findbar button {
+  background: var(--sf-find-btn);
+  color: var(--tx-find);
+  border: 1px solid var(--ln);
+  border-radius: 4px;
+  padding: 3px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+#findbar button:hover {
+  background: var(--sf-find-btn-hover);
+}
+
+/* ---- accent themes -----------------------------------------------------
+   The ONLY colours this file themes. Every neutral -- backgrounds, text,
+   borders, scrims -- stays hardcoded, and so do the state colours: green
+   means "a protection is on", amber "the engine refused", red "this failed",
+   and those must mean the same thing in every theme or the chrome's one
+   colour rule is gone. Per-feature identity pills keep their own tokens.
+
+   The :root block holds the DEFAULT theme: each value is exactly the hex
+   that used to be hardcoded at that variable's use sites, so with no
+   data-theme attribute -- or one this file does not know, which cannot
+   happen via the pref but can via a stale webview cache -- the chrome
+   renders byte-identically to before. chrome.js sets
+   documentElement.dataset.theme from the chrome_theme pref at boot and on
+   change; the three blocks below are the whole selectable set.
+
+   Contrast reasoning is stated per theme, and every value was checked by
+   machine (WCAG ratio >= the default theme's ratio for the same pair, on
+   the real chrome backgrounds); five drafted values were nudged a few
+   lightness points to clear that bar. Every alternative keeps the
+   default family's lightness ladder (accent < bright < tag < text), so
+   relationships that ship today -- the 2px tab edge brighter than a focus
+   ring, selected text near-white on a dark tinted fill -- hold in all four. */
+:root {
+  --accent: #4f8cff; /* focus rings, loading, brand mark, toast edge, selected borders, ephemeral badge */
+  --accent-bright: #6b9dff; /* active-tab top edge; quarantine identity */
+  --accent-choice-bg: #26304a; /* the chosen button in a picker row (button.small.active) */
+  --accent-choice-border: #4a6fa5;
+  --accent-choice-text: #cfe0ff;
+  --accent-text: #bcd4ff; /* selected panel-tab label (.tab.active) */
+  --accent-tag: #8fb0e8; /* one-phrase verdict in the resolver comparison */
+}
+
+/* Violet. The ladder hue-rotated from 219 to 256, then lifted about eight
+   points of lightness: at this hue the green channel -- which carries most
+   of a colour's luminance -- falls to the floor, so an unlifted rotation
+   would sit dimmer on the dark chrome backgrounds than the default does.
+   Lifted, each rung lands at the same on-background brightness as the rung
+   it replaces. Hue 256 is about as far from the state colours (green,
+   amber, red) as the wheel allows, so a focus ring here can never read as
+   a state. */
+:root[data-theme="violet"] {
+  --accent: #a180ff;
+  --accent-bright: #b194ff;
+  --accent-choice-bg: #3d3061;
+  --accent-choice-border: #7861b8;
+  --accent-choice-text: #f0ebff;
+  --accent-text: #e9e0ff;
+  --accent-tag: #c0afef;
+}
+
+/* Blood red. REPLACED Rose 2026-08-04 on the project owner's instruction (no
+   pink, ever). A deep saturated red, deliberately DARKER and bluer than
+   the muted error red (#c05050) is light: the two must never read as each
+   other, and the choice text/tag rungs stay warm-pale where the error
+   family is desaturated. 3.99:1 against the body -- above the 3:1
+   non-text bar the whole set is checked against
+   (scripts/theme-contrast-gate.py). */
+:root[data-theme="blood_red"] {
+  --accent: #d84040;
+  --accent-bright: #e35d5d;
+  --accent-choice-bg: #3d2023;
+  --accent-choice-border: #a04848;
+  --accent-choice-text: #ffd6d6;
+  --accent-text: #ffbdbd;
+  --accent-tag: #e89191;
+}
+
+/* Sky. Same ladder, hue rotated to 199 with lightness untouched: the green
+   channel rises at this hue, so every rung is strictly brighter on the
+   chrome backgrounds than the default rung it replaces. This is the sky
+   this file already cleared as distinct from protected green (see
+   #btn-update -- "sky rather than the teal the mockup shows"), not teal. */
+:root[data-theme="sky"] {
+  --accent: #4fc7ff;
+  --accent-bright: #6bd0ff;
+  --accent-choice-bg: #223b46;
+  --accent-choice-border: #4a88a5;
+  --accent-choice-text: #cff0ff;
+  --accent-text: #bceaff;
+  --accent-tag: #8fcce8;
+}
+
+/* The five below joined 2026-08-04 with blood red, and together they are
+   the SEED of the future premium theme pack (docs/premium-design.md) --
+   shipped unlocked; nothing gates them until licensing exists and the
+   operator flips that deliberately. Same seven-rung ladder, same
+   machine-checked bars as the originals. */
+
+/* Green. The one accent allowed NEAR the state hues, at the project owner's
+   request, and the ONLY accent with a per-scheme value: neon on the dark
+   chrome (this block), plain green when the White scheme lands -- neon on
+   white is unreadable and plain green on near-black is mud. A focus ring
+   here can read close to "protection on" green; accepted knowingly, the
+   swatch is labelled, and the state greens themselves never move. */
+:root[data-theme="green"] {
+  --accent: #39ff14;
+  --accent-bright: #74ff5c;
+  --accent-choice-bg: #17381a;
+  --accent-choice-border: #2fae2f;
+  --accent-choice-text: #d9ffd2;
+  --accent-text: #b6ffab;
+  --accent-tag: #7fe87f;
+}
+
+/* Amber. Warmer and far brighter than the warning amber (#d8b46a sits on
+   dim surfaces; this rides the accent slots), hue held at 38 so it never
+   drifts orange-red toward the error family. */
+:root[data-theme="amber"] {
+  --accent: #f0a832;
+  --accent-bright: #ffbd55;
+  --accent-choice-bg: #3b2d13;
+  --accent-choice-border: #a87e2e;
+  --accent-choice-text: #ffe7bd;
+  --accent-text: #ffdca3;
+  --accent-tag: #e8bd7a;
+}
+
+/* Teal. Between sky (199) and green, at 174 -- distinct from both by more
+   than the wheel distance separating the original four. */
+:root[data-theme="teal"] {
+  --accent: #2fd1c0;
+  --accent-bright: #58e0d2;
+  --accent-choice-bg: #14343a;
+  --accent-choice-border: #2f9a94;
+  --accent-choice-text: #ccf6f1;
+  --accent-text: #aff0e8;
+  --accent-tag: #7fd8cd;
+}
+
+/* Slate. The understated one: a desaturated steel blue whose whole ladder
+   stays close to the neutral greys, for a chrome that barely announces
+   its accent at all. Still clears every bar. */
+:root[data-theme="slate"] {
+  --accent: #92a7c4;
+  --accent-bright: #a9bcd6;
+  --accent-choice-bg: #262e3d;
+  --accent-choice-border: #64778f;
+  --accent-choice-text: #dde6f2;
+  --accent-text: #ccd9ea;
+  --accent-tag: #a3b4c9;
+}
+
+/* Purple. Deeper and bluer than violet (268 vs 256, lower lightness), so
+   the two remain distinguishable side by side in the picker; nowhere near
+   any pink. */
+:root[data-theme="purple"] {
+  --accent: #8c5bff;
+  --accent-bright: #a276ff;
+  --accent-choice-bg: #2c2050;
+  --accent-choice-border: #6a4bc0;
+  --accent-choice-text: #e5dcff;
+  --accent-text: #d7c9ff;
+  --accent-tag: #b49aef;
+}
+
+/* Accent picker in the settings panel. Same row-of-small-buttons treatment
+   as the resolver and idle-timeout pickers (the row layout comes from the
+   shared #theme-choices selector above); the selected swatch reuses
+   button.small.active, so the chosen state follows the theme like every
+   other chosen state and no new selection styling exists. The swatch dot
+   previews a theme you are NOT on, so its colour is hardcoded per theme --
+   keep these nine in step with the --accent values above. */
+.theme-swatch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.theme-swatch .swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  flex: none;
+  /* The dot previews another theme, so nothing guarantees it contrasts
+     with THIS one's panel (neon green on the White scheme, most of all).
+     The neutral line keeps every dot visible on every scheme. */
+  border: 1px solid var(--ln);
+}
+.theme-swatch[data-theme-choice="default"] .swatch {
+  background: #4f8cff;
+}
+.theme-swatch[data-theme-choice="violet"] .swatch {
+  background: #a180ff;
+}
+.theme-swatch[data-theme-choice="blood_red"] .swatch {
+  background: #d84040;
+}
+.theme-swatch[data-theme-choice="sky"] .swatch {
+  background: #4fc7ff;
+}
+.theme-swatch[data-theme-choice="green"] .swatch {
+  background: #39ff14;
+}
+.theme-swatch[data-theme-choice="amber"] .swatch {
+  background: #f0a832;
+}
+.theme-swatch[data-theme-choice="teal"] .swatch {
+  background: #2fd1c0;
+}
+.theme-swatch[data-theme-choice="slate"] .swatch {
+  background: #92a7c4;
+}
+.theme-swatch[data-theme-choice="purple"] .swatch {
+  background: #8c5bff;
+}
+/* ---- end accent themes ---- */
+/* ---- chrome schemes ----------------------------------------------------
+   Every neutral, line, text and STATE rung, lifted 2026-08-04 so the White
+   and Black schemes exist at all. Each --var's :root value is EXACTLY the
+   hex it replaced -- the Dark scheme renders byte-identically, same rule as
+   the accent lift. State hues stay semantic in every scheme (green = on,
+   amber = warned, red = failed); White re-tunes their lightness because
+   pale-on-white is invisible, Black inherits Dark's. Bars are enforced by
+   scripts/theme-contrast-gate.py, which is a GATE, not a one-shot. */
+:root {
+  --sf-body: #17181c;
+  --sf-sunken: #121317;
+  --sf-tabstrip: #191a1f;
+  --sf-strip: #1f2026;
+  --sf-card: #202128;
+  --sf-raised: #26272f;
+  --sf-panel: #1a1b20;
+  --sf-row: #1f2027;
+  --sf-row-hover: #24252d;
+  --sf-btn: #2b2c33;
+  --sf-btn-alt: #2b2c34;
+  --sf-btn-hover: #35363f;
+  --sf-btn-active: #3f4049;
+  --sf-chipx-hover: #33343d;
+  --sf-item: #202127;
+  --sf-scrim: #15161b;
+  --sf-ro: #101116;
+  --sf-code: #16161c;
+  --sf-findbar: #20242c;
+  --sf-find-input: #14161b;
+  --sf-find-btn: #2a2f3a;
+  --sf-find-btn-hover: #333947;
+  --sf-when: #191a20;
+  --ln: #3a3b43;
+  --ln-soft: #2c2d35;
+  --ln-soft2: #2c2d34;
+  --ln-input: #33343c;
+  --ln-strong: #34353f;
+  --ln-btn: #4a4b57;
+  --ln-card: #3a3b45;
+  --ln-code: #3a3a44;
+  --ln-msg: #30313a;
+  --ln-item: #2e2f37;
+  --tx-bright: #e9e9ee;
+  --tx: #d7d7dc;
+  --tx-dim: #9a9ba5;
+  --tx-faint: #8f909a;
+  --tx-dim2: #9a9aa3;
+  --tx-chip: #a9aab3;
+  --tx-chip-hover: #c9cad3;
+  --tx-chipx: #7f808b;
+  --tx-max: #f0f0f5;
+  --tx-head: #e2e2e8;
+  --tx-soft: #c3c4cd;
+  --tx-body: #b0b1bb;
+  --tx-note: #b9bac4;
+  --tx-title: #e4e4ea;
+  --tx-empty: #6c6d77;
+  --tx-code: #e8e8ef;
+  --tx-find: #d7dae0;
+  --tx-find-dim: #8b93a1;
+  --st-ok: #9fd6ac;
+  --st-ok-alt: #9ed08a;
+  --st-ok-cred: #6fcf8e;
+  --st-ok-msg: #7fbf7f;
+  --st-ok-strong: #4d8f5e;
+  --st-ok-dim: #3f6b4a;
+  --st-ok-bg: #1b2620;
+  --st-ok-bg-text: #cfe0d5;
+  --st-ok-badge-text: #eafaef;
+  --st-warn: #d8b46a;
+  --st-warn-border: #8a6d2f;
+  --st-warn-bg: #2a2418;
+  --st-warn-text: #e8d5a8;
+  --st-warn-strong: #f0dfb8;
+  --st-warn-border2: #5c4a22;
+  --st-warn-border3: #6b5423;
+  --st-warn-bg2: #3a3226;
+  --st-err: #e2a1a1;
+  --st-err-strong: #c05050;
+  --st-err-bg: #6b3333;
+  --st-err-hover: #3a2626;
+  --st-err-border: #7a3434;
+  --st-err-text: #d98a8a;
+  --st-err-border2: #8a4444;
+  --st-err-bg2: #4a2626;
+  --st-err-text2: #f0c8c8;
+  --st-err-plain: #e08080;
+  --st-link: #7fb3ff;
+  --st-msg-out-bg: #233246;
+  --st-msg-out-border: #34537a;
+  --st-upd-bg: #23303f;
+  --st-upd-text: #a8c2dd;
+}
+
+/* White scheme: black text on white. States re-tuned dark-on-light. */
+:root[data-scheme="white"] {
+  --sf-body: #ffffff;
+  --sf-sunken: #f1f1f4;
+  --sf-tabstrip: #ececef;
+  --sf-strip: #f7f7f9;
+  --sf-card: #f3f3f6;
+  --sf-raised: #ececf0;
+  --sf-panel: #fafafc;
+  --sf-row: #f5f5f8;
+  --sf-row-hover: #e9e9ed;
+  --sf-btn: #e6e6eb;
+  --sf-btn-alt: #e6e6ec;
+  --sf-btn-hover: #dcdce3;
+  --sf-btn-active: #d2d2da;
+  --sf-chipx-hover: #e2e2e8;
+  --sf-item: #f3f3f7;
+  --sf-scrim: #e8e8ec;
+  --sf-ro: #eeeef2;
+  --sf-code: #f0f0f4;
+  --sf-findbar: #f0f0f4;
+  --sf-find-input: #f4f4f7;
+  --sf-find-btn: #e4e6ec;
+  --sf-find-btn-hover: #d8dbe4;
+  --sf-when: #f2f2f5;
+  --ln: #c9c9d1;
+  --ln-soft: #dcdce2;
+  --ln-soft2: #dcdce3;
+  --ln-input: #c4c4cd;
+  --ln-strong: #b8b8c2;
+  --ln-btn: #a8a8b5;
+  --ln-card: #c6c6cf;
+  --ln-code: #c6c6d0;
+  --ln-msg: #d0d0d8;
+  --ln-item: #d4d4db;
+  --tx-bright: #1b1b20;
+  --tx: #26262c;
+  --tx-dim: #5f606a;
+  --tx-faint: #63646e;
+  --tx-dim2: #60616a;
+  --tx-chip: #4e4f58;
+  --tx-chip-hover: #3a3b44;
+  --tx-chipx: #6f707a;
+  --tx-max: #101014;
+  --tx-head: #202026;
+  --tx-soft: #43444d;
+  --tx-body: #4a4b55;
+  --tx-note: #45464f;
+  --tx-title: #1e1e24;
+  --tx-empty: #7d7e88;
+  --tx-code: #17171c;
+  --tx-find: #2a2d33;
+  --tx-find-dim: #5c6472;
+  --st-ok: #1e6f3a;
+  --st-ok-alt: #2a7a30;
+  --st-ok-cred: #1d7a44;
+  --st-ok-msg: #2f7a2f;
+  --st-ok-strong: #2f7a45;
+  --st-ok-dim: #cce4d2;
+  --st-ok-bg: #e8f4ec;
+  --st-ok-bg-text: #1d4a2e;
+  --st-ok-badge-text: #0f3d20;
+  --st-warn: #8a6a10;
+  --st-warn-border: #c8a94e;
+  --st-warn-bg: #faf3dc;
+  --st-warn-text: #6a5210;
+  --st-warn-strong: #574208;
+  --st-warn-border2: #d8c690;
+  --st-warn-border3: #d0bc80;
+  --st-warn-bg2: #f7f0dd;
+  --st-err: #a03030;
+  --st-err-strong: #b03535;
+  --st-err-bg: #f5dcdc;
+  --st-err-hover: #f3e0e0;
+  --st-err-border: #d89a9a;
+  --st-err-text: #a03838;
+  --st-err-border2: #d09090;
+  --st-err-bg2: #f0dada;
+  --st-err-text2: #7a2525;
+  --st-err-plain: #b02f2f;
+  --st-link: #2f6ad0;
+  --st-msg-out-bg: #dce8f8;
+  --st-msg-out-border: #a8c4e8;
+  --st-upd-bg: #e2ecf6;
+  --st-upd-text: #2f4a66;
+}
+
+/* Black scheme: true black. Neutrals darken; states inherit Dark's
+   values (they already sit on near-black and only gain contrast). */
+:root[data-scheme="black"] {
+  --sf-body: #000000;
+  --sf-sunken: #0a0a0d;
+  --sf-tabstrip: #050507;
+  --sf-strip: #0d0d11;
+  --sf-card: #101014;
+  --sf-raised: #16161b;
+  --sf-panel: #08080b;
+  --sf-row: #0e0e12;
+  --sf-row-hover: #15151a;
+  --sf-btn: #1a1a20;
+  --sf-btn-alt: #1a1a21;
+  --sf-btn-hover: #23232a;
+  --sf-btn-active: #2b2b33;
+  --sf-chipx-hover: #202027;
+  --sf-item: #101015;
+  --sf-scrim: #0a0a0e;
+  --sf-ro: #060609;
+  --sf-code: #08080c;
+  --sf-findbar: #0e0e13;
+  --sf-find-input: #090b0f;
+  --sf-find-btn: #191d26;
+  --sf-find-btn-hover: #222835;
+  --sf-when: #0c0c10;
+  --ln: #26262e;
+  --ln-soft: #1c1c22;
+  --ln-soft2: #1c1c23;
+  --ln-input: #24242c;
+  --ln-strong: #2a2a34;
+  --ln-btn: #34343f;
+  --ln-card: #26262f;
+  --ln-code: #262630;
+  --ln-msg: #1f1f27;
+  --ln-item: #1d1d24;
+  --tx-bright: #f2f2f6;
+  --tx: #e4e4e9;
+  --tx-dim: #a6a7b1;
+  --tx-faint: #9a9ba5;
+  --tx-dim2: #a5a6ae;
+  --tx-chip: #b4b5bd;
+  --tx-chip-hover: #d4d5dd;
+  --tx-chipx: #8a8b96;
+  --tx-max: #fafafc;
+  --tx-head: #ececf1;
+  --tx-soft: #ced0d8;
+  --tx-body: #babbc5;
+  --tx-note: #c4c5cf;
+  --tx-title: #eeeef3;
+  --tx-empty: #777881;
+  --tx-code: #f2f2f8;
+  --tx-find: #e1e4ea;
+  --tx-find-dim: #969eac;
+}
+
+/* White-scheme accent families. On white, "bright" means DEEPER (it marks
+   the active tab edge against a near-white strip), choice backgrounds are
+   light tints and every text rung is dark-on-light. The green family here
+   is the project owner's plain green -- neon lives only on Dark and Black.
+   Cascade note: these combined selectors (two attributes) out-rank both
+   the accent blocks and the scheme block (one attribute each), and the
+   plain [data-scheme="white"] default-accent block below the accent
+   section relies on FILE ORDER against [data-theme="..."], which is why
+   every white block sits after every accent block. Bars enforced by
+   scripts/theme-contrast-gate.py. */
+
+:root[data-scheme="white"] {
+  --accent: #2f6fe0;
+  --accent-bright: #1f5ac8;
+  --accent-choice-bg: #dce8ff;
+  --accent-choice-border: #88aade;
+  --accent-choice-text: #173a70;
+  --accent-text: #1d4a90;
+  --accent-tag: #3a5f9e;
+}
+
+:root[data-scheme="white"][data-theme="violet"] {
+  --accent: #6a3fd8;
+  --accent-bright: #5930c0;
+  --accent-choice-bg: #e9e1fb;
+  --accent-choice-border: #af97e0;
+  --accent-choice-text: #3a2080;
+  --accent-text: #4a28a8;
+  --accent-tag: #5c3f9e;
+}
+
+:root[data-scheme="white"][data-theme="blood_red"] {
+  --accent: #c22f2f;
+  --accent-bright: #a82525;
+  --accent-choice-bg: #fbe0e0;
+  --accent-choice-border: #d89090;
+  --accent-choice-text: #701818;
+  --accent-text: #8f1f1f;
+  --accent-tag: #953333;
+}
+
+:root[data-scheme="white"][data-theme="sky"] {
+  --accent: #0077b8;
+  --accent-bright: #0067a2;
+  --accent-choice-bg: #dcf0fb;
+  --accent-choice-border: #7fbcd8;
+  --accent-choice-text: #00476e;
+  --accent-text: #005a8a;
+  --accent-tag: #20668a;
+}
+
+:root[data-scheme="white"][data-theme="green"] {
+  --accent: #1e7d32;
+  --accent-bright: #186a28;
+  --accent-choice-bg: #ddf2e0;
+  --accent-choice-border: #8cc89a;
+  --accent-choice-text: #124a1e;
+  --accent-text: #176028;
+  --accent-tag: #2a6a3a;
+}
+
+:root[data-scheme="white"][data-theme="amber"] {
+  --accent: #9a6b00;
+  --accent-bright: #835a00;
+  --accent-choice-bg: #faeed2;
+  --accent-choice-border: #d0aa50;
+  --accent-choice-text: #5c3f00;
+  --accent-text: #7a5500;
+  --accent-tag: #7a5a10;
+}
+
+:root[data-scheme="white"][data-theme="teal"] {
+  --accent: #0e7a6e;
+  --accent-bright: #0a685e;
+  --accent-choice-bg: #d8f2ef;
+  --accent-choice-border: #7cc4bc;
+  --accent-choice-text: #084a42;
+  --accent-text: #0c5f56;
+  --accent-tag: #1a6a60;
+}
+
+:root[data-scheme="white"][data-theme="slate"] {
+  --accent: #4a6076;
+  --accent-bright: #3d5062;
+  --accent-choice-bg: #e4e9ef;
+  --accent-choice-border: #a2b2c2;
+  --accent-choice-text: #2a3a4a;
+  --accent-text: #3a4c5e;
+  --accent-tag: #4a5a6a;
+}
+
+:root[data-scheme="white"][data-theme="purple"] {
+  --accent: #6f42d8;
+  --accent-bright: #5f35c2;
+  --accent-choice-bg: #e8e0fb;
+  --accent-choice-border: #b09ae2;
+  --accent-choice-text: #3a1f80;
+  --accent-text: #5028a8;
+  --accent-tag: #54389e;
+}

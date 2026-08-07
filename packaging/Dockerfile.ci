@@ -1,0 +1,51 @@
+# Debian 13 (trixie) build and CI image.
+#
+# The build host MUST NOT be Debian 12. Its webkit2gtk is end-of-life at
+# 2.50.6 (Debian security tracker, DSA-6232-1), so it will never receive the
+# WSA-2026-0004 fixes: 23 CVEs, several of them memory corruption reachable by
+# visiting a page. Trixie security carries 2.52.5-1~deb13u1 (DSA-6398-1),
+# which is the floor `platform::MIN_WEBKITGTK` enforces at runtime.
+#
+# This is a container rather than a host upgrade on purpose: the machine this
+# was developed on runs 19 unrelated pm2 services, and a dist-upgrade to pick
+# up a browser dependency would be an absurd blast radius.
+FROM debian:13
+
+# trixie-security is where the fixed webkit lives, so it is not optional here.
+# Failing loudly at build time is better than silently resolving an older one.
+RUN apt-get update -qq && apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        curl \
+        ca-certificates \
+        git \
+        libwebkit2gtk-4.1-dev \
+        libgtk-3-dev \
+        libssl-dev \
+        xvfb \
+        xauth \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fail the image build if the engine is below the floor, rather than
+# discovering it in a test run later. dpkg-query is the build-time mirror of
+# the runtime check in enforce_engine_floor().
+RUN set -eu; \
+    v="$(dpkg-query -W -f='${Version}' libwebkit2gtk-4.1-dev)"; \
+    echo "webkit2gtk-4.1-dev = $v"; \
+    case "$v" in \
+      2.5[2-9].*|2.[6-9][0-9].*|[3-9].*) echo "at or above the 2.52.5 floor" ;; \
+      *) echo "REFUSING: $v is below the 2.52.5 security floor" >&2; exit 1 ;; \
+    esac
+
+# Pinned toolchain. rust-toolchain.toml pins the channel, but rustup must
+# exist to honour it, and the pin is repeated here so an image built without
+# the repo mounted still lands on the right compiler.
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+      | sh -s -- -y --no-modify-path --default-toolchain 1.96.0 \
+        -c rustfmt -c clippy \
+    && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
+
+WORKDIR /src

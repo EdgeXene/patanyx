@@ -1,0 +1,23 @@
+[package]
+# Note: crate directory name ("store") and package name are my choice
+# — the brief specifies `crates/integrity` for component A but names no
+# crate for B/C. Rename freely; nothing else depends on it yet.
+name = "patanyx-store"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+patanyx-integrity = { path = "../integrity" }
+argon2 = "0.5"
+chacha20poly1305 = "0.10"
+zeroize = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+# Note: sha2/hmac versions are not visible in the vault manifest I was
+# shown. 0.10/0.12 are the matching current lines; adjust if the workspace
+# pins something else. No rand_core dependency: OsRng is reached through
+# chacha20poly1305's re-export, exactly as the vault does.
+sha2 = "0.10"
+hmac = "0.12"

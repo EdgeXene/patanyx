@@ -1,0 +1,2217 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'"
+    />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <link rel="stylesheet" href="chrome.css" />
+    <title>PATANYX Browser</title>
+  </head>
+  <body>
+    <nav id="tabstrip" aria-label="Tabs">
+      <div id="tabs"></div>
+      <button id="btn-newtab" type="button" title="New tab">+</button>
+    </nav>
+
+    <!-- Toolbar. Navigation controls are glyph-only because back/forward/
+         reload are near-universal; every FEATURE button carries an icon AND a
+         written label, because an icon alone makes the user guess what a
+         thing does, and guessing wrong about a privacy control is worse than
+         a slightly wider toolbar. Each feature button also reports its own
+         state (aria-pressed plus a visible accent), so what is on is legible
+         without opening anything. -->
+    <header id="toolbar">
+      <!-- Brand mark. INLINED, not <img src>, because the mono asset fills
+           with currentColor and an <img> document does not inherit the host
+           page's colour — loaded that way it renders solid black. Decorative
+           and non-interactive: it is not a button, so it must not look like
+           one or imply an action. aria-hidden because the window title
+           already names the application; a screen reader announcing "PATANYX
+           Browser" before every toolbar control is noise. -->
+      <svg id="brand-mark" viewBox="40 20 49 88" aria-hidden="true">
+        <path
+          d="M44 20 L57 20 L57 64 L53.5 108 A3.5 3.5 0 0 1 46.5 108 L40 64 L40 24 A4 4 0 0 1 44 20 Z"
+        />
+        <path d="M57 20 A32 22 0 0 1 57 64 L57 51 A17 9 0 0 0 57 33 Z" />
+      </svg>
+      <button
+        id="btn-back"
+        class="nav-btn"
+        type="button"
+        title="Back"
+        aria-label="Back"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M10 3 L5 8 L10 13" />
+        </svg>
+      </button>
+      <button
+        id="btn-fwd"
+        class="nav-btn"
+        type="button"
+        title="Forward"
+        aria-label="Forward"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M6 3 L11 8 L6 13" />
+        </svg>
+      </button>
+      <button
+        id="btn-reload"
+        class="nav-btn"
+        type="button"
+        title="Reload"
+        aria-label="Reload"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M13 8 A5 5 0 1 1 11.4 4.4" />
+          <path d="M13 2 L13 5 L10 5" />
+        </svg>
+      </button>
+
+      <!-- Opens Tab Activity -- the same panel "TA" opens, not a second one.
+           A first draft of this button opened its OWN panel repeating the
+           origin, TLS and storage-profile status that panel already shows
+           under "Connection" and "Storage"; that would have been two places
+           answering "is this connection secure" and letting them read
+           differently is exactly the kind of thing this project's own gates
+           exist to catch. This button exists as a second, more conventional
+           way IN -- the padlock-adjacent-to-the-address-bar spot every
+           mainstream browser uses -- to content that already lives in one
+           place. The Cookies section and "Forget this site" below are the
+           only genuinely new thing here. -->
+      <button
+        id="btn-site-info"
+        class="nav-btn"
+        type="button"
+        title="About this site"
+        aria-label="About this site"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="2" y="2" width="12" height="12" rx="3" />
+          <path d="M8 7.2 V11.2" />
+          <path d="M8 4.9 V5.2" />
+        </svg>
+      </button>
+      <input
+        id="url"
+        type="text"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        placeholder="Search or enter address"
+        aria-label="Address bar"
+      />
+
+      <!-- Page zoom, shown only when it is NOT 100%. A permanent "100%" is
+           noise; its absence answers "am I zoomed" for the common case. Click
+           to reset, which is what someone wants the moment they notice it.
+
+           Moved to sit directly after the address bar, because what it
+           describes is the page named in that bar. -->
+      <button
+        id="zoom-chip"
+        type="button"
+        class="small"
+        title="Page zoom. Click to reset to 100%"
+        hidden
+      ></button>
+
+      <!-- ROW ONE ENDS HERE: THE PAGE IN FRONT OF YOU.
+           ============================================
+
+           This file has now described three different toolbars, and the two
+           dead descriptions are worth one sentence each so the next reader
+           knows which claims to distrust. First it held ten controls in a
+           single row, which read as an index rather than a toolbar. Then it
+           held three -- shield, freeze, menu -- with everything else inside a
+           vertical sheet, which cost a press to reach anything and, worse,
+           made assertions VACUOUS: a button sealed in a closed sheet still
+           reports `hidden === false`, so gates went on passing while proving
+           nothing about reachability.
+
+           It now holds every control across two rows, split by
+           `.toolbar-break`. The division is by SUBJECT, not by importance:
+
+             row one -- this page. Navigate it, bookmark it, open a clean tab
+                        to replace it, or read what the browser itself is.
+             row two -- the browser's standing state: protection, freeze,
+                        activity, vault, resolver, chat, library, integrity,
+                        updates.
+
+           Row two is laid out flush RIGHT (`justify-content: flex-end` in the
+           stylesheet). That only affects row two, because `#url` grows to eat
+           row one's free space and leaves none to distribute.
+
+           ORDER HERE IS LOAD-BEARING, AND WAS ONCE OVERRIDDEN INVISIBLY.
+           `#btn-about` carried `order: 99` left over from the sheet, and
+           because flex `order` reorders across the whole container it pulled
+           About past the row break onto row two no matter what this markup
+           said -- moving the button here simply appeared not to work. The
+           declaration is gone. If a control lands on the wrong row again,
+           check the stylesheet for `order` before rearranging these tags.
+
+           Integrity and Updates are absent below because update.js and
+           integrity.js append them at runtime; they land at the end of row
+           two, which is where they belong. -->
+
+      <button
+        id="btn-bookmark"
+        class="feature-btn"
+        type="button"
+        title="Bookmark this page"
+        aria-label="Bookmark this page"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M8 2 L9.8 6 L14 6.3 L10.9 9.1 L11.9 13.5 L8 11.2 L4.1 13.5 L5.1 9.1 L2 6.3 L6.2 6 Z"
+          />
+        </svg>
+        <span class="feature-label">Bookmark this page</span>
+      </button>
+      <button
+        id="btn-quarantine-menu"
+        class="feature-btn"
+        type="button"
+        aria-label="New quarantine tab"
+        title="Open a tab with JavaScript off, blocking on, and no stored state"
+      >
+        <!-- A MASK, AND IT REPLACED A THIRD SHIELD.
+             This button used to wear a shield with a check inside it. So does
+             Integrity. Privacy wears a shield too. Three shields in one strip
+             is not an icon set, it is the same icon three times, and the one
+             thing a glance was supposed to answer -- which of these is which
+             -- was the thing it could not.
+
+             Drawn here rather than borrowed: not the fedora-and-spectacles
+             every Chromium browser uses, and not a soft filled domino either.
+             The shoulders are chamfered and the eyes are cut as slits rather
+             than holes, which is the same hard geometry the rest of this icon
+             set is drawn from -- straight runs, one bend, no curves that are
+             not doing work.
+
+             THE ICON IS A METAPHOR AND NOT A CLAIM. A mask suggests going
+             unseen; this tab does not make anyone anonymous, and nothing about
+             it hides an IP address. What it actually does is in the `title`
+             one line above, in plain words, which is where the promise is
+             allowed to live. -->
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M2.2 5 L4 4.2 H12 L13.8 5 V7.2 C13.8 9.5 12.5 11.3 10.8 11.3 C9.5 11.3 8.6 10.3 8 9.4 C7.4 10.3 6.5 11.3 5.2 11.3 C3.5 11.3 2.2 9.5 2.2 7.2 Z"
+          />
+          <path d="M4.4 7.3 L6.7 7.3" />
+          <path d="M9.3 7.3 L11.6 7.3" />
+        </svg>
+        <span class="feature-label">New quarantine tab</span>
+      </button>
+      <button
+        id="btn-about"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Version, license, and the software this build is made of"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="6" />
+          <path d="M8 7.2 V11.2" />
+          <path d="M8 4.9 V5.2" />
+        </svg>
+        <span class="feature-label">About</span>
+      </button>
+
+      <!-- ROW BREAK. Everything after this wraps onto a second line, so the
+           feature pills sit UNDER the address bar and every one of them is
+           visible without opening anything.
+
+           A zero-height flex break rather than two container divs, and the
+           reason is update.js and integrity.js: both append their button to
+           #toolbar at runtime. Split the markup into real rows and those two
+           land outside both of them. Appending to the end of a wrapping
+           container puts them exactly where they belong, with no JS change and
+           nothing for a future panel to forget. -->
+      <div class="toolbar-break" aria-hidden="true"></div>
+
+      <button
+        id="btn-privacy"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Privacy protections for this browser"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M8 1.5 L13.5 3.5 V8 C13.5 11 11 13.6 8 14.5 C5 13.6 2.5 11 2.5 8 V3.5 Z"
+          />
+        </svg>
+        <span class="feature-label">Privacy</span>
+        <span id="privacy-count" class="badge" hidden></span>
+      </button>
+      <button
+        id="btn-theme"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Theme: how this browser looks"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 2.5 A5.5 5.5 0 1 0 13.5 8 L8 8 Z" />
+        </svg>
+        <span class="feature-label">Theme</span>
+      </button>
+      <button
+        id="btn-freeze"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Freeze this tab: stop it from making network requests"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 2 V14 M3.4 4.8 L12.6 11.2 M12.6 4.8 L3.4 11.2" />
+        </svg>
+        <span class="feature-label" id="freeze-label">Live</span>
+      </button>
+
+      <!-- Quarantine leads, because it is the only entry that is an ACTION
+           rather than a place, and because it is the answer to the question
+           someone actually arrives at this menu holding: "I do not trust this
+           link." One press applies JavaScript-off, blocking, ephemeral
+           storage and freeze together, which is otherwise four controls in
+           two different panels. -->
+
+      <!-- The full name is back. "TA" was a deliberate choice and the reason
+           given was space: about 20px against 60px in a horizontal row. A
+           vertical sheet has that 60px, so the constraint that produced the
+           abbreviation no longer applies and the decision it forced can be
+           unwound without contradicting it. -->
+      <button
+        id="btn-tab"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        aria-label="Tab Activity"
+        title="Tab Activity: hosts this tab contacted, freeze, storage"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M4 1.5 H9.5 L12.5 4.5 V14.5 H4 Z" />
+          <path d="M6 7.5 H10.5 M6 10 H10.5" />
+        </svg>
+        <!-- SHOWN AS "TA", the project owner's choice, and the reason is the row
+               it sits in: about 20px against the 60px the words cost, in a
+               horizontal line where that space buys another control's label.
+               It was briefly expanded when this control lived in a vertical
+               menu, where the constraint did not apply -- the menu is gone and
+               the constraint is back.
+
+               The full name is not lost: `aria-label` gives it to screen
+               readers and voice control, `title` gives it on hover, and the
+               panel's heading says it in full the moment the button is
+               pressed. The visible text is deliberately a case-insensitive
+               prefix of the accessible name, so the two do not disagree for
+               anyone driving this by voice. -->
+        <span class="feature-label">TA</span>
+      </button>
+
+      <!-- Padlock = the vault, and the shackle opens when it is unlocked, so
+           locked vs unlocked stays visible on the entry itself. -->
+      <button
+        id="btn-vault"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Passphrase vault"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <rect x="3.5" y="7" width="9" height="7" rx="1.5" />
+          <path
+            id="vault-shackle"
+            d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7"
+          />
+        </svg>
+        <span class="feature-label">Vault</span>
+        <span id="vault-dot" class="dot" hidden></span>
+      </button>
+
+      <!-- THE FILL BUTTON, AND WHY IT IS OUT HERE RATHER THAN IN A PANEL.
+           This control already existed -- as a row inside Tab Activity, below
+           Save page as PDF, under a "Passwords" heading. It worked. Nobody
+           found it. The project owner's report was that they could see their
+           credentials but were copying and pasting them, which is the rational
+           thing to do when the fill button is three clicks away inside a panel
+           named after something else entirely.
+
+           A password fill has to be where the password field is. So it lives
+           on the toolbar, and it is HIDDEN unless this exact site has a saved
+           credential -- which makes its mere presence the message. There is no
+           disabled state and no "no saved password for this site" text out
+           here: a permanently greyed button on a strip of nine live controls is
+           noise, and the panel row still says all of that for anyone who looks.
+
+           `hidden` by default, so a locked vault, a page with no origin, and a
+           platform without content-script injection all show nothing at all
+           rather than a control that cannot work. -->
+      <button
+        id="btn-fill"
+        class="feature-btn"
+        type="button"
+        title="Fill the saved password for this site"
+        hidden
+      >
+        <!-- A KEY, and deliberately not a lock: the vault button one position
+             to the left already wears the padlock, and its shackle animates
+             open and shut to carry locked-vs-unlocked. Repeating that shape
+             here would make the pair read as two states of one thing. A key is
+             the act rather than the container -- it is what you do WITH the
+             vault, which is exactly this button's job. -->
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="5.2" cy="10.8" r="2.7" />
+          <path d="M7.1 8.9 L12.8 3.2" />
+          <path d="M10.6 5.4 L12.2 7" />
+        </svg>
+        <span class="feature-label">Fill password</span>
+      </button>
+
+      <!-- Globe = name lookup, coloured by the chrome's one rule: GREY IS NOT
+           ACTIVE, GREEN IS ACTIVE. Grey on System, because the browser is
+           doing nothing about DNS; green on Mullvad or Quad9, because it is.
+           Green says "the browser is choosing your resolver", not "you are
+           private" -- System stays the right answer for a VPN user, and the
+           panel's comparison says so in its first entry.
+
+           Hidden until the engine says it can honour the setting: WebKitGTK
+           has no encrypted-DNS support of any kind, so on Linux this never
+           appears rather than opening a panel full of controls that do
+           nothing. -->
+      <button
+        id="btn-dns"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Who resolves the sites you visit"
+        hidden
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="6" />
+          <path d="M2.3 6 H13.7 M2.3 10 H13.7" />
+          <path d="M8 2 C5.5 4.5 5.5 11.5 8 14 C10.5 11.5 10.5 4.5 8 2" />
+        </svg>
+        <span class="feature-label" id="dns-label">DNS</span>
+      </button>
+
+      <!-- No `hidden` here, unlike btn-dns: the tunnel runs on both
+           platforms, so there is no platform gate to reveal it through. -->
+      <button
+        id="btn-tunnel"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Tunnel"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11.2 13.9 8 14.5 C4.8 13.9 2.5 11.5 2.5 8 V3.5 Z"
+          />
+        </svg>
+        <span class="feature-label" id="tunnel-label">Tunnel</span>
+      </button>
+
+      <!-- Hidden by default and revealed by chat.js, which is evaluated only
+           in chat builds. A default build never runs that script, so the
+           button must not be visible there or it would do nothing when
+           clicked. -->
+      <button
+        id="btn-chat"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Local-network chat"
+        hidden
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 3.5 H13.5 V11 H7.5 L4.5 13.5 V11 H2.5 Z" />
+        </svg>
+        <span class="feature-label">Chat</span>
+        <!-- Messages that arrived while you were not looking at them. It is
+               a COUNT, not a dot, because "three people wrote to you" and "one
+               did" are different situations. -->
+        <span id="chat-unread" class="badge" hidden></span>
+        <span id="chat-dot" class="dot" hidden></span>
+      </button>
+
+      <!-- The star SAVES the page you are on; the library is where what you
+           saved ends up, with downloads. Adjacent on purpose: the write and
+           the read of the same thing. -->
+
+      <button
+        id="btn-library"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        aria-label="Library: bookmarks and downloads"
+        title="Bookmarks and download records"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 13.5 H13.5" />
+          <path d="M4 13.5 V2.5 H6.5 V13.5" />
+          <path d="M6.5 13.5 L8.7 2.8 L11 3.6 L8.8 13.5" />
+        </svg>
+        <span class="feature-label">Library</span>
+      </button>
+
+      <!-- LAST, and kept there by `order` rather than by position.
+             update.js and integrity.js append their buttons to this container
+             at runtime, so anything written last in the markup stops being
+             last the moment those two scripts run -- About would sit above
+             Integrity and Updates, which is not where a person looks for it.
+             The sheet is a flex column, so `order` settles it whatever the
+             append sequence turns out to be. -->
+    </header>
+    <!-- A scheduled check found a newer version. NOTIFICATION ONLY: nothing
+         has been downloaded and nothing will install without the user opening
+         Updates and accepting. The button opens that panel rather than
+         starting anything, so the accept stays where it always was. -->
+    <div id="update-banner" role="status" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 2 V10" />
+        <path d="M5 7 L8 10 L11 7" />
+        <path d="M3 12 V13 A1 1 0 0 0 4 14 H12 A1 1 0 0 0 13 13 V12" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title"
+          >A newer version of PATANYX is available</span
+        >
+        <span id="update-banner-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="update-banner-open" type="button" class="small">
+          Show me
+        </button>
+        <button id="update-banner-dismiss" type="button" class="small">
+          Later
+        </button>
+      </div>
+    </div>
+
+    <!-- THE VAULT IS ABOUT TO LOCK.
+         Raised one minute out, and it exists because the things that keep a
+         vault open are not the things that keep a person at their desk. Typing
+         inside a page now counts, but reading a long article or watching a
+         video is no input at all -- and in a chat build the lock tears down the
+         transport, so somebody reading a conversation would drop off the
+         network mid-sentence with nothing having warned them.
+
+         `role="alert"` rather than `role="status"`: this one has a deadline and
+         an action, unlike the update notice above it. -->
+    <div id="lock-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="3.5" y="7" width="9" height="7" rx="1.5" />
+        <path d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title">Your vault is about to lock</span>
+        <span id="lock-warning-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="lock-warning-stay" type="button" class="small">
+          I'm still here
+        </button>
+        <button id="lock-warning-now" type="button" class="small">
+          Lock now
+        </button>
+      </div>
+    </div>
+
+    <!-- A CONTENT TAB SUBMITTED A LOGIN FORM.
+         The password itself never enters this webview's DOM or this file's
+         markup -- it sits in Rust's `AppState.pending_save` until Save is
+         clicked, at which point Rust writes it to the vault directly. This
+         banner only ever sees `{origin, username}`, the same pair
+         `tab_status`'s `pending_save` field carries.
+
+         The second button says "Not now", not "Never": clicking it clears
+         THIS one offer (`cred_save_dismiss`) and nothing more -- there is no
+         do-not-ask-again list in this pass, and the next submission on this
+         site will offer again. "Never" would claim a persistent choice this
+         feature does not make. -->
+    <div id="save-password-banner" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <rect x="3.5" y="7" width="9" height="7" rx="1.5" />
+        <path d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title">Save this password?</span>
+        <span id="save-password-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="save-password-save" type="button" class="small">
+          Save
+        </button>
+        <button id="save-password-dismiss" type="button" class="small">
+          Not now
+        </button>
+      </div>
+    </div>
+
+    <!-- A navigation was REFUSED because its host is on the malicious-host
+         list. The refusal already happened in Rust; this only explains it,
+         and it must, because a page that silently fails to load teaches the
+         user the browser is broken.
+
+         A banner rather than a full-page interstitial, on purpose. wry's
+         navigation handler carries no frame information, so on WebKitGTK this
+         fires for subframes too -- correct for BLOCKING, but replacing the
+         whole page would destroy a page the user is reading because one
+         embedded frame was refused. A banner is accurate in both cases.
+
+         The actions live HERE, in the chrome, not in a page. A blocked site
+         cannot forge a control it does not host. -->
+    <div id="blocked-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6" />
+        <path d="M4 4 L12 12" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title">This site was blocked</span>
+        <span id="blocked-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="blocked-allow" type="button" class="small danger">
+          Open anyway
+        </button>
+        <button id="blocked-dismiss" type="button" class="small">
+          Dismiss
+        </button>
+      </div>
+    </div>
+
+    <!-- Shown only when TWO independent signals agree: a real navigation
+         failed in a network-looks-dead way, AND a direct probe could not reach
+         the resolver the user chose. Either alone produces false positives, in
+         opposite directions -- see crates/app/src/resolver_probe.rs.
+
+         It offers no "switch to System" button ON PURPOSE. Changing the
+         resolver from a banner a hostile network can provoke would let that
+         network argue the browser into plaintext DNS by refusing service,
+         which is the exact adversary fail-closed exists to defeat. The banner
+         says where the setting is; the human goes and changes it. -->
+    <div id="resolver-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <circle cx="8" cy="8" r="6" />
+        <path d="M2.3 6 H13.7 M2.3 10 H13.7" />
+        <path d="M8 2 C5.5 4.5 5.5 11.5 8 14 C10.5 11.5 10.5 4.5 8 2" />
+      </svg>
+      <div class="banner-text">
+        <!-- States the OBSERVATION, not a culprit. The body explains that a
+             blocking network is the usual cause and that a dropped connection
+             or a reconnecting VPN are others; a headline reading "this network
+             is blocking your DNS service" would assert the one thing the
+             browser cannot actually distinguish, directly above a paragraph
+             admitting it. -->
+        <span class="banner-title" id="resolver-title">
+          Your DNS service cannot be reached
+        </span>
+        <span id="resolver-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="resolver-retry" type="button" class="small">
+          Check again
+        </button>
+        <button id="resolver-dismiss" type="button" class="small">
+          Dismiss
+        </button>
+      </div>
+    </div>
+
+    <!-- Fail-closed, and this banner must never suggest otherwise: there is
+         NO automatic fallback to a direct connection. MUST stay listed in
+         BANNERS in chrome.js; a banner missing from that list renders
+         outside the clipped strip and is invisible (the lock-warning
+         defect). -->
+    <div id="tunnel-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path
+          d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11.2 13.9 8 14.5 C4.8 13.9 2.5 11.5 2.5 8 V3.5 Z"
+        />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title" id="tunnel-warning-title">
+          The tunnel is not carrying traffic
+        </span>
+        <span id="tunnel-warning-body">
+          Pages are not loading because the tunnel is down. PATANYX will NOT
+          fall back to a direct connection. Open the tunnel panel.
+        </span>
+      </div>
+      <div class="banner-actions">
+        <button id="tunnel-warning-open" type="button" class="small">
+          Open Tunnel panel
+        </button>
+      </div>
+    </div>
+
+    <div id="tls-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1.5 L15 14 H1 Z" />
+        <path d="M8 6 V9.5 M8 11.8 V12.4" />
+      </svg>
+      <div class="tls-text">
+        <span class="tls-title">This connection is being intercepted</span>
+        <span>
+          Something on this network is decrypting the traffic between you and
+          this site. It can read everything you send and receive, including
+          passwords. This is common on work networks and with some antivirus
+          software.
+        </span>
+      </div>
+    </div>
+
+    <!-- Find bar. Not a panel: no scrim, no focus trap, and it must stay
+         reachable while a page has focus. Options are fixed (case-
+         insensitive, wraps around, highlights all); v1 has no toggles.
+         `hidden` keeps it out of the chrome height until opened -- opening
+         and closing go through the same height sync the banners use, or
+         content paints clipped underneath it. -->
+    <div id="findbar" hidden role="search">
+      <input
+        id="find-input"
+        type="text"
+        placeholder="Find in page"
+        autocomplete="off"
+        spellcheck="false"
+      />
+      <span id="find-count" aria-live="polite"></span>
+      <span id="find-unsupported" hidden>
+        Find is not available with this browser engine version.
+      </span>
+      <button id="find-prev" type="button" title="Previous match (Shift+Enter)">
+        Previous
+      </button>
+      <button id="find-next" type="button" title="Next match (Enter)">
+        Next
+      </button>
+      <button id="find-close" type="button" title="Close (Esc)">Close</button>
+    </div>
+
+    <!-- First-run tour. Auto-opened once, shown by chrome.js's boot sequence
+         when `onboarding_seen_get` reports `false` -- an install already
+         holding a vault is inferred to be an upgrade and never sees this
+         (prefs.rs::onboarding_resolved). No toolbar pill: reachable again
+         only from the "Show the tour again" button in About, and it is set
+         as THIS panel's registerPanel `button`, so opening it from there is
+         an ordinary panel-to-panel switch, not a special case.
+
+         A single scrollable page, not a stepped wizard -- explaining
+         everything and letting the reader skim at their own pace fits this
+         project's own rule better than forcing a sequence: "explain, then
+         let the user act," never gate action behind reading. Skip is
+         therefore never a separate control; Escape, the scrim, the auto-
+         injected Close button and "Got it" are all exactly the same dismiss,
+         and every one of them marks the tour seen (onClose below). -->
+    <section id="onboarding-panel" hidden>
+      <h1>Welcome to PATANYX</h1>
+      <p class="panel-intro">
+        A few things this browser does differently, in case the icons do not
+        make it obvious.
+      </p>
+
+      <span class="section-label">Who resolves the sites you visit</span>
+      <p class="panel-note">
+        Pick who looks up the sites you visit. Mullvad and Quad9 encrypt your
+        lookups and block malware and phishing. Nothing changes until you choose
+        one.
+      </p>
+
+      <span class="section-label">Quarantine tabs</span>
+      <p class="panel-note">
+        Not sure about a link? Open it in a quarantine tab. JavaScript is off,
+        blocking is on, and nothing is saved. The page freezes as soon as it
+        loads.
+      </p>
+
+      <span class="section-label">The vault</span>
+      <p class="panel-note">
+        Your passwords and notes are encrypted on this computer. Only your
+        passphrase opens them. Add a recovery key in case you ever forget it.
+      </p>
+
+      <p class="panel-note">
+        Tip: press Ctrl+K at any time to search for an action by name.
+      </p>
+
+      <div class="form-buttons">
+        <button id="onboarding-done" type="button">Got it</button>
+      </div>
+    </section>
+
+    <!-- Command palette. Ctrl+K only -- deliberately no toolbar pill, since a
+         palette exists for people who would rather type an action's name than
+         hunt an icon for it, and a pill would be a second, redundant way to
+         reach something the keyboard already reaches directly.
+
+         Every entry below runs the SAME button the toolbar itself uses --
+         `.click()` on the real element -- rather than a second copy of what
+         that action does. Two code paths for one action is how they drift. -->
+    <section id="palette-panel" hidden>
+      <h1>Jump to</h1>
+      <input
+        id="palette-query"
+        type="text"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        placeholder="Type an action's name…"
+        aria-label="Search actions"
+      />
+      <ul id="palette-list" class="items" role="listbox"></ul>
+      <p class="panel-foot" id="palette-empty" hidden>No matching action.</p>
+    </section>
+
+    <!-- Privacy panel. Every row states in plain words what it actually does,
+         because a bare switch labelled "Block ads" invites the reader to
+         assume more than the code delivers. Rows the engine cannot honour are
+         disabled and say why, rather than silently doing nothing. -->
+
+    <section id="tab-panel" hidden>
+      <h1>Tab Activity</h1>
+
+      <span class="section-label">Network requests</span>
+      <p class="panel-intro" id="tab-freeze-desc"></p>
+      <div class="form-buttons">
+        <button id="btn-tabfreeze" type="button">Freeze this tab</button>
+        <button id="btn-allow-site" type="button" class="small">
+          Allow this site while frozen
+        </button>
+      </div>
+      <p class="panel-note">
+        Freezing stops a page from sending anything once it has loaded. Live
+        pages like chat and maps stop working. That is what it is for. It
+        affects this tab only, and you can undo it. A site you allow keeps
+        working until the tab closes.
+      </p>
+
+      <span class="section-label">Storage</span>
+      <p class="panel-intro" id="tab-profile-desc"></p>
+      <div class="form-buttons">
+        <button id="btn-quarantine-panel" type="button" class="small">
+          Open a quarantine tab
+        </button>
+      </div>
+      <p class="panel-note">
+        A quarantine tab opens with JavaScript off, blocking on, and nothing
+        saved. It freezes as soon as the page loads. Storage is set when the tab
+        opens and cannot change afterwards.
+      </p>
+
+      <span class="section-label">Connection</span>
+      <p class="panel-intro" id="tab-tls-desc"></p>
+
+      <span class="section-label">Cookies</span>
+      <p class="panel-intro" id="tab-forget-desc"></p>
+      <div class="form-buttons">
+        <button id="btn-site-forget" type="button" class="small danger">
+          Forget this site
+        </button>
+      </div>
+      <div id="site-forget-confirm" hidden>
+        <p class="destructive-warning">
+          <strong>This clears cookies for this site only.</strong> Your saved
+          passwords and other site data are left alone. This cannot be undone.
+        </p>
+        <div class="form-buttons">
+          <button id="site-forget-yes" type="button" class="small danger">
+            Yes, forget it
+          </button>
+          <button id="site-forget-cancel" type="button" class="small">
+            Cancel
+          </button>
+        </div>
+      </div>
+      <p class="ok" id="site-forget-result" hidden></p>
+
+      <!-- Click-only, by design: nothing fills without this exact button
+           being pressed, so a page cannot read a value the user never asked
+           placed into its form. Static markup with one real listener, not a
+           runtime-built list, because v1 only ever offers a single matching
+           credential per origin (see the IPC doc on `cred_autofill_offer_get`)
+           -- there is nothing here to enumerate. -->
+      <!-- Saved into the downloads folder rather than a chosen location, and
+           the copy says so. Verify only ever looks there, so a file the user
+           placed elsewhere would get a record it could never check. -->
+      <span class="section-label">Archive</span>
+      <p class="panel-intro" id="tab-pdf-desc">
+        Saves this page to your downloads as a PDF, along with the address it
+        came from, so you can check later that it has not changed.
+      </p>
+      <div class="form-buttons">
+        <button id="btn-save-pdf" type="button" class="small">
+          Save page as PDF
+        </button>
+        <button id="btn-capture" type="button" class="small">
+          Save picture of page
+        </button>
+      </div>
+
+      <span class="section-label">Passwords</span>
+      <p class="panel-intro" id="tab-autofill-desc"></p>
+      <div class="form-buttons">
+        <button id="btn-autofill-fill" type="button" class="small" disabled>
+          Fill saved password
+        </button>
+      </div>
+
+      <!-- Privacy receipt: the ledger's own numbers, nothing estimated.
+           Where the engine cannot observe blocking these lines say so in
+           words; they never show a structural zero as a finding. -->
+      <span class="section-label">What was refused</span>
+      <p class="panel-intro" id="receipt-session"></p>
+      <p class="panel-intro" id="receipt-page"></p>
+
+      <h2>Hosts this tab has contacted</h2>
+      <ul id="ledger-list" class="items"></ul>
+      <p class="panel-foot" id="ledger-foot"></p>
+    </section>
+    <section id="library-panel" hidden>
+      <div id="library-locked" hidden>
+        <h1>Bookmarks and download records</h1>
+        <p id="library-locked-note">
+          These unlock with your vault. Open it from the toolbar. Downloads that
+          finish before you unlock are not recorded.
+        </p>
+      </div>
+
+      <div id="library-content" hidden>
+        <nav class="tabs">
+          <button id="lib-tab-bookmarks" type="button" class="tab active">
+            Bookmarks
+          </button>
+          <button id="lib-tab-downloads" type="button" class="tab">
+            Downloads
+          </button>
+        </nav>
+
+        <div id="lib-pane-bookmarks">
+          <p class="panel-intro">
+            Bookmarks are encrypted on this computer. They stay available all
+            session, even after the vault locks.
+          </p>
+          <div class="form-buttons">
+            <button id="bm-import" type="button" class="small">
+              Import bookmarks
+            </button>
+            <button
+              id="set-aside"
+              type="button"
+              class="small"
+              title="Store this window's tabs as a shelf and close them"
+            >
+              Set aside all tabs
+            </button>
+          </div>
+          <p class="panel-foot" id="bm-import-summary" hidden></p>
+          <span class="section-label">Shelves</span>
+          <div id="shelf-list" class="items"></div>
+
+          <!-- Bookmark search. Deliberately NOT a <form>: there is nothing to
+               submit, filtering happens as you type, and an Enter key that
+               appeared to "do" something would be a lie. It is also purely
+               local -- it filters the list already in this panel's memory and
+               sends no IPC, so searching your own bookmarks does not tell the
+               engine, the network, or anything else what you looked for.
+
+               Hidden while there are no bookmarks at all: a search box over
+               an empty list is furniture that answers nothing. -->
+          <div id="bm-search-row" hidden>
+            <input
+              id="bm-search"
+              type="text"
+              placeholder="Search bookmarks by name or address"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Search bookmarks"
+            />
+            <p class="panel-note" id="bm-search-count" hidden></p>
+          </div>
+
+          <ul id="bookmark-list" class="items"></ul>
+          <p class="panel-foot" id="bookmark-empty" hidden>
+            No bookmarks yet. The Bookmark button saves the page you are on.
+          </p>
+          <!-- Distinct from the empty state above on purpose: "you have none"
+               and "none match what you typed" are different facts, and
+               showing the first when the second is true reads as data loss. -->
+          <p class="panel-foot" id="bookmark-no-match" hidden></p>
+          <form id="bookmark-form" class="entry-form" hidden>
+            <input
+              id="bookmark-url"
+              type="text"
+              placeholder="Address"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <input
+              id="bookmark-title"
+              type="text"
+              placeholder="Title"
+              autocomplete="off"
+            />
+            <div class="form-buttons">
+              <button id="bookmark-submit" type="submit">Save changes</button>
+              <button id="bookmark-cancel" type="button">Cancel</button>
+            </div>
+            <p class="error" id="bookmark-error"></p>
+          </form>
+        </div>
+
+        <div id="lib-pane-downloads" hidden>
+          <p class="panel-intro">
+            Every download gets a fingerprint when it finishes. Verify checks
+            the file on this computer against it.
+          </p>
+          <ul id="download-list" class="items"></ul>
+          <p class="panel-foot" id="download-empty" hidden>
+            Nothing here yet. Downloads are fingerprinted when they finish, as
+            long as the vault is unlocked.
+          </p>
+          <p class="panel-foot">
+            A pass means the file has not changed since it arrived. It does not
+            tell you whether the file was safe to begin with.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Theme: how the chrome looks, and what pages are told about color
+         preference. Moved out of the privacy panel 2026-08-04 when the
+         accent set grew and chrome schemes were planned: looks are not a
+         protection, and the privacy panel's own rule is that everything in
+         it is one. The expanded accent set is the seed of the future
+         premium theme pack, shipped unlocked. -->
+    <section id="theme-panel" hidden>
+      <h1>Theme</h1>
+      <p class="panel-intro">
+        How this browser looks. Only the Page colors choice is visible to
+        websites; everything else is yours alone.
+      </p>
+
+      <section id="theme-choice">
+        <h3 class="section-head">Page colors</h3>
+        <p class="panel-foot">
+          Sites that have a dark theme will use it. Sites without one are
+          unchanged. Nothing is repainted or injected; this only tells sites
+          which look you prefer.
+        </p>
+        <div class="form-buttons">
+          <button id="theme-auto" type="button" class="small">
+            Follow system
+          </button>
+          <button id="theme-dark" type="button" class="small">Dark</button>
+          <button id="theme-light" type="button" class="small">Light</button>
+        </div>
+        <p class="panel-foot" id="theme-note" hidden></p>
+      </section>
+
+      <section id="scheme-choice">
+        <h3 class="section-head">Chrome colors</h3>
+        <p class="panel-foot">
+          The look of the browser itself. Your pick sticks; nothing here follows
+          the system. Pages are not affected.
+        </p>
+        <div class="form-buttons">
+          <button id="scheme-dark" type="button" class="small">Dark</button>
+          <button id="scheme-white" type="button" class="small">White</button>
+          <button id="scheme-black" type="button" class="small">Black</button>
+        </div>
+      </section>
+
+      <section id="accent-choice">
+        <h3 class="section-head">Accent color</h3>
+        <p class="panel-foot">
+          Changes the highlight color of this browser's own toolbar and panels.
+          Pages are not affected.
+        </p>
+        <div id="theme-choices">
+          <button
+            id="accent-default"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="default"
+          >
+            <span class="swatch"></span>Blue
+          </button>
+          <button
+            id="accent-violet"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="violet"
+          >
+            <!-- LABEL ONLY, like Red below: the stored value stays `violet`
+                 (prefs.rs ChromeTheme::Violet, [data-theme="violet"] in
+                 chrome.css, the id above, theme-contrast-gate.py). Renamed
+                 for the reader because "violet" is widely heard as a shade
+                 of purple, and this palette also ships a Purple. -->
+            <span class="swatch"></span>Lavender
+          </button>
+          <button
+            id="accent-blood_red"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="blood_red"
+          >
+            <!-- LABEL ONLY. The stored value stays `blood_red` (prefs.rs
+                 ChromeTheme::BloodRed, the CSS [data-theme="blood_red"]
+                 block, the id above, and theme-contrast-gate.py all key on
+                 it). Renaming the value would drop every saved preference
+                 on the floor for a word change. -->
+            <span class="swatch"></span>Red
+          </button>
+          <button
+            id="accent-sky"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="sky"
+          >
+            <span class="swatch"></span>Sky
+          </button>
+          <button
+            id="accent-green"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="green"
+          >
+            <span class="swatch"></span>Green
+          </button>
+          <button
+            id="accent-amber"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="amber"
+          >
+            <span class="swatch"></span>Amber
+          </button>
+          <button
+            id="accent-teal"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="teal"
+          >
+            <span class="swatch"></span>Teal
+          </button>
+          <button
+            id="accent-slate"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="slate"
+          >
+            <span class="swatch"></span>Slate
+          </button>
+          <button
+            id="accent-purple"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="purple"
+          >
+            <span class="swatch"></span>Purple
+          </button>
+        </div>
+      </section>
+    </section>
+
+    <section id="privacy-panel" hidden>
+      <h1>Privacy protections</h1>
+      <p class="panel-intro">
+        These apply to every tab, open now or opened later.
+      </p>
+
+      <label class="toggle-row" for="pv-block-ads">
+        <input id="pv-block-ads" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title">Block ads and trackers</span>
+          <span class="toggle-note" id="pv-block-ads-note">
+            The request never leaves your computer, so the tracker gets nothing.
+          </span>
+        </span>
+      </label>
+
+      <label class="toggle-row" for="pv-freeze">
+        <input id="pv-freeze" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title">Freeze pages after they load</span>
+          <span class="toggle-note" id="pv-freeze-note">
+            Pages stop sending anything once they finish loading. Chat, maps and
+            other live pages will break.
+          </span>
+        </span>
+      </label>
+
+      <label class="toggle-row" for="pv-js">
+        <input id="pv-js" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title">Allow JavaScript</span>
+          <span class="toggle-note">
+            Turning this off breaks most sites. It is also the strongest
+            protection here.
+          </span>
+        </span>
+      </label>
+
+      <label class="toggle-row" for="pv-ephemeral">
+        <input id="pv-ephemeral" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title"
+            >Open new tabs without a saved profile</span
+          >
+          <span class="toggle-note">
+            Cookies and site data are deleted when the tab closes. New tabs
+            only. Tabs already open keep what they started with.
+          </span>
+        </span>
+      </label>
+
+      <label class="toggle-row" for="pv-fingerprint">
+        <input id="pv-fingerprint" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title">Fingerprint Divergence</span>
+          <span class="toggle-note">
+            Different sites see different canvas, audio, and graphics readings,
+            reducing their ability to correlate your activity across the web.
+            New tabs only. Tabs already open keep what they started with.
+          </span>
+        </span>
+      </label>
+
+      <p class="panel-foot" id="privacy-foot"></p>
+
+      <!-- Site permissions. Rendered by chrome.js from permission_status:
+           deny-by-default means there is usually nothing here, and an empty
+           list is the healthy state rather than a missing feature, so the
+           empty text says so. Rows appear once a site has actually asked. -->
+      <section id="permission-choice">
+        <h3 class="section-head">What this site asked for</h3>
+        <p class="panel-foot">
+          Camera, microphone, location and notifications are switched off for
+          every site. Nothing here is allowed until you allow it, and allowed
+          sites reset when PATANYX closes.
+        </p>
+        <!-- Load-bearing warning, not decoration: changing a switch below
+             reloads the page, and a reload discards anything typed into it.
+             The user has to know that BEFORE they click, so it sits above the
+             switches rather than in a toast afterwards. -->
+        <p class="panel-warn" id="permission-warn">
+          Changing any of these reloads the page. Save anything you have typed
+          first.
+        </p>
+        <div id="permission-list"></div>
+        <p class="panel-foot" id="permission-note"></p>
+      </section>
+
+      <section id="dns-choice">
+        <h3 class="section-head">Who resolves the sites you visit</h3>
+        <p class="panel-foot">
+          Every site you visit starts with a DNS lookup, and whoever answers it
+          sees the name. Here you pick who that is. This does NOT hide your
+          browsing from your internet provider. The site name also travels in
+          plain text when the connection starts, and no browser can stop that.
+          Use a VPN or Tor if you need that.
+        </p>
+        <div class="form-buttons">
+          <button id="dns-system" type="button" class="small">
+            System or VPN
+          </button>
+          <button id="dns-mullvad" type="button" class="small">Mullvad</button>
+          <button id="dns-quad9" type="button" class="small">Quad9</button>
+        </div>
+        <p class="panel-foot" id="dns-describe"></p>
+        <p class="ok" id="dns-restart" hidden></p>
+        <p class="panel-note">
+          System is the default. The other two only apply if you pick one.
+          Mullvad and Quad9 both block malware and phishing. If either cannot be
+          reached, PATANYX stops rather than falling back to your network's DNS,
+          because that would put your lookups back in the open. The catch:
+          public WiFi sign-in pages stop working, since they hijack DNS to do
+          their job. Switch back to System and restart to sign in.
+        </p>
+      </section>
+
+      <section id="engine-confirmed">
+        <h3 class="section-head">What the engine confirmed</h3>
+        <p class="panel-foot">
+          What the browser engine actually did, not what PATANYX asked it to do.
+          Anything it refused says so here.
+        </p>
+        <ul id="engine-list" class="entry-list"></ul>
+      </section>
+
+      <section id="leakcheck" hidden>
+        <h3 class="section-head">Check an image before you share it</h3>
+        <p class="panel-foot">
+          Reads the text in a picture so you can see what it gives away, like an
+          address, a card number or a key. It runs on this computer. The picture
+          is never uploaded or saved.
+        </p>
+        <div class="form-buttons">
+          <button id="leakcheck-pick" type="button" class="small">
+            Choose an image
+          </button>
+        </div>
+        <p class="error" id="leakcheck-error"></p>
+        <p class="ok" id="leakcheck-status"></p>
+        <ul id="leakcheck-list" class="entry-list"></ul>
+      </section>
+    </section>
+
+    <!-- The resolver choice, reachable straight from the toolbar. It is a
+         MIRROR of the section inside the privacy panel, not a second setting:
+         one refresh function and one click handler drive both, because two
+         hand-written copies of one control is how two views of the same
+         setting start disagreeing -- and a resolver the UI names wrongly is a
+         privacy claim the user has no way to check.
+
+         The warning is deliberately in the panel body rather than a footnote.
+         Picking a resolver here MOVES who watches your lookups; it does not
+         remove them, and it does nothing at all about the site name travelling
+         in plaintext when the connection is set up. -->
+    <section id="dns-panel" hidden>
+      <h1>Who resolves the sites you visit</h1>
+      <p class="panel-intro">
+        Every site you visit starts with a DNS lookup, and whoever answers it
+        sees the name. Here you pick who that is. This does NOT hide your
+        browsing from your internet provider. The site name also travels in
+        plain text when the connection starts, and no browser can stop that. Use
+        a VPN or Tor if you need that.
+      </p>
+      <div class="form-buttons">
+        <button id="dnsp-system" type="button" class="small">
+          System or VPN
+        </button>
+        <button id="dnsp-mullvad" type="button" class="small">Mullvad</button>
+        <button id="dnsp-quad9" type="button" class="small">Quad9</button>
+      </div>
+      <p class="panel-foot" id="dnsp-describe"></p>
+      <p class="ok" id="dnsp-restart" hidden></p>
+      <!-- All THREE compared, not just the two encrypted ones. A user cannot
+           judge whether Mullvad is worth choosing without seeing what they
+           already have, and leaving the default out of the comparison would
+           quietly frame it as the option that needs no examination. Each entry
+           names what the choice COSTS as well as what it buys, because the
+           costs here are the part a user finds out about later: an over-blocked
+           page, a VPN split in half, a hotel WiFi that will not load. -->
+      <h2 class="section-head">Which one, and why</h2>
+      <dl id="dns-compare">
+        <dt>System</dt>
+        <dd>
+          <span class="dns-tag">Default. Nothing changes.</span>
+          Whatever your machine already uses: your VPN's resolver if you run
+          one, otherwise your internet provider's. Not encrypted by this
+          browser, so a provider can log what you look up and in some countries
+          sell it. Blocks nothing. Because the lookup is not encrypted, a
+          network can also strip the key that hides the site name inside the
+          connection, putting it back in the clear without telling you. The only
+          setting that works on public WiFi that makes you log in.
+        </dd>
+        <dt>Mullvad</dt>
+        <dd>
+          <span class="dns-tag">Blocks the most.</span>
+          Swedish, no account, no-logging policy. Encrypted, and blocks ads,
+          trackers, malware and phishing. That is more than Quad9, so fewer
+          requests leave your machine, and a slightly higher chance a page loses
+          something it wanted. Also protects the key that hides the site name
+          inside the connection from being stripped in transit. If you already
+          use Mullvad's VPN this keeps your browsing with one company rather
+          than splitting it across two.
+        </dd>
+        <dt>Quad9</dt>
+        <dd>
+          <span class="dns-tag">Interferes the least.</span>
+          Swiss, run by a non-profit foundation. Encrypted, and blocks malware
+          and phishing only, nothing else, so it is the safer pick if you would
+          rather nothing meddled with ordinary pages. It also publishes two
+          things Mullvad does not state: it checks that answers are signed
+          (DNSSEC), and it does not pass any part of your IP address on to the
+          servers it asks. Also protects the key that hides the site name inside
+          the connection from being stripped in transit.
+        </dd>
+      </dl>
+      <p class="panel-note">
+        In short: System changes nothing, Mullvad blocks the most, Quad9 gets in
+        the way least. Both encrypted choices see every site you look up.
+        Someone always does.
+      </p>
+      <p class="panel-note">
+        <strong>The site name inside the connection.</strong> Normally the site
+        you are opening travels in readable text at the very start of every
+        connection, before any encryption applies, so your provider or the WiFi
+        owner can read it even though the page itself is encrypted. This browser
+        encrypts that too, on every setting, wherever the site has set it up on
+        their side. Two limits worth knowing: it does not hide the address of
+        the server you reached, so on a large shared host that address says
+        little but a site on an address of its own is still identifiable by it;
+        and the key that makes it work is published in DNS, so on an unencrypted
+        lookup a network can remove it and quietly put the site name back in the
+        clear. That is what the encrypted choices above protect, and it is a
+        different thing from choosing who answers.
+      </p>
+      <p class="panel-note">
+        Mullvad and Quad9 never fall back to your network's DNS when they cannot
+        be reached, because that would put your lookups back in the open. The
+        catch is that public WiFi sign-in pages stop working, since they hijack
+        DNS to do their job. On hotel or airport WiFi, switch back to System,
+        restart, and sign in.
+      </p>
+    </section>
+
+    <section id="tunnel-panel" hidden>
+      <h1>Tunnel</h1>
+      <!-- Every word here about what the tunnel DOES arrives from Rust
+           (TunnelMode::describe, as describe_off / describe_imported in
+           tunnel_get). This markup carries mechanical labels only, so this
+           panel can never word a choice differently from another surface. -->
+      <p class="panel-foot" id="tunnelp-status"></p>
+      <p class="panel-foot" id="tunnelp-config"></p>
+      <div class="form-buttons">
+        <button id="tunnelp-off" type="button" class="small">Off</button>
+        <button id="tunnelp-imported" type="button" class="small">
+          Imported
+        </button>
+      </div>
+      <!-- Directly under the choice that causes it. It sat below both
+           describe paragraphs, which are long enough that the note landed
+           off the bottom of a 500px panel -- shown, and never seen. -->
+      <p class="ok" id="tunnelp-restart" hidden></p>
+      <p class="panel-foot" id="tunnelp-describe-off"></p>
+      <p class="panel-foot" id="tunnelp-describe-imported"></p>
+      <div class="form-buttons">
+        <button id="tunnelp-import" type="button" class="small">
+          Import configuration
+        </button>
+        <button id="tunnelp-remove" type="button" class="small">Remove</button>
+      </div>
+      <p class="panel-note">
+        Importing a configuration does not switch the tunnel on. Use the buttons
+        above for that.
+      </p>
+      <p class="panel-note" id="tunnelp-error" hidden></p>
+    </section>
+
+    <section id="vault-panel" hidden>
+      <div id="vault-none" class="vault-state" hidden>
+        <h1>Create vault</h1>
+        <form id="create-form">
+          <input
+            id="create-pass1"
+            type="password"
+            placeholder="Passphrase (min. 8 characters)"
+            autocomplete="new-password"
+          />
+          <input
+            id="create-pass2"
+            type="password"
+            placeholder="Confirm passphrase"
+            autocomplete="new-password"
+          />
+          <div class="form-buttons">
+            <button type="submit">Create vault</button>
+          </div>
+          <p class="error" id="create-error"></p>
+        </form>
+
+        <!-- Bringing a vault from another machine or from a native install.
+         This copy is on the NO-VAULT screen, so there is nothing here to
+         lose and no warning is needed. The same form appears in the Backup
+         pane for a machine that already has a vault, and that one carries
+         the destructive-replace warning. -->
+        <h1 id="import-heading">Or bring one across</h1>
+        <p id="import-intro">
+          Already use PATANYX on another machine? Export an encrypted backup
+          there and open it here. This builds a new vault with its own
+          passphrase and its own recovery key. The export passphrase then opens
+          nothing but the export file.
+        </p>
+        <form id="import-form" class="entry-form">
+          <div class="form-buttons">
+            <button id="import-pick" type="button">Choose backup file</button>
+          </div>
+          <p id="import-chosen" class="item-sub"></p>
+          <input
+            id="import-src"
+            type="text"
+            placeholder="Backup file path"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <input
+            id="import-export-pass"
+            type="password"
+            placeholder="Passphrase for that backup file"
+            autocomplete="off"
+          />
+          <input
+            id="import-pass1"
+            type="password"
+            placeholder="New passphrase for this vault (min. 8 characters)"
+            autocomplete="new-password"
+          />
+          <input
+            id="import-pass2"
+            type="password"
+            placeholder="Confirm new passphrase"
+            autocomplete="new-password"
+          />
+          <div class="form-buttons">
+            <button type="submit">Import vault</button>
+          </div>
+          <p class="error" id="import-error"></p>
+        </form>
+      </div>
+
+      <!-- Shown exactly once, after the vault is created or migrated. The key is
+       not stored anywhere in readable form, so if the user leaves this screen
+       without writing it down it is gone for good. -->
+      <div id="vault-recovery" class="vault-state" hidden>
+        <h1>Write this down now</h1>
+        <p>
+          This key is the only way in if you forget your passphrase. You will
+          see it once. Nobody can make you another one, including us.
+        </p>
+        <pre id="recovery-key" class="recovery-key"></pre>
+        <p class="error">
+          A backup will not help without this key or your passphrase. Backups
+          cover a broken disk, not a forgotten passphrase.
+        </p>
+        <div class="form-buttons">
+          <button id="recovery-ack" type="button">
+            I have written it down
+          </button>
+        </div>
+      </div>
+
+      <div id="vault-locked" class="vault-state" hidden>
+        <h1>Unlock vault</h1>
+        <form id="unlock-form">
+          <input
+            id="unlock-pass"
+            type="password"
+            placeholder="Passphrase"
+            autocomplete="current-password"
+          />
+          <div class="form-buttons">
+            <button type="submit">Unlock</button>
+          </div>
+          <p class="error" id="unlock-error"></p>
+        </form>
+
+        <!-- AUTO-LOCK, moved here from the Backup pane (decided 2026-08-05)
+             so it is seen at the moment the passphrase is keyed rather than
+             only by someone who already went looking for it.
+
+             It works on a LOCKED screen because vault_autolock_get/set read
+             and write crate::prefs, not the vault, and neither calls
+             unlocked(state) -- see ipc.rs, where the first such call is
+             cred_list immediately below them.
+
+             THAT ALSO MEANS THIS CONTROL IS REACHABLE WITHOUT THE
+             PASSPHRASE, and the project owner accepted that trade deliberately
+             on 2026-08-05 after it was raised: someone with brief physical
+             access to a locked browser can set this to Never, leave, and
+             return after the owner unlocks and walks away. The alternatives
+             offered were read-only here, or the picker on the creation
+             screen. If this is ever revisited, that is the thread to pull.
+
+             The default is five minutes and stays five minutes. What counts
+             as being here includes keys pressed inside a page, and a warning
+             arrives a minute before. -->
+        <h2>Lock when idle</h2>
+        <p class="panel-intro">
+          Typing anywhere in the browser counts as being here. A minute before
+          it locks, you get a countdown and a button to stay unlocked. Locking
+          clears your keys from memory. In builds with chat, it signs you out of
+          chat too, because your chat identity lives in the vault.
+        </p>
+        <div class="form-buttons" id="autolock-choices"></div>
+        <p class="panel-note" id="autolock-note"></p>
+
+        <p class="panel-foot">
+          Forgotten your passphrase? Use the recovery key from when you set up
+          the vault. It is the only other way in. Without it, nobody can recover
+          what is inside.
+        </p>
+        <form id="recovery-form">
+          <input
+            id="recovery-input"
+            type="text"
+            placeholder="Recovery key"
+            autocomplete="off"
+            spellcheck="false"
+          />
+          <div class="form-buttons">
+            <button type="submit" class="small">
+              Unlock with recovery key
+            </button>
+            <button id="recovery-scan" type="button" class="small" hidden>
+              Scan from a photo
+            </button>
+          </div>
+          <p class="error" id="recovery-error"></p>
+          <p class="panel-foot" id="recovery-scan-note" hidden></p>
+        </form>
+      </div>
+
+      <div id="vault-open" class="vault-state" hidden>
+        <nav class="tabs">
+          <button id="tab-creds" type="button" class="tab active">
+            Credentials
+          </button>
+          <button id="tab-notes" type="button" class="tab">Notes</button>
+          <button id="tab-backup" type="button" class="tab">Backup</button>
+          <span class="spacer"></span>
+          <button id="btn-lock" type="button">Lock</button>
+        </nav>
+
+        <!-- The Premium row (design 3.4): seen at every unlock, above the
+             panes so no tab switch hides it. Every state string here is
+             worded by Rust (licence_get / licence_paste payloads) and
+             reaches the DOM via textContent only. There are deliberately
+             no purchase links anywhere in this row: nothing is for sale
+             until the payment flow ships, so the row renders state text
+             and the paste flow only. -->
+        <div id="premium-row" hidden>
+          <p id="premium-head" class="panel-intro"></p>
+          <p id="premium-sub" class="panel-note"></p>
+          <button id="premium-add" type="button" class="small">
+            Add Premium token
+          </button>
+          <form id="premium-form" hidden>
+            <input
+              id="premium-token"
+              type="text"
+              autocomplete="off"
+              spellcheck="false"
+              placeholder="ptx1-"
+            />
+            <div class="form-buttons">
+              <button type="submit" class="small">Add token</button>
+            </div>
+            <p class="error" id="premium-error"></p>
+            <div id="premium-confirm" hidden>
+              <p class="panel-note" id="premium-confirm-text"></p>
+              <div class="form-buttons">
+                <button
+                  id="premium-confirm-replace"
+                  type="button"
+                  class="small"
+                >
+                  Replace the current token
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+
+        <div id="pane-creds">
+          <!-- Stated here because the behaviour is otherwise invisible and
+               reads as a bug: note_login_submitted (state.rs) returns early
+               when the vault is not OPEN, so a locked vault silently offers
+               nothing. We hit exactly that confusion. "unlocked",
+               not "on": an existing-but-locked vault is still no offer,
+               because there is nowhere to write. -->
+          <!-- Operator-worded 2026-08-05, replacing "These need the vault
+               unlocked, because what they use is stored inside it. While it
+               is locked, PATANYX does not offer them." -->
+          <p class="panel-intro">
+            Unlock the Vault to access the features below. If the Vault is
+            locked, the following features will not work.
+          </p>
+          <!-- The list, not a sentence, because "why is this pane empty" and
+               "why did chat sign me out" are the same question and a reader
+               who skims one line does not get an answer to either.
+
+               Derived by reading every unlocked(state) call site, not from
+               memory. OCR and the theme packs are deliberately ABSENT: they
+               have no unlocked(state) dependency and listing them would be a
+               claim the code does not make.
+
+               It describes the VAULT-UNLOCK requirement only, never licence
+               gating: nothing gates on licence state yet, and copy that
+               implied otherwise would be selling something that does not
+               exist.
+
+               Chat is the only build-conditional row, because chat is the
+               only compile-time feature here: the tunnel crate and the
+               licence IPC are unconditional, so their rows are true in every
+               build. (The tunnel is FREE as of 2026-08-05; it is in this
+               list because it needs the vault, not because it is paid.)
+               chat.js unhides #np-chat, which is why the row ships hidden. -->
+          <ul id="needs-passphrase">
+            <li>Saving and filling passwords.</li>
+            <li>Notes.</li>
+            <li>Backup, export, and import.</li>
+            <li>Changing the passphrase, or creating a recovery key.</li>
+            <li>
+              The Private Tunnel. Its configuration is stored in the vault.
+            </li>
+            <li>Confirming a Premium token, which is stored in the vault.</li>
+            <li id="np-chat" hidden>
+              Private Chat, and checking a page with a contact. Your chat
+              identity is stored in the vault, so locking it signs you out.
+            </li>
+          </ul>
+          <ul id="cred-list" class="items"></ul>
+          <form id="cred-form" class="entry-form">
+            <!-- THE SITE FIELD DECIDES WHETHER THIS CREDENTIAL EVER FILLS, AND
+                 NOTHING USED TO SAY SO. It is free text, and Rust parses an
+                 origin out of it (`parse_credential_origin`). A real hostname
+                 parses; a friendly label like "Google" does not, and that
+                 credential is then stored, listed, revealed on demand -- and
+                 silently never offered on any page, forever. Every credential
+                 saved before the origin field existed is in that state too.
+
+                 So the exact host is no longer something to be typed correctly
+                 from memory: the button fills it from the tab underneath.
+                 Hidden, not disabled, when the current page has no host to
+                 take (a blank tab, the onboarding page), because a control
+                 that cannot act is better absent than greyed. -->
+            <div class="field-row">
+              <input
+                id="cred-site"
+                type="text"
+                placeholder="Site (e.g. example.com)"
+                autocomplete="off"
+              />
+              <button id="cred-use-site" type="button" class="small" hidden>
+                Use this site
+              </button>
+            </div>
+            <input
+              id="cred-username"
+              type="text"
+              placeholder="Username"
+              autocomplete="off"
+            />
+            <input
+              id="cred-password"
+              type="password"
+              placeholder="Password"
+              autocomplete="off"
+            />
+            <input
+              id="cred-note"
+              type="text"
+              placeholder="Note (optional)"
+              autocomplete="off"
+            />
+            <div class="form-buttons">
+              <button id="cred-submit" type="submit">Add credential</button>
+              <button id="cred-cancel" type="button" hidden>Cancel</button>
+            </div>
+            <p class="error" id="cred-error"></p>
+          </form>
+        </div>
+
+        <div id="pane-notes" hidden>
+          <ul id="note-list" class="items"></ul>
+          <form id="note-form" class="entry-form">
+            <input
+              id="note-title"
+              type="text"
+              placeholder="Title"
+              autocomplete="off"
+            />
+            <textarea
+              id="note-body"
+              rows="4"
+              placeholder="Secret note"
+            ></textarea>
+            <div class="form-buttons">
+              <button id="note-submit" type="submit">Add note</button>
+              <button id="note-cancel" type="button" hidden>Cancel</button>
+            </div>
+            <p class="error" id="note-error"></p>
+          </form>
+        </div>
+        <!-- Backup and recovery. The copy here is deliberate and must stay
+             blunt: an export is ciphertext and is never presented as
+             protection against a forgotten passphrase (only the recovery key
+             is), and the plaintext export says exactly what it does. -->
+        <div id="pane-backup" hidden>
+          <h1>Backup and recovery</h1>
+          <p id="bk-recovery-status" class="panel-intro"></p>
+
+          <!-- Shown ONLY when this vault has no recovery key.
+               A key used to be obtainable at two moments -- when the vault was
+               made, and when an old one was migrated -- and both showed it
+               once. Anyone who looked away had no route back, while the line
+               above told them, correctly and uselessly, that they had no
+               safety net. The passphrase is asked for again because this
+               creates a permanent second way into everything stored here, and
+               an unlocked browser someone walked up to must not be enough. -->
+          <form id="recovery-create-form" hidden>
+            <p class="panel-note">
+              You can make one now. You will see it once, so have somewhere to
+              write it down first.
+            </p>
+            <input
+              id="recovery-create-pass"
+              type="password"
+              autocomplete="current-password"
+              placeholder="Your vault passphrase"
+            />
+            <div class="form-buttons">
+              <button type="submit" class="small">Create a recovery key</button>
+            </div>
+            <p class="error" id="recovery-create-error"></p>
+          </form>
+
+          <!-- AUTO-LOCK, second instance. The primary one is on the unlock
+               screen (moved there 2026-08-05 so it is seen while the
+               passphrase is keyed), but that screen only exists while the
+               vault is LOCKED -- so with it there alone, nobody could change
+               this setting once they were actually using the vault. It is
+               here as well so the answer to "can I change it right now" is
+               always yes.
+
+               Distinct ids because ids are unique; ONE renderer
+               (refreshAutolock) fills both, so the two cannot disagree about
+               the current value or drift in copy. -->
+          <h2>Lock when idle</h2>
+          <p class="panel-intro">
+            Typing anywhere in the browser counts as being here. A minute before
+            it locks, you get a countdown and a button to stay unlocked. Locking
+            clears your keys from memory. In builds with chat, it signs you out
+            of chat too, because your chat identity lives in the vault.
+          </p>
+          <div class="form-buttons" id="autolock-choices-open"></div>
+          <p class="panel-note" id="autolock-note-open"></p>
+
+          <h2>Encrypted export</h2>
+          <p class="panel-intro">
+            Writes one encrypted file, locked with an export passphrase you
+            choose here. Safe to copy anywhere, and the way to move this vault
+            to another machine. It covers a broken or lost machine. It does not
+            cover a forgotten passphrase. Only your recovery key does.
+          </p>
+          <form id="bk-export-form" class="entry-form">
+            <div class="form-buttons">
+              <button id="bk-exp-pick" type="button" hidden>
+                Choose location
+              </button>
+            </div>
+            <input
+              id="bk-exp-dest"
+              type="text"
+              placeholder="Destination file path"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <input
+              id="bk-exp-pass1"
+              type="password"
+              placeholder="Export passphrase"
+              autocomplete="new-password"
+            />
+            <input
+              id="bk-exp-pass2"
+              type="password"
+              placeholder="Confirm export passphrase"
+              autocomplete="new-password"
+            />
+            <div class="form-buttons">
+              <button type="submit">Write encrypted export</button>
+            </div>
+            <p class="error" id="bk-exp-error"></p>
+            <p class="ok" id="bk-exp-ok"></p>
+          </form>
+
+          <h2>Import a backup</h2>
+          <!-- Import is offered HERE, on a machine that already has a vault,
+               which is the case it used to refuse outright. The refusal meant
+               the only people who could see an import control were the ones
+               who had nothing to lose by it. The destructive part is now
+               stated in front of the form instead of being enforced behind
+               it. -->
+          <p class="destructive-warning" role="note">
+            Importing <strong>replaces the vault on this machine</strong>. Every
+            password, note and bookmark here is deleted and replaced by the
+            backup's. There is no undo. If anything here is not in the backup,
+            export it first.
+          </p>
+          <p class="panel-intro">
+            The imported vault gets a new passphrase you choose below and a new
+            recovery key. The export passphrase then opens nothing but the
+            export file.
+          </p>
+          <form id="bk-import-form" class="entry-form">
+            <div class="form-buttons">
+              <button id="bk-import-pick" type="button">
+                Choose backup file
+              </button>
+            </div>
+            <p id="bk-import-chosen" class="item-sub"></p>
+            <input
+              id="bk-import-src"
+              type="text"
+              placeholder="Backup file path"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <input
+              id="bk-import-export-pass"
+              type="password"
+              placeholder="Passphrase that protects the backup file"
+              autocomplete="off"
+            />
+            <input
+              id="bk-import-pass1"
+              type="password"
+              placeholder="New passphrase for this machine"
+              autocomplete="new-password"
+            />
+            <input
+              id="bk-import-pass2"
+              type="password"
+              placeholder="Confirm new passphrase"
+              autocomplete="new-password"
+            />
+            <div class="form-buttons">
+              <button type="submit">Replace this vault with the backup</button>
+            </div>
+            <p class="error" id="bk-import-error"></p>
+          </form>
+
+          <h2>Change passphrase</h2>
+          <p class="panel-intro">
+            Only the passphrase changes. Your contents stay as they are and your
+            recovery key keeps working. If it fails, say you typed the current
+            passphrase wrong, nothing changes and your old one still works.
+          </p>
+          <form id="bk-pw-form" class="entry-form">
+            <input
+              id="bk-pw-current"
+              type="password"
+              placeholder="Current passphrase"
+              autocomplete="current-password"
+            />
+            <input
+              id="bk-pw-new1"
+              type="password"
+              placeholder="New passphrase (min. 8 characters)"
+              autocomplete="new-password"
+            />
+            <input
+              id="bk-pw-new2"
+              type="password"
+              placeholder="Confirm new passphrase"
+              autocomplete="new-password"
+            />
+            <div class="form-buttons">
+              <button type="submit">Change passphrase</button>
+            </div>
+            <p class="error" id="bk-pw-error"></p>
+            <p class="ok" id="bk-pw-ok"></p>
+          </form>
+
+          <h2>Plaintext export: the way out</h2>
+          <p class="error">
+            This writes every password and note into a file anyone can read. No
+            encryption at all. Copies left behind by backups, search tools or
+            the disk itself can keep your passwords readable long after you
+            delete it.
+          </p>
+          <p class="panel-intro">
+            It exists so you can leave. Your data is not locked inside our
+            format. Make the file, use it, then delete it.
+          </p>
+          <form id="bk-plain-form" class="entry-form">
+            <div class="form-buttons">
+              <button id="bk-plain-pick" type="button" hidden>
+                Choose location
+              </button>
+            </div>
+            <input
+              id="bk-plain-dest"
+              type="text"
+              placeholder="Destination file path"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <p class="panel-intro">
+              To confirm, type this sentence exactly:
+              <strong id="bk-plain-sentence"></strong>
+            </p>
+            <input
+              id="bk-plain-confirm"
+              type="text"
+              placeholder="Type the sentence above"
+              autocomplete="off"
+              autocapitalize="off"
+              spellcheck="false"
+            />
+            <div class="form-buttons">
+              <button type="submit" class="danger">
+                Write plaintext export
+              </button>
+            </div>
+            <p class="error" id="bk-plain-error"></p>
+            <p class="ok" id="bk-plain-ok"></p>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- Chat panel. Structurally mirrors #vault-panel: one section, mutually
+     exclusive .chat-state divs. chat.js is evaluated separately by the Rust
+     side in chat builds and binds every listener — there is deliberately no
+     script tag for it here. -->
+    <section id="chat-panel" hidden>
+      <div id="chat-locked" class="chat-state" hidden>
+        <h1>Chat is locked</h1>
+        <p>
+          Your chat keys live in the vault, so chat works only while it is
+          unlocked. Open the Vault panel from the toolbar.
+        </p>
+      </div>
+
+      <div id="chat-intro" class="chat-state" hidden>
+        <h1>Set up chat</h1>
+        <p>
+          Your hash number is your chat address. Read it out or paste it to
+          someone on this network so their messages reach you. There is no
+          directory. You swap numbers yourselves.
+        </p>
+        <p class="chat-note">
+          You can skip this. Adding a contact creates a separate number just for
+          them.
+        </p>
+        <div class="form-buttons">
+          <button id="chat-mint" type="button">Create my hash number</button>
+          <button id="chat-intro-add" type="button">Add a contact</button>
+        </div>
+        <pre id="chat-myhash" class="hash-number" hidden></pre>
+        <p class="chat-note" id="chat-myhash-note" hidden>
+          Give this number to the person you want to hear from.
+        </p>
+        <p class="error" id="chat-intro-error"></p>
+      </div>
+
+      <div id="chat-contacts" class="chat-state" hidden>
+        <h1>Contacts</h1>
+        <p class="chat-note">
+          Chat works on this local network only. Other devices here can see that
+          this browser is reachable. They see your hash number and nothing else.
+        </p>
+        <p id="chat-discovery" class="chat-note"></p>
+        <ul id="chat-contact-list" class="items"></ul>
+        <div id="chat-ourhash-wrap" hidden>
+          <p class="chat-note" id="chat-ourhash-label"></p>
+          <pre id="chat-ourhash" class="hash-number"></pre>
+        </div>
+        <div id="chat-added-wrap" hidden>
+          <p class="chat-note" id="chat-added-label"></p>
+          <pre id="chat-added-hash" class="hash-number"></pre>
+        </div>
+        <form id="chat-add-form" class="entry-form">
+          <input
+            id="chat-add-label"
+            type="text"
+            placeholder="Their name (e.g. Alex)"
+            autocomplete="off"
+          />
+          <input
+            id="chat-add-hash"
+            type="text"
+            placeholder="Their hash number"
+            autocomplete="off"
+            autocapitalize="off"
+            spellcheck="false"
+          />
+          <div class="form-buttons">
+            <button id="chat-add-submit" type="submit">Add contact</button>
+          </div>
+          <p class="error" id="chat-add-error"></p>
+        </form>
+      </div>
+
+      <div id="chat-conversation" class="chat-state" hidden>
+        <nav class="tabs">
+          <button id="chat-back" type="button">&#x2039; Back</button>
+          <span id="chat-peer-name" class="chat-peer-name"></span>
+          <span id="chat-peer-state"></span>
+          <span class="spacer"></span>
+        </nav>
+        <p class="chat-note">
+          Nothing is kept: closing this panel clears the conversation.
+        </p>
+        <div id="chat-messages"></div>
+        <form id="chat-send-form">
+          <!-- The emoji grid is filled by chat.js and sits above the row it
+               belongs to. Empty here rather than a hundred buttons in markup:
+               the set is one list in one place, and the panel is built in a
+               chat build only. -->
+          <div id="chat-emoji-panel" hidden></div>
+          <div class="chat-send-row">
+            <!-- No image, no font download: an emoji IS text, and the CSP
+                 forbids fetching either. The system emoji face renders it. -->
+            <button
+              id="chat-emoji-toggle"
+              type="button"
+              class="small"
+              aria-expanded="false"
+              aria-controls="chat-emoji-panel"
+              aria-label="Insert an emoji"
+              title="Insert an emoji"
+            >
+              <span class="emoji-glyph" aria-hidden="true">🙂</span>
+            </button>
+            <input
+              id="chat-input"
+              type="text"
+              placeholder="Message"
+              autocomplete="off"
+            />
+            <button id="chat-send" type="submit">Send</button>
+          </div>
+          <div class="form-buttons">
+            <button id="chat-send-tab" type="button" class="small">
+              Send this tab
+            </button>
+            <button id="chat-share-cred" type="button" class="small">
+              Share a credential
+            </button>
+          </div>
+          <div id="chat-cred-picker" hidden>
+            <select id="chat-cred-select"></select>
+            <div class="form-buttons">
+              <button id="chat-cred-send" type="button" class="small">
+                Send login
+              </button>
+              <button id="chat-cred-cancel" type="button" class="small">
+                Cancel
+              </button>
+            </div>
+          </div>
+          <p class="error" id="chat-send-error"></p>
+        </form>
+      </div>
+    </section>
+
+    <!-- ABOUT.
+         What this program is, what it is licensed under, and what is inside
+         it. Every string in the body arrives from Rust rather than being
+         written here, and that is deliberate: the version, the licence text,
+         the notices and the third-party inventory are all facts about the
+         COMPILED BINARY, and markup cannot know them. A hand-written version
+         number in this file would be correct exactly until the next release.
+
+         The third-party list is fetched only when its section is opened. It is
+         around 300 KB for the Windows build, which is not a thing to push
+         across the IPC boundary every time somebody glances at About. -->
+    <section id="about-panel" hidden>
+      <h1 id="about-title">About</h1>
+      <p class="panel-intro" id="about-build"></p>
+      <div class="form-buttons">
+        <button id="about-tour-again" type="button" class="small">
+          Show the tour again
+        </button>
+      </div>
+      <div id="about-description"></div>
+
+      <h2 class="about-head">License</h2>
+      <p id="about-license-line"></p>
+      <button id="about-license-toggle" type="button" class="small">
+        Show the full license
+      </button>
+      <pre class="about-text" id="about-license-text" hidden></pre>
+
+      <h2 class="about-head">Notices</h2>
+      <p class="panel-note">
+        Credits that ship with PATANYX: the malicious-site list, the text-
+        recognition models, and the web engines.
+      </p>
+      <pre class="about-text" id="about-notice-text"></pre>
+
+      <h2 class="about-head">Third-party software</h2>
+      <p id="about-third-party-line"></p>
+      <p class="panel-note">
+        This is the list for THIS build only. The one in the source repository
+        covers every platform at once, so it names software that is not here.
+      </p>
+      <button id="about-third-party-toggle" type="button" class="small">
+        Show third-party licenses
+      </button>
+      <pre class="about-text" id="about-third-party-text" hidden></pre>
+
+      <!-- Diagnostics. What THIS session's state is, not what the build is --
+           see the comment on refreshDiagnosticsPrefill in chrome.js for why
+           it is fetched fresh rather than cached the way the sections above
+           are. Nothing here is sent anywhere on its own; copying or saving is
+           the only way it leaves the machine, and that is the user's own
+           choice to make and act on. -->
+      <h2 class="about-head">Diagnostics</h2>
+      <p class="panel-note">
+        A snapshot of this session, for troubleshooting: version, engine
+        settings, DNS mode, auto-lock and the last update check. No browsing
+        history, nothing from your vault, nothing from any page.
+      </p>
+      <div class="form-buttons">
+        <button id="diag-copy" type="button" class="small">
+          Copy to clipboard
+        </button>
+        <button id="diag-pick" type="button" class="small" hidden>
+          Choose location
+        </button>
+      </div>
+      <input
+        id="diag-dest"
+        type="text"
+        placeholder="Destination file path"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+      />
+      <div class="form-buttons">
+        <button id="diag-save" type="button" class="small">Save to file</button>
+      </div>
+      <p class="ok" id="diag-result" hidden></p>
+    </section>
+
+    <!-- The browser's own confirmation, replacing window.confirm().
+         The engine's dialog is titled with the page that raised it, so every
+         "Delete this?" arrived headed "JavaScript - rbchrome://localhost/
+         index.html" -- our internal scheme, shown to the user, in a dialog
+         that looks nothing like the rest of the browser.
+
+         One dialog for every destructive confirm in the chrome (credentials,
+         notes, bookmarks, chat contacts), driven by askConfirm() in
+         chrome.js and exported on window.__rb so chat.js uses the same one.
+         Cancel is focused on open and Escape cancels: for a destructive
+         question the safe answer is the default. -->
+    <div id="confirm-overlay" hidden>
+      <div
+        id="confirm-card"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="confirm-text"
+      >
+        <p id="confirm-text"></p>
+        <div class="form-buttons">
+          <button id="confirm-cancel" type="button" class="small">
+            Cancel
+          </button>
+          <button id="confirm-yes" type="button" class="small danger">
+            Delete
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div id="toasts" aria-live="polite"></div>
+
+    <script src="chrome.js"></script>
+    <script src="integrity.js" defer></script>
+    <script src="update.js" defer></script>
+  </body>
+</html>

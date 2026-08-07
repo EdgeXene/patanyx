@@ -1,0 +1,145 @@
+<style>
+  html,
+  body {
+    margin: 0;
+    font-family:
+      Liberation Sans,
+      sans-serif;
+  }
+  section {
+    padding: 28px 40px;
+  }
+  .dark {
+    background: #14161c;
+  }
+  .light {
+    background: #f4f5f7;
+  }
+  .lbl {
+    font-size: 11px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    margin-bottom: 16px;
+  }
+  .dark .lbl {
+    color: #8f909a;
+  }
+  .light .lbl {
+    color: #71727c;
+  }
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 40px;
+    flex-wrap: wrap;
+  }
+  img,
+  svg {
+    display: block;
+  }
+  .chip {
+    background: #1f2027;
+    border: 1px solid #3a3b43;
+    border-radius: 10px;
+    padding: 9px 14px;
+    display: flex;
+    align-items: center;
+    gap: 9px;
+    color: #d7d7dc;
+    font-size: 13px;
+  }
+  .tab {
+    background: #1f2027;
+    border-radius: 9px 9px 0 0;
+    padding: 8px 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #d7d7dc;
+    font-size: 13px;
+  }
+  .sizes {
+    display: flex;
+    align-items: flex-end;
+    gap: 22px;
+  }
+  .sizes figure {
+    margin: 0;
+    text-align: center;
+  }
+  .sizes figcaption {
+    font-size: 10px;
+    color: #8f909a;
+    margin-top: 8px;
+  }
+</style>
+
+<section class="dark">
+  <div class="lbl">Lockups on dark</div>
+  <div class="row">
+    <img src="patanyx-logo-horizontal-on-dark.svg" height="52" />
+    <img src="patanyx-logo-slogan-on-dark.svg" height="66" />
+  </div>
+</section>
+
+<section class="dark" style="padding-top: 0">
+  <div class="lbl">App icon at true pixel sizes</div>
+  <div class="sizes">
+    <figure>
+      <img src="png/patanyx-128.png" />
+      <figcaption>128</figcaption>
+    </figure>
+    <figure>
+      <img src="png/patanyx-64.png" />
+      <figcaption>64</figcaption>
+    </figure>
+    <figure>
+      <img src="png/patanyx-48.png" />
+      <figcaption>48</figcaption>
+    </figure>
+    <figure>
+      <img src="png/patanyx-32.png" />
+      <figcaption>32</figcaption>
+    </figure>
+    <figure>
+      <img src="png/patanyx-24.png" />
+      <figcaption>24</figcaption>
+    </figure>
+    <figure>
+      <img src="png/patanyx-16.png" />
+      <figcaption>16</figcaption>
+    </figure>
+  </div>
+</section>
+
+<section class="dark" style="padding-top: 0">
+  <div class="lbl">In app chrome &middot; monochrome (inlined)</div>
+  <div class="row">
+    <span class="tab"><img src="patanyx-mark.svg" height="15" /> New tab</span>
+    <span class="chip"
+      ><img src="patanyx-mark.svg" height="17" /> Vault locked</span
+    >
+    <span style="color: #e9e9ee"
+      ><svg width="23" height="41" viewBox="40 20 49 88" fill="currentColor">
+        <path
+          d="M44 20 L57 20 L57 64 L53.5 108 A3.5 3.5 0 0 1 46.5 108 L40 64 L40 24 A4 4 0 0 1 44 20 Z"
+        />
+        <path d="M57 20 A32 22 0 0 1 57 64 L57 51 A17 9 0 0 0 57 33 Z" /></svg
+    ></span>
+  </div>
+</section>
+
+<section class="light">
+  <div class="lbl">Lockups on light</div>
+  <div class="row">
+    <img src="patanyx-logo-horizontal-on-light.svg" height="52" />
+    <img src="patanyx-logo-slogan-on-light.svg" height="66" />
+    <span style="color: #22242b"
+      ><svg width="23" height="41" viewBox="40 20 49 88" fill="currentColor">
+        <path
+          d="M44 20 L57 20 L57 64 L53.5 108 A3.5 3.5 0 0 1 46.5 108 L40 64 L40 24 A4 4 0 0 1 44 20 Z"
+        />
+        <path d="M57 20 A32 22 0 0 1 57 64 L57 51 A17 9 0 0 0 57 33 Z" /></svg
+    ></span>
+  </div>
+</section>

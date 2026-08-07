@@ -1,0 +1,24 @@
+[package]
+name = "patanyx-update"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# The only new dependency in the workspace. Signature verification is the whole
+# point of this crate: a manifest is trusted because a compiled-in key signed
+# it, never because it arrived over TLS from the expected host.
+ed25519-dalek = "2"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+bsdiff = "0.2"
+miniz_oxide = "0.8"
+
+# Deliberately absent: no HTTP client, no async runtime, no filesystem, no
+# clock, no RNG. This crate is pure verification over bytes the caller supplies,
+# so the fetch layer can be replaced, sandboxed, or run out-of-process without
+# touching any of the security logic. Also no `zeroize`: this crate holds public
+# keys and hashes and never a secret, so wiping would be theatre.

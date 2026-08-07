@@ -1,0 +1,13 @@
+# Pinned so that a reproducible build is reproducible by someone else.
+#
+# A different rustc emits different code, so path normalization alone is not
+# enough: the toolchain is as much an input to the binary as the source is.
+# "stable" would silently mean a different compiler next month and every
+# published hash would stop verifying, with nothing in the repo to explain why.
+#
+# Bumping this is a deliberate act that CHANGES EVERY PUBLISHED HASH. When it
+# moves, the release notes have to say so.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

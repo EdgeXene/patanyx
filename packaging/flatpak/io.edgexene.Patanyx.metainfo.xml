@@ -1,0 +1,147 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.edgexene.Patanyx</id>
+  <name>PATANYX Browser</name>
+  <summary>Leave less behind.</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>Apache-2.0</project_license>
+  <developer id="io.edgexene">
+    <name>Edgexene</name>
+  </developer>
+  <description>
+    <p>
+      A privacy-first desktop browser. Ad and tracker blocking is compiled into
+      the engine, so a blocked request never leaves the machine and the browser
+      needs no per-request callback that could become a browsing log.
+    </p>
+    <p>
+      Credentials and notes live in an encrypted vault that is never sent
+      anywhere. This Flatpak stores everything inside its own sandbox and
+      requests no access to your home directory; file choices go through the
+      desktop portal, so the browser is handed the one file you picked.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.edgexene.Patanyx.desktop</launchable>
+  <!-- Flathub requires a homepage. This is the VENDOR's, verified reachable,
+       because no product page exists yet: /patanyx 404s today. Point this at
+       the product page when there is one; do not write a URL here that has
+       not been fetched. -->
+  <url type="homepage">https://edgexene.io</url>
+  <!-- Empty is correct and deliberate: OARS describes what the APPLICATION
+       contains, and this one contains no rateable content. What a user
+       chooses to visit with it is the web, which no browser rates for its
+       own listing. -->
+  <content_rating type="oars-1.1"/>
+  <!-- This file's version MUST equal crates/app/Cargo.toml's. It is what
+       software centres show and what AppStream reports; a stale value here
+       tells a Linux user they are running a version they are not.
+       `scripts/check-version.sh` enforces the equality and is wired into
+       ci-trixie.sh and build-flatpak.sh.
+       WHY THAT GATE EXISTS: the comment that used to sit here declared the
+       drift "RESOLVED as of 2026-07-28: this, crates/app/Cargo.toml agree on
+       0.9.0." That was true when written and false by 0.9.52 -- the crate was
+       bumped five times and this file was never touched, because nothing
+       compared them. The same shape as every other defect in this project's
+       history: a careful comment asserting a constraint nobody re-checked.
+       Do not replace the gate with a comment again.
+       The 0.9.x line (rather than 1.0.0) is deliberate: the maturity matrix
+       still has Windows at Preview and chat at Beta, and a 1.0 would read as
+       a claim neither supports yet. -->
+  <releases>
+    <release version="0.9.61" date="2026-08-06">
+      <description>
+        <p>Fingerprint Divergence. The canvas, audio, and graphics readouts sites use to recognize your browser get small site-specific noise: each site sees a different reading, and the readings change again when the browser restarts. On by default, with a switch in the Privacy panel that applies to new tabs.</p>
+        <p>Release notes now travel inside the signed update manifest, so the update panel can tell you what an update contains before you install it.</p>
+      </description>
+    </release>
+    <release version="0.9.60" date="2026-08-06">
+      <description>
+        <p>Hovering a link now shows where it goes, in a small readout at the bottom left. Deceptive characters that could make a link read as a different site are stripped before anything is shown.</p>
+        <p>Camera, microphone, location and notification requests are refused until you allow them, and an allowed site has to ask again next time you start the browser. Changing a permission reloads the page, with a warning first so you can save your work.</p>
+        <p>Pages loaded over plain HTTP can no longer reach devices on your own network.</p>
+        <p>Copying a link without tracking parameters now also unwraps known redirect wrappers, so the address you copy is where the link actually goes.</p>
+        <p>The browser warns when its phishing blocklist sources go stale.</p>
+      </description>
+    </release>
+    <release version="0.9.59" date="2026-08-05">
+      <description>
+        <p>Copying a link from the right-click menu works again. On Linux the whole right-click menu works again: opening a link in a new tab, the private and quarantine tabs, and the navigation entries were all doing nothing.</p>
+        <p>Panels no longer show the page through them on Windows.</p>
+        <p>The vault now shows Premium Time Left where you cannot miss it, and this build can verify a Premium token for the first time.</p>
+        <p>Wording fixes throughout.</p>
+      </description>
+    </release>
+    <release version="0.9.58" date="2026-08-05">
+      <description>
+        <p>The photo check now finds text that is too faint to see, like white on white, and shows you what it says. The colour measurement is a Rust port of XLiteOCR, EdgeXene's open-source OCR engine.</p>
+      </description>
+    </release>
+    <release version="0.9.57" date="2026-08-05">
+      <description>
+        <p>The right-click menu works on Windows. It never opened: the engine only raises its context-menu event while default menus are enabled, so a menu built with them disabled was never asked for.</p>
+        <p>A Theme panel, with nine accent colours and a choice of dark, white or black browser chrome.</p>
+        <p>Updates can download in the background once verified. Installing still waits for you, every time.</p>
+        <p>Updates can arrive as a small patch instead of a whole browser, when one is published for the version you run.</p>
+        <p>Update traffic goes through the private tunnel when one is imported, and fails rather than going around it.</p>
+        <p>Global Privacy Control is sent, tracking parameters are stripped from addresses, and more trackers are blocked.</p>
+      </description>
+    </release>
+    <release version="0.9.56" date="2026-08-03">
+      <description>
+        <p>Private Tunnel: import a WireGuard configuration and send only this browser's traffic through it. Fails closed, never falls back to a direct connection.</p>
+        <p>The tunnel row in Tab Activity is measured, not assumed, and says when a change needs a restart.</p>
+        <p>Banners are no longer clipped when a panel closes; Integrity and Updates are reachable from Ctrl+K.</p>
+        <p>The interface copy was rewritten in plain language throughout.</p>
+      </description>
+    </release>
+    <release version="0.9.55" date="2026-07-31">
+      <description>
+        <p>The vault locks when the workstation locks or sleeps.</p>
+        <p>Right-click opens links in a quarantine tab; save pages as PDF with a provenance record.</p>
+        <p>The malicious-host list has its own signing key and refreshes hourly.</p>
+        <p>List hygiene: URL-shaped feed junk rejected, bare platform suffixes tripwired.</p>
+      </description>
+    </release>
+    <release version="0.9.54" date="2026-07-31">
+      <description>
+        <p>Unreleased test-build version, burned: operator test builds carried this number. Its features ship in 0.9.55.</p>
+        <p>Site information and per-site cookie clearing from the address bar.</p>
+        <p>Ctrl+K opens a command palette for every toolbar action.</p>
+        <p>A diagnostic report you can copy or save, with no browsing history in it.</p>
+        <p>A first-run walkthrough of the controls that are not self-explanatory.</p>
+        <p>An opt-in Beta update channel.</p>
+        <p>Saved passwords can be offered and filled, matched on exact site.</p>
+      </description>
+    </release>
+    <release version="0.9.53" date="2026-07-29">
+      <description>
+        <p>Ephemeral tabs report the engine's answer, not the request.</p>
+        <p>A page can no longer close the browser by failing to open a tab.</p>
+        <p>Updates panel states the automatic check schedule in full.</p>
+      </description>
+    </release>
+    <!-- 0.9.52 is SKIPPED here deliberately. A 0.9.52 Windows build was placed
+         at /dl/ under the versionless filename without its manifest being
+         re-signed, so that number is spent: binaries carrying it exist outside
+         this repository. `decide` refuses anything not strictly newer, so
+         reusing it would leave every install that took the earlier one
+         permanently unable to accept this. -->
+    <release version="0.9.52" date="2026-07-29">
+      <description>
+        <p>Not published through the update channel.</p>
+      </description>
+    </release>
+    <release version="0.9.0" date="2026-07-28">
+      <description>
+        <p>First release served over the signed update channel.</p>
+        <p>Page zoom, a malicious-host blocklist, and encrypted-DNS choice.</p>
+      </description>
+    </release>
+    <release version="0.1.0" date="2026-07-25">
+      <description>
+        <p>Initial packaged build.</p>
+        <p>Final mark and wordmark.</p>
+      </description>
+    </release>
+  </releases>
+</component>
