@@ -154,7 +154,7 @@
     // Icon-only for the same reason as the integrity button; `title` above
     // already says "Updates".
 
-    // Labelled, at the publisher's direction, and named by chrome.css rather
+    // Labelled, deliberately, and named by chrome.css rather
     // than by copying a neighbour.
     //
     // This used to read `button.className = toolbar.querySelector("button")
@@ -215,12 +215,21 @@
     });
     var channelLabel = make("span", "Updates:");
     setStyles(channelLabel, { color: "#8f909a" });
-    els.channelStable = makeButton("Stable");
-    els.channelStable.id = "update-channel-stable";
+    // NO STABLE BUTTON WHILE THE WHOLE BROWSER IS PRE-RELEASE.
+    //
+    // Offering "Stable" alongside "Beta" says the two are different kinds of
+    // build. They are not yet: every release so far is a pre-release, both
+    // channels are served the same signed manifest, and a user choosing
+    // "Stable" would be picking a maturity that does not exist. One button
+    // that names what this actually is beats two that imply a choice.
+    //
+    // The pref, the IPC pair and the second manifest URL are all untouched,
+    // so restoring the row is re-adding a button when there IS a stable line
+    // to point at. `migrateToBeta` below is what keeps the shown state
+    // truthful in the meantime.
     els.channelBeta = makeButton("Beta");
     els.channelBeta.id = "update-channel-beta";
     channelRow.appendChild(channelLabel);
-    channelRow.appendChild(els.channelStable);
     channelRow.appendChild(els.channelBeta);
     panel.appendChild(channelRow);
 
@@ -314,9 +323,6 @@
     els.check.addEventListener("click", onCheck);
     els.install.addEventListener("click", onInstall);
     els.restart.addEventListener("click", onRestartClick);
-    els.channelStable.addEventListener("click", function () {
-      setChannel("stable");
-    });
     els.channelBeta.addEventListener("click", function () {
       setChannel("beta");
     });
@@ -327,21 +333,34 @@
   // Visual state only; `render()` separately disables both when this build
   // has no update networking at all, same as the Check button.
   function setChannelButtons(active) {
-    var stable = active !== "beta";
-    els.channelStable.style.borderColor = stable ? "#4f8cff" : "#3a3b43";
-    els.channelStable.style.fontWeight = stable ? "700" : "400";
-    els.channelBeta.style.borderColor = stable ? "#3a3b43" : "#4f8cff";
-    els.channelBeta.style.fontWeight = stable ? "400" : "700";
-    els.channelNote.textContent = stable
-      ? CHANNEL_NOTE_STABLE
-      : CHANNEL_NOTE_BETA;
+    var beta = active === "beta";
+    els.channelBeta.style.borderColor = beta ? "#4f8cff" : "#3a3b43";
+    els.channelBeta.style.fontWeight = beta ? "700" : "400";
+    els.channelNote.textContent = beta
+      ? CHANNEL_NOTE_BETA
+      : CHANNEL_NOTE_STABLE;
   }
 
   function refreshChannel() {
     window.__rb
       .request("update_channel_get", {})
       .then(function (data) {
-        setChannelButtons(data && data.channel);
+        var channel = data && data.channel;
+        // Stable is still the stored default, and with its button gone a
+        // user left on it would see one unlit button describing a channel
+        // they are not on -- the panel misreporting its own state, which is
+        // the shape of defect this project keeps paying for. Move them once.
+        //
+        // Safe to do silently TODAY, and only today: both channels are
+        // served the identical signed manifest, so nothing about what this
+        // install fetches changes. The moment a real beta line exists ahead
+        // of stable, this migration stops being a no-op and has to become a
+        // deliberate choice with the user told about it.
+        if (channel !== "beta") {
+          setChannel("beta");
+          return;
+        }
+        setChannelButtons(channel);
       })
       .catch(function () {});
   }
@@ -480,9 +499,7 @@
     els.check.style.cursor = els.check.disabled ? "default" : "pointer";
 
     // Choosing a channel this build can never fetch from is not a choice.
-    els.channelStable.disabled = !st.available;
     els.channelBeta.disabled = !st.available;
-    els.channelStable.style.opacity = st.available ? "1" : "0.5";
     els.channelBeta.style.opacity = st.available ? "1" : "0.5";
 
     var canInstall =

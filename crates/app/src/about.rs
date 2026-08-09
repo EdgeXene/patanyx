@@ -115,7 +115,7 @@ you have to go looking for.";
 type Feature = (&'static str, &'static str, &'static str);
 
 // `Automatic`, not `Opt-in`. TabPolicy::default() sets block_ads: true
-// (platform/privacy.rs), flipped by the publisher 2026-07-31; this tag was left
+// (platform/privacy.rs), flipped 2026-07-31; this tag was left
 // behind and still described the old default. On the published page `Opt-in`
 // means "off until you switch it on", so the tag was not merely stale, it was
 // inverted -- it told a reader they had to go and enable the one protection
@@ -156,7 +156,7 @@ const F_FREEZE: Feature = (
 // support of any kind -- the resolver control is hidden outright on Linux
 // rather than shown and inert.
 //
-// "Measured, not assumed" is the publisher's packet capture, and it is why this
+// "Measured, not assumed" refers to a packet capture on real hardware; it is why this
 // says the name is hidden rather than hedging about it. The site-support
 // qualifier stays: the key that makes it work is published by the SITE, so a
 // site that has not set it up gets no cover from it.
@@ -178,16 +178,50 @@ const F_QUARANTINE: Feature = (
 );
 const F_VAULT: Feature = (
     "A vault for passwords",
-    "On demand",
+    // NOT "On demand" any more, and the tag had to move with the behaviour:
+    // the legend defines that as a tool you reach for, and since the vault
+    // started opening itself at launch it reaches for you. Same tag-inversion
+    // the ad-blocking entry above was already caught by once.
+    "Automatic",
     "Your passwords and private notes live in one encrypted file that never \
      leaves your computer. Nothing is filled in automatically, and a secret \
-     is shown only when you ask for it. You get a recovery key when you set \
+     is shown only when you ask for it. PATANYX offers the vault when you \
+     open it, because your bookmarks and download records unlock with it too. \
+     It does not when another app hands PATANYX a link, and it never takes \
+     the keyboard, so you can just type an address instead. You get a \
+     recovery key when you set \
      the vault up, shown once, and it is the only way in if you forget your \
-     passphrase. Lost it? The Backup tab makes you a new one. The vault locks \
+     passphrase. Keep it safe: a lost recovery key cannot be reissued. \
+     If your vault has no recovery key at all, the Backup tab makes you one. The vault locks \
      itself after five minutes of nothing happening. Typing anywhere counts, \
      so it will not lock while you are working, and you get a countdown and \
      an \"I'm still here\" button a minute before. Five minutes can be 15, 30 \
      or 60, or off.",
+);
+// Bookmarks are table stakes and the do-not-list rule would normally keep
+// them off this page. This entry earns its place on ONE thing a browser's
+// bookmarks usually are not -- encrypted at rest, opened with the vault --
+// plus the one control people actually want from a manager, which is the
+// pinned row.
+//
+// Deliberately two sentences. An earlier draft also covered folders, the
+// absence of icon fetching and the page-change check; all true, and all cut,
+// because a feature list entry that runs five sentences stops being read.
+// Say plainly what happened to them: folders are visible in the manager, but
+// the other two are CUT, not relocated -- nothing in the UI tells a user that
+// no icon is ever fetched or that a bookmark can notice its page changed.
+// Worth stating so this comment cannot be read as licence for the next cut.
+//
+// Both claims are checkable against code: the store is encrypted
+// (crates/store), and Quick Access is a flag read outside the search and
+// folder filters, which is what makes "whatever you search for" true.
+const F_BOOKMARKS: Feature = (
+    "Bookmark Manager",
+    "On demand",
+    "Your bookmarks are encrypted on your computer and open with the vault, \
+     so a saved page is not a list anyone can read off your disk. Pin the \
+     ones you use most to Quick Access and they stay at the top, whatever \
+     you search for.",
 );
 const F_TUNNEL: Feature = (
     "A tunnel you supply the far end of",
@@ -199,8 +233,8 @@ const F_TUNNEL: Feature = (
     "WireGuard is built in. Import the configuration file from your own \
      server or your provider, and PATANYX sends only this browser's traffic \
      through it, not your other apps and not the rest of the computer. Your \
-     key is kept in the encrypted vault, so with the tunnel on, PATANYX opens \
-     at the unlock prompt. If the tunnel goes down, pages stop loading. \
+     key is kept in the encrypted vault. If the tunnel goes down, pages stop \
+     loading. \
      PATANYX will not fall back to a direct connection, because a silent \
      fallback looks exactly like a working tunnel. You picked the server at \
      the far end, and it sees your traffic, so this is not an anonymity \
@@ -251,6 +285,10 @@ fn features() -> Vec<Feature> {
     out.extend([
         F_QUARANTINE,
         F_VAULT,
+        // Beside the vault deliberately: bookmarks are encrypted in the same
+        // custody model and unlock with it, so the two belong together
+        // rather than the manager sitting among the protections.
+        F_BOOKMARKS,
         F_TUNNEL,
         F_OCR,
         F_INTEGRITY,
@@ -312,8 +350,8 @@ const PREMIUM_HEAD: &str = "Free and Premium";
 /// Future tense THROUGHOUT, on purpose: nothing is for sale today, and a
 /// page that reads as if it were would be the exact dishonesty the rest of
 /// this file exists to prevent. The one absolute sentence -- "Free features
-/// always remain free." -- is the publisher's standing commitment, worded by
-/// the publisher, and the test below pins it so a rewrite cannot soften it
+/// always remain free." -- is a standing commitment whose exact wording is
+/// deliberate, and the test below pins it so a rewrite cannot soften it
 /// into marketing. When Premium actually launches, this paragraph changes
 /// to present tense IN THE SAME COMMIT as the licensing ships, never before.
 const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Fingerprint Divergence, private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, and accent theme packs will be part of it. Nothing is behind a paywall today: Fingerprint Divergence, theme packs and the photo check are switched on for everyone in this build, and stay that way until Premium launches. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. Every other protection on this page is free. Free features always remain free. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
@@ -562,7 +600,7 @@ mod tests {
             lowered.contains("nothing is for sale yet"),
             "the premium section must say nothing is for sale until it is"
         );
-        // SECOND: the publisher's standing commitment, exact and brittle on
+        // SECOND: the standing free-forever commitment, exact and brittle on
         // purpose -- a rewrite must look this sentence in the eye.
         assert!(
             lowered.contains("free features always remain free"),

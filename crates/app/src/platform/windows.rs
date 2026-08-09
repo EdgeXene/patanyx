@@ -225,7 +225,7 @@ pub fn show_all(_hosts: &Hosts) {}
 //
 // Until 2026-07-27 nothing here configured a user-data directory at all, so
 // WebView2 used its default: a folder named `<exe-file-name>.WebView2` beside
-// the executable. On the publisher's machine that meant a full Chromium
+// the executable. On a real Windows machine that meant a full Chromium
 // profile -- Local State, Default, Crashpad, GrShaderCache, BrowserMetrics --
 // sitting in Downloads next to the exe, while the vault and store were
 // deliberately living under `%APPDATA%\patanyx\`. Deleting the executable
@@ -646,7 +646,7 @@ pub fn new_webview_builder() -> WebViewBuilder<'static> {
 ///
 /// The honest limit: `diag` compiles to nothing in a release build, and
 /// `windows_subsystem = "windows"` leaves no console for it anyway, so the
-/// release binary is silent about this and the publisher's Windows checklist
+/// release binary is silent about this and the hardware-test checklist
 /// carries the instruction instead. Surfacing it in the chrome UI is the
 /// right answer for GA and is a deliberately separate change.
 pub fn report_stray_profile() {
@@ -2172,7 +2172,7 @@ fn connect_request_interception(
 
 /// Debug-build console trace. The release build sets
 /// `windows_subsystem = "windows"` and has no console at all, so this is
-/// gated rather than merely quiet -- and the publisher runs the DEBUG exe
+/// gated rather than merely quiet -- and hardware probing runs the DEBUG exe
 /// against `scripts/freeze-probe.ps1` precisely to read these lines.
 ///
 /// One grep token (`patanyx:`) on every line, because a probe run is read
@@ -2816,7 +2816,7 @@ pub fn forget_site_cookies(webview: &WebView, host: &str) -> bool {
 /// (`scripts/login-probe.ps1`): a login cookie set in one launch was still
 /// present in the next. WebKitGTK loses them, WebView2 keeps them -- the same
 /// product behaving oppositely on a user-visible property, and NOTHING chose
-/// that. It was an engine default on each side. The publisher's decision is
+/// that. It was an engine default on each side. The decided behaviour is
 /// that neither platform keeps them: a session should not know who you were
 /// last time. See docs/third-party-cookies.md.
 ///
@@ -2969,7 +2969,7 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
 /// WHY THIS EXISTS AT ALL: BEFORE IT, Ctrl+P PRINTED THE TOOLBAR. Nothing in
 /// this codebase handled the key, so WebView2's built-in handling took it on
 /// whichever webview happened to hold focus -- and that is usually the chrome.
-/// The publisher got a preview of the PATANYX tab strip, footed
+/// The visible result was a preview of the PATANYX tab strip, footed
 /// `rbchrome.localhost/index.html`, in a dialog anchored to the chrome's own
 /// window and therefore clipped to the height of the toolbar strip. All three
 /// symptoms were the one cause.
@@ -3096,7 +3096,7 @@ pub fn save_page_as_pdf(
 // WebView2 raises `ContextMenuRequested` ONLY while
 // `AreDefaultContextMenusEnabled` is true; with the setting off the event
 // never fires and right-click is dead air on every target. That is not in the
-// setting's own doc -- it was measured on the publisher's hardware 2026-08-04,
+// setting's own doc -- it was measured on real Windows hardware 2026-08-04,
 // after shipping two menus built on the opposite assumption, and it is why
 // the vendor's custom-menu sample keeps the setting ENABLED and suppresses
 // per event. So: the BUILDER still disables the setting (the fail-closed
@@ -5034,11 +5034,37 @@ pub fn layout(
                 // one quantity, and any arithmetic mixing them inherits the
                 // gap.
                 //
-                // KNOWN LIMIT: resizing the window while a modal is open
-                // leaves the page at its old size until the modal closes and
-                // the Strip arm below re-applies bounds. A stale rect for the
-                // seconds a modal is open is a far smaller defect than a band
-                // that is wrong every single time one opens.
+                // THE SIZE, HOWEVER, IS RE-APPLIED, and the distinction is
+                // the whole fix. This used to read "resizing the window while
+                // a modal is open leaves the page at its old size until the
+                // modal closes", filed as a small defect because a modal was
+                // open for seconds at a time. The vault now offers itself at
+                // launch, so the FIRST thing many people do -- maximise the
+                // window -- happened with a modal open, and the page stayed
+                // at its old rectangle with bare window showing beside and
+                // below it. Not seconds any more, and not small.
+                //
+                // The position is still never recomputed. That is what caused
+                // the band, and the comment above still holds: the right
+                // answer for WHERE is "wherever it already was". So ask the
+                // webview where it is, keep that exactly, and only stretch
+                // width and height to the window's new edges. No constant is
+                // consulted and no arithmetic mixes the two strip heights,
+                // which is what every previous attempt got wrong.
+                if let Some(webview) = active {
+                    if let Ok(now) = webview.bounds() {
+                        let scale = hosts.window.scale_factor();
+                        let at = now.position.to_logical::<f64>(scale);
+                        let _ = webview.set_bounds(Rect {
+                            position: LogicalPosition::new(at.x, at.y).into(),
+                            size: LogicalSize::new(
+                                (size.width - at.x).max(0.0),
+                                (size.height - at.y).max(0.0),
+                            )
+                            .into(),
+                        });
+                    }
+                }
             } else if let Some(webview) = active {
                 let _ = webview.set_bounds(Rect {
                     position: LogicalPosition::new(0.0, 0.0).into(),
@@ -5208,7 +5234,7 @@ pub fn engine_info() -> crate::platform::EngineInfo {
 /// all". That reasoning covers ENFORCEMENT and not REPORTING, and the gap is
 /// user-visible: a quiet loaded page with freeze-after-load enabled stayed at
 /// phase Loaded forever, so the toolbar said "Live" on a tab that was armed to
-/// freeze. The publisher reported it as the setting not working, which is the
+/// freeze. The hardware report called it the setting not working, which is the
 /// only conclusion available from what the UI showed.
 ///
 /// Linux never had this problem -- unix.rs schedules a GTK timeout on load

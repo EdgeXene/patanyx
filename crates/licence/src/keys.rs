@@ -11,7 +11,7 @@ use crate::hex;
 /// The compiled-in licence verification key ring, as hex strings. key_id in
 /// a token is an INDEX into this slice (design 2.4).
 ///
-/// key_id 0 is the REAL licence verifying key, minted by the publisher's
+/// key_id 0 is the REAL licence verifying key, minted by the offline key
 /// ceremony on 2026-08-05 with the same house tool as the release and
 /// blocklist keys (`patanyx-sign keygen ... licence`). The signing half
 /// lives on the server for the licence server to mint with; it is never in
@@ -121,7 +121,7 @@ mod tests {
     #[test]
     fn the_real_ring_builds_and_carries_key_id_zero() {
         // The inversion of `placeholder_keys_are_refused_not_merely_inert`,
-        // performed the day the publisher's ceremony produced the first real
+        // performed the day the key ceremony produced the first real
         // key (2026-08-05), exactly as that test's comment instructed. The
         // shipped ring must build, hold exactly the ceremony's one key at
         // key_id 0, and refuse the out-of-range ids the validator maps to

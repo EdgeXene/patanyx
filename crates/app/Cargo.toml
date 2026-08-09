@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "0.9.61"
+version = "0.9.62"
 license = "Apache-2.0"
 edition = "2021"
 

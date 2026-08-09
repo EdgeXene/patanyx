@@ -48,6 +48,14 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="0.9.62" date="2026-08-08">
+      <description>
+        <p>Fingerprint Divergence is stronger. The sound reading a site can take of your machine now carries noise that varies across the recording and is tied to what was measured, so it cannot be normalized away or worked out by comparing two readings. Silence stays silent.</p>
+        <p>Divergence now reaches into background workers, where a growing share of fingerprinting runs, and covers the element measurements a site can take of text on the page. The reported number of processor cores and the amount of memory are capped, so an unusual machine stands out less.</p>
+        <p>Bookmarks can be given tags, and those tags appear as folders. Shelves open like folders too, and can carry a note. The toolbar can show icons only.</p>
+        <p>Updates now offer a single channel while the browser is a pre-release.</p>
+      </description>
+    </release>
     <release version="0.9.61" date="2026-08-06">
       <description>
         <p>Fingerprint Divergence. The canvas, audio, and graphics readouts sites use to recognize your browser get small site-specific noise: each site sees a different reading, and the readings change again when the browser restarts. On by default, with a switch in the Privacy panel that applies to new tabs.</p>

@@ -85,7 +85,7 @@ that PATANYX is what stops them.
 
 ## Windows: MEASURED 2026-08-01, same answer
 
-`scripts/cookie-probe.ps1`, run by the publisher on real Windows hardware
+`scripts/cookie-probe.ps1`, run on real Windows hardware
 against a debug build. The cross-site chain ran clean:
 
 | stage                                       | result       |

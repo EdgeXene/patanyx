@@ -14,13 +14,13 @@ Useful things to include, to the extent you have them:
 - steps to reproduce, or a proof of concept
 - whether the issue is already public anywhere
 
-You will get an acknowledgement within 5 business days. EdgeXene LLC is a small
-team, so a full assessment may take longer; we will tell you where things stand
-rather than go quiet.
+You will get an acknowledgement within 5 business days. EdgeXene is small, so a
+full assessment may take longer; you will be told where things stand rather
+than left waiting.
 
-We do not operate a paid bug bounty. Reporters who want credit will be named in
-the release notes for the fix, and reporters who would rather stay anonymous
-will not be named.
+EdgeXene does not operate a paid bug bounty. Reporters who want credit will be
+named in the release notes for the fix, and reporters who would rather stay
+anonymous will not be named.
 
 ## Supported versions
 

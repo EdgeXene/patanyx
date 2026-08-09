@@ -188,8 +188,8 @@ impl PageTheme {
 ///
 /// The set beyond the original four (BloodRed onward, minus the removed
 /// Rose) is the SEED of the future premium theme pack. It ships unlocked:
-/// nothing may gate it until the licence server exists and the publisher
-/// flips the gate deliberately.
+/// nothing may gate it until the licence server exists and the gate is
+/// flipped deliberately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChromeTheme {
@@ -274,6 +274,46 @@ impl ChromeScheme {
             "dark" => Some(Self::Dark),
             "white" => Some(Self::White),
             "black" => Some(Self::Black),
+            _ => None,
+        }
+    }
+}
+
+/// Whether toolbar feature buttons show their written labels.
+///
+/// `Show` is the default and stays the default. The toolbar's own comment in
+/// index.html records why: an icon alone makes a user guess what a control
+/// does, and guessing wrong about a privacy control is worse than a slightly
+/// wider toolbar. Icon-only was tried once and reversed after a reader asked
+/// which pill was the unnamed one (see the LIBRARY note in chrome.css).
+///
+/// It is offered as a CHOICE because that argument is about a default, not
+/// about everyone: a user who already knows the row and wants the width back
+/// can have it. Nothing else changes when it is `Hide` -- every button keeps
+/// its `title` and `aria-label`, so hovering still says what the button does
+/// and a screen reader still reads its full name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolbarLabels {
+    /// Icon and written label, the shape every build has shipped.
+    #[default]
+    Show,
+    /// Icon only. The name lives in `title` and `aria-label`.
+    Hide,
+}
+
+impl ToolbarLabels {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Show => "show",
+            Self::Hide => "hide",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "show" => Some(Self::Show),
+            "hide" => Some(Self::Hide),
             _ => None,
         }
     }
@@ -533,6 +573,24 @@ pub struct Prefs {
     /// shape `ephemeral` has. See `platform::privacy::divergence_script`.
     #[serde(default = "fingerprint_noise_default")]
     pub fingerprint_noise: bool,
+    /// Whether the bookmark folder bar is shown under the toolbar.
+    ///
+    /// `false` is the correct absent-field meaning and needs no override fn:
+    /// a prefs.json written before this existed describes a browser with two
+    /// chrome rows, and adding a third to someone's window on upgrade is a
+    /// layout change nobody asked for. Unlike the session-lock flag, `false`
+    /// here is not the weaker posture, it is simply the old one.
+    #[serde(default)]
+    pub bookmarks_bar: bool,
+    /// Whether toolbar feature buttons show their written labels.
+    ///
+    /// No field-level `#[serde(default)]` fn is needed: `ToolbarLabels`
+    /// derives `Default` as `Show`, which IS the correct absent-field
+    /// meaning. A prefs.json written before this field existed describes a
+    /// build whose toolbar was labelled, and that is what it reads back as.
+    /// Same shape as `page_theme` and unlike `vault_lock_on_session_lock`,
+    /// where the derived default is the weaker posture.
+    pub toolbar_labels: ToolbarLabels,
 }
 
 // Hand-written rather than derived, because `#[derive(Default)]` would give
@@ -555,6 +613,8 @@ impl Default for Prefs {
             update_background_download: true,
             vault_lock_on_session_lock: lock_on_session_lock_default(),
             fingerprint_noise: fingerprint_noise_default(),
+            toolbar_labels: ToolbarLabels::default(),
+            bookmarks_bar: false,
         }
     }
 }
@@ -850,6 +910,32 @@ mod tests {
             "an old prefs.json must default to fingerprint noise ON; \
              bool's own default (false) is the unsafe direction here"
         );
+    }
+
+    #[test]
+    fn old_prefs_json_without_toolbar_labels_reads_show() {
+        // The absent-field meaning has to be the shape every earlier build
+        // rendered: labelled. A prefs.json written before this setting
+        // existed describes a labelled toolbar, so it must read back as one.
+        let old = r#"{"dns":"system"}"#;
+        let prefs: Prefs = serde_json::from_str(old).expect("old prefs must parse");
+        assert_eq!(prefs.toolbar_labels, ToolbarLabels::Show);
+        assert_eq!(Prefs::default().toolbar_labels, ToolbarLabels::Show);
+    }
+
+    #[test]
+    fn toolbar_labels_round_trip_and_unknown_is_refused() {
+        let mut prefs = Prefs::default();
+        prefs.toolbar_labels = ToolbarLabels::Hide;
+        let text = serde_json::to_string(&prefs).unwrap();
+        let back: Prefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.toolbar_labels, ToolbarLabels::Hide);
+        // Wire names are the contract with chrome.js; a typo must not
+        // silently become a default.
+        assert_eq!(ToolbarLabels::parse("hide"), Some(ToolbarLabels::Hide));
+        assert_eq!(ToolbarLabels::parse("show"), Some(ToolbarLabels::Show));
+        assert_eq!(ToolbarLabels::parse("icons"), None);
+        assert_eq!(ToolbarLabels::Hide.as_str(), "hide");
     }
 
     #[test]

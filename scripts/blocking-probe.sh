@@ -12,7 +12,7 @@
 # filter, and look at which connections the server actually received.
 #
 # Runs inside the Debian 13 container: it edits /etc/hosts and binds :80, and
-# neither belongs anywhere near the host running the publisher's fleet.
+# neither belongs anywhere near the host running the production fleet.
 set -euo pipefail
 
 # Explicit, never a symlink into target/debug. That directory already exists

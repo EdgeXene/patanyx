@@ -425,7 +425,8 @@
         typeof data.similarity === "number"
           ? Math.round(data.similarity * 100)
           : 0;
-      head = "The visible text has changed -- about " + pct + "% still matches.";
+      head =
+        "The visible text has changed -- about " + pct + "% still matches.";
     }
     var wrap = box(color);
     wrap.appendChild(
@@ -683,7 +684,7 @@
   svg.appendChild(shield);
   svg.appendChild(tick);
   button.appendChild(svg);
-  // Labelled, at the publisher's direction. It was icon-only on the argument
+  // Labelled, deliberately. It was icon-only on the argument
   // that the address bar needed the width more -- but a shield with a tick,
   // unlabelled, is indistinguishable from the Privacy shield two buttons away,
   // and this one does something quite different. The width comes out of the

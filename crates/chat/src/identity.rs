@@ -22,7 +22,7 @@ pub const FINGERPRINT_LEN: usize = 16;
 /// for another purpose over the same key bytes.
 const FINGERPRINT_CONTEXT: &[u8] = b"patanyx-chat/fingerprint/v1";
 
-/// A contact-facing keypair. The publisher holds one of these PER CONTACT, so
+/// A contact-facing keypair. The user holds one of these PER CONTACT, so
 /// revoking one person is deleting one key and nobody else's address changes.
 /// Contacts cannot correlate the same user across conversations because each
 /// sees an unrelated public key.

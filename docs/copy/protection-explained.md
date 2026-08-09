@@ -1,6 +1,6 @@
 # Copy: how the malicious-site protection works
 
-**NOT PUBLISHED.** Drafted 2026-07-29 at the publisher's request, held back
+**NOT PUBLISHED.** Drafted 2026-07-29 and held back
 deliberately. Two versions below: one for the website, one for the Privacy
 panel inside the browser.
 

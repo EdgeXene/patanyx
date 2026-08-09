@@ -762,7 +762,18 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                     json!({
                         "id": shelf.id,
                         "name": shelf.name,
+                        "note": shelf.note,
                         "count": shelf.tabs.len(),
+                        // The titles and addresses inside, so a shelf can be
+                        // looked into without being restored. Reading a
+                        // shelf's own contents back to the chrome that wrote
+                        // them: no new storage, no schema change, and
+                        // nothing here that shelf_restore would not open
+                        // anyway.
+                        "tabs": shelf.tabs.iter().map(|t| json!({
+                            "title": t.title,
+                            "url": t.url,
+                        })).collect::<Vec<Value>>(),
                     })
                 })
                 .collect();
@@ -809,6 +820,39 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // The chrome asks nothing before sending this (a shelf is small and
         // recreatable, and confirm dialogs train click-through), but it
         // keeps the row's data until this reply confirms the deletion.
+        // Renaming a shelf and attaching a note to it. Store first, exactly
+        // like shelf_create: refuse before touching anything if there is no
+        // store to write to.
+        //
+        // THE IPC CAPS ARE IN BYTES AND THE STORE'S ARE IN CHARACTERS, and
+        // these are deliberately generous rather than equal. `arg_str_capped`
+        // REFUSES over-cap input with `bad_args`; the store TRUNCATES. If the
+        // byte cap were set to the character count, a note written in any
+        // script whose characters take more than one byte would be refused
+        // outright, well under the limit the user was shown. Four bytes per
+        // character is the widest UTF-8 encoding, so these bounds cannot
+        // refuse anything the store would have accepted. The store remains
+        // the authoritative cap.
+        "shelf_rename" => {
+            let store = store_open(state)?;
+            let id = arg_str(args, "id")?.to_string();
+            let name = arg_str_capped(args, "name", 120 * 4)?.to_string();
+            let found = store.rename_shelf(&id, &name).map_err(store_code)?;
+            if !found {
+                return Err("not_found");
+            }
+            Ok(json!({ "id": id, "name": name }))
+        }
+        "shelf_note_set" => {
+            let store = store_open(state)?;
+            let id = arg_str(args, "id")?.to_string();
+            let note = arg_str_capped(args, "note", 2000 * 4)?.to_string();
+            let found = store.set_shelf_note(&id, &note).map_err(store_code)?;
+            if !found {
+                return Err("not_found");
+            }
+            Ok(json!({ "id": id, "note": note }))
+        }
         "shelf_delete" => {
             let id = arg_str(args, "id")?;
             if !store_open(state)?.remove_shelf(id).map_err(store_code)? {
@@ -820,6 +864,14 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "vault_status" => Ok(json!({
             "exists": Vault::exists(&state.vault_path),
             "unlocked": state.vault.is_some(),
+        })),
+        // What this launch was: started on its own, or handed a link by
+        // another application because PATANYX is the default browser. The
+        // chrome asks once, at boot, to decide whether offering the vault is
+        // what the person came for or an interruption of what they asked for.
+        // A read of how the process was started; it touches nothing.
+        "startup_info" => Ok(json!({
+            "opened_with_url": state.opened_with_url,
         })),
         "vault_create" => {
             let passphrase = arg_str(args, "passphrase")?;
@@ -1675,6 +1727,38 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::platform::set_hover_readout_scheme(&state.hosts, scheme);
             Ok(json!({ "scheme": scheme.as_str() }))
         }
+        // Toolbar labels: shown or hidden, saved here and worn by chrome.js
+        // via a data attribute, exactly like the accent and the scheme. No
+        // engine involvement, so no ack to carry -- inventing an `applied`
+        // field here would claim a confirmation nobody asked the engine for.
+        "toolbar_labels_set" => {
+            let mode = crate::prefs::ToolbarLabels::parse(arg_str(args, "mode")?)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.toolbar_labels = mode;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "mode": mode.as_str() }))
+        }
+        // The bookmark folder bar. Same chrome-only shape as the toolbar
+        // labels above: saved here, worn by chrome.js, no engine ack.
+        "bookmarks_bar_set" => {
+            let shown = args
+                .get("shown")
+                .and_then(Value::as_bool)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.bookmarks_bar = shown;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "shown": shown }))
+        }
+        "bookmarks_bar_get" => Ok(json!({
+            "shown": crate::prefs::load().bookmarks_bar,
+        })),
+
+        "toolbar_labels_get" => Ok(json!({
+            "mode": crate::prefs::load().toolbar_labels.as_str(),
+        })),
+
         "chrome_scheme_get" => Ok(json!({
             "scheme": crate::prefs::load().chrome_scheme.as_str(),
         })),
@@ -1780,14 +1864,51 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // failed store yields one predictable error.
         "store_status" => Ok(state.store_status()),
         "bookmark_add" => {
-            // Always the current page, taken from the active tab: the chrome
-            // UI deliberately cannot bookmark an arbitrary URL it made up.
-            let tab = state.tabs.get(state.active).ok_or("not_found")?;
-            let url = tab.url.clone();
-            if url.is_empty() || url == "about:blank" {
-                return Err("bad_args");
-            }
-            let title = tab.title.clone();
+            // TWO ways in, and the difference matters.
+            //
+            // With no `url` argument this bookmarks THE CURRENT PAGE, read
+            // from the active tab -- the toolbar star's behaviour, unchanged,
+            // and still the only thing every existing caller does.
+            //
+            // With a `url`, the user typed an address by hand in the
+            // bookmarks manager. That is allowed, and the comment that used
+            // to sit here claiming the chrome "deliberately cannot bookmark
+            // an arbitrary URL it made up" is gone because it was no longer
+            // true -- and was already only half true, since `bookmark_update`
+            // has always let a user edit a saved bookmark's address to any
+            // allowed URL. What actually bounds both paths is the SAME
+            // content allowlist, applied below: no file://, no data:, no
+            // javascript:, not the reserved chrome host, nothing malformed.
+            // A typed address is normalised first, so "example.com" becomes
+            // https://example.com rather than being refused.
+            let typed = args.get("url").and_then(Value::as_str);
+            let (url, title) = match typed {
+                Some(raw) => {
+                    let url = normalize_input(raw);
+                    if !crate::state::is_allowed_content_url(&url) {
+                        return Err("bad_args");
+                    }
+                    // An empty name is not stored as an empty string: the
+                    // host is what a person recognises in a list.
+                    let title = args
+                        .get("title")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .or_else(|| crate::state::host_of(&url))
+                        .unwrap_or_else(|| url.clone());
+                    (url, title)
+                }
+                None => {
+                    let tab = state.tabs.get(state.active).ok_or("not_found")?;
+                    let url = tab.url.clone();
+                    if url.is_empty() || url == "about:blank" {
+                        return Err("bad_args");
+                    }
+                    (url, tab.title.clone())
+                }
+            };
             let store = store_open(state)?;
             let id = store.add_bookmark(&url, &title).map_err(store_code)?;
             Ok(json!({ "id": id, "url": url, "title": title }))
@@ -1803,12 +1924,18 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         "url": b.url,
                         "title": b.title,
                         "created_at": b.created_at,
+                        "tags": b.tags,
+                        "quick_access": b.quick_access,
                         "has_digest": b.digest.is_some(),
                         "digest_recorded_at": b.digest.as_ref().map(|d| d.recorded_at),
                     })
                 })
                 .collect();
-            Ok(json!({ "items": items }))
+            // The known folder names ride along so the chrome can show a
+            // folder that has no bookmarks in it yet. `items` shape is
+            // unchanged; this is purely additive to the reply.
+            let folders: Vec<&str> = store.folders().iter().map(String::as_str).collect();
+            Ok(json!({ "items": items, "folders": folders }))
         }
         "bookmark_update" => {
             let id = arg_str(args, "id")?;
@@ -1823,6 +1950,109 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 .update_bookmark(id, &url, title)
                 .map_err(store_code)?;
             Ok(json!({}))
+        }
+        // Tags ride the SAME edit as title and url, so the chrome sends them
+        // together. Separate arm rather than widening `bookmark_update`:
+        // that arm drops a recorded digest when the URL changes, and
+        // retagging must never be able to do that.
+        "bookmark_tags_set" => {
+            let id = arg_str(args, "id")?.to_string();
+            let tags: Vec<String> = args
+                .get("tags")
+                .and_then(Value::as_array)
+                .ok_or("bad_args")?
+                .iter()
+                .filter_map(|t| t.as_str().map(str::to_string))
+                .collect();
+            // The store normalises and caps; refuse only input so large it
+            // is obviously not a tag list. Bytes here, characters there, with
+            // the same headroom the shelf arms document.
+            if tags.len() > 64 || tags.iter().any(|t| t.len() > 40 * 4) {
+                return Err("bad_args");
+            }
+            let found = store_open(state)?
+                .set_bookmark_tags(&id, tags)
+                .map_err(store_code)?;
+            if !found {
+                return Err("not_found");
+            }
+            Ok(json!({ "id": id }))
+        }
+        // ---- bookmark folders (a folder IS a tag) ----
+        //
+        // Names are normalised HERE, at the edge, exactly as a tag is
+        // (trim -> lowercase -> 40-char cap) via the store's
+        // `normalize_folder_name`. A store test pins that this produces the
+        // identical string tag normalisation would, so a folder and the tag
+        // that stands for it can never split into two groups. An empty or
+        // over-long name is REFUSED (bad_args), not silently truncated -- a
+        // rejected name is never created, so it cannot drift.
+        "bookmark_folder_create" => {
+            let name =
+                patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
+            store_open(state)?.create_folder(&name).map_err(store_code)?;
+            Ok(json!({ "name": name }))
+        }
+        "bookmark_folder_rename" => {
+            let from = patanyx_store::normalize_folder_name(arg_str(args, "from")?)?;
+            let to = patanyx_store::normalize_folder_name(arg_str(args, "to")?)?;
+            let renamed = store_open(state)?
+                .rename_folder(&from, &to)
+                .map_err(store_code)?;
+            Ok(json!({ "from": from, "to": to, "renamed": renamed }))
+        }
+        // Deleting a folder UNFILES its bookmarks; it never deletes them.
+        // The store method carries the same guarantee (and a test pins it).
+        "bookmark_folder_delete" => {
+            let name =
+                patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
+            let deleted = store_open(state)?.delete_folder(&name).map_err(store_code)?;
+            Ok(json!({ "name": name, "deleted": deleted }))
+        }
+        // Atomic move: the store ADDS this folder to the bookmark's CURRENT
+        // tags, read authoritatively server-side, so two quick drops cannot
+        // each overwrite the whole tag list and lose the other's folder. This
+        // is why filing does NOT reuse `bookmark_tags_set` (which replaces the
+        // whole list from a client-side snapshot).
+        "bookmark_folder_file" => {
+            let id = arg_str(args, "id")?.to_string();
+            let folder =
+                patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
+            match store_open(state)?
+                .file_bookmark(&id, &folder)
+                .map_err(store_code)?
+            {
+                None => Err("not_found"),
+                Some(added) => Ok(json!({ "id": id, "folder": folder, "added": added })),
+            }
+        }
+        // Pin or unpin a bookmark in the Quick Access row. A flag on the
+        // bookmark, deliberately not a reserved folder name -- see the field's
+        // own comment in the store for why that distinction is load-bearing.
+        "bookmark_quick_access_set" => {
+            let id = arg_str(args, "id")?.to_string();
+            let on = args.get("on").and_then(Value::as_bool).ok_or("bad_args")?;
+            match store_open(state)?
+                .set_quick_access(&id, on)
+                .map_err(store_code)?
+            {
+                None => Err("not_found"),
+                Some(changed) => Ok(json!({ "id": id, "on": on, "changed": changed })),
+            }
+        }
+        // Remove ONE bookmark from ONE folder; its other folders and the
+        // bookmark itself are untouched.
+        "bookmark_folder_unfile" => {
+            let id = arg_str(args, "id")?.to_string();
+            let folder =
+                patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
+            match store_open(state)?
+                .unfile_bookmark(&id, &folder)
+                .map_err(store_code)?
+            {
+                None => Err("not_found"),
+                Some(removed) => Ok(json!({ "id": id, "folder": folder, "removed": removed })),
+            }
         }
         "bookmark_delete" => {
             let id = arg_str(args, "id")?;
@@ -2447,9 +2677,11 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     // A bookmark, because bookmarks travel with the export and the only way
     // to know they survived is to have put one in before exporting.
     //
-    // `bookmark_add` deliberately takes no URL -- it bookmarks the ACTIVE TAB,
-    // so the chrome cannot bookmark a URL it invented. That means the tab has
-    // to be given one here, which is also what the real UI does.
+    // This call passes no `url`, so `bookmark_add` takes the ACTIVE TAB --
+    // the path the toolbar star uses. (It also accepts a typed address now,
+    // for the manager's add-by-hand field; that path is bounded by the
+    // content allowlist and has its own test.) The tab therefore has to be
+    // given a URL here, which is also what the real UI does.
     const CARRIED_URL: &str = "https://carried.example/page";
     {
         let tab = state.tabs.get_mut(state.active).ok_or("smoke: no active tab")?;
@@ -3007,6 +3239,54 @@ mod tests {
     use super::normalize_input;
     use crate::state::is_allowed_content_url;
     use serde_json::json;
+
+    #[test]
+    fn a_typed_bookmark_address_cannot_smuggle_a_forbidden_scheme() {
+        // The guard `bookmark_add` applies to a HAND-TYPED address, tested as
+        // the composition the arm actually performs: normalise first, then
+        // refuse anything outside the content allowlist. Typing an address is
+        // allowed; typing one the browser would never navigate to is not.
+        //
+        // THE INVARIANT, stated as what actually reaches the store: whatever
+        // survives the guard is an http(s) URL. Never file://, never data:,
+        // never javascript:, never the chrome's own origin.
+        //
+        // Asserting "every hostile input is refused" would be WRONG and this
+        // test was written that way first. `javascript:alert(1)` carries no
+        // dot and no "://", so normalize_input classifies it as search TEXT
+        // and returns a duckduckgo query -- allowed, and harmless, because it
+        // is no longer a javascript: URL at all. The address bar has always
+        // behaved this way for typed input; a hand-typed bookmark address
+        // deliberately behaves identically. So the property worth pinning is
+        // the one below, which holds either way it is disposed of.
+        for hostile in [
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "javascript:alert(1.0)",
+            "data:text/html,<script>alert(1)</script>",
+            "rbchrome://chrome/index.html",
+            "http://rbchrome.localhost/",
+            "  file:///etc/shadow  ",
+        ] {
+            let normalised = normalize_input(hostile);
+            if is_allowed_content_url(&normalised) {
+                assert!(
+                    normalised.starts_with("http://") || normalised.starts_with("https://"),
+                    "a typed {hostile:?} passed the allowlist as {normalised:?}, \
+                     which is not an http(s) URL"
+                );
+            }
+        }
+        // And the ordinary cases still work, including a bare host, which is
+        // the whole reason the address is normalised before it is checked.
+        for ok in ["example.com", "https://example.com/page", "http://a.test/"] {
+            let normalised = normalize_input(ok);
+            assert!(
+                is_allowed_content_url(&normalised),
+                "a typed {ok:?} must be accepted, got {normalised:?}"
+            );
+        }
+    }
 
     #[test]
     fn polled_commands_are_not_evidence_a_user_is_here() {

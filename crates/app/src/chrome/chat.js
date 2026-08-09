@@ -797,7 +797,7 @@
   }
 
   // ---- contact list --------------------------------------------------------------
-  /// Presence for the contact list, in the publisher's three colours:
+  /// Presence for the contact list, in three fixed colours:
   /// green online, red offline, orange away.
   ///
   /// "connected" (a live session) collapses into online -- it is a fact about

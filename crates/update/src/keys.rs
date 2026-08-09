@@ -29,8 +29,8 @@ impl TrustedKeys {
     /// trusted keys is a build mistake, and build mistakes should be loud.
     ///
     /// A WEAK (small-order) key is rejected for the same reason and a sharper
-    /// one. The placeholder this project ships until the publisher pastes the
-    /// real key is 32 zero bytes, which decodes to a valid small-order point
+    /// one. The placeholder this project ships until the real key is pasted
+    /// in is 32 zero bytes, which decodes to a valid small-order point
     /// -- so it parsed, and a build carrying it looked configured. Signatures
     /// can be crafted that verify against such a key for ANY message, so the
     /// placeholder was not merely inert: it was the one input that would make

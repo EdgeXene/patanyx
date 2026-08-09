@@ -906,6 +906,18 @@ pub struct AppState {
     /// `ephemeral` is the exception: a WebContext is fixed once its view
     /// exists, so it only affects tabs opened afterwards.
     pub privacy: platform::TabPolicy,
+    /// Whether this launch was handed a URL to open, rather than being started
+    /// on its own.
+    ///
+    /// The difference is INTENT, and the vault's startup behaviour turns on
+    /// it. Someone who opened PATANYX from their desktop meant to use the
+    /// browser, so being offered the vault is what they came for. Someone who
+    /// clicked a link in another application meant to read THAT PAGE, and the
+    /// browser they had set as default is incidental -- covering the page they
+    /// asked for with a passphrase prompt would be an interruption, not a
+    /// service. Set from the positional argument in `main`, which is how a
+    /// default browser is handed a link on both platforms.
+    pub opened_with_url: bool,
     pub smoke_mode: bool,
     /// Set once the behavioural blocking probe has navigated, so the smoke
     /// exit does not fire before the page has had a chance to make requests.
@@ -1245,6 +1257,9 @@ impl AppState {
             chrome_height: platform::CHROME_HEIGHT_PX,
             chrome_arrangement: platform::ChromeLayout::Strip,
             privacy: platform::TabPolicy::default(),
+            // Defaults to "opened on its own"; `main` sets it from the
+            // positional argument once that has been parsed.
+            opened_with_url: false,
             smoke_mode,
             probe_started: false,
             ping_count: 0,
@@ -1572,7 +1587,7 @@ impl AppState {
         //
         // Closing a panel sends two messages: the arrangement first, the height
         // second. Between them `chrome_height` still holds the PANEL's height,
-        // and the Strip arm believes it -- the publisher's own diagnostic log
+        // and the Strip arm believes it -- a diagnostic log from real hardware
         // caught it:
         //
         //   arrangement=Strip chrome_height=500

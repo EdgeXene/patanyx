@@ -78,7 +78,7 @@
 //!
 //! So this tool cannot emit a manifest the browser would refuse. A malformed
 //! URL, a zero size, a truncated sha256, a payload that is not valid JSON, a
-//! wire-format drift -- all of them fail HERE, on the publisher's machine,
+//! wire-format drift -- all of them fail HERE, on the signing machine,
 //! instead of silently on every user's. Publishing an unusable manifest is the
 //! failure mode a signing tool exists to prevent, and a tool that merely
 //! produced bytes would not prevent it.
@@ -325,7 +325,7 @@ fn restrict(path: &Path) -> Result<(), String> {
     //
     // THE USERNAME IS RESOLVED HERE, not left as a shell variable. The first
     // version printed `%USERNAME%`, which is cmd.exe syntax -- in PowerShell,
-    // where the publisher actually was, that is a literal string and icacls
+    // where the command is actually pasted, that is a literal string and icacls
     // rejects it. There is no spelling of a variable that works in both shells,
     // so the right answer is to print neither and substitute the real name,
     // which every shell copies verbatim.

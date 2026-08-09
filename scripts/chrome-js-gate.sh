@@ -312,6 +312,37 @@ else
 fi
 
 echo
+echo "=== gate 1l: update banner ==="
+# The banner is the ONLY thing that tells a user an update exists without
+# them going looking, and it shipped dead: it fired on `offered` while the
+# scheduled check reported `checking`, and background download means the
+# state that matters is `ready`. Pinned in both directions because a banner
+# that never appears and one that never leaves are both failures.
+if [ -f scripts/update-banner-gate.js ]; then
+  if ! grep -q 'update-banner' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/update-banner-gate.js exists but index.html has" >&2
+    echo "  no update banner; it was removed and this gate would silently" >&2
+    echo "  vanish" >&2
+    exit 1
+  fi
+  node scripts/update-banner-gate.js
+else
+  echo "  (no update-banner gate in this tree)"
+fi
+
+echo
+echo "=== gate 1k2: the address bar never decodes a hostname ==="
+# A homograph domain is defeated here by an OMISSION -- nothing prettifies the
+# URL, so a Cyrillic lookalike arrives and is shown as xn--. That is strong
+# and easy to undo by accident, since decoding IDN for friendliness looks like
+# an improvement. This pins it.
+if [ -f scripts/hostname-display-gate.js ]; then
+  node scripts/hostname-display-gate.js
+else
+  echo "  (no hostname-display gate in this tree)"
+fi
+
+echo
 echo "=== gate 1l: inline credential autofill ==="
 # The save banner and the fill affordance -- the first feature in this
 # codebase to hold a password in memory ahead of an explicit user action, and
@@ -327,6 +358,44 @@ if [ -f scripts/credential-ui-gate.js ]; then
   node scripts/credential-ui-gate.js
 else
   echo "  (no credential autofill gate in this tree)"
+fi
+
+echo
+echo "=== gate 1l1: what opens at launch ==="
+# The vault opens itself when PATANYX is started on its own, and deliberately
+# does NOT when another application handed it a link to display -- covering
+# the page someone asked for with a passphrase prompt is an interruption. The
+# first-run tour outranks both. Each scenario boots chrome.js in its own
+# process, because the boot sequence runs once per document.
+if [ -f scripts/startup-vault-gate.js ]; then
+  if ! grep -q 'startup_info' "$CHROME/chrome.js"; then
+    echo "GATE FAIL: scripts/startup-vault-gate.js exists but chrome.js no" >&2
+    echo "  longer reads startup_info; the launch behaviour was removed and" >&2
+    echo "  this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/startup-vault-gate.js
+else
+  echo "  (no startup vault gate in this tree)"
+fi
+
+echo
+echo "=== gate 1l3: the bookmarks manager ==="
+# Quick Access is PINNED: it must survive a folder filter, a search and a
+# sort, because it exists so a user never has to go looking. Filing must go
+# through the atomic file/unfile, never the whole-list tags_set. And adding by
+# hand must hand the typed address to Rust, so the content allowlist there is
+# what decides. All three are proven against planted defects.
+if [ -f scripts/bookmarks-manager-gate.js ]; then
+  if ! grep -q 'id="bmm-quick"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/bookmarks-manager-gate.js exists but index.html" >&2
+    echo "  has no #bmm-quick; the manager was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/bookmarks-manager-gate.js
+else
+  echo "  (no bookmarks manager gate in this tree)"
 fi
 
 echo
@@ -364,21 +433,47 @@ else
 fi
 
 # fingerprint_divergence.js runs in the same page world but holds a SESSION TOKEN, so its
-# bar is higher than autofill's: no channels AT ALL. autofill legitimately
-# speaks postMessage to the chrome that built it; divergence has nothing to
-# say to anyone, so postMessage joins the forbidden list.
+# bar is higher than autofill's: no OUTBOUND channel AT ALL, because it carries
+# a per-session token. fetch/XMLHttpRequest/import are forbidden outright.
+#
+# postMessage is the one nuance. The CSP fallback (the Worker wrapper) hands the
+# page a facade over a worker THE PAGE ITSELF created, and forwards the page's
+# own messages to it -- real.postMessage(...). That is not a channel out of the
+# page: the token never reaches a worker, whose shim carries only the canvas
+# seed (the worker gate proves the token is absent from the shim source). So
+# postMessage is allowed ONLY as a method call on a local receiver, and is still
+# banned as a bare/implicit call or on any page-reachable global (self, window,
+# parent, top, opener) -- those WOULD carry data out of the page.
 DIVERGENCE_SCRIPT="crates/app/src/content_scripts/fingerprint_divergence.js"
 if [ -f "$DIVERGENCE_SCRIPT" ]; then
-  if grep -nE '\b(fetch|XMLHttpRequest|import|postMessage)\s*\(' "$DIVERGENCE_SCRIPT"; then
+  if grep -nE '\b(fetch|XMLHttpRequest|import)\s*\(' "$DIVERGENCE_SCRIPT"; then
     echo "GATE FAIL: $DIVERGENCE_SCRIPT opened a channel -- it carries the" >&2
     echo "  divergence session token and must have no way to send anything" >&2
     exit 1
   fi
-  echo "  ok  no fetch/XMLHttpRequest/import/postMessage in $DIVERGENCE_SCRIPT"
+  if grep -nE '(^|[^.[:alnum:]_$])postMessage[[:space:]]*\(|\b(self|window|parent|top|opener)\.postMessage[[:space:]]*\(' "$DIVERGENCE_SCRIPT"; then
+    echo "GATE FAIL: $DIVERGENCE_SCRIPT calls postMessage on a global or as a" >&2
+    echo "  bare/implicit send -- only forwarding onto a page-created worker is" >&2
+    echo "  allowed; the token-bearing script must not send data out of the page" >&2
+    exit 1
+  fi
+  echo "  ok  no fetch/XMLHttpRequest/import; postMessage only forwards to a worker in $DIVERGENCE_SCRIPT"
 
   # Same lesson as autofill: greps prove absence, only running it proves the
   # noise exists, is deterministic per site, and never stacks.
   node scripts/divergence-gate.js
+
+  # And the opposite question: how easily can a site tell the noise is THERE?
+  # Separate gate because it is a separate property, and because the figure
+  # it prints is published. It pins the exact set of techniques that succeed,
+  # so a change in either direction has to be made on purpose.
+  node scripts/divergence-detect-gate.js
+
+  # Worker coverage: the shim the Worker wrapper builds must apply noise
+  # byte-identical to the main thread (or a page could diff the two realms
+  # and read the mask off), and every non-classic case must fall back to an
+  # unwrapped worker rather than a broken or mismatched one.
+  node scripts/divergence-worker-gate.js
 fi
 
 echo

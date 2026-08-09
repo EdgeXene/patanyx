@@ -27,7 +27,7 @@
 # ------------------------------------------------------------------------
 # SOURCES AND LICENCES
 #
-# Retrieved 2026-08-07.
+# Retrieved 2026-08-08.
 #
 # 1. Phishing.Database -- https://github.com/mitchellkrogza/Phishing.Database
 #    phishing-domains-ACTIVE.txt -- 391522 hosts.
@@ -55,8 +55,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 #
-# 2. phishunt.io -- https://phishunt.io/ -- feed.txt -- 687 hosts,
-#    of which 665 were not already covered by the list above.
+# 2. phishunt.io -- https://phishunt.io/ -- feed.txt -- 710 hosts,
+#    of which 688 were not already covered by the list above.
 #
 # Creative Commons CC0 1.0 Universal (public domain dedication). From their
 # terms: "The data distributed through phishunt.io (JSON, CSV, TXT feeds, and
@@ -17472,7 +17472,6 @@
 3evrt.jkub.com
 3ey.me
 3ezseriesbooks.com
-3f-icloud.com
 3f.nstxu.gugarwalpackersmovers.com
 3f08001b-9f41-4e2e-be3e-4d4be500e555-00-2eafptdyyyyqy.worf.replit.dev
 3f08d4d3.cnmnw.com.cn
@@ -19654,6 +19653,7 @@
 491d5451.ahdye63jd1.shop
 4924049240.hoperadio1320am.com
 492413581.nzingaadvisors.co.za
+492718-coinbase.com
 49296313.com
 492d2c39.designqueen.cn
 4930772040988729163719032.quintaouteiro.pt
@@ -27876,12 +27876,9 @@
 73968login.weebly.com
 739fc5bd.sjw36sya1739.shop
 739lajisolutionscotwop-includesjscropglobalsbcspacealauto.weebly.com
-73a2370016b7.81.accounts-paypal.antimoney-laundering.org
-73a2370016b7.biljsh0258.paypal-updates.antimoney-laundering.org
-73a2370016b7.cb.account-paypal.antimoney-laundering.org
+73a2370016b7.2.web11931.paypal-support.antimoney-laundering.org
 73a2370016b7.paypal-login.antimoney-laundering.org
-73a2370016b7.wvil.accounts-paypal.antimoney-laundering.org
-73a2370016b7.www.pooh.paypal-support.antimoney-laundering.org
+73a2370016b7.rpub.account-paypal.antimoney-laundering.org
 73a2370016b7.www.secure23274.paypal-ssl.antimoney-laundering.org
 73a4833484a3e4202a91fd537a129d68.serveo.net
 73afde378ed6c178380b0d55fec97a6b-dot-gle9392420309493993.rj.r.appspot.com
@@ -40379,7 +40376,6 @@ account-support.info
 account-support.redirectme.net
 account-support.watch-critics.com
 account-support24h.pages.net.br
-account-suppport2871-apple.com
 account-suspended-case-1dd5a.firebaseapp.com
 account-suspended-case-1dd5a.web.app
 account-suspended-case-9c17f.firebaseapp.com
@@ -49124,6 +49120,8 @@ agenciasviajesbolivia.com
 agenciatributaria.aeat-agencia.com
 agenciatributaria.eu.socialsmp.com
 agenciatributaria.proteccion-es.com
+agenciatributariai-cm.eu.cc
+agenciatributariai-com.eu.cc
 agenciatributariaoopa.eu.cc
 agenciatributariaoopd.eu.cc
 agenciatributariaoops.eu.cc
@@ -55191,7 +55189,6 @@ allegro-demo-adminportal-aps.azurewebsites.net
 allegro-dostavka.ru
 allegro-dveri.ru
 allegro-logowanie-8a27af.ingress-earth.easywp.com
-allegro-lokalnie.4754767463483.click
 allegro-lokalnie.store
 allegro-lokalniie.fun
 allegro-m.ru
@@ -55222,7 +55219,6 @@ allegro-worxx.de
 allegro-wosp-2023.4hosting2.4ourclient.com
 allegro.0437246.cfd
 allegro.24transakcje.pl
-allegro.4754767463483.click
 allegro.657184.com
 allegro.7584743.one
 allegro.82137.cfd
@@ -55592,6 +55588,9 @@ allegrolokalnie.kategorie-proponowane-id394.shop
 allegrolokalnie.kategorie-proponowane.buzz
 allegrolokalnie.kupna24-7.pl
 allegrolokalnie.loan
+allegrolokalnie.lokalna-ofera293925.lol
+allegrolokalnie.lokalna-ofeta16xv0y2j0070.shop
+allegrolokalnie.lokalna-ofeta2121.top
 allegrolokalnie.mrro8ot0.xyz
 allegrolokalnie.news
 allegrolokalnie.ochronazakupu.pl
@@ -55632,6 +55631,7 @@ allegrolokalnie.okazje-weekendowe-152.buzz
 allegrolokalnie.one
 allegrolokalnie.order-4012.pl
 allegrolokalnie.ov8a72.pl
+allegrolokalnie.p09oferta9374zvs93.rest
 allegrolokalnie.p0v0a0s.pl
 allegrolokalnie.p24-0v910y198v.shop
 allegrolokalnie.p24-0va0sa1.icu
@@ -59273,7 +59273,6 @@ amazon-pi-nine.vercel.app
 amazon-portal.evpump.app
 amazon-prime-opui.openplatform.co
 amazon-prime.asia
-amazon-prime.one
 amazon-prime.today
 amazon-privacy-policy.customerservice-center02.com
 amazon-produckt-qs59743793lm.portugaloffroad.com
@@ -59319,7 +59318,6 @@ amazon-signin.duckdns.org
 amazon-signin.qkegl.com
 amazon-site-clone.vercel.app
 amazon-site-replica.vercel.app
-amazon-slots.best
 amazon-sopper.ga
 amazon-st.xyz
 amazon-steel-nu.vercel.app
@@ -109414,7 +109412,6 @@ bankofamerica-comp-login-sec-hold.com
 bankofamerica-cv.webcindario.com
 bankofamerica-day.paypallfind.com
 bankofamerica-ds.webcindario.com
-bankofamerica-fraud-protection.ph
 bankofamerica-g.webcindario.com
 bankofamerica-info.com
 bankofamerica-l07.serveirc.com
@@ -125043,6 +125040,7 @@ bradescard-milhas.3utilities.com
 bradescard.express-k.com
 bradesco-com-dot-gl494903049.wl.r.appspot.com
 bradesco-exclusive.zapto.org
+bradesco-validacao.digital
 bradesco.agenciapj.com
 bradesco.ajudaparaempresas.com
 bradesco.ajudaparaempresas.ml
@@ -136110,7 +136108,6 @@ cdnheicloudeuorg-1015.iaku-1.workers.dev
 cdnhot-whatsapp.69.ocry.com
 cdnic.duckagi.com
 cdnimg.act31.com
-cdnjennifer.paypal-updates.antimoney-laundering.org
 cdnln.pages.dev
 cdnmp.com
 cdnnews.hs-sites.com
@@ -137383,6 +137380,7 @@ ch.fbookus-26897174.elif.ba
 ch.hagertyportugal.com
 ch.hjjhhjgfhjfghjghjfg.com
 ch.kontoportal.com
+ch.lfuggn.com
 ch.liberpater.pt
 ch.portaldelsolsl.com
 ch.postswiss.promocioneswm.com
@@ -145255,7 +145253,9 @@ coinbase-pro-log1.godaddysites.com
 coinbase-pro-login--btc-exchange.yolasite.com
 coinbase-pro-login-6.gitbook.io
 coinbase-pro-login-cdn.pages.dev
+coinbase-pro-login-cleared.net.ph
 coinbase-pro-login-io.webflow.io
+coinbase-pro-login-trouble.net.ph
 coinbase-pro-login-usa-help.mystrikingly.com
 coinbase-pro-login4.godaddysites.com
 coinbase-pro-loginzz.godaddysites.com
@@ -148512,6 +148512,7 @@ configuracao-200000235896487502.tk
 configuracao-200000235896487506.tk
 configuracao-200000235896487508.tk
 configuracioneswordzzzzzzz.atwebpages.com
+configurar-santanderkey.com
 configurarmeusenvioscoleta.com
 configuration-safety-100000099557446853521.tk
 configuration-safety-100000099557446853523.tk
@@ -159560,6 +159561,7 @@ deluxe03.php.xdomain.jp
 deluxefoundation.net
 deluxeinternationalschool.co.zw
 deluxelimos.ca
+deluxxe.com.br
 delvasayang04.000webhostapp.com
 delwavdaposhu-a242bd.ingress-florina.easywp.com
 delzacc.com.ar
@@ -163276,6 +163278,7 @@ dhlexpress.ro
 dhlexpressdeliveringnm.000webhostapp.com
 dhlexpressdeliveryltdpm.000webhostapp.com
 dhlexpresshu.com
+dhlexpressindonesia.my.id
 dhlexpressmail.com
 dhlexpresspacerlltd.000webhostapp.com
 dhlexpressparcel-de.com
@@ -176327,6 +176330,7 @@ empiezalasubasta.es
 empiezanpromosdejunio.netlify.app
 empiindia.com
 empire-interactive.com
+empire.account-paypal.antimoney-laundering.org
 empirebuilderbusiness.com
 empirecrestfinance.com
 empiredigitalagencies.com
@@ -178692,6 +178696,7 @@ eruais-cubuvia-a6456.pages.dev
 erui.cam
 eruiturukewryjwuuryrrytdy.weebly.com
 erusruaetru8tyh.groovepages.com
+erutjhpk.login.dwmnhsqa.wccheck-6b3c4826-a.santandertelephony-yfcowbeta.bimp-bot.duckdns.org
 erv-b5559a.ingress-baronn.ewp.live
 erv.bfhdgry67tu8jm.dns-dynamic.net
 ervcnj.ml
@@ -185258,7 +185263,6 @@ facebook-in.blogspot.com
 facebook-inc.weebly.com
 facebook-int.blogspot.com
 facebook-int.gq
-facebook-invst.com
 facebook-io.com
 facebook-ipr.com
 facebook-iq7.cf
@@ -186587,7 +186591,6 @@ facebook.volendipity.com
 facebook.web.tr
 facebook.web.unaux.com
 facebook.webartisanbd.com
-facebook.webseodesigners.com
 facebook.webservis.ru
 facebook.worldtrade-llc.com
 facebook.xinmayday.click
@@ -192404,6 +192407,7 @@ fedexnotice.com
 fedexparcelpost.com
 fedexs.net
 fedexs.org
+fedexshipman.com
 fedexshipping-qsgtv6c3q-officercarolhouse-gmailcom.vercel.app
 fedexswiftdelivery.com
 fedexswitzerlanddelivery-invoice-a66d9f.ingress-bonde.easywp.com
@@ -194542,6 +194546,7 @@ fifashijiepaimingyilanbiaoquanbuduiwu.lol
 fifashijiepaimingyilanbiaozuixin.lol
 fifaworldcupgiveaway.com
 fifaworldcups26.com
+fifazuixinshijiepaiming.lol
 fifazuixinshijiepaimingwanzheng.lol
 fifazuixinshijiepaimingzuihouyiming.lol
 fifazuqiushijiepojieban.lol
@@ -209034,7 +209039,6 @@ go.wepicko.com
 go.woolik.com
 go.zamenapp.com
 go.zima-fest-2024.pp.ru
-go0glev.com
 go0oglle.000webhostapp.com
 go2.axt-w-g.com
 go2.browngreer.com
@@ -209849,6 +209853,7 @@ google29.m4ntapaset.ink
 google32.m4ntapaset.ink
 google561.com
 google88.vip
+google888phmacao.com
 google8upbd.com
 googleaccount-tanzania.duckdns.org
 googleaccountmirror.iamsystem32.workers.dev
@@ -209889,6 +209894,7 @@ googleplaydown.com
 googlepldy.com
 googleplhjk.com
 googlepllry.com
+googleplouy.com
 googleplrzy.com
 googleplty.com
 googlepodstream.unaux.com
@@ -224045,7 +224051,6 @@ hetrios.com.br
 hettiesueglutenfree.com
 hetuprajapati.github.io
 hetwegrop.emyspot.com
-hetzitzo.rabobankpensioenfonds.nl
 heuchler-riffraff.com
 heude-mal.web.app
 heuffenunnaureu.vercel.app
@@ -228255,6 +228260,7 @@ hotmailoffice32.site
 hotmailoutlookk.zya.me
 hotmailpe.hostfree.pw
 hotmailsesion23.vastserve.com
+hotmailskjfhurytnadinbox.weebly.com
 hotmailupdate-dus.turtipafyo.workers.dev
 hotmailupdated.pages.dev
 hotmailxmsnx.weebly.com
@@ -232408,6 +232414,7 @@ icloud.world-online1.ml
 icloud33secure.ddns.net
 icloudacount.com
 icloudapp24.blogspot.com
+icloudapple.support
 icloudbuthoritativ.americanunfinished.com
 iclouddsx.com
 icloude.me
@@ -240490,7 +240497,6 @@ interbankpe.ws
 interbankperu.cfd
 interbankperu.uno
 interbankprestamos-personas-solicita-pe.top
-interbankswitch.com
 interbeneficios-creditos-digitales.warzonematrix.com
 interbeneficios-prestamos-digitales.xrc.mx
 interbenefit.web-formularios.click
@@ -252475,6 +252481,7 @@ julpher.net
 jultnor02.com
 julu.pilot45.com
 julwill.github.io
+july.paypal-updates.antimoney-laundering.org
 july05doc.myportfolio.com
 julyemailclosurer.weebly.com
 jum7590-o.weebly.com
@@ -262534,6 +262541,7 @@ latam-pi-topaz.vercel.app
 latam-usa-77ad75c2.azurewebsites.net
 latam.adobeexperience.com.br
 latam.ofertasonline.cc
+latam.paypal-updates.antimoney-laundering.org
 latam.store
 latam.tagme.com.br
 latamairlines-co.vercel.app
@@ -262594,7 +262602,6 @@ latest-tech-trends.com
 latest-text4342564.click
 latest-videos-wa.000webhostapp.com
 latest.nowcache.com
-latest.paypal-support.antimoney-laundering.org
 latest.quadientdxp.com
 latestcache.com
 latestfirm.com
@@ -268633,6 +268640,7 @@ lkfaxzpudajpqhoy-dot-millinium.ey.r.appspot.com
 lkgandharw25.github.io
 lkghsbervzbbzzdg-dot-millinium.ey.r.appspot.com
 lkghytfgbnj22.pages.dev
+lkgrazsl.login.5b55bakaizeipheexooz.bckwsbem.santander.bimp-bot.duckdns.org
 lkhalsamgy.myfunnelish.com
 lkhcjtmcgelpsplo-dot-millinium.ey.r.appspot.com
 lkhkpaupwczzhcgc-dot-millinium.ey.r.appspot.com
@@ -270572,6 +270580,7 @@ login-dnb-help.com
 login-docusign-auth-docu.docusing2022.workers.dev
 login-docusign-auth-uncommon.johoneh4.workers.dev
 login-dropbox-preview-file.com
+login-east3.cashappps.com
 login-email.smeezy.org
 login-emailserver.us-southeast-1.linodeobjects.com
 login-en-docs-trzor.webflow.io
@@ -271374,6 +271383,7 @@ login.rakuten.co.jp.rakutenrakutenldfgwertwe.xyz
 login.recyclinglives.net
 login.register.ssl.erastrotecnologia.com.br
 login.registration-auth-miicrosoft.ml
+login.rmdbwskx.santander.bimp-bot.duckdns.org
 login.rochdale-facebook.com
 login.rogersform.ca
 login.rogersform.com
@@ -271444,6 +271454,7 @@ login.w3llsf5rgo.workers.dev
 login.wallet.blockchaine11f10289.rcgsecurity.ro
 login.wallet.blockchaine147f02c4.rcgsecurity.ro
 login.wastereclaimco.com
+login.wccheck-b18ca936-a.santander.bimp-bot.duckdns.org
 login.web-nta-go-jp.top
 login.webmail.com.greenseedhome.com
 login.webmailservice.at
@@ -273203,6 +273214,7 @@ lozenec-lan.net
 lozengy-stretchers.000webhostapp.com
 lozkina.ru
 lozmmnigktkkpgqf-dot-millinium.ey.r.appspot.com
+lp-28d.account-paypal.antimoney-laundering.org
 lp-dialok-rs-pf.fiven-goods.com
 lp-muban1.yhctlp.com
 lp-mypwd.pages.dev
@@ -275716,6 +275728,7 @@ m.gicaea.icu
 m.gjbfyb.com
 m.gjbiaowu.com
 m.gleichner-fbpagesmnnsj.k5tnncty9o-xmz4qzn5p42o.p.runcloud.link
+m.global-hsbcbank.ws
 m.gosmartshop.com
 m.gpgy.cn
 m.gpt00.com
@@ -277902,7 +277915,6 @@ mail.360floorcleaningservice.com
 mail.367450.com
 mail.3acomposite.com
 mail.3d-laundry.com
-mail.3f-icloud.com
 mail.423.k-cv.my.id
 mail.45-142-208-144.cprapid.com
 mail.4752dg.des4.com.tr
@@ -279624,7 +279636,6 @@ mail.icloud-fmi-nc.com
 mail.icloud-lp.com
 mail.icloud-lsupported.us
 mail.icloud-sing.com.de
-mail.icloud-zr.com
 mail.icloud.com-imaps.com
 mail.icloud.device.net.ar
 mail.icloudsign-in.com
@@ -287361,7 +287372,6 @@ meetmole.com
 meetms-klogin.webflow.io
 meetomaxklogin.webflow.io
 meetomaxkwallet.webflow.io
-meett-google.com
 meettaa-mskklooggsin.godaddysites.com
 meettaamskk-logiinn.gitbook.io
 meettaamsskkklogginnnn.godaddysites.com
@@ -299673,6 +299683,7 @@ mobile-free-assistance.net
 mobile-google.cn
 mobile-https.paypal.info.timoi.info
 mobile-iitaucardbr.com
+mobile-ingdirect.com
 mobile-intelligent-33998764300.blogspot.com
 mobile-intelligent-33998764300.blogspot.tw
 mobile-internet-fixe.weebly.com
@@ -311477,7 +311488,6 @@ netflix-youtube.vercel.app
 netflix-zeta-swart.vercel.app
 netflix-zeta-two.vercel.app
 netflix.7rozes.lv
-netflix.abenether.com
 netflix.account-security-information-preventing-blocked.center
 netflix.account.verification.inoxgiadungthuanphat.com
 netflix.account.verification.netflix.netflix.verification.login.inoxgiadungthuanphat.com
@@ -311874,6 +311884,7 @@ netflixsupport01-20.info
 netflixsupportcenter.compla.pl
 netflixsupportgroup.me
 netflixtester.vercel.app
+netflixtoto.xyz
 netflixtunisie.com.tn
 netflixtvinfos.com
 netflixuiclone-blush.vercel.app
@@ -327270,6 +327281,7 @@ outlooks-userserver.web.app
 outlooksecured.netlify.app
 outlooksecurity.yolasite.com
 outlookseinformation.creatorlink.net
+outlooksereguri365.hstn.me
 outlookserv3erhelp.creatorlink.net
 outlooksingin.zya.me
 outlooksisnet.iceiy.com
@@ -337859,6 +337871,7 @@ plugdistant.com
 plugging0099.000webhostapp.com
 pluggy53.servehttp.com
 plugingeorgia.com
+plugins.sugar-outlook.com
 plugnplaypos.com
 plugoffices.com
 plugs.d2wg8ria76rbvw.amplifyapp.com
@@ -352993,6 +353006,7 @@ publishnetworks.com
 publishpostnow.github.io
 publishvm.info
 publisio.bestwebdevs.com
+publlic-trezor-suite.typedream.app
 pubm122ndauqg.website-276-91-gk.biz.id
 pubmseason11.com
 pubmspinvip.com
@@ -373227,6 +373241,7 @@ santandercodersgrupo6.vercel.app
 santandercommercialhelpdesk.firebaseapp.com
 santandercommercialhelpdesk.web.app
 santanderconcepts.com
+santanderconsumer.it
 santanderconsumer.sviluppo.host
 santandercycling.com.co
 santanderdigipj.duckdns.org
@@ -376886,6 +376901,8 @@ sk46ch37qobgisaw.gt-industries.com
 sk71k.jlnzbh.ru
 ska.cialisim.com
 skachat-fifa.ru
+skachat-itunes.ru
+skachat-microsoft-visual.ru
 skagitvalleyhomes.com
 skamble-123.github.io
 skating--en-trezor.webflow.io
@@ -379773,6 +379790,7 @@ suethch.weebly.com
 sufifova.weebly.com
 sufna25.github.io
 sufyanahmed09-wd.github.io
+sugar-outlook.com
 sugarcoatedbinacle.vercel.app
 sughiswap.github.io
 suhaibajaz05.github.io
@@ -383437,6 +383455,7 @@ trezor--waljet.webflow.io
 trezor--wallet.pages.dev
 trezor-access.com
 trezor-app-briddg.pages.dev
+trezor-app-bridge.typedream.app
 trezor-app-suite.co.com
 trezor-app-treding.webflow.io
 trezor-app.cn
@@ -383501,6 +383520,7 @@ trezor-io-start-goup.webflow.io
 trezor-io-start-learn-access-us.typedream.app
 trezor-io-start-ledger-web-co.typedream.app
 trezor-io-start-m.webflow.io
+trezor-io-start-public-sso-web.typedream.app
 trezor-io-start-r--suport-cd.webflow.io
 trezor-io-start-r-a--new.webflow.io
 trezor-io-start-sd-us.pages.dev
@@ -384514,6 +384534,7 @@ u0688998.plsk.regruhosting.ru
 u06u.xyz
 u0eyrt-cbcd20-xq7xh5s6qz.edgeone.app
 u2-app.s3-website-ap-northeast-1.amazonaws.com
+u2zj.paypal-support.antimoney-laundering.org
 u3212790.isp.regruhosting.ru
 u43p.xyz
 u49b.xyz
@@ -385379,6 +385400,7 @@ us-trazoorwallet.webflow.io
 us-trezor-log-in.pages.dev
 us-trezor-wallet-en.pages.dev
 us-trezorstartio.pages.dev
+us-uoc.paypal-support.antimoney-laundering.org
 us-uphold-login-fed.pages.dev
 us-uphold-login.pages.dev
 us-uphold-wallet-io.pages.dev
@@ -389007,6 +389029,7 @@ wellsfargo-secureportal-auth-support-login.ikorta-agro.ge
 wellsfargo.alumni-stage.com
 wellsfargo00connectweb.vercel.app
 wellsfargobanklogin4.godaddysites.com
+wellsfargosupport.help
 wellsfrg-oscc.github.io
 wellt--ledgre-sso.webflow.io
 wellt-exodus.godaddysites.com

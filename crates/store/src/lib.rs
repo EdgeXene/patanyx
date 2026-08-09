@@ -66,7 +66,9 @@ mod model;
 pub mod provenance;
 
 pub use error::StoreError;
-pub use model::{Bookmark, DownloadRecord, RecordedDigest, Shelf, ShelfTab, StoreData};
+pub use model::{
+    normalize_folder_name, Bookmark, DownloadRecord, RecordedDigest, Shelf, ShelfTab, StoreData,
+};
 // Re-exported so callers of the bookmark API don't need to name the
 // integrity crate in their own manifests.
 pub use patanyx_integrity::{ContentDigest, Verdict};
@@ -302,6 +304,48 @@ impl Store {
         Ok(true)
     }
 
+    /// Renames a shelf. `Ok(false)` means no shelf had that id.
+    ///
+    /// Capped at [`SHELF_NAME_MAX_CHARS`] CHARACTERS, not bytes, so a name
+    /// in a non-Latin script is never cut through the middle of a letter.
+    /// Over-length input is truncated rather than refused: the user has
+    /// already typed it, and losing the whole edit to enforce a limit they
+    /// were not shown is the worse outcome.
+    ///
+    /// Rolls back on write failure, like its two neighbours above: Ok is the
+    /// only state in which the change exists.
+    pub fn rename_shelf(&mut self, id: &str, name: &str) -> Result<bool, StoreError> {
+        let capped = cap_chars(name, SHELF_NAME_MAX_CHARS);
+        let Some(shelf) = self.data.shelves.iter_mut().find(|s| s.id == id) else {
+            return Ok(false);
+        };
+        let previous = std::mem::replace(&mut shelf.name, capped);
+        if let Err(err) = self.save() {
+            if let Some(shelf) = self.data.shelves.iter_mut().find(|s| s.id == id) {
+                shelf.name = previous;
+            }
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Sets a shelf's note. `Ok(false)` means no shelf had that id. Same
+    /// character cap, truncation, and rollback rules as [`Self::rename_shelf`].
+    pub fn set_shelf_note(&mut self, id: &str, note: &str) -> Result<bool, StoreError> {
+        let capped = cap_chars(note, SHELF_NOTE_MAX_CHARS);
+        let Some(shelf) = self.data.shelves.iter_mut().find(|s| s.id == id) else {
+            return Ok(false);
+        };
+        let previous = std::mem::replace(&mut shelf.note, capped);
+        if let Err(err) = self.save() {
+            if let Some(shelf) = self.data.shelves.iter_mut().find(|s| s.id == id) {
+                shelf.note = previous;
+            }
+            return Err(err);
+        }
+        Ok(true)
+    }
+
     // ---- bookmarks ----
 
     /// Persist-on-write, same rule as the vault: a failed save is a hard
@@ -313,6 +357,8 @@ impl Store {
             url: url.to_string(),
             title: title.to_string(),
             created_at: now_unix(),
+            tags: Vec::new(),
+            quick_access: false,
             digest: None,
         });
         self.save()?;
@@ -341,6 +387,173 @@ impl Store {
         }
         entry.title = title.to_string();
         self.save()
+    }
+
+    /// Replaces a bookmark's tags. `Ok(false)` means no bookmark had that id.
+    ///
+    /// Normalised here rather than at the edges: trimmed, lowercased, empties
+    /// dropped, duplicates removed, and capped. Tags are for grouping, so
+    /// "Chem" and "chem" being two different groups would be a bug the user
+    /// cannot see and cannot fix.
+    ///
+    /// ROLLS BACK on write failure. `update_bookmark` beside this one does
+    /// not, and that is a latent defect rather than a pattern worth copying:
+    /// a failed save there leaves the edit in memory, where an unrelated
+    /// later save can persist it. Not changed here because it is not this
+    /// change's business, but it should be.
+    pub fn set_bookmark_tags(&mut self, id: &str, tags: Vec<String>) -> Result<bool, StoreError> {
+        let normalised = normalize_tags(tags);
+        let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) else {
+            return Ok(false);
+        };
+        let previous = std::mem::replace(&mut entry.tags, normalised);
+        if let Err(err) = self.save() {
+            if let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) {
+                entry.tags = previous;
+            }
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    // ---- bookmark folders --------------------------------------------------
+    //
+    // A folder IS a tag (see `plan_folder_*` in model.rs). These four wrap the
+    // pure planners with the same persist-then-rollback contract the bookmark
+    // and shelf methods above use, so a folder change that could not be written
+    // did not happen. Create/file/unfile touch one place and roll back that one
+    // place; rename/delete rewrite every bookmark's tags, so they snapshot the
+    // whole `StoreData` (it derives Clone) and restore it wholesale on failure
+    // rather than trying to unwind each edit. The names arrive pre-normalized
+    // (`normalize_folder_name`), so the store never has to reconcile spellings.
+
+    /// Records an empty folder so it survives with no bookmarks in it.
+    /// Idempotent: creating a folder that already exists is a silent success
+    /// with no write. Rolls back on write failure.
+    pub fn create_folder(&mut self, name: &str) -> Result<(), StoreError> {
+        if !self.data.plan_folder_create(name) {
+            return Ok(());
+        }
+        if let Err(err) = self.save() {
+            self.data.bookmark_folders.pop();
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Renames a folder across the known list AND every bookmark tagged with
+    /// it. `Ok(false)` means nothing carried the old name. Snapshots the whole
+    /// store and restores it if the write fails.
+    pub fn rename_folder(&mut self, from: &str, to: &str) -> Result<bool, StoreError> {
+        let snapshot = self.data.clone();
+        if !self.data.plan_folder_rename(from, to) {
+            return Ok(false);
+        }
+        if let Err(err) = self.save() {
+            self.data = snapshot;
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Deletes a folder: drops it from the known list and unfiles it from
+    /// every bookmark. THE BOOKMARKS SURVIVE, untagged by that folder.
+    /// `Ok(false)` means nothing carried the name. Snapshot rollback on write
+    /// failure.
+    pub fn delete_folder(&mut self, name: &str) -> Result<bool, StoreError> {
+        let snapshot = self.data.clone();
+        if !self.data.plan_folder_delete(name) {
+            return Ok(false);
+        }
+        if let Err(err) = self.save() {
+            self.data = snapshot;
+            return Err(err);
+        }
+        Ok(true)
+    }
+
+    /// Files one bookmark into a folder by ADDING that folder to the
+    /// bookmark's current tags, read authoritatively from the store here so
+    /// two quick drops cannot each clobber the other. `Ok(None)` means no
+    /// bookmark had that id; `Ok(Some(false))` means it was already there (no
+    /// write). Rolls back the single added tag on write failure.
+    pub fn file_bookmark(&mut self, id: &str, folder: &str) -> Result<Option<bool>, StoreError> {
+        match self.data.plan_folder_file(id, folder) {
+            None => Ok(None),
+            Some(false) => Ok(Some(false)),
+            Some(true) => {
+                if let Err(err) = self.save() {
+                    if let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) {
+                        entry.tags.pop();
+                    }
+                    return Err(err);
+                }
+                Ok(Some(true))
+            }
+        }
+    }
+
+    /// Removes one bookmark from one folder, leaving its other folders and the
+    /// bookmark itself intact. Same return shape as [`Self::file_bookmark`].
+    /// Rolls back the removed tag on write failure.
+    pub fn unfile_bookmark(&mut self, id: &str, folder: &str) -> Result<Option<bool>, StoreError> {
+        let previous_tags = self
+            .data
+            .bookmarks
+            .iter()
+            .find(|b| b.id == id)
+            .map(|b| b.tags.clone());
+        match self.data.plan_folder_unfile(id, folder) {
+            None => Ok(None),
+            Some(false) => Ok(Some(false)),
+            Some(true) => {
+                if let Err(err) = self.save() {
+                    if let (Some(entry), Some(tags)) = (
+                        self.data.bookmarks.iter_mut().find(|b| b.id == id),
+                        previous_tags,
+                    ) {
+                        entry.tags = tags;
+                    }
+                    return Err(err);
+                }
+                Ok(Some(true))
+            }
+        }
+    }
+
+    /// The known folder names, so the UI can show a folder that has no
+    /// bookmarks in it yet.
+    pub fn folders(&self) -> &[String] {
+        &self.data.bookmark_folders
+    }
+
+    /// Pins or unpins a bookmark in the Quick Access row. Same
+    /// mutate-then-persist-with-rollback contract as the folder methods
+    /// above: the in-memory flag goes back if the write fails, so `Ok` is the
+    /// only state in which the change exists.
+    ///
+    /// `Ok(None)` = no bookmark had that id. `Ok(Some(false))` = it was
+    /// already in the requested state, so nothing was written.
+    /// `Ok(Some(true))` = flipped and persisted.
+    pub fn set_quick_access(
+        &mut self,
+        id: &str,
+        on: bool,
+    ) -> Result<Option<bool>, StoreError> {
+        let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) else {
+            return Ok(None);
+        };
+        if entry.quick_access == on {
+            return Ok(Some(false));
+        }
+        entry.quick_access = on;
+        if let Err(err) = self.save() {
+            if let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) {
+                entry.quick_access = !on;
+            }
+            return Err(err);
+        }
+        Ok(Some(true))
     }
 
     /// Deleting a bookmark removes its recorded digest along with it (the
@@ -481,6 +694,44 @@ impl Store {
 // the tiered-sensitivity design above — bookmark/provenance entries are not
 // treated as in-memory secrets the way vault passwords are.
 
+/// Caps for user-entered shelf text. Generous: these exist to bound a write,
+/// not to shape what a user may say. Counted in characters, so the limit
+/// means the same thing whatever script the user writes in.
+const SHELF_NAME_MAX_CHARS: usize = 120;
+const SHELF_NOTE_MAX_CHARS: usize = 2000;
+
+/// Truncates to `max` CHARACTERS, never bytes. `String::truncate` panics on a
+/// non-boundary index, and byte-slicing multi-byte text is how a cap turns
+/// into a crash or a broken glyph.
+fn cap_chars(text: &str, max: usize) -> String {
+    text.chars().take(max).collect()
+}
+
+/// At most this many tags per bookmark, each at most this many characters.
+/// Bounds a write; not an opinion about how anyone organises their reading.
+const BOOKMARK_MAX_TAGS: usize = 12;
+const BOOKMARK_TAG_MAX_CHARS: usize = 40;
+
+/// Trim, lowercase, drop empties, dedupe, and cap. Order of first appearance
+/// is kept so a user's own ordering survives.
+fn normalize_tags(tags: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for tag in tags {
+        let cleaned = cap_chars(tag.trim(), BOOKMARK_TAG_MAX_CHARS)
+            .to_lowercase()
+            .trim()
+            .to_string();
+        if cleaned.is_empty() || out.iter().any(|t| t == &cleaned) {
+            continue;
+        }
+        out.push(cleaned);
+        if out.len() == BOOKMARK_MAX_TAGS {
+            break;
+        }
+    }
+    out
+}
+
 fn now_unix() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -568,6 +819,220 @@ mod tests {
 
     fn page_digest(words: &str) -> ContentDigest {
         patanyx_integrity::digest(format!("<p>{words}</p>").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn bookmark_tags_survive_close_and_unlock_and_normalise() {
+        let path = test_path("bm-tags");
+        let id;
+        {
+            let mut store = make_store(&path, "correct horse");
+            id = store.add_bookmark("https://example.com/", "Example").unwrap();
+            assert!(store.get_bookmark(&id).unwrap().tags.is_empty());
+            assert!(store
+                .set_bookmark_tags(
+                    &id,
+                    vec![
+                        "  Chem  ".to_string(),
+                        "CHEM".to_string(),   // same tag, different case
+                        "".to_string(),       // dropped
+                        "lab".to_string(),
+                    ],
+                )
+                .unwrap());
+        }
+        {
+            let store = Store::unlock(&path, "correct horse").unwrap();
+            let b = store.get_bookmark(&id).unwrap();
+            assert_eq!(
+                b.tags,
+                vec!["chem".to_string(), "lab".to_string()],
+                "trimmed, lowercased, deduped, empties dropped, order kept"
+            );
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn bookmark_tags_are_capped_and_survive_the_export_round_trip() {
+        let path = test_path("bm-tags-cap");
+        let mut store = make_store(&path, "correct horse");
+        let id = store.add_bookmark("https://example.com/", "Example").unwrap();
+        let many: Vec<String> = (0..BOOKMARK_MAX_TAGS + 10)
+            .map(|n| format!("tag{n}"))
+            .collect();
+        assert!(store.set_bookmark_tags(&id, many).unwrap());
+        assert_eq!(store.get_bookmark(&id).unwrap().tags.len(), BOOKMARK_MAX_TAGS);
+
+        // The export path serialises the whole struct and the import path
+        // deserialises it, so this proves tags survive that round trip
+        // rather than asserting it from the type.
+        let encoded = serde_json::to_vec(store.bookmarks()).unwrap();
+        let decoded: Vec<Bookmark> = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded[0].tags.len(), BOOKMARK_MAX_TAGS);
+
+        // And an entry written before tags existed still loads.
+        let old = r#"[{"id":"a","url":"https://e.com/","title":"E","created_at":1,"digest":null}]"#;
+        let legacy: Vec<Bookmark> = serde_json::from_str(old).unwrap();
+        assert!(legacy[0].tags.is_empty(), "absent tags read as an empty list");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shelf_name_and_note_survive_close_and_unlock() {
+        // The acceptance requirement is restart survival, so this exercises
+        // the REAL write path and re-unlocks, rather than asserting on the
+        // capping helper. A method that forgot to call save() would pass a
+        // helper test and fail this one.
+        let path = test_path("shelf-note");
+        let id;
+        {
+            let mut store = make_store(&path, "correct horse");
+            let shelf = store
+                .add_shelf(
+                    "Set aside 2 tabs".to_string(),
+                    vec![ShelfTab {
+                        title: "Paper".to_string(),
+                        url: "https://example.com/paper".to_string(),
+                    }],
+                )
+                .unwrap();
+            id = shelf.id.clone();
+            assert_eq!(shelf.note, "", "a new shelf starts with no note");
+            assert!(store.rename_shelf(&id, "Chem lab").unwrap());
+            assert!(store
+                .set_shelf_note(&id, "Due Friday, cite the 2019 paper")
+                .unwrap());
+        }
+        {
+            let store = Store::unlock(&path, "correct horse").unwrap();
+            let shelf = store.shelves().iter().find(|s| s.id == id).unwrap();
+            assert_eq!(shelf.name, "Chem lab");
+            assert_eq!(shelf.note, "Due Friday, cite the 2019 paper");
+            assert_eq!(shelf.tabs.len(), 1, "editing text must not touch the tabs");
+        }
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn shelf_text_is_capped_by_characters_not_bytes() {
+        // A byte cap would panic or cut a glyph in half on multi-byte text.
+        // The store is the authoritative cap, so this is where it is proven.
+        let path = test_path("shelf-cap");
+        let mut store = make_store(&path, "correct horse");
+        let shelf = store.add_shelf("s".to_string(), Vec::new()).unwrap();
+        let long = "\u{1F600}".repeat(SHELF_NOTE_MAX_CHARS + 50);
+        assert!(store.set_shelf_note(&shelf.id, &long).unwrap());
+        let stored = &store.shelves()[0].note;
+        assert_eq!(stored.chars().count(), SHELF_NOTE_MAX_CHARS);
+        assert!(
+            stored.chars().all(|c| c == '\u{1F600}'),
+            "no glyph was split"
+        );
+        assert!(!store.rename_shelf("shelf-does-not-exist", "x").unwrap());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn folders_round_trip_the_full_organizer_workflow() {
+        // The whole organizer workflow, against the REAL write path with a
+        // close-and-reopen so a method that forgot save() would fail: create
+        // an empty folder, file two bookmarks, rename the
+        // folder (both bookmarks must follow), delete another folder (its
+        // bookmark must SURVIVE, only unfiled). Every step persists.
+        let path = test_path("folders");
+        let (a, b);
+        {
+            let mut store = make_store(&path, "correct horse");
+            a = store.add_bookmark("https://a.test/", "A").unwrap();
+            b = store.add_bookmark("https://b.test/", "B").unwrap();
+
+            // An empty folder survives with nothing in it.
+            store.create_folder("chem").unwrap();
+            assert_eq!(store.folders(), &["chem".to_string()]);
+            store.create_folder("chem").unwrap(); // idempotent, still one
+            assert_eq!(store.folders().len(), 1);
+
+            // File both bookmarks into it; filing is additive and idempotent.
+            assert_eq!(store.file_bookmark(&a, "chem").unwrap(), Some(true));
+            assert_eq!(store.file_bookmark(&a, "chem").unwrap(), Some(false));
+            assert_eq!(store.file_bookmark(&b, "chem").unwrap(), Some(true));
+            assert_eq!(store.file_bookmark("missing", "chem").unwrap(), None);
+
+            // A second folder for the delete-survives check.
+            store.file_bookmark(&b, "reading").unwrap();
+        }
+        {
+            // Reopened: rename must carry every filed bookmark with it.
+            let mut store = Store::unlock(&path, "correct horse").unwrap();
+            assert!(store.rename_folder("chem", "chemistry").unwrap());
+            assert!(!store.rename_folder("chem", "chemistry").unwrap()); // gone
+            assert_eq!(store.folders(), &["chemistry".to_string()]);
+            for id in [&a, &b] {
+                assert!(store
+                    .get_bookmark(id)
+                    .unwrap()
+                    .tags
+                    .contains(&"chemistry".to_string()));
+            }
+
+            // Deleting a folder unfiles but never destroys its bookmark.
+            assert!(store.delete_folder("reading").unwrap());
+            let survivor = store.get_bookmark(&b).unwrap();
+            assert!(!survivor.tags.contains(&"reading".to_string()));
+            assert!(survivor.tags.contains(&"chemistry".to_string()));
+            assert!(store.get_bookmark(&b).is_some(), "bookmark survived delete");
+
+            // Unfile one, its other folder stays.
+            assert_eq!(store.unfile_bookmark(&b, "chemistry").unwrap(), Some(true));
+            assert!(store.get_bookmark(&b).is_some());
+        }
+        {
+            // Everything above must have hit disk.
+            let store = Store::unlock(&path, "correct horse").unwrap();
+            assert_eq!(store.folders(), &["chemistry".to_string()]);
+            assert!(store
+                .get_bookmark(&a)
+                .unwrap()
+                .tags
+                .contains(&"chemistry".to_string()));
+            assert!(!store
+                .get_bookmark(&b)
+                .unwrap()
+                .tags
+                .contains(&"chemistry".to_string()));
+        }
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn quick_access_flips_is_idempotent_and_survives_a_reopen() {
+        // The real write path, with a close-and-reopen: a method that forgot
+        // to save() would pass an in-memory assertion and fail this.
+        let path = test_path("quickaccess");
+        let id;
+        {
+            let mut store = make_store(&path, "correct horse");
+            id = store.add_bookmark("https://a.test/", "A").unwrap();
+            assert!(
+                !store.get_bookmark(&id).unwrap().quick_access,
+                "a new bookmark starts unpinned"
+            );
+            assert_eq!(store.set_quick_access("missing", true).unwrap(), None);
+            assert_eq!(store.set_quick_access(&id, true).unwrap(), Some(true));
+            // Pinning an already-pinned bookmark writes nothing.
+            assert_eq!(store.set_quick_access(&id, true).unwrap(), Some(false));
+        }
+        {
+            let mut store = Store::unlock(&path, "correct horse").unwrap();
+            assert!(store.get_bookmark(&id).unwrap().quick_access, "pin persisted");
+            assert_eq!(store.set_quick_access(&id, false).unwrap(), Some(true));
+        }
+        {
+            let store = Store::unlock(&path, "correct horse").unwrap();
+            assert!(!store.get_bookmark(&id).unwrap().quick_access, "unpin persisted");
+        }
+        let _ = fs::remove_dir_all(&path);
     }
 
     #[test]

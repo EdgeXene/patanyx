@@ -449,7 +449,7 @@ mod tests {
         assert_eq!(
             row_copy(&LicenceState::Active { days_left: 1 }, 21000).0,
             "Premium Time Left: 1 day",
-            "reworded 2026-08-05; if the publisher changes it again, change this pin"
+            "reworded 2026-08-05; if the copy changes again, change this pin"
         );
         let lapsed = LicenceState::Lapsed {
             expires_day: EXPIRES,

@@ -243,7 +243,7 @@ check(
 // Every check above drives #btn-autofill-fill, the row inside Tab Activity.
 // That control worked from the day it shipped and nobody used it, because it
 // sits under a "Passwords" heading below Save-as-PDF inside a panel named
-// after something else -- the publisher's report was that they could see their
+// after something else -- the field report was that users could see their
 // credentials and were copying and pasting them by hand. #btn-fill is the same
 // offer, on the toolbar, where the password field is.
 //
@@ -272,8 +272,8 @@ check(
     // and pass with the feature removed -- the same vacuous shape the
     // credential-list check was caught in.
     //
-    // LIT, not just present. This is the defect the publisher actually
-    // reported: the button was on the toolbar and looked exactly like the
+    // LIT, not just present. This is the defect actually reported from
+    // hardware: the button was on the toolbar and looked exactly like the
     // inert controls beside it, so "it appeared" and "nothing lit up" were
     // both true at once. `.is-active` is this chrome's green live state.
     assert(
@@ -377,7 +377,7 @@ check("a tab where autofill cannot work shows no fill button", async () => {
 // A credential's `site` is free text; Rust parses an origin out of it, and a
 // label like "Google" parses to nothing. Such a credential saves, lists,
 // reveals -- and never fills, anywhere, with no symptom except an offer that
-// never arrives. The publisher hit exactly this and reported it as the fill
+// never arrives. Real-hardware use hit exactly this, reported as the fill
 // button not working.
 //
 // Two halves, gated together because either alone leaves the trap open:

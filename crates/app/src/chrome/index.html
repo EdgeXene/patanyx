@@ -298,7 +298,7 @@
           <path d="M4 1.5 H9.5 L12.5 4.5 V14.5 H4 Z" />
           <path d="M6 7.5 H10.5 M6 10 H10.5" />
         </svg>
-        <!-- SHOWN AS "TA", the publisher's choice, and the reason is the row
+        <!-- SHOWN AS "TA", a deliberate choice, and the reason is the row
                it sits in: about 20px against the 60px the words cost, in a
                horizontal line where that space buys another control's label.
                It was briefly expanded when this control lived in a vertical
@@ -337,7 +337,7 @@
       <!-- THE FILL BUTTON, AND WHY IT IS OUT HERE RATHER THAN IN A PANEL.
            This control already existed -- as a row inside Tab Activity, below
            Save page as PDF, under a "Passwords" heading. It worked. Nobody
-           found it. The publisher's report was that they could see their
+           found it. The field report was that users could see their
            credentials but were copying and pasting them, which is the rational
            thing to do when the fill button is three clicks away inside a panel
            named after something else entirely.
@@ -449,8 +449,8 @@
         class="feature-btn"
         type="button"
         aria-pressed="false"
-        aria-label="Library: bookmarks and downloads"
-        title="Bookmarks and download records"
+        aria-label="Library: bookmarks, sets of tabs and downloads"
+        title="Bookmarks, sets of tabs and download records"
       >
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.5 13.5 H13.5" />
@@ -468,6 +468,19 @@
              The sheet is a flex column, so `order` settles it whatever the
              append sequence turns out to be. -->
     </header>
+
+    <!-- BOOKMARKS BAR. Off by default and shown only when asked for: it is a
+         third chrome row, and vertical space on a laptop is the thing this
+         browser's own layout notes keep coming back to.
+
+         The folders are TAGS. A bookmark tagged "data" appears under a Data
+         folder here; one tagged twice appears under both, which is the
+         difference from a filesystem folder and the reason tags were the
+         right shape to build on. Nothing new is stored for this row: it is a
+         second view of bookmark_list.
+
+         Built entirely in chrome.js, like the tab strip, because its contents
+         change whenever a bookmark does. -->
     <!-- A scheduled check found a newer version. NOTIFICATION ONLY: nothing
          has been downloaded and nothing will install without the user opening
          Updates and accepting. The button opens that panel rather than
@@ -872,30 +885,38 @@
       <ul id="ledger-list" class="items"></ul>
       <p class="panel-foot" id="ledger-foot"></p>
     </section>
-    <section id="library-panel" hidden>
+    <!-- BOOKMARKS MANAGER. Carries `panel-modal` like every other panel (the
+         shared card geometry, positioning and scrolling all hang off it) plus
+         `panel-wide`, which only widens it. Dropping `panel-modal` would take
+         the card out of the overlay entirely.
+
+         Everything here has a CLICK path. Dragging a bookmark onto a folder
+         works, but nothing depends on it: drag is invisible to a keyboard and
+         it silently did nothing for the first person who tried it. The
+         Folders button on each row is the real mechanism. -->
+    <section id="bookmarks-panel" class="panel-modal panel-wide" hidden>
+      <!-- The PANEL is "Library": it holds bookmarks, the tabs you set aside
+           and download records, so naming it after only the first would be
+           wrong the moment someone opens Downloads. "Bookmark Manager" is the
+           <h3> on the bookmarks view below, and that is the name the About
+           page carries; a gate compares those two strings so they cannot
+           drift apart. -->
+      <h2>Library</h2>
+
+      <!-- Vault locked: bookmarks, shelves and download records all live in
+           the encrypted store, so there is nothing to show until it opens.
+           Kept from the old Library panel, whose job this panel took over. -->
       <div id="library-locked" hidden>
-        <h1>Bookmarks and download records</h1>
-        <p id="library-locked-note">
-          These unlock with your vault. Open it from the toolbar. Downloads that
-          finish before you unlock are not recorded.
-        </p>
+        <p id="library-locked-note"></p>
       </div>
 
       <div id="library-content" hidden>
-        <nav class="tabs">
-          <button id="lib-tab-bookmarks" type="button" class="tab active">
-            Bookmarks
-          </button>
-          <button id="lib-tab-downloads" type="button" class="tab">
-            Downloads
-          </button>
-        </nav>
-
-        <div id="lib-pane-bookmarks">
-          <p class="panel-intro">
-            Bookmarks are encrypted on this computer. They stay available all
-            session, even after the vault locks.
-          </p>
+        <!-- Add by hand. Deliberately NOT a <form>: nothing is submitted to a
+           server, and Rust refuses any address the browser would not navigate
+           to anyway. Typing "example.com" is enough; it is completed to
+           https:// on the way in. -->
+        <div id="bmm-bookmarks-top">
+          <h3 class="section-head">Bookmark Manager</h3>
           <div class="form-buttons">
             <button id="bm-import" type="button" class="small">
               Import bookmarks
@@ -910,75 +931,139 @@
             </button>
           </div>
           <p class="panel-foot" id="bm-import-summary" hidden></p>
-          <span class="section-label">Shelves</span>
-          <div id="shelf-list" class="items"></div>
-
-          <!-- Bookmark search. Deliberately NOT a <form>: there is nothing to
-               submit, filtering happens as you type, and an Enter key that
-               appeared to "do" something would be a lie. It is also purely
-               local -- it filters the list already in this panel's memory and
-               sends no IPC, so searching your own bookmarks does not tell the
-               engine, the network, or anything else what you looked for.
-
-               Hidden while there are no bookmarks at all: a search box over
-               an empty list is furniture that answers nothing. -->
-          <div id="bm-search-row" hidden>
+          <div id="bmm-add-row">
             <input
-              id="bm-search"
+              id="bmm-add-url"
+              type="text"
+              placeholder="Address (example.com)"
+              autocomplete="off"
+              spellcheck="false"
+              aria-label="Address of the bookmark to add"
+            />
+            <input
+              id="bmm-add-title"
+              type="text"
+              placeholder="Name (optional)"
+              autocomplete="off"
+              aria-label="Name for the bookmark"
+            />
+            <button id="bmm-add" type="button" class="small">
+              Add bookmark
+            </button>
+          </div>
+          <p class="panel-note" id="bmm-add-error" hidden></p>
+
+          <!-- Quick Access: PINNED AT THE TOP. It is deliberately outside the
+           filtering below, so choosing a folder, typing a search or changing
+           the sort never takes it away. -->
+          <h3 class="section-head">Quick Access</h3>
+          <div id="bmm-quick"></div>
+          <p class="panel-foot" id="bmm-quick-empty" hidden>
+            Nothing pinned yet. Use Pin on any bookmark to put it here.
+          </p>
+
+          <div id="bmm-controls">
+            <input
+              id="bmm-search"
               type="text"
               placeholder="Search bookmarks by name or address"
               autocomplete="off"
               spellcheck="false"
               aria-label="Search bookmarks"
             />
-            <p class="panel-note" id="bm-search-count" hidden></p>
-          </div>
-
-          <ul id="bookmark-list" class="items"></ul>
-          <p class="panel-foot" id="bookmark-empty" hidden>
-            No bookmarks yet. The Bookmark button saves the page you are on.
-          </p>
-          <!-- Distinct from the empty state above on purpose: "you have none"
-               and "none match what you typed" are different facts, and
-               showing the first when the second is true reads as data loss. -->
-          <p class="panel-foot" id="bookmark-no-match" hidden></p>
-          <form id="bookmark-form" class="entry-form" hidden>
+            <select id="bmm-sort" aria-label="Sort bookmarks">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="title">Name A to Z</option>
+            </select>
             <input
-              id="bookmark-url"
+              id="bmm-new-folder"
               type="text"
-              placeholder="Address"
+              maxlength="40"
+              placeholder="New folder name"
               autocomplete="off"
-              autocapitalize="off"
               spellcheck="false"
+              aria-label="New folder name"
             />
-            <input
-              id="bookmark-title"
-              type="text"
-              placeholder="Title"
-              autocomplete="off"
-            />
-            <div class="form-buttons">
-              <button id="bookmark-submit" type="submit">Save changes</button>
-              <button id="bookmark-cancel" type="button">Cancel</button>
-            </div>
-            <p class="error" id="bookmark-error"></p>
-          </form>
+            <button id="bmm-new-folder-add" type="button" class="small">
+              New folder
+            </button>
+          </div>
+          <p class="panel-note" id="bmm-folder-error" hidden></p>
         </div>
 
-        <div id="lib-pane-downloads" hidden>
-          <p class="panel-intro">
-            Every download gets a fingerprint when it finishes. Verify checks
-            the file on this computer against it.
-          </p>
-          <ul id="download-list" class="items"></ul>
-          <p class="panel-foot" id="download-empty" hidden>
-            Nothing here yet. Downloads are fingerprinted when they finish, as
-            long as the vault is unlocked.
-          </p>
-          <p class="panel-foot">
-            A pass means the file has not changed since it arrived. It does not
-            tell you whether the file was safe to begin with.
-          </p>
+        <div class="bmm-body">
+          <nav id="bmm-folders" aria-label="Folders"></nav>
+          <div class="bmm-main-col">
+            <!-- One view at a time, chosen from the sidebar. Bookmarks, the
+               tabs you set aside, and download records all live in this one
+               panel now; they used to be three tabs in a separate Library. -->
+            <div id="bmm-view-bookmarks">
+              <div id="bmm-batch" hidden></div>
+              <div id="bmm-cards"></div>
+              <ul id="bmm-list"></ul>
+              <p class="panel-foot" id="bmm-empty" hidden></p>
+
+              <form id="bookmark-form" class="entry-form" hidden>
+                <input
+                  id="bookmark-url"
+                  type="text"
+                  placeholder="Address"
+                  autocomplete="off"
+                  autocapitalize="off"
+                  spellcheck="false"
+                />
+                <input
+                  id="bookmark-title"
+                  type="text"
+                  placeholder="Title"
+                  autocomplete="off"
+                />
+                <!-- Tags, comma separated. Plain text rather than a chip editor:
+                 the rest of this form is plain inputs, and the store is the
+                 thing that normalises (trim, lowercase, dedupe, cap), so the
+                 field only has to carry what was typed. -->
+                <input
+                  id="bookmark-tags"
+                  type="text"
+                  placeholder="Tags, separated by commas"
+                  autocomplete="off"
+                  autocapitalize="off"
+                />
+                <div class="form-buttons">
+                  <button id="bookmark-submit" type="submit">
+                    Save changes
+                  </button>
+                  <button id="bookmark-cancel" type="button">Cancel</button>
+                </div>
+                <p class="error" id="bookmark-error"></p>
+              </form>
+            </div>
+
+            <div id="bmm-view-shelves" hidden>
+              <h3 class="section-head">Sets of tabs</h3>
+              <p class="panel-foot">
+                Whole windows you set aside, with the notes you left on them.
+              </p>
+              <ul id="shelf-list-2"></ul>
+            </div>
+
+            <div id="bmm-view-downloads" hidden>
+              <p class="panel-intro">
+                Every download gets a fingerprint when it finishes. Verify
+                checks the file on this computer against it.
+              </p>
+              <ul id="download-list" class="items"></ul>
+              <p class="panel-foot" id="download-empty" hidden>
+                Nothing here yet. Downloads are fingerprinted when they finish,
+                as long as the vault is unlocked.
+              </p>
+              <p class="panel-foot">
+                A pass means the file has not changed since it arrived. It does
+                not tell you whether the file was safe to begin with.
+              </p>
+            </div>
+          </div>
         </div>
       </div>
     </section>
@@ -1117,6 +1202,35 @@
           </button>
         </div>
       </section>
+
+      <!-- Toolbar labels. Sits with the other look-and-feel choices, and
+           with the free ones: page colors and chrome colors are free, the
+           accent pack is the paid extra. This is a display choice, so it
+           belongs here rather than in the privacy panel.
+
+           SHOW IS THE DEFAULT AND STAYS THE DEFAULT. The toolbar comment in
+           this file argues why a feature button carries a word, and that
+           argument is not being reversed -- it is being offered as a choice
+           to a reader who already knows the row. Hiding a label never hides
+           a name: `title` and `aria-label` are untouched. -->
+      <section id="labels-choice">
+        <h3 class="section-head">Toolbar labels</h3>
+        <p class="panel-foot">
+          Buttons can show their names or just their icons. With names off,
+          hovering a button still tells you what it does.
+        </p>
+        <div class="form-buttons">
+          <button id="labels-show" type="button" class="small">
+            Icons and names
+          </button>
+          <button id="labels-hide" type="button" class="small">
+            Icons only
+          </button>
+        </div>
+      </section>
+
+      <!-- The bookmark folder bar. Off by default: it is a third chrome row
+           and costs vertical space, so it appears only when asked for. -->
     </section>
 
     <section id="privacy-panel" hidden>
@@ -1513,7 +1627,7 @@
              cred_list immediately below them.
 
              THAT ALSO MEANS THIS CONTROL IS REACHABLE WITHOUT THE
-             PASSPHRASE, and the publisher accepted that trade deliberately
+             PASSPHRASE, and that trade was accepted deliberately
              on 2026-08-05 after it was raised: someone with brief physical
              access to a locked browser can set this to Never, leave, and
              return after the owner unlocks and walks away. The alternatives

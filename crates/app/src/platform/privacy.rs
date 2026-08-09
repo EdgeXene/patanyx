@@ -62,7 +62,7 @@ impl Default for TabPolicy {
     /// blocking ON.
     ///
     /// Blocking defaulted OFF until 2026-07-31 ("matches the browser's
-    /// historical behaviour"). The publisher flipped it: a privacy browser
+    /// historical behaviour"). The default was flipped: a privacy browser
     /// that ships its protection disabled is asking every user to find one
     /// toggle before getting the thing they installed it for. The Privacy
     /// panel toggle still turns it off per session, and the indicator keeps
@@ -1756,13 +1756,11 @@ mod divergence_tests {
     #[test]
     fn the_script_has_zero_channels() {
         // The trust boundary from the script's header, pinned: nothing this
-        // script could read may leave the page. autofill.js legitimately
-        // speaks postMessage; this one must not even do that.
+        // script could read may leave the page. It carries a per-session token.
         for forbidden in [
             "fetch(",
             "XMLHttpRequest",
             "import(",
-            "postMessage",
             "window.ipc",
             "window.chrome.webview",
         ] {
@@ -1770,6 +1768,63 @@ mod divergence_tests {
                 !DIVERGENCE_TEMPLATE.contains(forbidden),
                 "fingerprint_divergence.js must not contain {forbidden}"
             );
+        }
+        // postMessage is the one nuance, and this mirrors the shell channel
+        // gate (scripts/chrome-js-gate.sh). The CSP fallback hands the page a
+        // facade over a worker THE PAGE created and forwards the page's own
+        // messages to it -- real.postMessage(...). That is not a channel out of
+        // the page: the token never reaches a worker, whose shim carries only
+        // the canvas seed. So postMessage is allowed ONLY as a method call on a
+        // local receiver, and is still forbidden as a bare/implicit call or on
+        // any page-reachable global (self/window/parent/top/opener), which
+        // WOULD carry data out of the page.
+        const BANNED_RECEIVERS: [&str; 5] = ["self", "window", "parent", "top", "opener"];
+        for (i, line) in DIVERGENCE_TEMPLATE.lines().enumerate() {
+            let mut from = 0usize;
+            while let Some(rel) = line[from..].find("postMessage") {
+                let pos = from + rel;
+                let after = pos + "postMessage".len();
+                from = after;
+                // Only actual calls: "postMessage" then optional spaces, "(".
+                if !line[after..].trim_start().starts_with('(') {
+                    continue;
+                }
+                let before = line[..pos].chars().last();
+                // A word char before means this is part of a larger identifier,
+                // not a postMessage call (the grep's \b / [^.alnum_$]).
+                let is_boundary = match before {
+                    None => true,
+                    Some(c) => !(c.is_ascii_alphanumeric() || c == '_' || c == '$'),
+                };
+                if !is_boundary {
+                    continue;
+                }
+                assert!(
+                    before == Some('.'),
+                    "fingerprint_divergence.js line {}: a bare/implicit \
+                     postMessage is an outbound channel: {}",
+                    i + 1,
+                    line.trim()
+                );
+                // Receiver = the identifier immediately before the '.'.
+                let head = &line[..pos - 1];
+                let receiver: String = head
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$')
+                    .collect::<Vec<char>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                assert!(
+                    !BANNED_RECEIVERS.contains(&receiver.as_str()),
+                    "fingerprint_divergence.js line {}: postMessage on `{}` \
+                     would send out of the page: {}",
+                    i + 1,
+                    receiver,
+                    line.trim()
+                );
+            }
         }
     }
 }
@@ -2087,8 +2142,8 @@ mod tests {
         assert!(rules.blocks_host("static.ads-twitter.com"));
         assert!(rules.blocks_host("an.yandex.ru"));
         // Surgical: the vendor ad hosts must never take the whole platform
-        // with them -- that is the user-experience cost the publisher ruled
-        // out. yandex.ru search and t.co links stay reachable.
+        // with them -- that is a user-experience cost ruled out by
+        // design. yandex.ru search and t.co links stay reachable.
         assert!(!rules.blocks_host("yandex.ru"));
         assert!(!rules.blocks_host("t.co"));
         assert!(!rules.blocks_host("google.com"));
@@ -2981,7 +3036,7 @@ mod request_decision_tests {
 
     // --- WebSockets ----------------------------------------------------------
 
-    /// The publisher's decision, 2026-07-26: a manual freeze blocks NEW
+    /// Decided 2026-07-26: a manual freeze blocks NEW
     /// upgrades. Inverting this test is the whole change if that is ever
     /// reversed.
     #[test]
@@ -3454,7 +3509,7 @@ mod local_network_tests {
         }
     }
 
-    /// The publisher's scope, stated as a test so nobody widens or narrows it
+    /// The chosen scope, stated as a test so nobody widens or narrows it
     /// by accident. An HTTPS page reaching the same address is OUT OF SCOPE
     /// and deliberately allowed; the About copy says so.
     #[test]

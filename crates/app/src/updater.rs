@@ -220,10 +220,17 @@ const MAX_MANIFEST_FETCH_BYTES: u64 = 16 * 1024;
 /// error is normal; re-polling a finished check is not.
 const CHECK_COOLDOWN: Duration = Duration::from_secs(60);
 
+/// How often the scheduled check looks to see whether its own fetch has
+/// settled, and how long it is willing to wait before reporting whatever is
+/// true at that moment. The wait covers a background DOWNLOAD as well as the
+/// manifest fetch, which is why it is minutes rather than seconds.
+const SETTLE_POLL: Duration = Duration::from_millis(250);
+const SETTLE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
 /// Dev-only signing seed for end-to-end tests. Any 32 bytes are a valid
 /// Ed25519 secret seed, and these are printed on the tin; the matching
 /// verifying key is what `dev_print_keypair` prints. NEVER the production
-/// key, never anything the publisher generates.
+/// key, never anything generated outside tests.
 #[cfg(test)]
 const DEV_SIGNING_SEED: [u8; 32] = *b"patanyx-dev-signing-key-00000000";
 
@@ -1278,6 +1285,37 @@ mod tests {
 
     const TEST_BINARY: &[u8] = b"patanyx updater test binary: not a real release";
 
+    /// The scheduled check must report a SETTLED state, because the chrome
+    /// only interrupts the user for one. This pins the predicate that decides
+    /// when the reporting thread is still waiting.
+    ///
+    /// The defect it exists for: `check_now` returns the moment it spawns its
+    /// fetch, so the emitted state was `checking` forever and the banner
+    /// could not fire on any platform. Both halves matter -- treating
+    /// `downloading` as settled would announce an update mid-download and the
+    /// banner would claim bytes that are not there yet.
+    #[test]
+    fn only_a_finished_check_is_worth_announcing() {
+        for state in ["checking", "downloading"] {
+            assert!(
+                in_flight(&json!({ "state": state })),
+                "{state} is still in progress; announcing it tells the user \
+                 something that is not true yet"
+            );
+        }
+        for state in ["offered", "ready", "uptodate", "failed", "refused"] {
+            assert!(
+                !in_flight(&json!({ "state": state })),
+                "{state} is a settled answer and must be reported, or the \
+                 scheduled check stays silent the way it did before"
+            );
+        }
+        // A snapshot with no state at all is settled by default: waiting
+        // forever on a shape we do not recognise would be the same silence
+        // in a new costume.
+        assert!(!in_flight(&json!({})));
+    }
+
     fn dev_signing_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&DEV_SIGNING_SEED)
     }
@@ -2139,8 +2177,8 @@ mod tests {
 /// is synchronous and performs an HTTP GET on whatever thread calls it.
 ///
 /// This comment previously said blocking was "tolerable for the IPC path (the
-/// user pressed a button and is watching)". That was wrong, and the publisher
-/// found it: pressing Check now froze the whole browser -- shortcuts, tabs,
+/// user pressed a button and is watching)". That was wrong, and hardware
+/// testing found it: pressing Check now froze the whole browser -- shortcuts, tabs,
 /// clicks -- for up to the 30s manifest timeout, and with encrypted DNS
 /// failing closed the full timeout was the likely case. A user watching a
 /// spinner has not agreed to their other tabs freezing.
@@ -2158,9 +2196,42 @@ pub fn check_in_background(proxy: &tao::event_loop::EventLoopProxy<crate::UserEv
     let _ = std::thread::Builder::new()
         .name("update-check".into())
         .spawn(move || {
-            let status = check_now();
+            // WAIT FOR THE ANSWER BEFORE REPORTING IT.
+            //
+            // `check_now` SPAWNS the fetch and returns immediately, so its
+            // return value is `checking` in every case that matters. That
+            // value was what got emitted, and the chrome deliberately does not
+            // interrupt anyone for `checking` -- so the scheduled check could
+            // never raise the banner, on any platform, for any release. The
+            // notification half of "notify, never install" was silently
+            // absent: the phase settled on this thread's sibling and nothing
+            // ever told the UI.
+            //
+            // Polling rather than a callback because the phase lives behind
+            // the same lock the panel reads, and a settled phase is the only
+            // thing worth announcing. The deadline is generous: a full
+            // download on a slow link is a legitimate reason to still be
+            // in flight, and expiring merely reports whatever is true then.
+            let mut status = check_now();
+            let deadline = Instant::now() + SETTLE_TIMEOUT;
+            while in_flight(&status) && Instant::now() < deadline {
+                std::thread::sleep(SETTLE_POLL);
+                status = self::status();
+            }
             let _ = proxy.send_event(crate::UserEvent::UpdateChecked(status));
         });
+}
+
+/// True while a check has not yet reached a state worth reporting.
+///
+/// Named states rather than the `Phase` enum because this reads the same
+/// snapshot the chrome does, so the two cannot drift apart on what "still
+/// working" means.
+fn in_flight(status: &Value) -> bool {
+    matches!(
+        status.get("state").and_then(Value::as_str),
+        Some("checking") | Some("downloading")
+    )
 }
 
 #[cfg(test)]

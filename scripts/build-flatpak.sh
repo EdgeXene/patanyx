@@ -159,7 +159,7 @@ PYEOF
   # configuration these scripts exist to protect -- the one that must never
   # contain chat -- was the one configuration nothing asserted about. On the
   # Linux side that was still true. FEATURES is an environment variable, so a
-  # value exported in the invoking user s shell (or inherited by a CI runner) would
+  # value exported in the build machine shell (or inherited by a CI runner) would
   # have compiled chat into the PUBLIC bundle, and every other gate here --
   # engine floor, ITP, sandbox permissions -- passes identically either way.
   #
@@ -201,7 +201,7 @@ PYEOF
     echo "GATE FAIL: the sandbox was granted filesystem access" >&2
     exit 1
   fi
-  # The bundle the publisher actually receives, exported from the SAME build
+  # The bundle actually handed over, exported from the SAME build
   # the gates above just passed. It used to be produced by a separate manual
   # step, which meant the artifact in hand and the artifact proven were only
   # related by intent -- and the shipped one turned out to predate a gate

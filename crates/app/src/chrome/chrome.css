@@ -256,15 +256,24 @@ body.modal-open #toolbar {
 
 /* Escape and a click on the scrim both close a panel, and neither is
    discoverable. Every panel gets a real control that says so. */
+/* The way out of a panel. It was transparent on a transparent border, which
+   reads as a caption rather than a control -- and this is the only visible
+   exit, since Escape and a click on the scrim announce themselves nowhere. It
+   now carries the same outline every other control does. */
 .panel-close {
   position: absolute;
   top: 10px;
   right: 12px;
-  padding: 4px 8px;
+  padding: 4px 10px;
   line-height: 1;
   background: transparent;
-  border-color: transparent;
+  border-color: var(--ln);
+  border-radius: 7px;
   color: var(--tx-dim);
+}
+.panel-close:hover {
+  border-color: var(--ln-strong);
+  color: var(--tx-bright);
 }
 .panel-close:hover {
   background: var(--sf-btn);
@@ -290,14 +299,28 @@ body.modal-open #toolbar {
   }
 }
 
+/* SHARED SHAPE. The radii below are the whole difference between this chrome
+   looking current and looking like a 2012 settings dialog: buttons, inputs
+   and list rows were all 4px, which reads as a hairline box rather than a
+   surface. The bookmarks manager was built at 8-10px and the contrast was
+   obvious side by side, so the manager's shape moved down here where every
+   panel inherits it rather than living in one panel's stylesheet.
+   `.feature-btn` sets its own padding and radius, so the toolbar pills are
+   unaffected by the padding change. */
 button {
   font: inherit;
   color: var(--tx);
   background: var(--sf-btn);
   border: 1px solid var(--ln);
-  border-radius: 4px;
-  padding: 5px 10px;
+  border-radius: 8px;
+  padding: 6px 12px;
   cursor: pointer;
+}
+/* Hover is a border lift, not a colour change: three schemes and ten accents
+   share these rules, and a background shift that reads well in one is muddy
+   in another. Motion is opt-out; see the reduced-motion block at the end. */
+button:hover:not(:disabled) {
+  border-color: var(--ln-strong);
 }
 button:hover {
   background: var(--sf-btn-hover);
@@ -310,8 +333,9 @@ button:disabled {
   cursor: default;
 }
 button.small {
-  padding: 2px 8px;
+  padding: 4px 10px;
   font-size: 12px;
+  border-radius: 7px;
 }
 /* The CHOSEN one in a row of mutually exclusive small buttons (the resolver
    picker uses this in both its mirrors).
@@ -524,6 +548,20 @@ button.danger:hover {
 }
 .feature-btn.is-active .ico {
   stroke: var(--st-ok);
+}
+
+/* The fill button is an ACTION offered for THIS page, not a passive status,
+   and it is shown only when there is actually a password to fill. A green
+   border and icon -- enough to MEAN something on a protection pill that is
+   always present -- was reported TWICE as "nothing lit up" here, because a
+   thin outline among a row of grey pills is easy to miss on the very button
+   you are looking for. So this one gets a green WASH behind it as well: a
+   filled area reads at a glance where an outline does not. Translucent so it
+   sits correctly over all three chrome schemes without a hard-coded colour,
+   and scoped to #btn-fill so the status pills keep their single-outline
+   restraint and the row still reads as a toolbar. */
+#btn-fill.is-active {
+  background: color-mix(in srgb, var(--st-ok) 20%, transparent);
 }
 
 /* The engine REFUSED something that was asked of it.
@@ -869,8 +907,8 @@ body.loading #url {
    is wrong in the other eleven. */
 /* The Premium row's headline ("Premium Time Left: 43 days" / "PATANYX
    Free" / "Premium ended March 12."). It carried .panel-intro's --tx-dim,
-   which styles supporting copy a reader may skip -- and the publisher's
-   direction (2026-08-05) is the exact opposite: this line must be
+   which styles supporting copy a reader may skip -- and the 2026-08-05
+   direction is the exact opposite: this line must be
    impossible to miss. Same prominence tool as #needs-passphrase below:
    bright, bigger, boxed. Deliberately NOT --accent, NOT amber, NOT red --
    this chrome assigns those "focused", "destructive" and "failed", and a
@@ -1012,15 +1050,24 @@ form {
 }
 
 input,
-textarea {
+textarea,
+select {
   font: inherit;
   color: var(--tx-bright);
   background: var(--sf-sunken);
   border: 1px solid var(--ln-input);
-  border-radius: 4px;
-  padding: 6px 10px;
+  border-radius: 8px;
+  padding: 7px 11px;
   outline: none;
   width: 100%;
+}
+/* Checkboxes and radios are CONTROLS, not fields. Without this they inherit
+   the full-width field sizing above and stretch into a column, which pushed
+   the content of every row that has one away from its own checkbox. */
+input[type="checkbox"],
+input[type="radio"] {
+  width: auto;
+  padding: 0;
 }
 input:focus,
 textarea:focus {
@@ -1223,8 +1270,11 @@ textarea {
 .item {
   background: var(--sf-item);
   border: 1px solid var(--ln-item);
-  border-radius: 4px;
-  padding: 6px 8px;
+  border-radius: 10px;
+  padding: 9px 11px;
+}
+.item:hover {
+  border-color: var(--ln-strong);
 }
 .item-head {
   display: flex;
@@ -1951,7 +2001,7 @@ textarea {
    to "About". Measured 900-1600px with Library labelled, the row still holds
    at two lines and the strip at 136px against the 148 budget.
 
-   QUARANTINE WENT THE OTHER WAY, at the publisher's direction, and it is the
+   QUARANTINE WENT THE OTHER WAY, deliberately, and it is the
    rule working rather than an exception to it. That button carried a word for
    one reason: its shield collided with Privacy's and Integrity's. Redrawing it
    as a mask removed the collision, and once the glyph is unambiguous the
@@ -1965,7 +2015,628 @@ textarea {
   display: none;
 }
 
-/* Tab Activity keeps a mark, at the publisher's direction: "TA" rather than the
+/* The Library's folder view. Folders open IN PLACE here: this pane has the
+   room that a clipped chrome strip does not, so there is no dropdown and no
+   height negotiation. */
+#folder-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  margin: 0.6rem 0 1rem;
+}
+.folder-head {
+  display: flex;
+  align-items: center;
+  gap: 0.45rem;
+  width: 100%;
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--line, #262832);
+  border-radius: 7px;
+  background: none;
+  color: var(--ink, #f2f3f7);
+  font: inherit;
+  font-size: 0.9rem;
+  text-align: left;
+  cursor: pointer;
+}
+.folder-head::before {
+  content: "";
+  width: 14px;
+  height: 11px;
+  flex: none;
+  border-radius: 2px 3px 2px 2px;
+  background: var(--accent, #4f8cff);
+  opacity: 0.85;
+}
+.folder-head:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+.folder-items {
+  list-style: none;
+  margin: 0.25rem 0 0.5rem 1.1rem;
+  padding: 0 0 0 0.8rem;
+  border-left: 1px solid var(--line, #262832);
+}
+.folder-items li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+.folder-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent, #4f8cff);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.folder-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* BOOKMARKS MANAGER.
+   `panel-wide` only widens the shared card; every other property still comes
+   from `.panel-modal`, which this class is always used alongside. */
+.panel-modal.panel-wide {
+  width: min(1180px, calc(100vw - 48px));
+}
+#bmm-add-row,
+#bmm-controls {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  align-items: center;
+  margin: 0.5rem 0;
+}
+#bmm-add-url,
+#bmm-search {
+  flex: 1 1 14rem;
+  min-width: 0;
+}
+#bmm-add-row input,
+#bmm-controls input,
+#bmm-controls select {
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--ln);
+  border-radius: 6px;
+  background: none;
+  color: var(--tx);
+  font: inherit;
+  font-size: 0.9rem;
+}
+#bmm-quick {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(96px, 1fr));
+  gap: 8px;
+}
+.bmm-quick-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 10px;
+  color: var(--tx);
+  cursor: pointer;
+}
+.bmm-quick-item:hover {
+  border-color: var(--ln-strong);
+}
+.bmm-quick-name {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--tx-dim);
+}
+.bmm-body {
+  display: flex;
+  gap: 14px;
+  margin-top: 14px;
+  align-items: flex-start;
+}
+#bmm-folders {
+  width: 200px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bmm-side {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 6px 8px;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  color: var(--tx);
+  cursor: pointer;
+  text-align: left;
+  font: inherit;
+}
+.bmm-side:hover {
+  background: var(--sf-card);
+}
+.bmm-side.selected,
+.bmm-side[aria-current="true"] {
+  background: var(--sf-card);
+  border-color: var(--ln-strong);
+  color: var(--tx-bright);
+}
+/* Sets of tabs and Downloads are not bookmarks and not drop targets, so the
+   sidebar says so with a rule above them rather than by looking identical. */
+.bmm-side-break {
+  margin-top: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--ln-soft);
+  border-radius: 0 0 8px 8px;
+}
+.bmm-side.drop-hover {
+  border-color: var(--accent);
+}
+.bmm-side-count {
+  color: var(--tx-dim);
+}
+.bmm-main-col {
+  flex: 1;
+  min-width: 0;
+}
+/* The letter tile. Background and text color are set from JS per hostname;
+   only the shape lives here. */
+.bmtile {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  font-weight: 600;
+  font-size: 14px;
+  flex: none;
+}
+.bmm-quick-item .bmtile {
+  width: 36px;
+  height: 36px;
+  font-size: 17px;
+}
+#bmm-list {
+  margin: 0;
+  padding: 0;
+}
+.bmm-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 10px;
+  list-style: none;
+}
+.bmm-row.dragging {
+  opacity: 0.5;
+}
+/* The select-for-batch box is a 13px control, not a column. Without this it
+   picks up the panel's generic input sizing and grows, pushing the tile and
+   the name away from the left edge with dead space. */
+.bmm-row > input[type="checkbox"] {
+  flex: none;
+  width: auto;
+  margin: 0;
+}
+/* THE NAME AND ADDRESS GET A FLOOR, and this is load-bearing. They were
+   `flex: 1; min-width: 0`, which lets a flex item collapse completely: the
+   chips and the button row are `flex: none` and refuse to shrink, so at this
+   panel's width the only flexible item went to ZERO and every row rendered as
+   a tile and five buttons with no visible bookmark. The DOM was correct
+   throughout, which is why no gate caught it and a screenshot did. */
+.bmm-meta {
+  flex: 1 1 18rem;
+  min-width: 12rem;
+}
+.bmm-title {
+  display: block;
+  font-weight: 600;
+  color: var(--tx-bright);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bmm-url {
+  display: block;
+  font-size: 12px;
+  color: var(--tx-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bmm-chips {
+  display: flex;
+  gap: 4px;
+  flex: none;
+  flex-wrap: wrap;
+}
+.bmm-chip {
+  padding: 1px 8px;
+  border: 1px solid var(--ln);
+  border-radius: 999px;
+  font-size: 11px;
+  color: var(--tx-dim);
+}
+.bmm-actions {
+  display: flex;
+  gap: 6px;
+  flex: none;
+  flex-wrap: wrap;
+}
+#bmm-batch {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 8px 10px;
+  margin-bottom: 10px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-strong);
+  border-radius: 10px;
+  color: var(--tx);
+}
+.bmm-batch-count {
+  font-weight: 600;
+  color: var(--tx-bright);
+}
+#bmm-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.bmm-card {
+  padding: 10px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 10px;
+  color: var(--tx);
+}
+.bmm-card.drop-hover {
+  border-color: var(--accent);
+}
+.bmm-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  background: none;
+  border: none;
+  font: inherit;
+  font-weight: 600;
+  color: var(--tx-bright);
+  text-align: left;
+  cursor: pointer;
+}
+/* The selected folder's own controls, shown where its cards would be on the
+   overview. This is the only place a folder can be renamed or deleted once
+   you are inside it. */
+.bmm-folder-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px;
+  margin-bottom: 10px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 10px;
+}
+.bmm-folder-name {
+  font-weight: 600;
+  color: var(--tx-bright);
+  margin-right: auto;
+}
+.bmm-card-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.bmm-card-rename {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+.bmm-card-rename input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--ln);
+  border-radius: 6px;
+  background: none;
+  color: var(--tx);
+  font: inherit;
+}
+.bmm-popover {
+  position: absolute;
+  z-index: 5;
+  width: 260px;
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 10px;
+  background: var(--sf-panel);
+  border: 1px solid var(--ln-strong);
+  border-radius: 10px;
+}
+.bmm-pop-title {
+  font-weight: 600;
+  color: var(--tx-bright);
+  margin-bottom: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bmm-pop-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 8px;
+  padding: 4px 2px;
+  color: var(--tx);
+  cursor: pointer;
+}
+/* Same reason as the row checkbox: keep it a control, not a column, or the
+   folder name is flung to the far edge away from the box it belongs to. */
+.bmm-pop-row > input[type="checkbox"] {
+  flex: none;
+  width: auto;
+  margin: 0;
+}
+.bmm-pop-new {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.bmm-pop-new input {
+  flex: 1;
+  min-width: 0;
+  padding: 0.3rem 0.4rem;
+  border: 1px solid var(--ln);
+  border-radius: 6px;
+  background: none;
+  color: var(--tx);
+  font: inherit;
+}
+
+/* ORGANIZER. New-folder row, per-folder rename/delete, drag-in-to-file. */
+#folder-new-row {
+  display: flex;
+  gap: 0.4rem;
+  margin: 0.5rem 0 0.2rem;
+}
+#folder-new-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line, #262832);
+  border-radius: 6px;
+  background: none;
+  color: var(--ink, #f2f3f7);
+  font: inherit;
+  font-size: 0.9rem;
+}
+/* A folder is a card so its head, actions and open list read as one unit,
+   and so the whole card is an obvious drop target. */
+.folder {
+  border: 1px solid transparent;
+  border-radius: 8px;
+  padding: 0.15rem;
+}
+.folder.drop-hover {
+  border-color: var(--accent, #4f8cff);
+  background: color-mix(in srgb, var(--accent, #4f8cff) 12%, transparent);
+}
+.folder-actions {
+  display: flex;
+  gap: 0.35rem;
+  margin: 0.2rem 0 0.1rem 1.1rem;
+}
+.folder-rename {
+  display: flex;
+  gap: 0.35rem;
+  align-items: center;
+}
+.folder-rename input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 0.35rem 0.5rem;
+  border: 1px solid var(--line, #262832);
+  border-radius: 6px;
+  background: none;
+  color: var(--ink, #f2f3f7);
+  font: inherit;
+  font-size: 0.9rem;
+}
+/* The draggable source list: every bookmark, grab-and-drop into a folder. */
+.folder-source {
+  list-style: none;
+  margin: 0.3rem 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.2rem;
+}
+.source-item {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.3rem 0.45rem;
+  border: 1px solid var(--line, #262832);
+  border-radius: 6px;
+  cursor: grab;
+}
+.source-item:active {
+  cursor: grabbing;
+}
+.source-item.dragging {
+  opacity: 0.5;
+}
+.source-name {
+  color: var(--ink, #f2f3f7);
+  font-size: 0.9rem;
+}
+
+/* BOOKMARK FOLDER BAR. A third chrome row, off unless asked for. Measured
+   by closedChromePx like the other two rows, so it cannot render outside
+   the strip. `hidden` is honoured by the global [hidden] rule above; do not
+   give this a `display` that would outrank it. */
+#bmbar {
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.25rem 0.6rem;
+  border-bottom: 1px solid var(--line, #262832);
+  overflow-x: auto;
+  white-space: nowrap;
+  position: relative;
+}
+.bmbar-empty {
+  color: var(--dim, #9195a3);
+  font-size: 0.78rem;
+}
+.bmfolder {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.16rem 0.55rem;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: none;
+  color: var(--ink, #f2f3f7);
+  font: inherit;
+  font-size: 0.82rem;
+  cursor: pointer;
+}
+.bmfolder::before {
+  content: "";
+  width: 12px;
+  height: 10px;
+  flex: none;
+  border-radius: 2px 3px 2px 2px;
+  background: var(--accent, #4f8cff);
+  opacity: 0.85;
+}
+.bmfolder:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: var(--line, #262832);
+}
+/* The dropdown. Positioned by script against the document rather than by
+   CSS against the bar, and NOT a child of the bar: `#bmbar` scrolls
+   horizontally, which makes it a scroll container, and a scroll container
+   clips its absolutely-positioned children on BOTH axes. Parented there,
+   this menu was invisible while occupying real height. */
+.bmfolder-menu {
+  position: absolute;
+  z-index: 40;
+  min-width: 15rem;
+  max-width: 26rem;
+  padding: 0.3rem;
+  border: 1px solid var(--line, #262832);
+  border-radius: 8px;
+  background: var(--card, #16181f);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.45);
+  display: flex;
+  flex-direction: column;
+}
+.bmfolder-item {
+  display: block;
+  width: 100%;
+  padding: 0.32rem 0.5rem;
+  border: 0;
+  border-radius: 5px;
+  background: none;
+  color: var(--ink, #f2f3f7);
+  font: inherit;
+  font-size: 0.84rem;
+  text-align: left;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bmfolder-item:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+
+/* Shelves behave like folders: the name is the control that opens one.
+   Styled as text rather than a pill so the row still reads as a heading
+   with contents under it, not as a fourth button competing with Restore,
+   Delete and Edit. */
+.shelf-name {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: inherit;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+}
+.shelf-name:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.shelf-contents {
+  list-style: none;
+  margin: 0.4rem 0 0.2rem;
+  padding: 0 0 0 0.9rem;
+  border-left: 1px solid var(--line, #262832);
+}
+.shelf-contents li {
+  display: flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.15rem 0;
+}
+.shelf-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  color: var(--accent, #4f8cff);
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.shelf-link:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* ICON-ONLY TOOLBAR, opt-in and off by default.
+
+   The default above stands: a feature button carries a word because an icon
+   alone makes a user guess, and the one time these labels came off, the
+   question back was "what is that one pill that doesn't have a name?". That
+   argument is about a DEFAULT, though, not about everyone. A reader who
+   already knows this row and wants the width back can have it.
+
+   Nothing but the word goes. `title` and `aria-label` are untouched, so the
+   name is still one hover away and a screen reader still reads it in full --
+   which is the same reasoning that lets Tab Activity ship as "TA".
+
+   Attribute ABSENT means labelled, so a failed or slow settings read renders
+   the toolbar every earlier build rendered, never a surprise icon row. */
+:root[data-toolbar-labels="hide"] .feature-label {
+  display: none;
+}
+
+/* Tab Activity keeps a mark, deliberately: "TA" rather than the
    full name, about 20px against the 60px the words would cost.
 
    THIS IS AN EXCEPTION AND NOT A LOOPHOLE. The rule above is that a button
@@ -2174,7 +2845,7 @@ textarea {
 .chat-relay-save {
   margin-top: 8px;
 }
-/* presence colours per the publisher spec — ONLY if these two are absent;
+/* presence colours per the chat spec — ONLY if these two are absent;
    green online / red offline are already built: */
 .chat-st-away {
   color: var(--st-warn);
@@ -2304,7 +2975,7 @@ textarea {
   --accent-tag: #c0afef;
 }
 
-/* Blood red. REPLACED Rose 2026-08-04 on the publisher's instruction (no
+/* Blood red. REPLACED Rose 2026-08-04 under a standing rule (no
    pink, ever). A deep saturated red, deliberately DARKER and bluer than
    the muted error red (#c05050) is light: the two must never read as each
    other, and the choice text/tag rungs stay warm-pale where the error
@@ -2339,11 +3010,11 @@ textarea {
 /* The five below joined 2026-08-04 with blood red, and together they are
    the SEED of the future premium theme pack (docs/premium-design.md) --
    shipped unlocked; nothing gates them until licensing exists and the
-   publisher flips that deliberately. Same seven-rung ladder, same
+   gate is flipped deliberately. Same seven-rung ladder, same
    machine-checked bars as the originals. */
 
-/* Green. The one accent allowed NEAR the state hues, at the publisher's
-   request, and the ONLY accent with a per-scheme value: neon on the dark
+/* Green. The one accent allowed NEAR the state hues, by deliberate
+   exception, and the ONLY accent with a per-scheme value: neon on the dark
    chrome (this block), plain green when the White scheme lands -- neon on
    white is unreadable and plain green on near-black is mud. A focus ring
    here can read close to "protection on" green; accepted knowingly, the
@@ -2699,7 +3370,7 @@ textarea {
 /* White-scheme accent families. On white, "bright" means DEEPER (it marks
    the active tab edge against a near-white strip), choice backgrounds are
    light tints and every text rung is dark-on-light. The green family here
-   is the publisher's plain green -- neon lives only on Dark and Black.
+   is the plain green -- neon lives only on Dark and Black.
    Cascade note: these combined selectors (two attributes) out-rank both
    the accent blocks and the scheme block (one attribute each), and the
    plain [data-scheme="white"] default-accent block below the accent

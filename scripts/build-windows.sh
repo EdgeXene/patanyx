@@ -100,7 +100,7 @@ fi
 # model directory existing only in the source tree "would leave the feature
 # permanently unavailable on their machine with no visible reason why" -- which
 # is precisely what happened, for every user, for weeks. The copy was correct
-# for a folder the publisher drags around and useless for what we actually
+# for a folder dragged around by hand and useless for what we actually
 # distribute: one file, swapped by an updater that knows nothing about a models
 # directory. The panel hid itself exactly as designed and nobody saw the
 # feature at all.

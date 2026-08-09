@@ -60,7 +60,7 @@ it; the LAN path involves no relay and has no such exposure.
 address, port, and key fingerprint. Peers appear in a list. Direct socket
 connection. Zero infrastructure, zero metadata exposure.
 
-**PROJECT ATTRIBUTION: this is a TRLX project** (decided 2026-07-24). TRLX is
+**THIS IS A TRLX PROJECT** (decided 2026-07-24). TRLX is
 the only entity, brand, and hosting environment associated with it. Any future
 coordination service is TRLX infrastructure. Do not attach any other property's
 naming or servers to this project.
@@ -68,8 +68,8 @@ naming or servers to this project.
 **Phasing, as decided 2026-07-24 (deliberate) and AMENDED 2026-07-25 — read the amendment, the original text below
 it is kept for the reasoning, not for the facts:**
 
-> **AMENDMENT, 2026-07-25.** The publisher explicitly overruled the
-> mDNS-only default, twice, and the relay was deployed the same day. It is
+> **AMENDMENT, 2026-07-25.** The mDNS-only default was explicitly overruled,
+> twice, and the relay was deployed the same day. It is
 > LIVE at `wss://relay.edgexene.io`. So "NO SERVER OF ANY KIND RUNS" and "no relay is hosted
 > anywhere" are both false as of that date, and the paragraph about not
 > deploying without a new decision has been overtaken by that decision.

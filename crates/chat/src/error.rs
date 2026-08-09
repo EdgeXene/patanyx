@@ -72,7 +72,7 @@ pub enum ChatError {
     #[error("the relay rejected the Premium token as expired")]
     TokenExpired,
     /// The token's key_id is no longer in the relay's accepted set (a key
-    /// the publisher dropped server-side, design 2.5).
+    /// dropped server-side, design 2.5).
     #[error("the relay no longer accepts the Premium token's signing key")]
     KeyRejected,
     #[error("invalid relay URL (wss://host[:port]/path expected)")]

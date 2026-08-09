@@ -20,7 +20,7 @@ from OUTSIDE the process existed.
 
 ## The measurement
 
-`scripts/referrer-probe.ps1`, run by the publisher on real Windows hardware,
+`scripts/referrer-probe.ps1`, run on real Windows hardware,
 2026-07-31, against a 0.9.54 build carrying the trim code (presence verified by
 string-search on the exact artifact). A page served from `127.0.0.1:8931`
 loaded an image from `localhost:8932` -- same machine, different origin -- and

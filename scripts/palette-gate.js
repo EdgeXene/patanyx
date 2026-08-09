@@ -105,7 +105,7 @@ check("the palette has no toolbar pill of its own", () => {
   assert(
     !html.slice(headerAt, headerEnd).includes("palette"),
     "the toolbar markup mentions the palette -- it is meant to be reachable " +
-      "by Ctrl+K only, per the publisher's direction that a pill here would " +
+      "by Ctrl+K only, because a pill here would " +
       "just be a second, redundant way into something the shortcut already " +
       "reaches",
   );

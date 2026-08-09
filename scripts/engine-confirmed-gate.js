@@ -9,7 +9,7 @@
 // section whose whole purpose is to report what the engine did reported
 // nothing at all -- silently, with no error, on every platform.
 //
-// Found by the publisher looking at a screenshot, which is the same way the
+// Found by a human looking at a screenshot, which is the same way the
 // panel-padding defect and the invisible Chat button were found. Nothing in
 // the suite could see it: the JS was correct, the markup was correct, the Rust
 // was correct, and the two halves had simply never been introduced. panel-audit

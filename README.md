@@ -1,4 +1,22 @@
-# PATANYX
+<!-- Two files rather than one, because GitHub renders this page on a light
+     or a dark background depending on the reader's theme, and a logo drawn
+     for one is unreadable on the other. The <picture> element lets the
+     browser pick; the <img> inside it is what every other renderer falls
+     back to, so the light version has to be the one that stands alone. -->
+<h1>
+  <picture>
+    <source
+      media="(prefers-color-scheme: dark)"
+      srcset="packaging/brand/patanyx-logo-horizontal-on-dark.svg"
+    />
+    <img
+      src="packaging/brand/patanyx-logo-horizontal-on-light.svg"
+      alt="PATANYX"
+      width="279"
+      height="64"
+    />
+  </picture>
+</h1>
 
 **Leave less behind.**
 

@@ -721,7 +721,7 @@ mod profile_path_tests {
         );
     }
 
-    /// The exact shape the publisher found beside the exe on 2026-07-27.
+    /// The exact shape found beside the exe on real hardware, 2026-07-27.
     #[test]
     fn the_stray_folder_follows_the_whole_file_name() {
         assert_eq!(

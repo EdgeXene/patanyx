@@ -335,7 +335,7 @@ fi
 # untidy: the signed manifest's `entries` has to be the post-acceptance,
 # post-dedup figure, and `install_verified_list` refuses any list parsing to
 # under 90% of what was declared. A script that printed the raw line count
-# would be handing the publisher a number that quietly breaks the refresh on
+# would be handing over a number that quietly breaks the refresh on
 # every install.
 #
 # Mirrors hostrules::acceptable -- host charset only, at least two labels, no

@@ -307,7 +307,7 @@ pub fn read_frame<R: Read>(reader: &mut R) -> Result<Frame, ChatError> {
 // hold — address squatting and routing hijack.
 // What it does NOT prevent: the relay operator learning which fingerprints are
 // currently online and which pairs exchange traffic. The relay routes opaque
-// ciphertext; metadata visibility to the publisher is accepted and documented,
+// ciphertext; metadata visibility to the relay operator is accepted and documented,
 // not hidden.
 
 /// Relay side: a fresh ephemeral keypair and challenge for one registration.

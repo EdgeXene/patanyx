@@ -529,6 +529,13 @@ fn main() {
     // measured from startup, not from the first event to arrive.
     let mut schedule = schedule::Schedule::new(std::time::Instant::now());
     let mut app = AppState::new(chrome, hosts, proxy.clone(), smoke_mode);
+    // Was this launch handed a page to open? That is how the OS starts the
+    // default browser when someone clicks a link in another application, and
+    // the chrome uses it to decide whether opening the vault would be
+    // welcome or an interruption. Compared against the same `about:blank`
+    // fallback `start_url` was built with, so "no argument" is the only thing
+    // that reads as opened-on-its-own.
+    app.opened_with_url = start_url != "about:blank";
     // First tab: active and visible; further tabs are built via the same
     // factory (tab_new IPC / OpenInNewTab event).
     //

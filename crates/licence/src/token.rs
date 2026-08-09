@@ -829,7 +829,7 @@ mod tests {
 
     #[test]
     fn a_lapsed_licence_gates_exactly_like_no_licence() {
-        // The publisher's rule, verbatim intent: if they don't renew, they
+        // The design rule, verbatim intent: if they don't renew, they
         // don't get Premium features AT ALL. No fallback set, no ship-day
         // comparison, nothing.
         let token = golden_token();

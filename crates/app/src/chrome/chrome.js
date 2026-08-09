@@ -27,8 +27,16 @@
     const strip = $("tabstrip");
     const bar = $("toolbar");
     if (!strip || !bar) return CHROME_CLOSED_FLOOR_PX;
+    // The bookmarks bar is a THIRD row when it is showing, and it has to be
+    // measured with the other two. A row the strip does not know about is
+    // drawn outside it, which is the scrollbar-on-a-fixed-strip defect this
+    // whole measurement exists to prevent. `hidden` rows measure 0, so this
+    // needs no branch of its own.
+    const marks = $("bmbar");
     const measured =
-      strip.getBoundingClientRect().height + bar.getBoundingClientRect().height;
+      strip.getBoundingClientRect().height +
+      bar.getBoundingClientRect().height +
+      (marks ? marks.getBoundingClientRect().height : 0);
     // Ceil, then the floor: a fractional layout height rounded DOWN is exactly
     // how you get one row of pixels clipped and a scrollbar to reach them.
     return Math.max(CHROME_CLOSED_FLOOR_PX, Math.ceil(measured));
@@ -54,7 +62,7 @@
     publishChromeMetric();
     if (typeof ResizeObserver !== "undefined") {
       const ro = new ResizeObserver(publishChromeMetric);
-      for (const id of ["tabstrip", "toolbar"]) {
+      for (const id of ["tabstrip", "toolbar", "bmbar"]) {
         const el = $(id);
         if (el) ro.observe(el);
       }
@@ -64,7 +72,12 @@
   // The privacy panel is four explained rows; it needs less room than the
   // vault's forms. Both stay under the Rust-side clamp in ipc.rs.
   const PRIVACY_OPEN_PX = 500;
-  const THEME_OPEN_PX = 500;
+  // Raised from 500 when Toolbar labels became a fourth section: at 500 the
+  // new section sat below the fold, and the panel scrolls, so it "worked"
+  // while being invisible to anyone who did not think to scroll a settings
+  // card. Sits just under the Rust-side clamp ceiling (120..720 in ipc.rs) and under
+  // the modal max-height, which is viewport-derived.
+  const THEME_OPEN_PX = 700;
 
   // How long a command may go unanswered before its Promise is rejected.
   //
@@ -528,6 +541,17 @@
   // request cannot attach itself to some later page.
   let pendingBookmarkCheck = null;
   let bookmarkItems = [];
+  // Known folder names from bookmark_list's `folders` reply. Kept separate
+  // from the tags carried on bookmarks so an EMPTY folder -- one made but not
+  // yet filled -- still shows up. The union of the two is what the organizer
+  // renders.
+  let bookmarkFolderNames = [];
+  // The id of the bookmark currently being dragged, or null. A module-level
+  // flag rather than dataTransfer: the drop target can read it during
+  // `dragover` (where dataTransfer contents are not readable on either
+  // engine), and the internal bookmark id never rides in text/plain where a
+  // drop onto some other app could carry it away.
+  let draggedBookmarkId = null;
   // The bookmark search box's current text. Held here, never sent anywhere:
   // filtering is done over the list this panel already has, so searching your
   // own bookmarks produces no IPC, no request, and no record of the term.
@@ -780,7 +804,7 @@
   // A panel is a CENTERED CARD, always. It was briefly a right-docked pane
   // (2026-07-31, one build): that hijacked the Split arrangement
   // reserved for chat -- a docked chat and a docked panel would have fought
-  // over one pane -- and the publisher rejected the geometry on sight. Split
+  // over one pane -- and the geometry was rejected on sight. Split
   // remains chat's; panels cover the window and say so.
   //
   // What DOES vary is the backdrop. Where the backend can lift a transparent
@@ -1630,6 +1654,10 @@
     { label: "Open Tunnel", buttonId: "btn-tunnel" },
     { label: "Open Chat", buttonId: "btn-chat" },
     { label: "Open Library", buttonId: "btn-library" },
+    // The only control that makes a shelf, and it sits in the bookmarks
+    // view -- hidden from the "Sets of tabs" view that lists shelves. The
+    // palette is its second way in.
+    { label: "Set aside all tabs", buttonId: "set-aside" },
     // These two buttons are built at runtime by integrity.js/update.js, not
     // in index.html -- which is exactly why they were missed here: nothing
     // failed when the palette predated them. `paletteVisibleActions` resolves
@@ -1752,12 +1780,6 @@
     }
   });
 
-  $("lib-tab-bookmarks").addEventListener("click", () =>
-    selectLibraryTab("bookmarks"),
-  );
-  $("lib-tab-downloads").addEventListener("click", () =>
-    selectLibraryTab("downloads"),
-  );
   btnBookmark.addEventListener("click", async () => {
     const existing = currentBookmark();
     try {
@@ -1800,6 +1822,10 @@
       refreshTheme();
       refreshAccent();
       refreshScheme();
+      refreshToolbarLabels();
+      rb("bookmarks_bar_get")
+        .then((r) => wearBookmarkBar(r.shown))
+        .catch(() => {});
     },
   });
 
@@ -2497,6 +2523,12 @@
     // own error handling, and showState is called from synchronous paths.
     if (name === "open") {
       void refreshLicence();
+      // The folder bar draws from bookmarks, which only exist once the store
+      // is open. At boot it rendered its empty note because the vault was
+      // still locked, and nothing brought it back: unlock is the moment its
+      // contents become knowable, so it refreshes here rather than waiting
+      // for the Library panel to be opened.
+      void refreshBookmarkBar();
       // The Backup pane's copy of the auto-lock picker, for the same reason
       // the locked screen's is refreshed below: the value it shows must be
       // the current one whenever the screen carrying it appears.
@@ -3391,8 +3423,46 @@
   // genuinely fresh install.
   rb("onboarding_seen_get")
     .then((data) => {
-      if (data && data.seen === false) togglePanelNamed("onboarding");
+      if (data && data.seen === false) {
+        togglePanelNamed("onboarding");
+        // The tour wins a first run outright. Only ONE panel is ever open, so
+        // asking for the vault here would either clobber the tour or be
+        // clobbered by it; and being asked for a passphrase before being told
+        // what a vault is in this browser is the wrong order to meet it in.
+        return null;
+      }
+      // THE VAULT OPENS ITSELF at launch on every later run. Bookmarks, saved
+      // passwords and download records all unlock with it, so a locked vault
+      // is the state in which most of the browser quietly does nothing -- the
+      // Library panel's own empty text is "they unlock together with your
+      // vault", which is a thing a person had to go and discover.
+      //
+      // BUT ONLY WHEN PATANYX WAS OPENED ON ITS OWN. If another application
+      // handed it a link because it is the default browser, the person wants
+      // to read that page; putting a passphrase prompt over it would
+      // interrupt the thing they actually asked for. `startup_info` reports
+      // which of the two happened.
+      //
+      // Deliberately does NOT focus the passphrase field (refreshVault never
+      // calls focus, and nothing here adds it): the address bar keeps the
+      // keyboard, so someone who launched the browser to go somewhere can
+      // just type, and someone who launched it to unlock can click once. A
+      // dialog that silently swallows the first thing you type is worse than
+      // one you have to click.
+      return rb("startup_info").then((startup) => {
+        if (startup && startup.opened_with_url === true) return null;
+        return rb("vault_status").then((status) => {
+          // Unlocked cannot happen at launch, but it is checked rather than
+          // assumed. `openPanelName` guards the case where something else got
+          // there first, so this can never close a panel a user opened.
+          if (status && !status.unlocked && !openPanelName) {
+            togglePanelNamed("vault");
+          }
+        });
+      });
     })
+    // One catch for both steps: a failed read opens nothing rather than
+    // guessing, the same rule the tour above already follows.
     .catch(() => {});
 
   // ---- from the privsurface draft ----
@@ -3434,6 +3504,15 @@
       ? panels.get(openPanelName).heightPx
       : closedChromePx();
     let extra = 0;
+    // An open folder menu grows the strip while it is open, for the same
+    // reason banners do: the chrome is CLIPPED to the height Rust was told,
+    // so anything drawn below that height is not drawn at all. This is the
+    // lock-warning banner defect in a different costume, and the fix is the
+    // same one -- measure it and ask for the room.
+    const folderMenu = document.querySelector(".bmfolder-menu");
+    if (folderMenu) {
+      extra += Math.ceil(folderMenu.getBoundingClientRect().height) + 8;
+    }
     for (const id of BANNERS) {
       const banner = $(id);
       if (banner && !banner.hidden) {
@@ -3890,17 +3969,363 @@
   }
 
   // ---- from the bookmarks draft ----
+  /// Opens the Library and selects one of its views. `tab` keeps the old
+  /// vocabulary ("bookmarks" | "shelves" | "downloads") because the call
+  /// sites elsewhere in this file still speak it.
   function openLibrary(tab) {
     if (openPanelName !== "library") togglePanelNamed("library");
-    selectLibraryTab(tab || "bookmarks");
+    managerSelected =
+      tab === "downloads" ? "downloads" : tab === "shelves" ? "shelves" : "all";
+    renderBookmarksManager();
   }
 
-  // ---- from the bookmarks draft ----
-  function selectLibraryTab(which) {
-    $("lib-tab-bookmarks").classList.toggle("active", which === "bookmarks");
-    $("lib-tab-downloads").classList.toggle("active", which === "downloads");
-    $("lib-pane-bookmarks").hidden = which !== "bookmarks";
-    $("lib-pane-downloads").hidden = which !== "downloads";
+  // The folder organizer. One source of truth: bookmark_list, whose bookmarks
+  // carry their folders as tags and whose `folders` reply names the empty ones
+  // too. A folder opens in place rather than in a dropdown, because this pane
+  // has the room a chrome strip does not.
+  let openFolderName = null;
+  // The folder whose head is currently an inline rename field, or null. Inline
+  // rather than a modal so no new dialog surface is added; only one folder is
+  // ever being renamed at a time.
+  let renamingFolder = null;
+
+  // The known folders unioned with any tag that has bookmarks but was never
+  // "made" (a tag typed into the Edit field). Known names first, in their
+  // stored order, so an empty folder is visible; then the stragglers.
+  function allFolders() {
+    const withItems = bookmarkFolders(bookmarkItems); // [{tag, items}]
+    const byTag = new Map(withItems.map((f) => [f.tag, f]));
+    const out = [];
+    const seen = new Set();
+    for (const name of bookmarkFolderNames) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      out.push(byTag.get(name) || { tag: name, items: [] });
+    }
+    for (const f of withItems) {
+      if (seen.has(f.tag)) continue;
+      seen.add(f.tag);
+      out.push(f);
+    }
+    return out;
+  }
+
+  // Reload bookmarks AND folder names from the store, THROWING on failure so a
+  // caller that just wrote can tell the user the view is stale rather than
+  // leaving it silently drifted from disk. `refreshBookmarks` below wraps this
+  // and swallows, for the many best-effort callers that predate folders.
+  async function reloadBookmarkState() {
+    const data = await rb("bookmark_list");
+    bookmarkItems = data.items || [];
+    bookmarkFolderNames = Array.isArray(data.folders) ? data.folders : [];
+  }
+
+  // Files the dragged bookmark into `folder`, then reloads and re-renders. A
+  // write failure and a post-write refresh failure are reported differently:
+  // the first means nothing changed, the second means it did but the view has
+  // not caught up.
+  async function fileDraggedInto(folder) {
+    const id = draggedBookmarkId;
+    draggedBookmarkId = null;
+    if (!id) return;
+    try {
+      await rb("bookmark_folder_file", { id, folder });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function refreshOrganizerAfterWrite() {
+    try {
+      await reloadBookmarkState();
+    } catch (e) {
+      toast("Saved, but the view could not refresh: " + friendly(e), true);
+      return;
+    }
+    renderFolderGrid();
+    renderBookmarks();
+    renderBookmarkBar();
+    renderBookmarksManager();
+    updateStar();
+  }
+
+  function renderFolderGrid() {
+    const grid = $("folder-grid");
+    if (!grid) return;
+    grid.textContent = "";
+    const folders = allFolders();
+    $("folder-empty").hidden = folders.length > 0;
+
+    for (const folder of folders) {
+      const wrap = document.createElement("div");
+      wrap.className = "folder";
+
+      // The whole card is a drop target. dragover is where the decision to
+      // ACCEPT a drop is made (preventDefault), and it reads the module flag
+      // -- dataTransfer contents are unreadable here on both engines, and the
+      // flag is also how we ignore a drag of anything that is not a bookmark.
+      const acceptDrag = (ev) => {
+        if (!draggedBookmarkId) return;
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+        wrap.classList.add("drop-hover");
+      };
+      wrap.addEventListener("dragover", acceptDrag);
+      wrap.addEventListener("dragenter", acceptDrag);
+      wrap.addEventListener("dragleave", () =>
+        wrap.classList.remove("drop-hover"),
+      );
+      wrap.addEventListener("drop", (ev) => {
+        if (!draggedBookmarkId) return;
+        ev.preventDefault();
+        wrap.classList.remove("drop-hover");
+        fileDraggedInto(folder.tag);
+      });
+
+      if (renamingFolder === folder.tag) {
+        // Inline rename: the head becomes a field pre-filled with the name.
+        const form = document.createElement("form");
+        form.className = "folder-rename";
+        const input = document.createElement("input");
+        input.type = "text";
+        input.maxLength = 40;
+        input.value = folder.tag;
+        input.setAttribute("aria-label", "Rename folder");
+        form.appendChild(input);
+        const save = el("button", "small", "Save");
+        save.type = "submit";
+        form.appendChild(save);
+        const cancel = el("button", "small", "Cancel");
+        cancel.type = "button";
+        cancel.addEventListener("click", () => {
+          renamingFolder = null;
+          renderFolderGrid();
+        });
+        form.appendChild(cancel);
+        form.addEventListener("submit", (ev) => {
+          ev.preventDefault();
+          submitRename(folder.tag, input.value);
+        });
+        wrap.appendChild(form);
+        grid.appendChild(wrap);
+        // Focus after it is in the document.
+        input.focus();
+        input.select();
+        continue;
+      }
+
+      const head = document.createElement("button");
+      head.type = "button";
+      head.className = "folder-head";
+      head.setAttribute("aria-expanded", String(openFolderName === folder.tag));
+      head.textContent = folder.tag + " (" + folder.items.length + ")";
+      head.addEventListener("click", () => {
+        openFolderName = openFolderName === folder.tag ? null : folder.tag;
+        renderFolderGrid();
+      });
+      wrap.appendChild(head);
+
+      // Rename / delete, always visible so the folder can be managed without
+      // first opening it. Delete says plainly that it unfiles, never destroys.
+      const actions = document.createElement("div");
+      actions.className = "folder-actions";
+      const renameBtn = el("button", "small", "Rename");
+      renameBtn.type = "button";
+      renameBtn.addEventListener("click", () => {
+        renamingFolder = folder.tag;
+        renderFolderGrid();
+      });
+      actions.appendChild(renameBtn);
+      const delBtn = el("button", "small danger", "Delete folder");
+      delBtn.type = "button";
+      delBtn.title = "Removes the folder. The bookmarks in it are kept.";
+      delBtn.addEventListener("click", () => deleteFolder(folder.tag));
+      actions.appendChild(delBtn);
+      wrap.appendChild(actions);
+
+      if (openFolderName === folder.tag) {
+        const list = document.createElement("ul");
+        list.className = "folder-items";
+        if (!folder.items.length) {
+          const li = document.createElement("li");
+          li.className = "item-sub";
+          li.textContent =
+            "Empty. Use Folders on any bookmark to file it here, or drag one in.";
+          list.appendChild(li);
+        }
+        for (const item of folder.items) {
+          const li = document.createElement("li");
+          const open = document.createElement("button");
+          open.type = "button";
+          open.className = "folder-link";
+          open.textContent = item.title || item.url;
+          open.title = item.url;
+          open.addEventListener("click", async () => {
+            try {
+              await rb("bookmark_open", { id: item.id });
+              if (openPanelName === "library") togglePanelNamed("library");
+            } catch (e) {
+              toast(friendly(e), true);
+            }
+          });
+          li.appendChild(open);
+          const host = document.createElement("span");
+          host.className = "item-sub";
+          host.textContent = hostOf(item.url);
+          li.appendChild(host);
+          // Remove this one bookmark from this one folder. Its other folders
+          // and the bookmark itself are untouched.
+          const unfile = el("button", "small", "Remove");
+          unfile.type = "button";
+          unfile.title = "Remove from this folder. The bookmark is kept.";
+          unfile.addEventListener("click", async () => {
+            try {
+              await rb("bookmark_folder_unfile", {
+                id: item.id,
+                folder: folder.tag,
+              });
+            } catch (e) {
+              toast(friendly(e), true);
+              return;
+            }
+            await refreshOrganizerAfterWrite();
+          });
+          li.appendChild(unfile);
+          list.appendChild(li);
+        }
+        wrap.appendChild(list);
+      }
+      grid.appendChild(wrap);
+    }
+
+    renderFolderSource(grid, folders.length > 0);
+  }
+
+  // The draggable source: every bookmark, so any of them can be dragged into
+  // any folder above. Dragging is additive and idempotent server-side, so
+  // dropping a bookmark on a folder it is already in simply does nothing.
+  function renderFolderSource(grid, haveFolders) {
+    if (!bookmarkItems.length) return;
+    const head = document.createElement("h3");
+    head.className = "section-head";
+    head.textContent = "All bookmarks";
+    grid.appendChild(head);
+    const hint = document.createElement("p");
+    hint.className = "panel-foot";
+    hint.textContent = haveFolders
+      ? "Drag a bookmark onto a folder above, or use Folders on any bookmark in the Bookmark Manager."
+      : "Make a folder above, then file bookmarks into it from the Bookmark Manager.";
+    grid.appendChild(hint);
+
+    const list = document.createElement("ul");
+    list.className = "folder-source";
+    for (const item of bookmarkItems) {
+      const li = document.createElement("li");
+      li.className = "source-item";
+      li.setAttribute("draggable", "true");
+      li.title = item.url;
+      const name = document.createElement("span");
+      name.className = "source-name";
+      name.textContent = item.title || hostOf(item.url);
+      li.appendChild(name);
+      if (Array.isArray(item.tags) && item.tags.length) {
+        const inFolders = document.createElement("span");
+        inFolders.className = "item-sub";
+        inFolders.textContent = "in " + item.tags.join(", ");
+        li.appendChild(inFolders);
+      }
+      li.addEventListener("dragstart", (ev) => {
+        draggedBookmarkId = item.id;
+        li.classList.add("dragging");
+        if (ev.dataTransfer) {
+          ev.dataTransfer.effectAllowed = "copy";
+          // A payload is set because some engines will not start a drag
+          // without one, but it is deliberately not the bookmark id -- the
+          // real target is carried in the module flag, so nothing internal
+          // leaks if this is dropped outside the app.
+          ev.dataTransfer.setData("text/plain", item.title || "bookmark");
+        }
+      });
+      li.addEventListener("dragend", () => {
+        draggedBookmarkId = null;
+        li.classList.remove("dragging");
+        for (const w of grid.querySelectorAll(".drop-hover")) {
+          w.classList.remove("drop-hover");
+        }
+      });
+      list.appendChild(li);
+    }
+    grid.appendChild(list);
+  }
+
+  // New-folder control: makes an empty folder that survives with nothing in
+  // it. Idempotent server-side, so re-creating an existing name is a quiet
+  // success. Refuses empty/over-long the same way the store does.
+  async function createFolderFromInput() {
+    const input = $("folder-new-name");
+    const errline = $("folder-new-error");
+    if (!input) return;
+    const name = (input.value || "").trim();
+    if (errline) errline.hidden = true;
+    if (!name) {
+      if (errline) {
+        errline.textContent = "Type a folder name first.";
+        errline.hidden = false;
+      }
+      return;
+    }
+    try {
+      await rb("bookmark_folder_create", { name });
+    } catch (e) {
+      if (errline) {
+        errline.textContent = friendly(e);
+        errline.hidden = false;
+      }
+      return;
+    }
+    input.value = "";
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function submitRename(from, raw) {
+    const to = (raw || "").trim();
+    // An unchanged or empty name is a quiet cancel: nothing to write.
+    if (!to || to === from) {
+      renamingFolder = null;
+      renderFolderGrid();
+      return;
+    }
+    try {
+      await rb("bookmark_folder_rename", { from, to });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    // The renamed folder keeps its open state under its new (normalised) name.
+    const normalised = to.toLowerCase();
+    if (openFolderName === from) openFolderName = normalised;
+    renamingFolder = null;
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function deleteFolder(name) {
+    const ok = await askConfirm(
+      "Delete the folder “" +
+        name +
+        "”? The bookmarks in it are kept, just " +
+        "no longer filed under this folder.",
+    );
+    if (!ok) return;
+    try {
+      await rb("bookmark_folder_delete", { name });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    if (openFolderName === name) openFolderName = null;
+    await refreshOrganizerAfterWrite();
   }
 
   // ---- from the bookmarks draft ----
@@ -3911,23 +4336,26 @@
   // Filter as you type. `input` rather than `keyup` so it also catches a
   // paste, a drag-drop of text, and the clear button browsers put in search
   // fields -- all of which change the value without a key ever going up.
-  $("bm-search").addEventListener("input", (ev) => {
-    bookmarkQuery = ev.target.value || "";
-    renderBookmarks();
-  });
   // Escape clears the filter rather than closing the panel, which is what a
   // search box in a list is expected to do. The panel's own Escape still
   // works from anywhere else in it, because this only stops the event when
   // there is a filter to clear.
-  $("bm-search").addEventListener("keydown", (ev) => {
-    if (ev.key !== "Escape") return;
-    if (!bookmarkQuery) return;
-    ev.stopPropagation();
-    ev.preventDefault();
-    bookmarkQuery = "";
-    ev.target.value = "";
-    renderBookmarks();
-  });
+
+  // New-folder control in the organizer pane. The button and Enter both
+  // create; guards inside createFolderFromInput handle empty/over-long.
+  const folderAddBtn = $("folder-new-add");
+  if (folderAddBtn) {
+    folderAddBtn.addEventListener("click", () => createFolderFromInput());
+  }
+  const folderNameInput = $("folder-new-name");
+  if (folderNameInput) {
+    folderNameInput.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") {
+        ev.preventDefault();
+        createFolderFromInput();
+      }
+    });
+  }
 
   $("bm-import").addEventListener("click", async () => {
     const btn = $("bm-import");
@@ -3983,25 +4411,43 @@
     }
   });
 
+  // How many shelves the last fetch saw, for the sidebar's count. Cached
+  // because shelves are fetched per render rather than held in a list here,
+  // and a sidebar cannot wait on a round trip to draw itself.
+  let shelfCountCached = 0;
+  function shelfCount() {
+    return shelfCountCached;
+  }
+
   async function shelfRenderList() {
-    const list = $("shelf-list");
-    list.textContent = "";
+    // TWO lists, one fetch: the Bookmarks tab keeps its shelves where they
+    // have always been, and the Shelves tab shows the same sets under its
+    // folders. Rows are built per list rather than shared, because a DOM
+    // node has one parent and appending it twice would silently move it.
+    const lists = ["shelf-list", "shelf-list-2"].map($).filter(Boolean);
+    if (!lists.length) return;
+    for (const list of lists) list.textContent = "";
     let items;
     try {
       const reply = await rb("shelf_list");
       items = (reply && reply.items) || [];
+      shelfCountCached = items.length;
     } catch (e) {
       // Unavailable is not empty: the panel says which one it is.
-      list.textContent = friendly(e);
+      for (const list of lists) list.textContent = friendly(e);
       return;
     }
     if (items.length === 0) {
-      list.textContent =
-        "No shelves. Set aside stores this window's tabs here.";
+      for (const list of lists) {
+        list.textContent =
+          "No shelves. Set aside stores this window's tabs here.";
+      }
       return;
     }
-    for (const shelf of items) {
-      list.appendChild(shelfRow(shelf));
+    for (const list of lists) {
+      for (const shelf of items) {
+        list.appendChild(shelfRow(shelf));
+      }
     }
   }
 
@@ -4009,11 +4455,57 @@
     const row = document.createElement("li");
     row.className = "item";
 
-    const name = document.createElement("span");
-    // textContent, never markup injection: shelf names are fixed today but
-    // this row must stay safe if they ever carry page-derived text.
-    name.textContent = shelf.name;
+    // The name is the disclosure: a shelf behaves like a folder, so clicking
+    // it opens it rather than doing nothing. The count sits beside the name
+    // because "what is in here" is the question a named set of tabs raises,
+    // and answering it should not require restoring the whole set.
+    const count = Array.isArray(shelf.tabs)
+      ? shelf.tabs.length
+      : shelf.count || 0;
+    const name = document.createElement("button");
+    name.type = "button";
+    name.className = "shelf-name";
+    name.setAttribute("aria-expanded", "false");
+    // textContent, never markup injection: shelf names are user-entered now,
+    // so this is load-bearing rather than defensive.
+    name.textContent =
+      shelf.name + " (" + count + (count === 1 ? " tab)" : " tabs)");
     row.appendChild(name);
+
+    // Built once, hidden until asked for. Rebuilt on every render, so a
+    // rename or a restore cannot leave a stale list behind.
+    const contents = document.createElement("ul");
+    contents.className = "shelf-contents";
+    contents.hidden = true;
+    for (const t of shelf.tabs || []) {
+      const entry = document.createElement("li");
+      const open = document.createElement("button");
+      open.type = "button";
+      open.className = "shelf-link";
+      open.textContent = t.title || t.url;
+      open.title = t.url;
+      open.addEventListener("click", async () => {
+        try {
+          // ONE tab, and the shelf is left exactly as it was. Restore opens
+          // the whole set; this is for fetching a single thing back out of
+          // it, which is the reason to look inside at all.
+          await rb("tab_new", { url: t.url });
+          if (openPanelName === "library") togglePanelNamed("library");
+        } catch (e) {
+          toast(friendly(e), true);
+        }
+      });
+      entry.appendChild(open);
+      const where = document.createElement("span");
+      where.className = "item-sub";
+      where.textContent = hostOf(t.url);
+      entry.appendChild(where);
+      contents.appendChild(entry);
+    }
+    name.addEventListener("click", () => {
+      contents.hidden = !contents.hidden;
+      name.setAttribute("aria-expanded", contents.hidden ? "false" : "true");
+    });
 
     const restore = document.createElement("button");
     restore.type = "button";
@@ -4060,6 +4552,98 @@
     });
     row.appendChild(del);
 
+    // The note, when there is one. textContent for the same reason the name
+    // above uses it.
+    if (shelf.note) {
+      const note = document.createElement("p");
+      note.className = "panel-foot";
+      note.textContent = shelf.note;
+      row.appendChild(note);
+    }
+    row.appendChild(contents);
+
+    // Edit opens one small inline form for both the name and the note. One
+    // form rather than two affordances: they are edited together in
+    // practice, and the row already carries three buttons.
+    //
+    // `editor` is cleared whenever the form goes away, by Cancel, by Save,
+    // or by the toggle. Leaving a stale reference behind is why a second
+    // click would otherwise be needed to reopen it.
+    let editor = null;
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "small";
+    edit.textContent = "Edit";
+    edit.addEventListener("click", () => {
+      if (editor) {
+        editor.remove();
+        editor = null;
+        return;
+      }
+      const form = document.createElement("form");
+      form.className = "entry-form";
+
+      const nameInput = document.createElement("input");
+      nameInput.type = "text";
+      nameInput.placeholder = "Name";
+      nameInput.value = shelf.name || "";
+      nameInput.maxLength = 120;
+      form.appendChild(nameInput);
+
+      const noteInput = document.createElement("textarea");
+      noteInput.placeholder = "Notes for this set, such as what it is for";
+      noteInput.value = shelf.note || "";
+      noteInput.maxLength = 2000;
+      noteInput.rows = 3;
+      form.appendChild(noteInput);
+
+      const buttons = document.createElement("div");
+      buttons.className = "form-buttons";
+      const save = document.createElement("button");
+      save.type = "submit";
+      save.textContent = "Save";
+      buttons.appendChild(save);
+      const cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.textContent = "Cancel";
+      cancel.addEventListener("click", () => {
+        form.remove();
+        editor = null;
+      });
+      buttons.appendChild(cancel);
+      form.appendChild(buttons);
+
+      form.addEventListener("submit", async (ev) => {
+        ev.preventDefault();
+        save.disabled = true;
+        try {
+          const named = await rb("shelf_rename", {
+            id: shelf.id,
+            name: nameInput.value,
+          });
+          const noted = await rb("shelf_note_set", {
+            id: shelf.id,
+            note: noteInput.value,
+          });
+          // Re-read from the REPLIES, never from what was typed: the store
+          // caps both, so what it kept is the truth.
+          shelf.name = named.name;
+          shelf.note = noted.note;
+          form.remove();
+          editor = null;
+          shelfRenderList();
+        } catch (e) {
+          save.disabled = false;
+          toast(friendly(e), true);
+        }
+      });
+
+      editor = form;
+      row.appendChild(form);
+      nameInput.focus();
+    });
+    row.appendChild(edit);
+
     return row;
   }
 
@@ -4073,7 +4657,7 @@
         // A recorded open error is more useful than the generic line.
         $("library-locked-note").textContent = st.error
           ? friendly(new Error(st.error))
-          : "They unlock together with your vault. Open the Vault panel from the toolbar. Downloads finished before unlocking are not recorded.";
+          : "Bookmarks, the tabs you set aside and download records all unlock with your vault. PATANYX offers it when you start it on its own. Downloads that finish before you unlock are not recorded.";
         return;
       }
       await Promise.all([
@@ -4081,17 +4665,165 @@
         refreshDownloads(),
         shelfRenderList(),
       ]);
+      // All three views live in this panel, so one render puts every one of
+      // them in step with what was just fetched.
+      renderBookmarksManager();
     } catch (e) {
       /* leave the panel as-is */
+    }
+  }
+
+  // ---- bookmark folder bar --------------------------------------------
+  //
+  // The folders ARE the tags. Rendered from the same bookmark_list the
+  // Library panel uses, so there is no second source of truth to drift: a
+  // retag in the panel changes this row on the next refresh.
+  //
+  // A bookmark with two tags appears under both folders. That is the
+  // deliberate difference from a filesystem folder, where a link has exactly
+  // one home, and it is the reason tags were worth building on.
+  let bmbarOpenFolder = null;
+
+  function closeBookmarkFolder() {
+    const bar = $("bmbar");
+    if (!bar) return;
+    const open = document.querySelector(".bmfolder-menu");
+    if (!open) {
+      bmbarOpenFolder = null;
+      return;
+    }
+    open.remove();
+    bmbarOpenFolder = null;
+    // Give the room back.
+    if (typeof syncChromeHeight === "function") syncChromeHeight();
+  }
+
+  function bookmarkFolders(items) {
+    // Ordered by first appearance so the row is stable between renders
+    // rather than reshuffling as counts change.
+    const order = [];
+    const byTag = new Map();
+    for (const item of items) {
+      for (const tag of item.tags || []) {
+        if (!byTag.has(tag)) {
+          byTag.set(tag, []);
+          order.push(tag);
+        }
+        byTag.get(tag).push(item);
+      }
+    }
+    return order.map((tag) => ({ tag, items: byTag.get(tag) }));
+  }
+
+  function renderBookmarkBar() {
+    const bar = $("bmbar");
+    if (!bar) return;
+    closeBookmarkFolder();
+    bar.textContent = "";
+    const folders = bookmarkFolders(bookmarkItems);
+    if (!folders.length) {
+      // Nothing tagged yet. Say so rather than showing an empty strip that
+      // looks broken; the row only exists because the user asked for it.
+      const empty = el(
+        "span",
+        "bmbar-empty",
+        "Tag a bookmark to make a folder",
+      );
+      bar.appendChild(empty);
+      return;
+    }
+    for (const folder of folders) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "bmfolder";
+      btn.setAttribute("aria-expanded", "false");
+      btn.title = folder.items.length + " bookmarks tagged " + folder.tag;
+      btn.textContent = folder.tag;
+      btn.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const wasOpen = bmbarOpenFolder === folder.tag;
+        closeBookmarkFolder();
+        if (wasOpen) return;
+        const menu = document.createElement("div");
+        menu.className = "bmfolder-menu";
+        for (const item of folder.items) {
+          const link = document.createElement("button");
+          link.type = "button";
+          link.className = "bmfolder-item";
+          link.textContent = item.title || item.url;
+          link.title = item.url;
+          link.addEventListener("click", async () => {
+            closeBookmarkFolder();
+            try {
+              await rb("bookmark_open", { id: item.id });
+            } catch (e) {
+              toast(friendly(e), true);
+            }
+          });
+          menu.appendChild(link);
+        }
+        btn.setAttribute("aria-expanded", "true");
+        bmbarOpenFolder = folder.tag;
+        // Parented to the document, not the bar: the bar is a horizontal
+        // scroll container and would clip this away. Anchored under the
+        // button it belongs to, nudged left if it would run off the edge.
+        document.body.appendChild(menu);
+        const barBox = bar.getBoundingClientRect();
+        const btnBox = btn.getBoundingClientRect();
+        menu.style.top = Math.ceil(barBox.bottom) + 2 + "px";
+        const width = menu.getBoundingClientRect().width || 240;
+        const maxLeft = Math.max(4, (window.innerWidth || 1000) - width - 8);
+        menu.style.left = Math.min(Math.max(4, btnBox.left), maxLeft) + "px";
+        // Measured after it is laid out, so the strip grows by what it needs.
+        syncChromeHeight();
+      });
+      bar.appendChild(btn);
+    }
+  }
+
+  // Anywhere else closes it, the way every other transient menu here behaves.
+  document.addEventListener("click", () => closeBookmarkFolder());
+  document.addEventListener("keydown", (ev) => {
+    if (ev.key === "Escape") closeBookmarkFolder();
+  });
+
+  async function refreshBookmarkBar() {
+    try {
+      const r = await rb("bookmarks_bar_get");
+      const bar = $("bmbar");
+      if (bar) bar.hidden = !r.shown;
+      // Both toggles are dressed from the SAME reply, so opening the Library
+      // after flipping this in Theme shows the state that is actually in
+      // force rather than whatever the button last said.
+      wearBookmarkBar(r.shown);
+      if (r.shown) {
+        // The bar needs bookmarks to render folders from, and it can be
+        // switched on while the Library panel has never been opened.
+        if (!bookmarkItems.length) {
+          try {
+            await reloadBookmarkState();
+          } catch (_) {
+            /* store closed: the row renders its empty note */
+          }
+        }
+        renderBookmarkBar();
+      } else {
+        closeBookmarkFolder();
+      }
+      publishChromeMetric();
+    } catch (_) {
+      /* leave the row as it is */
     }
   }
 
   // ---- from the bookmarks draft ----
   async function refreshBookmarks() {
     try {
-      const data = await rb("bookmark_list");
-      bookmarkItems = data.items || [];
+      await reloadBookmarkState();
       renderBookmarks();
+      renderBookmarkBar();
+      renderFolderGrid();
+      renderBookmarksManager();
       updateStar();
     } catch (e) {
       /* store may be closed; keep the last list */
@@ -4119,11 +4851,20 @@
     if (!needle) return true;
     const title = String(item.title || "").toLowerCase();
     const url = String(item.url || "").toLowerCase();
-    return title.includes(needle) || url.includes(needle);
+    // Tags are searched too: grouping is only useful if typing the group
+    // name finds the group. They are already lowercased by the store.
+    const tags = Array.isArray(item.tags) ? item.tags.join(" ") : "";
+    return (
+      title.includes(needle) || url.includes(needle) || tags.includes(needle)
+    );
   }
 
   function renderBookmarks() {
+    // The flat list this drew was replaced by the manager's own rows. The
+    // function survives because several refresh paths still call it; with no
+    // #bookmark-list in the markup there is nothing for it to draw.
     const list = $("bookmark-list");
+    if (!list) return;
     list.textContent = "";
 
     // The search box is furniture over an empty list, so it appears only once
@@ -4178,6 +4919,11 @@
             : "No page snapshot recorded",
         ),
       );
+      // Tags, when there are any. One line, textContent like every other
+      // field here; the store already lowercased and deduped them.
+      if (Array.isArray(item.tags) && item.tags.length) {
+        li.appendChild(el("div", "item-sub", "Tags: " + item.tags.join(", ")));
+      }
 
       const row = el("div", "item-row");
 
@@ -4234,6 +4980,9 @@
         editingBookmark = item.id;
         $("bookmark-url").value = item.url || "";
         $("bookmark-title").value = item.title || "";
+        $("bookmark-tags").value = Array.isArray(item.tags)
+          ? item.tags.join(", ")
+          : "";
         $("bookmark-error").textContent = "";
         $("bookmark-form").hidden = false;
         $("bookmark-url").focus();
@@ -4270,42 +5019,54 @@
     $("bookmark-form").hidden = true;
     $("bookmark-url").value = "";
     $("bookmark-title").value = "";
+    $("bookmark-tags").value = "";
     $("bookmark-error").textContent = "";
   }
 
   // The edit form had no submit handler, which made it the most convincing
   // of the dead forms: Edit opened it and focused the URL field, so it looked
   // alive right up until "Save changes" did nothing -- no write, no error.
-  $("bookmark-form").addEventListener("submit", async (ev) => {
-    ev.preventDefault();
-    const err = $("bookmark-error");
-    err.textContent = "";
-    if (!editingBookmark) {
-      // Nothing selected means the form was opened by something other than an
-      // Edit button; refusing beats writing to a guessed id.
+  if ($("bookmark-form"))
+    $("bookmark-form").addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const err = $("bookmark-error");
+      err.textContent = "";
+      if (!editingBookmark) {
+        // Nothing selected means the form was opened by something other than an
+        // Edit button; refusing beats writing to a guessed id.
+        resetBookmarkForm();
+        return;
+      }
+      const url = $("bookmark-url").value.trim();
+      if (!url) {
+        err.textContent = "Address is required.";
+        return;
+      }
+      try {
+        await rb("bookmark_update", {
+          id: editingBookmark,
+          url,
+          title: $("bookmark-title").value.trim(),
+        });
+        // Separate call on purpose: bookmark_update drops a recorded digest
+        // when the URL changes, and tags must never be able to cause that.
+        await rb("bookmark_tags_set", {
+          id: editingBookmark,
+          tags: $("bookmark-tags")
+            .value.split(",")
+            .map((t) => t.trim())
+            .filter((t) => t.length > 0),
+        });
+        resetBookmarkForm();
+        await refreshBookmarks();
+      } catch (e) {
+        err.textContent = friendly(e);
+      }
+    });
+  if ($("bookmark-cancel"))
+    $("bookmark-cancel").addEventListener("click", () => {
       resetBookmarkForm();
-      return;
-    }
-    const url = $("bookmark-url").value.trim();
-    if (!url) {
-      err.textContent = "Address is required.";
-      return;
-    }
-    try {
-      await rb("bookmark_update", {
-        id: editingBookmark,
-        url,
-        title: $("bookmark-title").value.trim(),
-      });
-      resetBookmarkForm();
-      await refreshBookmarks();
-    } catch (e) {
-      err.textContent = friendly(e);
-    }
-  });
-  $("bookmark-cancel").addEventListener("click", () => {
-    resetBookmarkForm();
-  });
+    });
 
   // ---- local OCR ----------------------------------------------------------
   //
@@ -4617,6 +5378,8 @@
   // Boot: wear the saved accent as early as the bridge allows, so the
   // default flashes only for users who chose another theme, briefly.
   refreshAccent();
+  refreshToolbarLabels();
+  refreshBookmarkBar();
 
   // ---- chrome scheme ----
   // Same contract as the accent: worn via a data-scheme attribute on the
@@ -4634,6 +5397,76 @@
       $("scheme-" + s).classList.toggle("active", s === name);
     }
   }
+  // Toolbar labels. Same three-part shape as the scheme above: a wear
+  // function that owns the attribute and the button marking, a refresher
+  // that reads Rust rather than trusting the last click, and click handlers
+  // that re-mark from the REPLY.
+  //
+  // ABSENT means shown, deliberately: a failed read leaves the toolbar
+  // labelled, which is what every build before this setting rendered.
+  const TOOLBAR_LABEL_MODES = ["show", "hide"];
+  function wearToolbarLabels(mode) {
+    if (mode === "show") {
+      delete document.documentElement.dataset.toolbarLabels;
+    } else {
+      document.documentElement.dataset.toolbarLabels = mode;
+    }
+    for (const m of TOOLBAR_LABEL_MODES) {
+      $("labels-" + m).classList.toggle("active", m === mode);
+    }
+  }
+  async function refreshToolbarLabels() {
+    try {
+      const r = await rb("toolbar_labels_get");
+      if (r && TOOLBAR_LABEL_MODES.includes(r.mode)) wearToolbarLabels(r.mode);
+    } catch (_) {}
+  }
+  for (const m of TOOLBAR_LABEL_MODES) {
+    $("labels-" + m).addEventListener("click", async () => {
+      try {
+        const r = await rb("toolbar_labels_set", { mode: m });
+        wearToolbarLabels(r.mode);
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+  }
+
+  // Bookmark folder bar toggle, same shape as the labels trio above.
+  //
+  // TWO controls, one pref. The Theme panel has the pair of buttons this was
+  // built with; the Library has a single toggle, because that is where a
+  // person is when they think about folders. Both call the same
+  // `bookmarks_bar_set` and both are re-dressed from the reply, so neither
+  // can end up showing a state the other disagrees with.
+  // The folder row under the toolbar and both of its switches are GONE from
+  // the markup: it duplicated the Bookmark Manager and rendered as a clipped
+  // sliver at the strip's height. These survive only because several refresh
+  // paths still call them, and with no elements to dress they do nothing.
+  // The IPC arms behind them are untouched and simply go unused.
+  function wearBookmarkBar(shown) {
+    const on = $("bmbar-on");
+    const off = $("bmbar-off");
+    if (on) on.classList.toggle("active", !!shown);
+    if (off) off.classList.toggle("active", !shown);
+  }
+
+  for (const [id, shown] of [
+    ["bmbar-on", true],
+    ["bmbar-off", false],
+  ]) {
+    if (!$(id)) continue;
+    $(id).addEventListener("click", async () => {
+      try {
+        const r = await rb("bookmarks_bar_set", { shown });
+        wearBookmarkBar(r.shown);
+        await refreshBookmarkBar();
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+  }
+
   async function refreshScheme() {
     try {
       const r = await rb("chrome_scheme_get");
@@ -4716,20 +5549,31 @@
   function applyUpdateChecked(data) {
     const banner = $("update-banner");
     // The updater's own snapshot. `state` and its values are a contract with
-    // updater.rs (status_json), pinned by tests there -- "offered" is the one
-    // state worth interrupting for. Up-to-date, refused, failed and
-    // downloading all belong in the panel, not across the top of the window.
-    const offered = data && data.state === "offered";
-    if (offered) {
+    // updater.rs (status_json), pinned by tests there. TWO states are worth
+    // interrupting for, and for a while this listed only one:
+    //
+    //   offered  a new version exists and nothing has been fetched
+    //   ready    it is already downloaded and verified, waiting on a restart
+    //
+    // `ready` is the DEFAULT outcome, because background download ships on,
+    // so a banner that fired only on `offered` was quiet for almost everyone.
+    // Up-to-date, refused, failed and downloading still belong in the panel
+    // rather than across the top of the window.
+    const state = data && data.state;
+    const version = data && data.offered ? String(data.offered) : "";
+    const show = state === "offered" || state === "ready";
+    if (show) {
       $("update-banner-body").textContent =
-        (data.offered
-          ? "Version " + data.offered + " is ready to install. "
-          : "") +
-        "Nothing has been downloaded yet. Open Updates to see what changed " +
-        "and decide.";
+        state === "ready"
+          ? (version ? "Version " + version + " is " : "It is ") +
+            "downloaded and verified. Nothing has been installed: open " +
+            "Updates to see what changed and restart when it suits you."
+          : (version ? "Version " + version + " is ready to install. " : "") +
+            "Nothing has been downloaded yet. Open Updates to see what " +
+            "changed and decide.";
     }
-    if (banner.hidden !== !offered) {
-      banner.hidden = !offered;
+    if (banner.hidden !== !show) {
+      banner.hidden = !show;
       syncChromeHeight();
     }
   }
@@ -5206,12 +6050,1020 @@
       }
     },
   });
+  // ONE panel for everything saved. Bookmarks, the tabs you set aside and
+  // download records were three tabs in a separate Library; they are now
+  // three views of this one, chosen from its sidebar. The panel keeps the
+  // id and the toolbar button it always had, so nothing that points at the
+  // Library has to learn a new name.
   registerPanel("library", {
-    el: $("library-panel"),
+    el: $("bookmarks-panel"),
     button: $("btn-library"),
-    heightPx: LIBRARY_OPEN_PX,
+    // The manager is wide and tall; 720 is the ceiling the Rust side clamps
+    // a chrome height request to.
+    heightPx: 720,
     onOpen: refreshLibrary,
   });
+
+  // ---- the bookmarks manager ---------------------------------------------
+  //
+  // A wide panel for finding, filing, pinning and batch-editing bookmarks.
+  // Every write goes through the same reload the Library organizer uses, so
+  // the two views cannot drift into showing different truths.
+  //
+  // DRAG IS NOT THE MECHANISM. Dropping a bookmark on a folder works, but
+  // every drag target also has a click path, because drag is invisible to a
+  // keyboard and it did nothing at all for the first person who tried it.
+  // The Folders button on each row is how a bookmark is filed.
+  let managerSelected = "all"; // "all" | "quick" | "unfiled" | a folder name
+  let managerQuery = "";
+  let managerSort = "newest"; // "newest" | "oldest" | "title"
+  const managerSelection = new Set(); // bookmark ids ticked for batch actions
+  let managerRenamingFolder = null;
+  // A batch is running. Every batch control is disabled while it is set, so
+  // two overlapping runs cannot interleave their writes and their refreshes
+  // and leave the selection decided by whichever finished last.
+  let managerBatchBusy = false;
+  // The bookmark id whose Folders popover is open, or null. The popover
+  // survives a re-render: it is re-anchored and re-filled from fresh state,
+  // and closes itself if its bookmark or its row has gone.
+  let foldersPopoverFor = null;
+  let popoverRefocusFolder = null;
+  // "id|folder" pairs with a file/unfile call in flight. Only the pending
+  // pair's checkbox is disabled, so one toggle cannot fire twice while a
+  // different folder stays live; each call is atomic server-side anyway.
+  const folderOpsPending = new Set();
+
+  // Letter tiles: the only icon this chrome is allowed. No images and no
+  // network -- the CSP forbids both, and fetching a site's icon would
+  // disclose the whole bookmark list to the sites in it. One letter, on a
+  // background whose hue is a hash of the name, so a given site is always the
+  // same color. Colors go through node.style, which the CSP does not govern
+  // (the folder menu already positions itself this way).
+  function tileHostKey(url) {
+    return String(hostOf(url) || "")
+      .replace(/^www\./i, "")
+      .split(":")[0]
+      .toLowerCase();
+  }
+
+  function tileHueOf(key) {
+    let h = 0;
+    for (let i = 0; i < key.length; i += 1) {
+      h = (h * 31 + key.charCodeAt(i)) >>> 0;
+    }
+    return h % 360;
+  }
+
+  /// A tile for any label: `key` decides both the letter and the color, so
+  /// the same site (or the same folder) always looks the same.
+  function makeTile(key) {
+    const clean = String(key || "");
+    const tile = el("span", "bmtile");
+    const match = /[a-z0-9]/i.exec(clean);
+    tile.textContent = (match ? match[0] : "?").toUpperCase();
+    const hue = tileHueOf(clean.toLowerCase());
+    tile.style.background = "hsl(" + hue + ", 45%, 38%)";
+    // A light tint of the SAME hue, so the letter reads on its own tile in
+    // all three color schemes without borrowing a panel token.
+    tile.style.color = "hsl(" + hue + ", 70%, 92%)";
+    // Decorative: the name beside it is the accessible label.
+    tile.setAttribute("aria-hidden", "true");
+    return tile;
+  }
+
+  function makeLetterTile(url) {
+    return makeTile(tileHostKey(url));
+  }
+
+  function managerPinned() {
+    return bookmarkItems.filter((b) => b.quick_access === true);
+  }
+
+  function managerUnfiled() {
+    return bookmarkItems.filter(
+      (b) => !Array.isArray(b.tags) || b.tags.length === 0,
+    );
+  }
+
+  function folderMembers(name) {
+    return bookmarkItems.filter(
+      (b) => Array.isArray(b.tags) && b.tags.indexOf(name) >= 0,
+    );
+  }
+
+  // Sidebar chooses the working set, search narrows it, sort only orders
+  // what is left. Selection is by id, so none of the three can lose a tick.
+  function managerVisibleItems() {
+    let items;
+    if (managerSelected === "quick") {
+      items = managerPinned();
+    } else if (managerSelected === "unfiled") {
+      items = managerUnfiled();
+    } else if (managerSelected === "all") {
+      items = bookmarkItems.slice();
+    } else {
+      items = folderMembers(managerSelected);
+    }
+    const needle = managerQuery.trim().toLowerCase();
+    items = items.filter((item) => bookmarkMatches(item, needle));
+    if (managerSort === "title") {
+      items.sort((a, b) =>
+        String(a.title || a.url || "").localeCompare(
+          String(b.title || b.url || ""),
+        ),
+      );
+    } else if (managerSort === "oldest") {
+      items.sort((a, b) => (a.created_at || 0) - (b.created_at || 0));
+    } else {
+      items.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    }
+    return items;
+  }
+
+  // ---- Quick Access, pinned at the top ----
+  //
+  // Rendered from EVERY pinned bookmark, never from the filtered list: the
+  // sidebar, the search box and the sort must not be able to take it away.
+  // That is the whole point of pinning something.
+  function renderManagerQuick() {
+    const grid = $("bmm-quick");
+    if (!grid) return;
+    grid.textContent = "";
+    const pinned = managerPinned();
+    const empty = $("bmm-quick-empty");
+    if (empty) empty.hidden = pinned.length > 0;
+    for (const item of pinned) {
+      const tile = el("button", "bmm-quick-item");
+      tile.type = "button";
+      tile.title = item.url;
+      tile.appendChild(makeLetterTile(item.url));
+      tile.appendChild(
+        el("span", "bmm-quick-name", item.title || hostOf(item.url)),
+      );
+      tile.addEventListener("click", async () => {
+        try {
+          await rb("bookmark_open", { id: item.id });
+          if (openPanelName === "library") togglePanelNamed("library");
+        } catch (e) {
+          toast(friendly(e), true);
+        }
+      });
+      grid.appendChild(tile);
+    }
+  }
+
+  function renderManagerSidebar() {
+    const nav = $("bmm-folders");
+    if (!nav) return;
+    nav.textContent = "";
+    const entries = [
+      { key: "all", label: "All bookmarks", count: bookmarkItems.length },
+      { key: "quick", label: "Quick Access", count: managerPinned().length },
+    ];
+    for (const folder of allFolders()) {
+      entries.push({
+        key: folder.tag,
+        label: folder.tag,
+        count: folder.items.length,
+        droppable: true,
+      });
+    }
+    entries.push({
+      key: "unfiled",
+      label: "Unfiled",
+      count: managerUnfiled().length,
+    });
+    // The other two things this panel now holds. Below the folders and
+    // marked apart, because they are not bookmarks and filing a bookmark
+    // into "Downloads" would make no sense: they are deliberately NOT
+    // drop targets.
+    entries.push({
+      key: "shelves",
+      label: "Sets of tabs",
+      count: shelfCount(),
+      separated: true,
+    });
+    entries.push({
+      key: "downloads",
+      label: "Downloads",
+      count: downloadItems.length,
+    });
+
+    for (const entry of entries) {
+      const btn = el("button", "bmm-side");
+      btn.type = "button";
+      if (entry.separated) btn.classList.add("bmm-side-break");
+      const selected = managerSelected === entry.key;
+      // Both a class and the ARIA state: the class is the styling contract,
+      // the attribute is what a screen reader announces.
+      btn.classList.toggle("selected", selected);
+      if (selected) btn.setAttribute("aria-current", "true");
+      btn.appendChild(el("span", "bmm-side-label", entry.label));
+      btn.appendChild(el("span", "bmm-side-count", String(entry.count)));
+      btn.addEventListener("click", () => {
+        managerSelected = entry.key;
+        closeFoldersPopover();
+        renderBookmarksManager();
+      });
+      if (entry.droppable) {
+        const accept = (ev) => {
+          if (!draggedBookmarkId) return;
+          ev.preventDefault();
+          if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+          btn.classList.add("drop-hover");
+        };
+        btn.addEventListener("dragover", accept);
+        btn.addEventListener("dragenter", accept);
+        btn.addEventListener("dragleave", () =>
+          btn.classList.remove("drop-hover"),
+        );
+        btn.addEventListener("drop", (ev) => {
+          if (!draggedBookmarkId) return;
+          ev.preventDefault();
+          btn.classList.remove("drop-hover");
+          fileDraggedInto(entry.key);
+        });
+      }
+      nav.appendChild(btn);
+    }
+  }
+
+  function renderManagerCards() {
+    const wrap = $("bmm-cards");
+    if (!wrap) return;
+    wrap.textContent = "";
+    // INSIDE a folder, show that folder's own controls. The cards below only
+    // render on the overview, so selecting a folder in the sidebar left
+    // nothing anywhere that could rename or delete it: the folder you were
+    // looking at was the one folder you could not act on.
+    const knownNames = allFolders().map((f) => f.tag);
+    if (knownNames.indexOf(managerSelected) >= 0) {
+      const bar = el("div", "bmm-folder-bar");
+      if (managerRenamingFolder === managerSelected) {
+        const form = el("form", "bmm-card-rename");
+        const input = document.createElement("input");
+        input.type = "text";
+        input.maxLength = 40;
+        input.value = managerSelected;
+        input.setAttribute("aria-label", "Rename folder");
+        form.appendChild(input);
+        const save = el("button", "small", "Save");
+        save.type = "submit";
+        form.appendChild(save);
+        const cancel = el("button", "small", "Cancel");
+        cancel.type = "button";
+        cancel.addEventListener("click", () => {
+          managerRenamingFolder = null;
+          renderBookmarksManager();
+        });
+        form.appendChild(cancel);
+        const target = managerSelected;
+        form.addEventListener("submit", (ev) => {
+          ev.preventDefault();
+          managerRenameFolder(target, input.value);
+        });
+        bar.appendChild(form);
+        wrap.appendChild(bar);
+        input.focus();
+        input.select();
+        return;
+      }
+      bar.appendChild(makeTile(managerSelected));
+      bar.appendChild(
+        el(
+          "span",
+          "bmm-folder-name",
+          managerSelected + " (" + folderMembers(managerSelected).length + ")",
+        ),
+      );
+      const rename = el("button", "small", "Rename");
+      rename.type = "button";
+      rename.addEventListener("click", () => {
+        managerRenamingFolder = managerSelected;
+        renderBookmarksManager();
+      });
+      bar.appendChild(rename);
+      const del = el("button", "small danger", "Delete folder");
+      del.type = "button";
+      del.title = "Removes the folder. The bookmarks in it are kept.";
+      const target = managerSelected;
+      del.addEventListener("click", () => managerDeleteFolder(target));
+      bar.appendChild(del);
+      wrap.appendChild(bar);
+      return;
+    }
+    // Folder cards belong to the overview.
+    if (managerSelected !== "all") return;
+    for (const folder of allFolders()) {
+      const card = el("div", "bmm-card");
+      const accept = (ev) => {
+        if (!draggedBookmarkId) return;
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "copy";
+        card.classList.add("drop-hover");
+      };
+      card.addEventListener("dragover", accept);
+      card.addEventListener("dragenter", accept);
+      card.addEventListener("dragleave", () =>
+        card.classList.remove("drop-hover"),
+      );
+      card.addEventListener("drop", (ev) => {
+        if (!draggedBookmarkId) return;
+        ev.preventDefault();
+        card.classList.remove("drop-hover");
+        fileDraggedInto(folder.tag);
+      });
+
+      if (managerRenamingFolder === folder.tag) {
+        const form = el("form", "bmm-card-rename");
+        const input = document.createElement("input");
+        input.type = "text";
+        input.maxLength = 40;
+        input.value = folder.tag;
+        input.setAttribute("aria-label", "Rename folder");
+        form.appendChild(input);
+        const save = el("button", "small", "Save");
+        save.type = "submit";
+        form.appendChild(save);
+        const cancel = el("button", "small", "Cancel");
+        cancel.type = "button";
+        cancel.addEventListener("click", () => {
+          managerRenamingFolder = null;
+          renderBookmarksManager();
+        });
+        form.appendChild(cancel);
+        form.addEventListener("submit", (ev) => {
+          ev.preventDefault();
+          managerRenameFolder(folder.tag, input.value);
+        });
+        card.appendChild(form);
+        wrap.appendChild(card);
+        input.focus();
+        input.select();
+        continue;
+      }
+
+      const head = el("button", "bmm-card-head");
+      head.type = "button";
+      head.appendChild(makeTile(folder.tag));
+      head.appendChild(
+        el("span", null, folder.tag + " (" + folder.items.length + ")"),
+      );
+      head.addEventListener("click", () => {
+        managerSelected = folder.tag;
+        closeFoldersPopover();
+        renderBookmarksManager();
+      });
+      card.appendChild(head);
+
+      const actions = el("div", "bmm-card-actions");
+      const rename = el("button", "small", "Rename");
+      rename.type = "button";
+      rename.addEventListener("click", () => {
+        managerRenamingFolder = folder.tag;
+        renderBookmarksManager();
+      });
+      actions.appendChild(rename);
+      const del = el("button", "small danger", "Delete folder");
+      del.type = "button";
+      del.title = "Removes the folder. The bookmarks in it are kept.";
+      del.addEventListener("click", () => managerDeleteFolder(folder.tag));
+      actions.appendChild(del);
+      card.appendChild(actions);
+      wrap.appendChild(card);
+    }
+  }
+
+  function managerRow(item) {
+    const li = el("li", "bmm-row");
+    li.setAttribute("draggable", "true");
+
+    const tick = document.createElement("input");
+    tick.type = "checkbox";
+    tick.checked = managerSelection.has(item.id);
+    tick.setAttribute("aria-label", "Select " + (item.title || item.url));
+    tick.addEventListener("change", () => {
+      if (tick.checked) managerSelection.add(item.id);
+      else managerSelection.delete(item.id);
+      renderManagerBatch();
+    });
+    li.appendChild(tick);
+
+    li.appendChild(makeLetterTile(item.url));
+
+    const meta = el("div", "bmm-meta");
+    meta.appendChild(el("span", "bmm-title", item.title || hostOf(item.url)));
+    meta.appendChild(el("span", "bmm-url", item.url));
+    li.appendChild(meta);
+
+    if (Array.isArray(item.tags) && item.tags.length) {
+      const chips = el("div", "bmm-chips");
+      for (const tag of item.tags)
+        chips.appendChild(el("span", "bmm-chip", tag));
+      li.appendChild(chips);
+    }
+
+    const actions = el("div", "bmm-actions");
+
+    const foldersBtn = el("button", "small", "Folders");
+    foldersBtn.type = "button";
+    foldersBtn.setAttribute(
+      "aria-expanded",
+      String(foldersPopoverFor === item.id),
+    );
+    foldersBtn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      if (foldersPopoverFor === item.id) {
+        closeFoldersPopover();
+        foldersBtn.focus();
+        return;
+      }
+      foldersPopoverFor = item.id;
+      syncFoldersPopover();
+    });
+    actions.appendChild(foldersBtn);
+
+    const pin = el("button", "small", item.quick_access ? "Unpin" : "Pin");
+    pin.type = "button";
+    pin.title = item.quick_access
+      ? "Remove from Quick Access"
+      : "Put this in Quick Access at the top";
+    pin.addEventListener("click", async () => {
+      try {
+        await rb("bookmark_quick_access_set", {
+          id: item.id,
+          on: !item.quick_access,
+        });
+      } catch (e) {
+        toast(friendly(e), true);
+        return;
+      }
+      await refreshOrganizerAfterWrite();
+    });
+    actions.appendChild(pin);
+
+    // Edit lived only on the old flat rows. Without it here a bookmark's
+    // address and name would become uneditable once that list went away.
+    const edit = el("button", "small", "Edit");
+    edit.type = "button";
+    edit.addEventListener("click", () => {
+      editingBookmark = item.id;
+      $("bookmark-url").value = item.url || "";
+      $("bookmark-title").value = item.title || "";
+      $("bookmark-tags").value = Array.isArray(item.tags)
+        ? item.tags.join(", ")
+        : "";
+      $("bookmark-error").textContent = "";
+      $("bookmark-form").hidden = false;
+      $("bookmark-url").focus();
+    });
+    actions.appendChild(edit);
+
+    const copy = el("button", "small", "Copy URL");
+    copy.type = "button";
+    copy.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(item.url);
+        toast("Address copied.");
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+    actions.appendChild(copy);
+
+    const open = el("button", "small", "Open");
+    open.type = "button";
+    open.addEventListener("click", async () => {
+      try {
+        await rb("bookmark_open", { id: item.id });
+        if (openPanelName === "library") togglePanelNamed("library");
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+    actions.appendChild(open);
+
+    const del = el("button", "small danger", "Delete");
+    del.type = "button";
+    del.addEventListener("click", async () => {
+      const ok = await askConfirm(
+        "Delete bookmark " + (item.title || item.url) + "?",
+      );
+      if (!ok) return;
+      try {
+        await rb("bookmark_delete", { id: item.id });
+      } catch (e) {
+        toast(friendly(e), true);
+        return;
+      }
+      if (foldersPopoverFor === item.id) closeFoldersPopover();
+      await refreshOrganizerAfterWrite();
+    });
+    actions.appendChild(del);
+
+    li.appendChild(actions);
+
+    li.addEventListener("dragstart", (ev) => {
+      draggedBookmarkId = item.id;
+      li.classList.add("dragging");
+      if (ev.dataTransfer) {
+        ev.dataTransfer.effectAllowed = "copy";
+        // A payload is set because some engines refuse to start a drag
+        // without one, but it is a CONSTANT. Neither the bookmark's id nor
+        // its title rides in text/plain: if this drag ends in another
+        // application, nothing about what the user has saved goes with it.
+        ev.dataTransfer.setData("text/plain", "bookmark");
+      }
+    });
+    li.addEventListener("dragend", () => {
+      draggedBookmarkId = null;
+      li.classList.remove("dragging");
+    });
+
+    return li;
+  }
+
+  function renderManagerList() {
+    const list = $("bmm-list");
+    if (!list) return;
+    list.textContent = "";
+    const items = managerVisibleItems();
+    const empty = $("bmm-empty");
+    if (empty) {
+      empty.hidden = items.length > 0;
+      if (!items.length) {
+        empty.textContent = bookmarkItems.length
+          ? "Nothing here matches."
+          : "No bookmarks yet. Add one above, or use the bookmark button on a page.";
+      }
+    }
+    for (const item of items) list.appendChild(managerRow(item));
+  }
+
+  function renderManagerBatch() {
+    const bar = $("bmm-batch");
+    if (!bar) return;
+    bar.textContent = "";
+    const ids = Array.from(managerSelection);
+    bar.hidden = ids.length === 0;
+    if (!ids.length) return;
+
+    bar.appendChild(el("span", "bmm-batch-count", ids.length + " selected"));
+
+    const folderNames = allFolders().map((f) => f.tag);
+    const pick = document.createElement("select");
+    pick.setAttribute("aria-label", "Folder for the selected bookmarks");
+    if (!folderNames.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No folders yet";
+      pick.appendChild(opt);
+      pick.disabled = true;
+    }
+    for (const name of folderNames) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      pick.appendChild(opt);
+    }
+    bar.appendChild(pick);
+
+    const mk = (label, run) => {
+      const b = el("button", "small", label);
+      b.type = "button";
+      b.disabled = managerBatchBusy;
+      b.addEventListener("click", run);
+      bar.appendChild(b);
+      return b;
+    };
+
+    mk("Add to folder", () => {
+      if (!pick.value) return;
+      runBatch(ids, (id) =>
+        rb("bookmark_folder_file", { id, folder: pick.value }),
+      );
+    });
+    mk("Remove from folder", () => {
+      if (!pick.value) return;
+      runBatch(ids, (id) =>
+        rb("bookmark_folder_unfile", { id, folder: pick.value }),
+      );
+    });
+    mk("Pin", () =>
+      runBatch(ids, (id) => rb("bookmark_quick_access_set", { id, on: true })),
+    );
+    mk("Unpin", () =>
+      runBatch(ids, (id) => rb("bookmark_quick_access_set", { id, on: false })),
+    );
+    mk("Delete", async () => {
+      const ok = await askConfirm(
+        "Delete " +
+          ids.length +
+          " bookmark" +
+          (ids.length === 1 ? "" : "s") +
+          "?",
+      );
+      if (!ok) return;
+      runBatch(ids, (id) => rb("bookmark_delete", { id }));
+    });
+    const clear = el("button", "small", "Clear selection");
+    clear.type = "button";
+    clear.disabled = managerBatchBusy;
+    clear.addEventListener("click", () => {
+      managerSelection.clear();
+      renderBookmarksManager();
+    });
+    bar.appendChild(clear);
+  }
+
+  /// Runs one operation over every selected bookmark, in order, and reports
+  /// honestly. A partial failure keeps ONLY the failed ids selected, so the
+  /// user can see what did not happen and try again on exactly those.
+  async function runBatch(ids, op) {
+    if (managerBatchBusy) return;
+    managerBatchBusy = true;
+    renderManagerBatch(); // disable the bar while this runs
+    const failed = [];
+    for (const id of ids) {
+      try {
+        await op(id);
+      } catch (_) {
+        failed.push(id);
+      }
+    }
+    managerSelection.clear();
+    for (const id of failed) managerSelection.add(id);
+    managerBatchBusy = false;
+    if (failed.length) {
+      toast(
+        failed.length + " of " + ids.length + " could not be changed.",
+        true,
+      );
+    }
+    closeFoldersPopover();
+    await refreshOrganizerAfterWrite();
+  }
+
+  // ---- the Folders popover: the click path that replaces dragging ----
+
+  function closeFoldersPopover() {
+    foldersPopoverFor = null;
+    popoverRefocusFolder = null;
+    const open = document.querySelector(".bmm-popover");
+    if (open) open.remove();
+  }
+
+  /// Rebuilds the popover from CURRENT state and re-anchors it to the row it
+  /// belongs to. Called after every render, so a refresh underneath it (a
+  /// folder renamed, a bookmark deleted elsewhere) can never leave it
+  /// pointing at a node that is no longer in the document.
+  function syncFoldersPopover() {
+    const existing = document.querySelector(".bmm-popover");
+    if (existing) existing.remove();
+    if (!foldersPopoverFor) return;
+    const panel = $("bookmarks-panel");
+    const item = bookmarkItems.find((b) => b.id === foldersPopoverFor);
+    if (!panel || !item) {
+      // The bookmark is gone. Close rather than float over nothing.
+      foldersPopoverFor = null;
+      return;
+    }
+    // Find the row still showing this bookmark; if the current filter no
+    // longer includes it, there is nothing to anchor to.
+    const list = $("bmm-list");
+    let anchor = null;
+    const visible = managerVisibleItems();
+    const index = visible.findIndex((b) => b.id === item.id);
+    if (list && index >= 0 && list.children[index]) {
+      const row = list.children[index];
+      const actions = row.children[row.children.length - 1];
+      if (actions && actions.children.length) anchor = actions.children[0];
+    }
+    if (!anchor) {
+      foldersPopoverFor = null;
+      return;
+    }
+
+    const pop = el("div", "bmm-popover");
+    pop.appendChild(el("div", "bmm-pop-title", item.title || hostOf(item.url)));
+    const names = allFolders().map((f) => f.tag);
+    if (!names.length) {
+      pop.appendChild(
+        el("div", "bmm-pop-row", "No folders yet. Make one below."),
+      );
+    }
+    for (const name of names) {
+      const row = el("label", "bmm-pop-row");
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      const inIt = Array.isArray(item.tags) && item.tags.indexOf(name) >= 0;
+      box.checked = inIt;
+      box.disabled = folderOpsPending.has(item.id + "|" + name);
+      box.addEventListener("change", () =>
+        toggleFolderFor(item.id, name, box.checked, box),
+      );
+      row.appendChild(box);
+      row.appendChild(el("span", null, name));
+      pop.appendChild(row);
+      if (popoverRefocusFolder === name) box.focus();
+    }
+
+    // Create a folder and file this bookmark into it, in one step.
+    const form = el("form", "bmm-pop-new");
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 40;
+    input.placeholder = "New folder";
+    input.setAttribute("aria-label", "New folder name");
+    form.appendChild(input);
+    const add = el("button", "small", "Add");
+    add.type = "submit";
+    form.appendChild(add);
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      createFolderAndFile(item.id, input.value);
+    });
+    pop.appendChild(form);
+
+    pop.addEventListener("click", (ev) => ev.stopPropagation());
+    panel.appendChild(pop);
+
+    // Positioned against the PANEL, which is the containing block (it is
+    // position:fixed), and offset by its scroll so the popover travels with
+    // the row rather than detaching when the panel is scrolled.
+    const panelBox = panel.getBoundingClientRect();
+    const anchorBox = anchor.getBoundingClientRect();
+    pop.style.left = Math.max(8, anchorBox.left - panelBox.left) + "px";
+    pop.style.top =
+      anchorBox.bottom - panelBox.top + (panel.scrollTop || 0) + 4 + "px";
+
+    if (popoverRefocusFolder === null) {
+      const first = pop.querySelector("input");
+      if (first) first.focus();
+    }
+    popoverRefocusFolder = null;
+  }
+
+  /// One checkbox, one atomic call. Never `bookmark_tags_set`: that would
+  /// write the whole list from a client snapshot, so two quick toggles would
+  /// each overwrite the other. `file`/`unfile` add or remove exactly one tag
+  /// against the store's own current tags.
+  async function toggleFolderFor(id, folder, wanted, box) {
+    const key = id + "|" + folder;
+    if (folderOpsPending.has(key)) return;
+    folderOpsPending.add(key);
+    if (box) box.disabled = true;
+    popoverRefocusFolder = folder;
+    try {
+      await rb(wanted ? "bookmark_folder_file" : "bookmark_folder_unfile", {
+        id,
+        folder,
+      });
+    } catch (e) {
+      toast(friendly(e), true);
+      // Put the box back the way it was; nothing was written.
+      if (box) {
+        box.checked = !wanted;
+        box.disabled = false;
+      }
+      folderOpsPending.delete(key);
+      return;
+    }
+    folderOpsPending.delete(key);
+    // Re-enable BEFORE the refresh: if the reload fails, the checkbox must
+    // still be usable rather than staying dead until the popover is reopened.
+    if (box) box.disabled = false;
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function createFolderAndFile(id, raw) {
+    const name = (raw || "").trim();
+    if (!name) return;
+    let created = null;
+    try {
+      created = await rb("bookmark_folder_create", { name });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    const folder = (created && created.name) || name.toLowerCase();
+    try {
+      await rb("bookmark_folder_file", { id, folder });
+    } catch (e) {
+      // The FOLDER WAS created even though the filing failed. Refresh anyway
+      // or it exists on disk and is invisible here, which reads as the whole
+      // action having failed.
+      toast("Folder made, but filing failed: " + friendly(e), true);
+      await refreshOrganizerAfterWrite();
+      return;
+    }
+    popoverRefocusFolder = folder;
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function managerRenameFolder(from, raw) {
+    const to = (raw || "").trim();
+    if (!to || to === from) {
+      managerRenamingFolder = null;
+      renderBookmarksManager();
+      return;
+    }
+    try {
+      await rb("bookmark_folder_rename", { from, to });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    const normalised = to.toLowerCase();
+    if (managerSelected === from) managerSelected = normalised;
+    managerRenamingFolder = null;
+    await refreshOrganizerAfterWrite();
+  }
+
+  async function managerDeleteFolder(name) {
+    const ok = await askConfirm(
+      "Delete the folder “" +
+        name +
+        "”? The bookmarks in it are kept, just no longer filed under it.",
+    );
+    if (!ok) return;
+    try {
+      await rb("bookmark_folder_delete", { name });
+    } catch (e) {
+      toast(friendly(e), true);
+      return;
+    }
+    if (managerSelected === name) managerSelected = "all";
+    await refreshOrganizerAfterWrite();
+  }
+
+  /// Add a bookmark by typing its address. Rust normalises it (so
+  /// "example.com" is enough) and refuses anything the browser would not
+  /// navigate to; this side only reports what came back.
+  async function managerAddByHand() {
+    const urlField = $("bmm-add-url");
+    const titleField = $("bmm-add-title");
+    const errline = $("bmm-add-error");
+    if (!urlField) return;
+    const url = (urlField.value || "").trim();
+    if (errline) errline.hidden = true;
+    if (!url) {
+      if (errline) {
+        errline.textContent = "Type an address first.";
+        errline.hidden = false;
+      }
+      return;
+    }
+    try {
+      await rb("bookmark_add", {
+        url,
+        title: (titleField && titleField.value) || "",
+      });
+    } catch (e) {
+      if (errline) {
+        errline.textContent =
+          e && String(e.message) === "bad_args"
+            ? "That is not an address this browser can open."
+            : friendly(e);
+        errline.hidden = false;
+      }
+      return;
+    }
+    urlField.value = "";
+    if (titleField) titleField.value = "";
+    await refreshOrganizerAfterWrite();
+  }
+
+  function renderBookmarksManager() {
+    const list = $("bmm-list");
+    if (!list) return; // a build without the manager markup
+    // Prune the selection against what the store actually holds, so the batch
+    // bar can never claim a bookmark that has been deleted elsewhere.
+    const live = new Set(bookmarkItems.map((b) => b.id));
+    for (const id of Array.from(managerSelection)) {
+      if (!live.has(id)) managerSelection.delete(id);
+    }
+    // The folder the sidebar is filtered on can vanish underneath us (renamed
+    // or deleted from the Library organizer). Fall back to everything rather
+    // than showing an unexplained empty list.
+    const known = allFolders().map((f) => f.tag);
+    if (
+      managerSelected !== "all" &&
+      managerSelected !== "quick" &&
+      managerSelected !== "unfiled" &&
+      managerSelected !== "shelves" &&
+      managerSelected !== "downloads" &&
+      known.indexOf(managerSelected) < 0
+    ) {
+      managerSelected = "all";
+    }
+    // Only one view is on screen at a time, and the bookmarks-only chrome
+    // above (add-by-hand, Quick Access, search and sort) steps aside with it:
+    // searching bookmarks while looking at downloads would be furniture.
+    const view =
+      managerSelected === "downloads"
+        ? "downloads"
+        : managerSelected === "shelves"
+          ? "shelves"
+          : "bookmarks";
+    const top = $("bmm-bookmarks-top");
+    if (top) top.hidden = view !== "bookmarks";
+    for (const [name, id] of [
+      ["bookmarks", "bmm-view-bookmarks"],
+      ["shelves", "bmm-view-shelves"],
+      ["downloads", "bmm-view-downloads"],
+    ]) {
+      const node = $(id);
+      if (node) node.hidden = view !== name;
+    }
+    if (view !== "bookmarks") closeFoldersPopover();
+
+    renderManagerQuick();
+    renderManagerSidebar();
+    renderManagerCards();
+    renderManagerList();
+    renderManagerBatch();
+    // LAST, and always: the popover is re-anchored to the rebuilt rows. Any
+    // path that re-renders without this leaves it pointing at a detached node.
+    syncFoldersPopover();
+  }
+
+  if ($("bmm-add")) {
+    $("bmm-add").addEventListener("click", () => managerAddByHand());
+  }
+  if ($("bmm-add-url")) {
+    $("bmm-add-url").addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      managerAddByHand();
+    });
+  }
+  if ($("bmm-search")) {
+    $("bmm-search").addEventListener("input", (ev) => {
+      managerQuery = ev.target.value || "";
+      // The whole manager, not just the list: the rows are rebuilt, so the
+      // popover has to be re-anchored with them.
+      renderBookmarksManager();
+    });
+  }
+  if ($("bmm-sort")) {
+    $("bmm-sort").addEventListener("change", (ev) => {
+      managerSort = ev.target.value || "newest";
+      renderBookmarksManager();
+    });
+  }
+  if ($("bmm-new-folder-add")) {
+    const addFolder = async () => {
+      const field = $("bmm-new-folder");
+      const errline = $("bmm-folder-error");
+      const name = (field.value || "").trim();
+      if (errline) errline.hidden = true;
+      if (!name) {
+        if (errline) {
+          errline.textContent = "Type a folder name first.";
+          errline.hidden = false;
+        }
+        return;
+      }
+      try {
+        await rb("bookmark_folder_create", { name });
+      } catch (e) {
+        if (errline) {
+          errline.textContent = friendly(e);
+          errline.hidden = false;
+        }
+        return;
+      }
+      field.value = "";
+      await refreshOrganizerAfterWrite();
+    };
+    $("bmm-new-folder-add").addEventListener("click", addFolder);
+    $("bmm-new-folder").addEventListener("keydown", (ev) => {
+      if (ev.key !== "Enter") return;
+      ev.preventDefault();
+      addFolder();
+    });
+  }
+  // A click anywhere else closes the popover, the way every transient surface
+  // in this chrome behaves. The popover stops its own clicks from reaching
+  // here, and the Folders button handles its own toggle.
+  document.addEventListener("click", () => {
+    if (foldersPopoverFor) closeFoldersPopover();
+  });
+  // Escape closes the POPOVER first, and only the popover. Captured, so it
+  // runs before the panel manager's own Escape and does not close the whole
+  // manager out from under someone who was only dismissing a small menu.
+  // Same layering askConfirm uses for its dialog.
+  document.addEventListener(
+    "keydown",
+    (ev) => {
+      if (ev.key !== "Escape" || !foldersPopoverFor) return;
+      ev.stopPropagation();
+      ev.preventDefault();
+      closeFoldersPopover();
+    },
+    true,
+  );
 
   // ---- About -------------------------------------------------------------
   //
