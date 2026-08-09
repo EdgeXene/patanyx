@@ -34,9 +34,9 @@ as backports.
 This repository contains the browser and its client-side crates: the ad and
 tracker blocker, the network freeze and privacy ledger, the encrypted vault and
 session store, page integrity checks, the signed update and blocklist clients,
-the Private Tunnel client, on-device OCR, and the chat client with its wire
-protocol. Server-side services and deployment infrastructure are not part of this
-repository, but reports about them are still welcome through the same channel.
+the Private Tunnel client, and on-device OCR. Server-side services and
+deployment infrastructure are not part of this repository, but reports about
+them are still welcome through the same channel.
 
 Some limits are known and documented rather than treated as vulnerabilities. The
 ["What it cannot hide"](https://patanyx.edgexene.io/about/#cannot-hide) section of
