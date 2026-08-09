@@ -32,7 +32,7 @@ PATANYX runs on Windows and Linux and is actively under development.
 
 Browser-side privacy and security mechanisms are open source and auditable; commercial backend services and deployment infrastructure are proprietary.
 
-This repository contains the browser and its client-side crates: the ad and tracker blocker, the network freeze and privacy ledger, the encrypted vault and session store, page integrity checks, the signed update and blocklist clients, the Private Tunnel client, on-device OCR, and the chat client with its wire protocol. Server-side services and deployment infrastructure are not part of this repository.
+This repository contains the browser and its client-side crates: the ad and tracker blocker, the network freeze and privacy ledger, the encrypted vault and session store, page integrity checks, the signed update and blocklist clients, the Private Tunnel client, and on-device OCR. Server-side services and deployment infrastructure are not part of this repository.
 
 ## Quick start
 
