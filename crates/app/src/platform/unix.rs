@@ -65,6 +65,15 @@ pub struct Hosts {
     /// readout floating over a modal would claim something about a page the
     /// user can neither see nor click.
     readout_suppressed: Rc<Cell<bool>>,
+    /// What the chrome is using along the top and down the left, in logical
+    /// pixels. The page is positioned inside the window by these two numbers.
+    ///
+    /// `Rc<Cell>` because the overlay's `get-child-position` handler is a
+    /// 'static closure that outlives this call and must read the CURRENT
+    /// values on every allocation -- which is what makes the inset survive a
+    /// resize without anything recomputing it. GTK is single-threaded, so
+    /// this is the same shape as every other shared cell here.
+    insets: Rc<Cell<(i32, i32)>>,
 }
 
 /// One per tab: the container packed into the content box. Tab visibility
@@ -77,6 +86,9 @@ pub struct TabView {
     /// Kept because removing a user stylesheet requires the same instance
     /// that was added (GTK objects are refcounted pointers).
     cosmetic_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
+    /// The page-scrollbar sheet (`set_page_scrollbar`), kept for the same
+    /// reason: swapping it out needs the instance that went in.
+    scrollbar_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
 }
 
 pub fn create_hosts(window: Window) -> Hosts {
@@ -87,20 +99,64 @@ pub fn create_hosts(window: Window) -> Hosts {
         .default_vbox()
         .expect("tao window has no default gtk vbox")
         .clone();
-    // Chrome container: fixed height (resized later by set_chrome_height).
+
+    // THE CHROME TAKES THE WHOLE WINDOW AND THE PAGE SITS ON TOP OF IT, inset.
+    //
+    // It used to be a vertical stack: a fixed-height chrome row, then the
+    // page filling what was left. That cannot express the sidebar layout,
+    // because the chrome then paints an L -- a strip along the top and a
+    // column down the left -- and a box packs rectangles.
+    //
+    // So the arrangement is inverted to match what the Windows backend has
+    // always done for its docked pane: give the chrome everything, put the
+    // page in front of it, and let the page's own rectangle carve out the
+    // shape the chrome shows through. One code path describes both layouts,
+    // and Top is the case where the left inset happens to be zero.
+    //
+    // `set_size_request` is deliberately gone with it. As the main child it
+    // would still force the WINDOW's minimum height to whatever the chrome
+    // asked for, so opening a 700px panel would grow the window rather than
+    // cover the page -- the old behaviour, kept by accident, in a layout
+    // that no longer means it.
     let chrome_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    chrome_box.set_size_request(-1, CHROME_HEIGHT_PX);
-    vbox.pack_start(&chrome_box, false, false, 0);
-    // Content container: takes all remaining space; hosts one gtk::Box per tab.
-    // It sits inside an Overlay rather than directly in the vbox so the hover
-    // readout can float over the page without reserving a row of its own.
-    // Tab containers are still packed into content_box, so remove_tab's
-    // "the container's parent IS content_box" fact is unchanged -- only
-    // content_box's own parent moved.
+    // Content container: hosts one gtk::Box per tab. It sits inside its own
+    // Overlay so the hover readout can float over the page without reserving
+    // a row. Tab containers are still packed into content_box, so
+    // remove_tab's "the container's parent IS content_box" fact is unchanged
+    // -- only content_box's own parent moved.
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let overlay = gtk::Overlay::new();
     overlay.add(&content_box);
-    vbox.pack_start(&overlay, true, true, 0);
+
+    let insets = Rc::new(Cell::new((CHROME_HEIGHT_PX, 0)));
+    let root = gtk::Overlay::new();
+    root.add(&chrome_box);
+    root.add_overlay(&overlay);
+    // The page's rectangle, recomputed by GTK on every allocation. A handler
+    // rather than margins, for two reasons: margin_start is RTL-aware and
+    // would put the page on the wrong side of a right-to-left desktop while
+    // the stylesheet still drew the sidebar at left: 0; and a handler reads
+    // the insets fresh, so a resize needs nothing re-applied. The arithmetic
+    // is platform::page_rect, the same pure function the Windows backend
+    // lays out with.
+    {
+        let insets = Rc::clone(&insets);
+        root.connect_get_child_position(move |root, _child| {
+            let alloc = root.allocation();
+            let (top, left) = insets.get();
+            let (x, y, w, h) = crate::platform::page_rect(
+                f64::from(alloc.width()),
+                f64::from(alloc.height()),
+                top,
+                left,
+                0,
+                crate::platform::PAGE_FRAME_PX,
+            );
+            #[allow(clippy::cast_possible_truncation)]
+            Some(gtk::Rectangle::new(x as i32, y as i32, w as i32, h as i32))
+        });
+    }
+    vbox.pack_start(&root, true, true, 0);
 
     // The readout label. Bottom-left, status-bar fashion.
     let readout = gtk::Label::new(None);
@@ -132,6 +188,7 @@ pub fn create_hosts(window: Window) -> Hosts {
         readout_css: gtk::CssProvider::new(),
         readout_styled: Rc::new(Cell::new(false)),
         readout_suppressed: Rc::new(Cell::new(false)),
+        insets,
     }
 }
 
@@ -614,6 +671,7 @@ pub fn build_content(
         container,
         state,
         cosmetic_sheet: RefCell::new(None),
+        scrollbar_sheet: RefCell::new(None),
     };
     apply_policy(&webview, &view, policy);
     // GPC's navigator.globalPrivacyControl, registered as a document-start
@@ -626,7 +684,50 @@ pub fn build_content(
     // neither engine can re-register a live view's scripts, and the panel
     // copy says so.
     install_divergence_script(&webview, policy.ephemeral);
+    // The page-scrollbar courtesy, as a User-level stylesheet: author rules
+    // beat it by definition, which is the "the page's own choice wins"
+    // contract stated in privacy.rs. Colour is what the chrome last reported.
+    set_page_scrollbar(&webview, &view, crate::prefs::load().chrome_palette.scrollbar);
     Ok((webview, view))
+}
+
+/// See `chrome_caps`: WebKitGTK does not implement `scrollbar-color` (checked
+/// on 2.50.6 under Xvfb, 2026-08-17: the sheet installs, the bar stays the
+/// GTK theme's), so the accent does not reach page scrollbars on this
+/// backend and the panel copy must not say it does. The sheet is still
+/// installed below -- it costs nothing and describes what the page SHOULD
+/// do -- but the claim follows the engine, not the intent.
+pub fn page_scrollbar_support() -> &'static str {
+    "unsupported"
+}
+
+/// Gives this tab's pages a scrollbar in the chrome's accent, replacing the
+/// previous sheet if there was one. WebKit re-styles the LIVE view when a
+/// user stylesheet is swapped, so IF the engine ever honours
+/// `scrollbar-color` a palette change is visible in every open tab at once
+/// -- today it honours nothing here (see `page_scrollbar_support`). Same
+/// instance rule as the cosmetic sheet: removal needs the object that was
+/// added.
+pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
+    use webkit2gtk::UserContentManagerExt;
+    use wry::WebViewExtUnix;
+    let Some(ucm) = user_content_manager(&webview.webview()) else {
+        // Same degrade-never-crash rule as set_cosmetic: no content manager,
+        // no courtesy, and the engine's own scrollbar is what shows.
+        return;
+    };
+    if let Some(old) = view.scrollbar_sheet.borrow_mut().take() {
+        ucm.remove_style_sheet(&old);
+    }
+    let sheet = webkit2gtk::UserStyleSheet::new(
+        &privacy::page_scrollbar_css(rgb),
+        webkit2gtk::UserContentInjectedFrames::AllFrames,
+        webkit2gtk::UserStyleLevel::User,
+        &[],
+        &[],
+    );
+    ucm.add_style_sheet(&sheet);
+    *view.scrollbar_sheet.borrow_mut() = Some(sheet);
 }
 
 /// Installs the GPC navigator-property user script on a content view.
@@ -1234,6 +1335,19 @@ pub fn allow_site(webview: &WebView, view: &TabView, host: &str) {
 /// clears anything). Windows-only for this pass; see `windows.rs` for the
 /// real implementation via `ICoreWebView2CookieManager`.
 pub fn forget_site_cookies(_webview: &WebView, _host: &str) -> bool {
+    false
+}
+
+/// Not implemented on this backend -- always refuses.
+///
+/// The browser-wide clear is refused here even though WebKitGTK CAN clear
+/// whole-manager data: `WebKitWebsiteDataManager::clear` takes a data-type
+/// mask, and the type this feature is allowed to touch is cookies alone. That
+/// call is reachable, so this is a "not built and not tested on this backend"
+/// refusal rather than an engine limit, and it is stated as one instead of
+/// being dressed up as impossibility. Windows-only for this pass, like its
+/// per-site neighbour above; see `windows.rs` for the real implementation.
+pub fn forget_all_cookies(_webview: &WebView) -> bool {
     false
 }
 
@@ -2005,8 +2119,43 @@ pub fn remove_tab(view: &TabView, webview: &WebView) {
     }
 }
 
+/// What the chrome is using along the top, in logical pixels.
+///
+/// Stored rather than applied: the overlay's position handler reads it on
+/// every allocation, so `queue_resize` is the whole of "apply". That is what
+/// makes a window resize need nothing here -- the old size request had to be
+/// re-honoured by GTK, this is re-read by GTK.
 pub fn set_chrome_height(hosts: &Hosts, px: i32) {
-    hosts.chrome_box.set_size_request(-1, px);
+    let (_, left) = hosts.insets.get();
+    hosts.insets.set((px, left));
+    hosts.chrome_box.queue_resize();
+}
+
+/// The title bar is the window manager's on this backend, and its colour is
+/// the desktop theme's, not ours: GTK draws no caption of its own for a
+/// server-side-decorated window and this app does not ask for client-side
+/// decorations. Accepted so state.rs has one call on both platforms; the
+/// chrome's own frame is all the accent there is here.
+pub fn set_window_accent(_hosts: &Hosts, _palette: &super::ChromePalette) -> bool {
+    false
+}
+
+/// See `set_window_accent`: nothing to re-apply on this backend either.
+pub fn reapply_window_accent(_hosts: &Hosts, _palette: &super::ChromePalette) {}
+
+/// See `set_window_accent`: nothing to refresh on this backend.
+pub fn refresh_window_accent(_hosts: &Hosts, _palette: &super::ChromePalette) {}
+
+/// The window manager's answer; only the Windows backend acts on it.
+pub fn window_is_maximized(hosts: &Hosts) -> bool {
+    hosts._window.is_maximized()
+}
+
+/// See `set_chrome_height`: same mechanism, the left edge.
+pub fn set_chrome_left(hosts: &Hosts, px: i32) {
+    let (top, _) = hosts.insets.get();
+    hosts.insets.set((top, px));
+    hosts.chrome_box.queue_resize();
 }
 
 pub fn layout(
@@ -2014,19 +2163,21 @@ pub fn layout(
     _chrome: &WebView,
     _active: Option<&WebView>,
     _chrome_height: i32,
+    _chrome_left: i32,
     arrangement: ChromeLayout,
 ) {
-    // GEOMETRY is still nothing here: GTK repacks automatically on resize and
-    // size-request changes; manual geometry exists only in the Windows
-    // backend.
+    // GEOMETRY is still nothing here, and now for a better reason than
+    // before: the page's rectangle is computed by the root overlay's
+    // position handler from the insets `set_chrome_height` and
+    // `set_chrome_left` store, so it is already correct on every allocation
+    // -- including the ones GTK does on its own, which is what a resize is.
     //
-    // `ChromeLayout::Split` therefore DOES NOTHING here, and that is a real
-    // limitation rather than an oversight: a docked pane needs the content
-    // widget re-packed into a horizontal box beside it, which is a GTK change
-    // this function is not the place for. Until that exists, chat on this
-    // backend stays the modal it has always been -- see `split_supported`,
-    // which the chrome asks before offering the arrangement at all, so nobody
-    // is given a control that quietly does nothing.
+    // `ChromeLayout::Split` still DOES NOTHING here. A docked pane needs a
+    // pane widget to dock, which the sidebar work did not add; the geometry
+    // it would need is now expressible (page_rect takes a pane width and the
+    // handler could pass one), but the chrome asks `split_supported` before
+    // offering the arrangement at all, so nobody is given a control that
+    // quietly does nothing.
     //
     // The hover readout is the one thing here that is NOT geometry. Every
     // state change that reaches this function -- tab switch, tab close,

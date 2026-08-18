@@ -23,4 +23,10 @@ pub enum StoreError {
     /// user input. Kept coarse so it cannot become an oracle.
     #[error("cryptographic failure: {0}")]
     Crypto(String),
+    /// A bounded collection is at its limit. Its own variant rather than an
+    /// io error: nothing is wrong with the disk or the file, the answer is
+    /// simply no, and the caller should say so plainly rather than reporting
+    /// a fault. Carries what is full and what the limit is.
+    #[error("{0}")]
+    Full(String),
 }

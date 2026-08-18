@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "0.9.62"
+version = "0.9.63"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -124,6 +124,10 @@ webview2-com = "0.38"
 #   Win32_UI_WindowsAndMessaging -- RegisterClassW/CreateWindowExW/
 #     SetWindowPos/ShowWindow and the WM_* constants its wndproc answers.
 #   Win32_System_LibraryLoader -- GetModuleHandleW, for the class's hInstance.
+#   Win32_Graphics_Dwm         -- DwmSetWindowAttribute, for the title bar and
+#     window border to wear the chrome's accent (set_window_accent). Windows
+#     11 only honours the three colour attributes; older runtimes refuse the
+#     call and the chrome's own frame is all the accent there is.
 windows = { version = "0.61", features = [
   "Win32_System_RemoteDesktop",
   "Win32_System_Power",
@@ -133,6 +137,7 @@ windows = { version = "0.61", features = [
   "Win32_Graphics_Gdi",
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_LibraryLoader",
+  "Win32_Graphics_Dwm",
 ] }
 
 # GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
@@ -160,6 +165,8 @@ bsdiff = "0.2"
 # exercised end to end rather than against a fixture. Dev-only: the shipped
 # binary verifies signatures, it never makes them.
 ed25519-dalek = "2"
+# The activation tests write a device-id file beside a temp vault path.
+tempfile = "3"
 
 # build.rs compiles src/blocklist.txt into sorted hashes; it shares
 # hostrules.rs with the crate and therefore needs the same hasher.

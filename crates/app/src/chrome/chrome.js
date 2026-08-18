@@ -22,11 +22,20 @@
   // floor is the old constant, so a measurement taken before layout settles
   // can only ever be too generous, never clipping.
   const CHROME_CLOSED_FLOOR_PX = 148;
+  // The same floor for the layout whose toolbar is down the left edge. One
+  // row of pills leaves the top, so the strip is the tab row plus the address
+  // row, and the honest floor is lower. Measured at 1280x800 in Chromium:
+  // 41 + 47 = 88. Keeping the 148 floor here would have padded the page down
+  // by 60px of nothing, in the layout the floor was raised to protect.
+  const CHROME_CLOSED_FLOOR_LEFT_PX = 88;
 
   function closedChromePx() {
     const strip = $("tabstrip");
     const bar = $("toolbar");
-    if (!strip || !bar) return CHROME_CLOSED_FLOOR_PX;
+    const floor = sidebarShowing()
+      ? CHROME_CLOSED_FLOOR_LEFT_PX
+      : CHROME_CLOSED_FLOOR_PX;
+    if (!strip || !bar) return floor;
     // The bookmarks bar is a THIRD row when it is showing, and it has to be
     // measured with the other two. A row the strip does not know about is
     // drawn outside it, which is the scrollbar-on-a-fixed-strip defect this
@@ -39,19 +48,35 @@
       (marks ? marks.getBoundingClientRect().height : 0);
     // Ceil, then the floor: a fractional layout height rounded DOWN is exactly
     // how you get one row of pixels clipped and a scrollbar to reach them.
-    return Math.max(CHROME_CLOSED_FLOOR_PX, Math.ceil(measured));
+    return Math.max(floor, Math.ceil(measured));
   }
-  // The stylesheet needs the same measurement: panels sit BELOW the chrome,
-  // and a constant there is how their first line ended up rendering under the
-  // toolbar (96px against a 148px chrome). Published as a CSS variable and
-  // kept current whenever either row changes height. The observer is guarded:
-  // the DOM harness the gates run in has no ResizeObserver, and the floor
-  // default in the stylesheet keeps that environment honest anyway.
+  // Whether the feature buttons are currently in the left strip. Read from
+  // the DOM rather than from a variable so there is one answer: the attribute
+  // IS the layout, and everything else -- the stylesheet, the measurement,
+  // the inset -- keys off it.
+  function sidebarShowing() {
+    return document.documentElement.dataset.toolbarPlacement === "left";
+  }
+  // What the chrome is using down the left edge. Zero unless the sidebar is
+  // showing, and measured rather than assumed for the same reason the height
+  // is: a width in this file would be a claim about padding and icon metrics
+  // that the stylesheet is free to change.
+  function closedChromeLeftPx() {
+    const rail = $("sidebar");
+    if (!sidebarShowing() || !rail) return 0;
+    return Math.ceil(rail.getBoundingClientRect().width);
+  }
+  // The stylesheet needs the same measurements: panels sit BELOW the chrome
+  // and beside the sidebar, and a constant there is how their first line
+  // ended up rendering under the toolbar (96px against a 148px chrome).
+  // Published as CSS variables and kept current whenever a row or the rail
+  // changes size. The observer is guarded: the DOM harness the gates run in
+  // has no ResizeObserver, and the defaults in the stylesheet keep that
+  // environment honest anyway.
   function publishChromeMetric() {
-    document.documentElement.style.setProperty(
-      "--chrome-closed-px",
-      closedChromePx() + "px",
-    );
+    const root = document.documentElement.style;
+    root.setProperty("--chrome-closed-px", closedChromePx() + "px");
+    root.setProperty("--chrome-left-px", closedChromeLeftPx() + "px");
   }
   // Deferred a tick: `$` is declared further down this file, so running the
   // measurement inline here would throw at boot and take the whole chrome
@@ -62,7 +87,7 @@
     publishChromeMetric();
     if (typeof ResizeObserver !== "undefined") {
       const ro = new ResizeObserver(publishChromeMetric);
-      for (const id of ["tabstrip", "toolbar", "bmbar"]) {
+      for (const id of ["tabstrip", "toolbar", "bmbar", "sidebar"]) {
         const el = $(id);
         if (el) ro.observe(el);
       }
@@ -75,9 +100,11 @@
   // Raised from 500 when Toolbar labels became a fourth section: at 500 the
   // new section sat below the fold, and the panel scrolls, so it "worked"
   // while being invisible to anyone who did not think to scroll a settings
-  // card. Sits just under the Rust-side clamp ceiling (120..720 in ipc.rs) and under
-  // the modal max-height, which is viewport-derived.
-  const THEME_OPEN_PX = 700;
+  // card. Raised again when the same section gained the placement row, for
+  // the same reason and with the same test -- open it and look at the
+  // bottom. Sits under the Rust-side clamp ceiling (CHROME_TOP_RANGE in
+  // platform/mod.rs, 80..=800) and under the modal max-height.
+  const THEME_OPEN_PX = 760;
 
   // How long a command may go unanswered before its Promise is rejected.
   //
@@ -132,13 +159,48 @@
         break;
       }
       case "tabs_changed":
-        renderTabs(msg.data && msg.data.items);
+        // Remembered so entering select mode can re-render the strip with
+        // checkboxes immediately instead of waiting for the next
+        // tabs_changed. This event stays the only writer, so there is
+        // still exactly one source of truth for what the strip shows.
+        lastTabItems = (msg.data && msg.data.items) || [];
+        renderTabs(lastTabItems);
         break;
       case "find_open":
         openFindBar();
         break;
+      // Phase 4: an activation or release call finished on its worker;
+      // the row and the toolbar re-read the state from Rust.
+      case "licence_changed":
+        void refreshLicence();
+        break;
       case "find_state":
         onFindState(msg.data);
+        break;
+      // Ctrl+Shift+F, emitted by Rust so it works while a content webview
+      // has focus. Toggled like every other panel: pressing it again while
+      // the panel is open closes it.
+      case "find_tabs_open":
+        togglePanelNamed("findtabs");
+        break;
+      // Always re-render, even with the panel hidden: gating on open would
+      // drop the completion that lands one frame after a close/reopen, and
+      // painting a hidden list costs nothing.
+      case "find_tabs_state":
+        renderFindTabs(msg.data);
+        break;
+      // A goto from the panel started the ordinary find on the now-active
+      // tab, so the ordinary bar takes over the interaction from here.
+      // openFindBar re-sends find_start with the same query, which is
+      // harmless BY CONSTRUCTION: FindSession::on_query returns Ignore for
+      // a repeat of the live query, so no session restarts and no
+      // highlight repaints.
+      case "find_adopt":
+        if (msg.data && typeof msg.data.query === "string") {
+          findInput.value = msg.data.query;
+          openFindBar();
+          if (openPanelName === "findtabs") togglePanelNamed("findtabs");
+        }
         break;
       // Ctrl+L. The key is caught natively (a focused page has no IPC), so
       // the chrome UI only has to move focus when told.
@@ -292,6 +354,35 @@
       case "ocr_result":
         if (window.__rb_ocr) window.__rb_ocr(msg.data || {});
         break;
+      // The region-read capture settled (well or badly). Function-declared
+      // below and hoisted, same file, so no window hook is needed.
+      case "region_capture_ready":
+        onRegionCaptureReady(msg.data || {});
+        break;
+      // A contact asked what WE downloaded, and this browser answered
+      // automatically. Surfaced unconditionally: an automatic reply the
+      // user cannot see is the shape of a backdoor even when it is not one.
+      case "download_compare_request_received":
+        toast(
+          "A contact asked what you downloaded from " +
+            hostOf((msg.data && msg.data.url) || "") +
+            ". Your record's fingerprint was sent back.",
+        );
+        break;
+      case "archive_saved":
+        onArchiveSaved(msg.data || {});
+        break;
+      case "download_compare_verdict":
+        renderCompareVerdict(msg.data || {});
+        break;
+      case "download_compare_note":
+        renderCompareNote(msg.data || {});
+        break;
+      case "download_compare_error":
+        renderCompareNote({
+          reason: (msg.data && msg.data.code) || "bad_message",
+        });
+        break;
       case "downloads_changed":
         if (openPanelName === "library") refreshDownloads();
         break;
@@ -349,6 +440,10 @@
     no_storable_tabs:
       "Nothing to set aside: every tab here is ephemeral or an internal page",
     bad_args: "That does not look right",
+    // Find across tabs is the first premium-gated feature. The panel ALSO
+    // un-hides a standing note on this code -- a toast alone would vanish
+    // and leave the run button looking broken.
+    premium_required: "Find across tabs is a Premium feature.",
     // Site permissions. `bad_origin` is reachable from a real page: an
     // opaque or sandboxed document has no site to attach a permission to, so
     // there is nothing the user could allow even in principle. Say that,
@@ -380,6 +475,24 @@
       "Could not read any text in that picture. A sharper, straighter, better lit one usually works.",
     bad_image:
       "That file is not a picture PATANYX can read. Try a PNG or JPEG.",
+    // The region-read mode's own refusals. Stale is a state, not a fault:
+    // the capture this panel was looking at has been replaced or released,
+    // and capturing again is the whole remedy.
+    // Download corroboration, asking side. Both are about OUR OWN record,
+    // not the contact's: the contact's refusals arrive as notes, worded
+    // separately, because "you have no record of this" and "they have no
+    // record of this" are different sentences and must not share one.
+    no_download: "There is no record of that download to compare.",
+    record_untrusted:
+      "Your own record of this download failed its integrity check, so its fingerprint cannot be trusted. Nothing was sent.",
+    // Deep Recall. Its own sentence rather than a generic "full": the user
+    // can act on this, and the action is to delete something first.
+    archive_full:
+      "Deep Recall is full. Delete a saved page to make room for this one.",
+    region_stale: "That capture expired. Capture the page again.",
+    region_empty: "Drag a rectangle around the text to read.",
+    region_out_of_bounds:
+      "That selection is outside the capture. Drag inside the image.",
     bad_relay_url:
       "The relay address has to start with wss://. Encrypted connections only, so http:// and ws:// are refused.",
     // Every code Rust can return must appear here, or friendly() renders the
@@ -447,6 +560,16 @@
     no_site: "This page has no site to forget.",
     cookie_delete_failed:
       "Could not clear cookies for this site. The engine refused the request; nothing was changed.",
+    // The browser-wide clear's own failures. Separate codes from the per-site
+    // ones above because the sentences differ: "for this site" is false here,
+    // and no_persistent_tab is not a fault at all.
+    cookie_delete_all_failed:
+      "Could not clear cookies. The engine refused the request; nothing was changed.",
+    // Expected, not broken: quarantine tabs keep their cookies in memory and
+    // throw them away when they close, so there is genuinely nothing saved to
+    // clear. Says what to do rather than only what went wrong.
+    no_persistent_tab:
+      "Every open tab is a quarantine tab, and those keep no saved cookies. Open an ordinary tab to clear the saved ones.",
     // Inline credential autofill. no_pending_save fires if Save/Never is
     // clicked twice (e.g. a double click) -- the first click already
     // resolved it, so the second has nothing left to act on.
@@ -588,13 +711,39 @@
     return hostOf(tab.url);
   }
 
+  let lastTabItems = []; // last payload of the tabs_changed event
+
   function renderTabs(items) {
     const wrap = $("tabs");
     wrap.textContent = "";
+    if (tabSelectMode) {
+      // A tab closed since it was ticked must not stay selected: the
+      // count would name tabs that no longer exist and the batch actions
+      // would aim at ids that can only fail.
+      const live = new Set();
+      for (const tab of items || []) live.add(tab.id);
+      for (const id of Array.from(tabSelection)) {
+        if (!live.has(id)) tabSelection.delete(id);
+      }
+    }
     for (const tab of items || []) {
       const chip = el("div", "tab-chip" + (tab.active ? " active" : ""));
       chip.title = tab.title || tab.url || "";
       // Truncation itself is CSS (max-width + ellipsis).
+      if (tabSelectMode) {
+        const tick = document.createElement("input");
+        tick.type = "checkbox";
+        tick.className = "chip-select";
+        tick.checked = tabSelection.has(tab.id);
+        tick.setAttribute("aria-label", "Select " + chipLabel(tab));
+        tick.addEventListener("click", (ev) => ev.stopPropagation());
+        tick.addEventListener("change", () => {
+          if (tick.checked) tabSelection.add(tab.id);
+          else tabSelection.delete(tab.id);
+          renderTabBatchBar();
+        });
+        chip.appendChild(tick);
+      }
       chip.appendChild(el("span", "chip-title", chipLabel(tab)));
       const close = el("button", "chip-close", "\u00D7");
       close.type = "button";
@@ -605,11 +754,188 @@
       });
       chip.appendChild(close);
       chip.addEventListener("click", () => {
+        if (tabSelectMode) {
+          // In select mode the whole chip is the toggle: aiming for a
+          // small checkbox is how ticks get lost, and switching tabs
+          // mid-selection would abandon the set being built.
+          if (tabSelection.has(tab.id)) tabSelection.delete(tab.id);
+          else tabSelection.add(tab.id);
+          const tick = chip.querySelector(".chip-select");
+          if (tick) tick.checked = tabSelection.has(tab.id);
+          renderTabBatchBar();
+          return;
+        }
         if (!tab.active) rb("tab_switch", { id: tab.id }).catch(() => {});
       });
       wrap.appendChild(chip);
     }
+    if (tabSelectMode) renderTabBatchBar();
   }
+
+  // ---- tab multi-select + batch actions (Premium) ----------------------
+  //
+  // Select mode adds a checkbox to every chip and shows #tabbatch-bar
+  // above the strip. Entry is gated server-side by the tabs_batch_enter
+  // arm: what Premium sells here is the multi-select affordance itself,
+  // so the refusal must happen before a single checkbox is drawn, and
+  // Rust must be the one that refuses -- a chrome-side licence check is
+  // text anyone can edit. The batch actions then use the same ungated
+  // arms a free user already drives one tab at a time.
+  let tabSelectMode = false;
+  const tabSelection = new Set(); // tab ids ticked in select mode
+  // One batch at a time: overlapping runs would interleave their writes
+  // and their refreshes and leave the selection decided by whichever
+  // finished last.
+  let tabBatchBusy = false;
+
+  async function toggleTabSelectMode() {
+    if (tabSelectMode) {
+      // Leaving select mode mid-batch would clear the selection the batch
+      // is still working through; the bar's Cancel honors the same rule.
+      if (tabBatchBusy) return;
+      exitTabSelectMode();
+      return;
+    }
+    // LEAVING mode is never gated: a lapse mid-session must not strand the
+    // user inside a mode they cannot exit. Entering re-reads the licence for
+    // the same reason regionStart does.
+    await refreshPremium();
+    if (premiumBlocked()) return;
+    try {
+      await rb("tabs_batch_enter", {});
+    } catch (e) {
+      if (e && e.message === "premium_required") {
+        toast("Selecting several tabs at once is a Premium feature.", true);
+      } else {
+        toast(friendly(e), true);
+      }
+      return;
+    }
+    tabSelectMode = true;
+    $("btn-tabselect").setAttribute("aria-pressed", "true");
+    renderTabBatchBar();
+    renderTabs(lastTabItems);
+  }
+
+  function exitTabSelectMode() {
+    tabSelectMode = false;
+    tabSelection.clear();
+    $("btn-tabselect").setAttribute("aria-pressed", "false");
+    renderTabBatchBar();
+    renderTabs(lastTabItems);
+  }
+
+  function renderTabBatchBar() {
+    const bar = $("tabbatch-bar");
+    if (!bar) return;
+    if (bar.hidden === tabSelectMode) {
+      // The strip grew or shrank by the bar's height, and the content
+      // webview must be told before anything paints under it -- the find
+      // bar and the banners live by the same contract.
+      bar.hidden = !tabSelectMode;
+      syncChromeInsets();
+    }
+    if (!tabSelectMode) return;
+    $("tabbatch-count").textContent =
+      tabSelection.size +
+      (tabSelection.size === 1 ? " tab selected" : " tabs selected");
+    const idle = !tabBatchBusy && tabSelection.size > 0;
+    $("tabbatch-close").disabled = !idle;
+    $("tabbatch-bookmark").disabled = !idle;
+    $("tabbatch-shelf").disabled = !idle;
+    $("tabbatch-cancel").disabled = tabBatchBusy;
+  }
+
+  /// Runs one operation over every ticked tab, in order, and reports
+  /// honestly -- the bookmark manager's runBatch contract applied to
+  /// tabs. A partial failure keeps ONLY the failed ids ticked, so the
+  /// user can see what did not happen and try again on exactly those.
+  /// Returns the failed ids.
+  async function runTabBatch(ids, op) {
+    if (tabBatchBusy) return ids.slice(); // buttons disable while busy
+    tabBatchBusy = true;
+    renderTabBatchBar();
+    const failed = [];
+    for (const id of ids) {
+      try {
+        await op(id);
+      } catch (_) {
+        failed.push(id);
+      }
+    }
+    tabSelection.clear();
+    for (const id of failed) tabSelection.add(id);
+    tabBatchBusy = false;
+    if (failed.length) {
+      toast(
+        failed.length + " of " + ids.length + " could not be changed.",
+        true,
+      );
+    }
+    renderTabBatchBar();
+    renderTabs(lastTabItems);
+    return failed;
+  }
+
+  $("btn-tabselect").addEventListener("click", toggleTabSelectMode);
+
+  $("tabbatch-close").addEventListener("click", async () => {
+    const ids = Array.from(tabSelection);
+    if (!ids.length || tabBatchBusy) return;
+    const ok = await askConfirm(
+      "Close " + ids.length + (ids.length === 1 ? " tab?" : " tabs?"),
+    );
+    if (!ok) return;
+    const failed = await runTabBatch(ids, (id) => rb("tab_close", { id }));
+    // A clean close empties the set it worked on, so the mode has nothing
+    // left to do; a partial failure keeps the failed ids ticked instead.
+    if (!failed.length) exitTabSelectMode();
+  });
+
+  $("tabbatch-bookmark").addEventListener("click", () => {
+    const ids = Array.from(tabSelection);
+    if (!ids.length || tabBatchBusy) return;
+    const byId = new Map();
+    for (const tab of lastTabItems) byId.set(tab.id, tab);
+    // The mode stays open on purpose: nothing was closed, and "bookmark,
+    // then close" is the sequence this button exists for. bookmark_add's
+    // typed-url path normalizes and refuses non-content urls itself, so
+    // an internal page in the selection fails its own bookmark honestly.
+    runTabBatch(ids, (id) => {
+      const tab = byId.get(id);
+      if (!tab) return Promise.reject(new Error("not_found"));
+      return rb("bookmark_add", { url: tab.url, title: tab.title || "" });
+    });
+  });
+
+  $("tabbatch-shelf").addEventListener("click", async () => {
+    const ids = Array.from(tabSelection);
+    if (!ids.length || tabBatchBusy) return;
+    tabBatchBusy = true;
+    renderTabBatchBar();
+    try {
+      const res = await rb("shelf_create", { ids });
+      tabBatchBusy = false;
+      if (res && res.left_out) {
+        toast(
+          res.left_out +
+            (res.left_out === 1 ? " tab was" : " tabs were") +
+            " not set aside: ephemeral and internal tabs are never shelved.",
+          true,
+        );
+      }
+      exitTabSelectMode();
+    } catch (e) {
+      tabBatchBusy = false;
+      renderTabBatchBar();
+      toast(friendly(e), true);
+    }
+  });
+
+  $("tabbatch-cancel").addEventListener("click", () => {
+    if (tabBatchBusy) return;
+    exitTabSelectMode();
+  });
 
   // ---- the browser's own confirmation ---------------------------------------
   //
@@ -814,14 +1140,44 @@
   // a zero rect and the scrim is solid, because siblings that cannot
   // composite must not fake a see-through.
   let chromeCovered = null;
-  rb("chrome_caps", {})
-    .then((r) => {
-      document.body.classList.toggle(
-        "translucent-backdrop",
-        !!(r && r.translucent_overlay),
-      );
-    })
-    .catch(() => {});
+  // One round trip carrying everything the chrome must know before it paints.
+  //
+  // `page_covers_chrome` is the other half of the backdrop question above,
+  // and it decides how tall a modal card may be: where the chrome is NOT
+  // lifted, the page covers everything the chrome is not using, so a card
+  // sized against the viewport extends underneath it and its lower half is
+  // simply not on screen -- with no scrollbar, because as far as the
+  // document is concerned it fits.
+  //
+  // `toolbar_placement` rides along for a plainer reason: a second round
+  // trip for it would mean a Left user watches the top layout assemble and
+  // then rearrange itself. Falls back to its own get if a reply arrives
+  // without it.
+  function refreshChromeCaps() {
+    return rb("chrome_caps", {})
+      .then((r) => {
+        document.body.classList.toggle(
+          "translucent-backdrop",
+          !!(r && r.translucent_overlay),
+        );
+        document.body.classList.toggle(
+          "page-covers-chrome",
+          !!(r && r.page_covers_chrome),
+        );
+        // Whether the accent reaches the scrollbars of pages ("live" on
+        // WebView2; "unsupported" on WebKitGTK, which has no
+        // scrollbar-color). The sentence is shown only where it is true,
+        // rather than worded loosely enough to be true everywhere.
+        const note = $("accent-scrollbar-note");
+        if (note) note.hidden = !(r && r.page_scrollbar === "live");
+        if (r && TOOLBAR_PLACEMENTS.includes(r.toolbar_placement)) {
+          wearToolbarPlacement(r.toolbar_placement);
+          return;
+        }
+        return refreshToolbarPlacement();
+      })
+      .catch(() => refreshToolbarPlacement());
+  }
   function syncChromeCoverage() {
     const want = !!openPanelName;
     if (want === chromeCovered) return;
@@ -898,10 +1254,10 @@
     // before it: on GTK this message is the only thing that actually resizes
     // the chrome, and closing a panel resets the height Rust remembers. See
     // the comment in syncChromeCoverage for the defect this prevents.
-    // `syncChromeHeight` reads `openPanelName`, which is already updated
+    // `syncChromeInsets` reads `openPanelName`, which is already updated
     // here, so it resolves the panel's height when opening and the
     // banner-aware strip height when closing.
-    syncChromeHeight();
+    syncChromeInsets();
   }
 
   // ---- panel zoom -------------------------------------------------------
@@ -1001,7 +1357,7 @@
     findPrevBtn.disabled = !available;
     findNextBtn.disabled = !available;
     findUnsupported.hidden = available;
-    syncChromeHeight();
+    syncChromeInsets();
   }
 
   async function findSend(query) {
@@ -1021,7 +1377,7 @@
       // Same contract as the banners: the strip grew, so the content webview
       // must be told before anything paints under the bar. Reopening an
       // already-open bar skips this -- nothing changed size.
-      syncChromeHeight();
+      syncChromeInsets();
     }
     findInput.focus();
     findInput.select();
@@ -1038,7 +1394,7 @@
     findBar.hidden = true;
     // The strip shrank back; skipping this leaves a dead band above the
     // page, which is exactly the clipping bug the banners already fixed.
-    syncChromeHeight();
+    syncChromeInsets();
     findCount.textContent = "";
     rb("find_stop", {}).catch(() => {});
   }
@@ -1083,6 +1439,237 @@
     // where they are unit-tested, never here.
     if (typeof data.text === "string") findCount.textContent = data.text;
   }
+
+  // ---- find across tabs panel ----
+  // The cross-tab counterpart of the bar above, held to the same honesty
+  // rules one level up. Rust words EVERYTHING the list says -- counts come
+  // from find::format_count, refusals from tab_search::reason_copy -- and
+  // the chrome renders both verbatim, never wording a count or a reason
+  // itself. The list is built with el() and textContent only, never
+  // markup parsing (gate 2): snippet text is page content, and page content in
+  // the trusted chrome document must never be parsed as markup.
+  const findtabsQuery = $("findtabs-query");
+  const findtabsRun = $("findtabs-run");
+  const findtabsNote = $("findtabs-note");
+  const findtabsPremium = $("findtabs-premium");
+  const findtabsProgress = $("findtabs-progress");
+  const findtabsList = $("findtabs-list");
+  const findtabsEmpty = $("findtabs-empty");
+  const findtabsLocked = $("findtabs-locked");
+  // The standing text lives in index.html; captured once so every render
+  // can rebuild the note and re-append (or drop) the quarantine line
+  // without duplicating it. Normalized so reflowing the markup cannot
+  // change what renders.
+  const findtabsNoteText = findtabsNote.textContent.replace(/\s+/g, " ").trim();
+  // Rust's snippet offsets are UTF-8 BYTE offsets; JS string indexing is
+  // UTF-16 code units. Slicing the string at those numbers would bold the
+  // wrong span in any snippet with a non-ASCII character before the match
+  // (and could split a surrogate pair), so the text is encoded ONCE and
+  // the three pieces are sliced as bytes and decoded back.
+  const findtabsEncoder = new TextEncoder();
+  const findtabsDecoder = new TextDecoder();
+
+  function findtabsSnippetLine(snip) {
+    const bytes = findtabsEncoder.encode((snip && snip.text) || "");
+    // Clamped rather than trusted: slice() reads a negative index as
+    // from-the-end, so a bad offset would bold the WRONG text quietly.
+    const start = Math.min(
+      Math.max(0, (snip && snip.start) || 0),
+      bytes.length,
+    );
+    const end = Math.min(
+      Math.max(start, (snip && snip.end) || 0),
+      bytes.length,
+    );
+    const line = el("button", "findtabs-snippet");
+    line.type = "button";
+    line.appendChild(
+      document.createTextNode(findtabsDecoder.decode(bytes.slice(0, start))),
+    );
+    line.appendChild(
+      el("b", null, findtabsDecoder.decode(bytes.slice(start, end))),
+    );
+    line.appendChild(
+      document.createTextNode(findtabsDecoder.decode(bytes.slice(end))),
+    );
+    return line;
+  }
+
+  function renderFindTabs(data) {
+    data = data || {};
+    const rows = Array.isArray(data.rows) ? data.rows : [];
+    const scanning = !!data.scanning;
+    const locked = !!data.locked;
+
+    // A locked vault ended the scan server-side along with it. Every
+    // control state here is assigned from the snapshot on every render, so
+    // a later unlocked snapshot re-enables the box and button on its own --
+    // there is no separate "unlock" path to keep in step.
+    findtabsLocked.hidden = !locked;
+    findtabsQuery.disabled = locked;
+    findtabsRun.disabled = locked;
+    if (locked) {
+      findtabsList.textContent = "";
+      findtabsProgress.textContent = "";
+      findtabsEmpty.hidden = true;
+      findtabsNote.textContent = findtabsNoteText;
+      syncChromeInsets();
+      return;
+    }
+
+    // Rebuilt wholesale on every snapshot. Clearing via textContent is the
+    // only node removal here -- nothing is ever parsed as markup.
+    findtabsList.textContent = "";
+    for (const row of rows) {
+      const item = el("li", "findtabs-row");
+      // The host is parsed, never trusted: about:blank, an internal page,
+      // or a closed tab's empty url all fail new URL, and the header
+      // simply shows no host.
+      let host = "";
+      try {
+        host = new URL(row.url || "").host;
+      } catch (_) {
+        // No host to show.
+      }
+      // Rust already writes "Closed tab" into the title of a row whose tab
+      // is gone, so the title renders VERBATIM: an empty title on a live
+      // page is a page with no title, never evidence the tab closed. The
+      // fallback mirrors chipLabel: the host if there is one, else the
+      // same "New tab" wording the strip uses.
+      const title = row.title || host || "New tab";
+      let status = "";
+      if (row.state === "pending") status = "Searching...";
+      else if (row.state === "done" && typeof row.text === "string")
+        status = row.text;
+      else if (row.state === "unsearchable" && typeof row.reason === "string")
+        status = row.reason;
+      item.appendChild(
+        el(
+          "p",
+          "findtabs-head",
+          (host ? title + " (" + host + ")" : title) + ": " + status,
+        ),
+      );
+      // The click handler lives ONLY on snippet lines, and only a done row
+      // has snippets: a pending or unsearchable row can do nothing, so it
+      // gets no handler at all -- not a no-op one.
+      if (row.state === "done" && Array.isArray(row.snippets)) {
+        for (const snip of row.snippets) {
+          const line = findtabsSnippetLine(snip);
+          line.addEventListener("click", () => {
+            // The SNAPSHOT's query, not the box's -- the user may have
+            // edited the box since this scan ran, and Rust hands this
+            // query to the engine's find on the now-active tab.
+            rb("find_tabs_goto", { id: row.id, query: data.query || "" }).catch(
+              (e) => toast(friendly(e), true),
+            );
+          });
+          item.appendChild(line);
+        }
+      }
+      findtabsList.appendChild(item);
+    }
+
+    if (scanning) {
+      const settled = rows.filter((row) => row.state !== "pending").length;
+      findtabsProgress.textContent =
+        "Searched " + settled + " of " + rows.length + " tabs.";
+    } else {
+      findtabsProgress.textContent = "";
+    }
+
+    // rows.length > 0 because "every row is done" is vacuously true of an
+    // empty list, and an empty list means NO scan has run (a search with
+    // nothing to scan is refused with no_tab) -- claiming no tab contains
+    // a query that was never searched for would be a lie.
+    findtabsEmpty.hidden = !(
+      !scanning &&
+      rows.length > 0 &&
+      rows.every((row) => row.state === "done") &&
+      rows.every((row) => (row.count || 0) === 0)
+    );
+
+    // The quarantine line is appended to the standing note, never edited
+    // into it, so rebuilding from the captured text keeps re-renders
+    // idempotent.
+    findtabsNote.textContent = findtabsNoteText;
+    const skipped = data.skipped_quarantine || 0;
+    if (skipped > 0) {
+      findtabsNote.appendChild(el("br"));
+      findtabsNote.appendChild(
+        document.createTextNode(
+          skipped === 1
+            ? "1 quarantine tab is not searched."
+            : skipped + " quarantine tabs are not searched.",
+        ),
+      );
+    }
+
+    // Same trap the find bar documents: anything that can change the
+    // panel's height rides the sync, or content paints clipped.
+    syncChromeInsets();
+  }
+
+  async function findtabsSearch() {
+    const query = findtabsQuery.value;
+    // No client-side validation on purpose: Rust's check_query is the one
+    // authority on what a searchable query is, and its bad_args refusal
+    // surfaces through the same toast every other refusal uses. A silent
+    // return here would be exactly the broken-looking control the premium
+    // note exists to prevent.
+    try {
+      // The reply IS the first snapshot -- every row pending -- in the
+      // same shape the find_tabs_state events carry, so one renderer
+      // serves the first paint and every later update.
+      const first = await rb("find_tabs_search", { query });
+      // A search that ran proves premium is active; the note would be a
+      // stale accusation from here on.
+      findtabsPremium.hidden = true;
+      renderFindTabs(first);
+    } catch (e) {
+      if (e && e.message === "premium_required") {
+        // The control stays put -- a control that silently disappears is
+        // indistinguishable from a broken one -- and the note says why it
+        // refused.
+        findtabsPremium.hidden = false;
+        syncChromeInsets();
+      }
+      toast(friendly(e), true);
+    }
+  }
+
+  findtabsQuery.addEventListener("keydown", (ev) => {
+    if (ev.key !== "Enter") return;
+    ev.preventDefault();
+    findtabsSearch();
+  });
+  findtabsRun.addEventListener("click", findtabsSearch);
+  // The panel's own close control (see the markup comment: shipping one
+  // keeps the query box the first focusable, so the manager's deferred
+  // focus lands on it).
+  $("findtabs-close").addEventListener("click", () =>
+    togglePanelNamed("findtabs"),
+  );
+
+  // The registerPanel button lives INSIDE the find bar rather than on the
+  // toolbar -- the palette is the precedent for a panel with no pill,
+  // reachable from the bar's "All tabs" button and from Ctrl+Shift+F.
+  // toolbar-gate's MUST_BE_VISIBLE list is hand-kept, so adding no toolbar
+  // button means no gate change.
+  registerPanel("findtabs", {
+    el: $("findtabs-panel"),
+    button: $("find-all"),
+    heightPx: 520,
+    onOpen: () => findtabsQuery.focus(),
+    // Deliberately no onClose: there is no find_tabs_stop command to send.
+    // The scan holds no engine sessions and paints no highlights -- only a
+    // goto starts one, on the chosen tab, and the ordinary find bar owns
+    // that session -- so closing the panel has nothing server-side to
+    // undo. A new search replaces the scan wholesale and a vault lock
+    // drops it; a stop's only job would be cancelling tokens that Rust
+    // already refuses by scan id.
+  });
+
   /// Keep Tab inside an open panel.
   ///
   /// Escape and the scrim already closed a panel, and focus already returned
@@ -1148,10 +1735,17 @@
       // descendant, so without this every click inside it -- including
       // Cancel -- read as a click outside the panel and closed the panel out
       // from under the question it was asking.
+      //
+      // #sidebar is exempt because in the left layout it IS the toolbar. The
+      // buttons move into it, so without this a press on a feature button
+      // would close the open panel before the click reached the button --
+      // running its onClose, which clears vault secrets and wipes a chat
+      // transcript -- and the click would then reopen it. Same button, twice
+      // the work, and one of the two panels loses state doing it.
       if (
         panel &&
         !panel.el.contains(ev.target) &&
-        !ev.target.closest("#toolbar, #tabstrip, #confirm-overlay")
+        !ev.target.closest("#toolbar, #sidebar, #tabstrip, #confirm-overlay")
       ) {
         closeOpenPanel();
       }
@@ -1556,7 +2150,7 @@
     const banner = $("save-password-banner");
     if (banner && !banner.hidden) {
       banner.hidden = true;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -1574,7 +2168,7 @@
       "?";
     if (banner.hidden) {
       banner.hidden = false;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -1667,6 +2261,12 @@
     { label: "About this site", buttonId: "btn-site-info" },
     { label: "Save page as PDF", buttonId: "btn-save-pdf" },
     { label: "About PATANYX", buttonId: "btn-about" },
+    // Premium tab-pack entries. Their buttons are hidden literals in
+    // index.html (the gate resolves ids there), and the premium refusal
+    // happens server-side when the clicked surface asks Rust -- the
+    // palette rows stay visible so the features are discoverable.
+    { label: "Switch tab...", buttonId: "btn-switcher" },
+    { label: "Select tabs...", buttonId: "btn-tabselect" },
   ];
   const PALETTE_OPEN_PX = 420;
   let paletteMatches = [];
@@ -1756,6 +2356,149 @@
       paletteReturnFocus = null;
     },
   });
+  // ---- tab switcher (Premium) ------------------------------------------
+  //
+  // A palette-shaped panel over the open tabs. Entry is the palette's
+  // "Switch tab..." action -- which clicks the hidden #btn-switcher, ids
+  // resolved from index.html exactly as the palette gate requires -- or a
+  // programmatic togglePanelNamed("switcher"). The list comes from the
+  // gated tabs_switcher_list arm: the gate lives in Rust because a
+  // chrome-side licence check is text anyone can edit, and it cannot sit
+  // on tab_list because the tab strip, which is not Premium, reads that
+  // arm.
+  const switcherQuery = $("switcher-query");
+  const switcherList = $("switcher-list");
+  const switcherEmpty = $("switcher-empty");
+  const switcherPremium = $("switcher-premium");
+  let switcherRows = []; // rows from the last tabs_switcher_list reply
+  let switcherMatches = []; // rows passing the live query, ranked
+  let switcherSelected = 0; // index into switcherMatches
+  // Bumped on every open. A reply or refusal quoting an older opening is
+  // dropped: open -> close -> reopen leaves the first request in flight,
+  // and openPanelName alone cannot tell the two openings apart, so a
+  // stale reply could paint old rows (or a stale refusal) into the new
+  // panel.
+  let switcherOpenGen = 0;
+
+  registerPanel("switcher", {
+    el: $("switcher-panel"),
+    button: $("btn-switcher"),
+    heightPx: PALETTE_OPEN_PX, // palette-shaped, palette-sized
+    onOpen: openSwitcher,
+  });
+
+  function openSwitcher() {
+    const gen = ++switcherOpenGen;
+    switcherRows = [];
+    switcherMatches = [];
+    switcherSelected = 0;
+    switcherQuery.value = "";
+    switcherList.textContent = "";
+    switcherEmpty.hidden = true;
+    switcherPremium.hidden = true;
+    // Show the panel's standing locked notice immediately rather than
+    // asking for a list that will be refused; the panel stays open and
+    // explains, which is the rule an empty list would break.
+    if (!premiumState.premium) {
+      switcherPremium.hidden = false;
+      syncChromeInsets();
+      return;
+    }
+    rb("tabs_switcher_list", {})
+      .then((res) => {
+        if (gen !== switcherOpenGen || openPanelName !== "switcher") return;
+        switcherRows = (res && Array.isArray(res.items) && res.items) || [];
+        renderSwitcherRows();
+        switcherQuery.focus();
+      })
+      .catch((e) => {
+        if (gen !== switcherOpenGen || openPanelName !== "switcher") return;
+        if (e && e.message === "premium_required") {
+          // The refusal is a state the panel shows, never an empty list
+          // that reads as "you have no tabs".
+          switcherPremium.hidden = false;
+          syncChromeInsets();
+        } else {
+          toast(friendly(e), true);
+        }
+      });
+  }
+
+  function renderSwitcherRows() {
+    switcherList.textContent = "";
+    const query = switcherQuery.value.trim();
+    let ranked;
+    if (!query) {
+      ranked = switcherRows.slice(); // strip order, as Rust listed it
+    } else {
+      // Title and address are the two things a person remembers about a
+      // tab; the better of the two scores wins, same rule as bookmarks.
+      const scored = [];
+      for (const row of switcherRows) {
+        const byTitle = fuzzyScore(query, String(row.title || ""));
+        const byUrl = fuzzyScore(query, String(row.url || ""));
+        let best = null;
+        for (const score of [byTitle, byUrl]) {
+          if (score !== null && (best === null || score > best)) best = score;
+        }
+        if (best !== null) scored.push({ row, score: best });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      ranked = scored.map((entry) => entry.row);
+    }
+    switcherMatches = ranked;
+    if (switcherSelected >= ranked.length) switcherSelected = ranked.length - 1;
+    if (switcherSelected < 0) switcherSelected = 0;
+    switcherEmpty.hidden = ranked.length !== 0;
+    ranked.forEach((row, i) => {
+      const li = el(
+        "li",
+        "switcher-row" + (i === switcherSelected ? " selected" : ""),
+      );
+      li.setAttribute("role", "option");
+      li.setAttribute(
+        "aria-selected",
+        i === switcherSelected ? "true" : "false",
+      );
+      li.appendChild(el("span", "switcher-title", chipLabel(row)));
+      li.appendChild(el("span", "switcher-url", row.url || ""));
+      li.addEventListener("click", () => activateSwitcherRow(i));
+      switcherList.appendChild(li);
+    });
+  }
+
+  function activateSwitcherRow(index) {
+    const row = switcherMatches[index];
+    if (!row) return;
+    rb("tab_switch", { id: row.id }).catch((e) => toast(friendly(e), true));
+    if (openPanelName === "switcher") togglePanelNamed("switcher");
+  }
+
+  switcherQuery.addEventListener("input", () => {
+    switcherSelected = 0;
+    renderSwitcherRows();
+  });
+
+  // The palette's keyboard contract, mirrored exactly: arrows WRAP around
+  // the ends (the palette moves by modulo, not by clamping) and Enter
+  // activates the selected row.
+  switcherQuery.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (!switcherMatches.length) return;
+      const step = ev.key === "ArrowDown" ? 1 : -1;
+      switcherSelected =
+        (switcherSelected + step + switcherMatches.length) %
+        switcherMatches.length;
+      renderSwitcherRows();
+      const sel = switcherList.querySelector(".selected");
+      if (sel && sel.scrollIntoView) sel.scrollIntoView({ block: "nearest" });
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      activateSwitcherRow(switcherSelected);
+    }
+  });
+
   $("palette-query").addEventListener("input", (ev) => {
     renderPaletteMatches(ev.target.value);
   });
@@ -1809,6 +2552,11 @@
     button: $("btn-privacy"),
     heightPx: PRIVACY_OPEN_PX,
     onOpen: () => {
+      // A destructive control must never be found already confirming, and a
+      // "cleared" line from a previous visit must not greet a fresh open as
+      // though something just happened. Both are reset before the refresh.
+      $("forget-all-confirm").hidden = true;
+      $("forget-all-result").hidden = true;
       refreshPrivacy();
     },
   });
@@ -1970,7 +2718,7 @@
       banner.hidden = !show;
       // The chrome is a clipped strip; a (dis)appearing banner changes the
       // height Rust must be told about, same as every other banner.
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -2092,6 +2840,103 @@
     }
   }
 
+  // ---- per-site Fingerprint Divergence, and the proof ---------------------
+  //
+  // Two honest limits the copy must keep, and this code must not undermine:
+  //
+  //   1. A CHOICE REACHES THE NEXT TAB, not this one. Neither engine can
+  //      re-register scripts on a live view, so flipping the switch cannot
+  //      change what the page in front of you already got. The switch says
+  //      so, and the proof line below shows what THIS tab actually got,
+  //      which is how the two stay distinguishable.
+  //   2. THE PROOF IS ABOUT REGISTRATION. It reports that the script was
+  //      installed with a given profile, not that any site was fooled. Only
+  //      the live test page can show the second thing, which is why the
+  //      button opens it rather than this panel claiming it.
+
+  let divergenceHost = "";
+
+  async function refreshDivergenceSite() {
+    const section = $("divergence-site");
+    try {
+      const proof = await rb("divergence_proof_get");
+      divergenceHost = proof.host || "";
+      $("dv-premium").hidden = true;
+      section.hidden = false;
+      $("dv-host").textContent = divergenceHost
+        ? "This tab is on " + divergenceHost + "."
+        : "This tab is not on a website.";
+      $("dv-off").checked = !!proof.off_for_this_site;
+      $("dv-off").disabled = !divergenceHost;
+      // Observed, never inferred from the pref: a tab opened before the
+      // pref last changed still carries what it was built with.
+      if (!proof.enabled_globally) {
+        $("dv-proof").textContent =
+          "Fingerprint Divergence is switched off, so this tab was given no noise.";
+      } else if (proof.registered) {
+        $("dv-proof").textContent =
+          "This tab was given divergence for " +
+          (proof.surfaces || []).join(", ") +
+          ". That is what was installed in it, not proof that a site was fooled.";
+      } else {
+        $("dv-proof").textContent =
+          "This tab was given no divergence. A tab keeps whatever it started with, so a change made since it opened is not in it.";
+      }
+      const list = await rb("divergence_sites_list");
+      const off = (list.items || []).filter((i) => i.off).map((i) => i.host);
+      $("dv-list").textContent = off.length
+        ? "Switched off for: " + off.join(", ")
+        : "No site has it switched off.";
+    } catch (e) {
+      if (e && e.message === "premium_required") {
+        // The section stays VISIBLE and explains itself. Hiding it would
+        // make a Premium feature indistinguishable from one that does not
+        // exist.
+        section.hidden = false;
+        $("dv-premium").hidden = false;
+        $("dv-off").disabled = true;
+        $("dv-host").textContent = "";
+        $("dv-list").textContent = "";
+        $("dv-proof").textContent = "";
+        return;
+      }
+      section.hidden = true;
+    }
+  }
+
+  $("dv-off").addEventListener("change", async () => {
+    if (!divergenceHost) return;
+    await refreshPremium();
+    if (premiumBlocked()) {
+      $("dv-off").checked = !$("dv-off").checked;
+      $("dv-premium").hidden = false;
+      return;
+    }
+    try {
+      await rb("divergence_site_set", {
+        host: divergenceHost,
+        off: $("dv-off").checked,
+      });
+    } catch (e) {
+      $("dv-off").checked = !$("dv-off").checked;
+      toast(friendly(e), true);
+    }
+    await refreshDivergenceSite();
+  });
+
+  $("dv-prove").addEventListener("click", async () => {
+    // The live test page computes its badges in whatever browser opens it,
+    // with nothing hardcoded. That is the only thing that can show a site
+    // being fooled, and it is deliberately not a claim this panel makes.
+    try {
+      await rb("tab_new", {
+        url: "https://patanyx.net/fingerprint-divergence/test/",
+      });
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+  });
+
   async function refreshPrivacy() {
     try {
       applyPrivacyStatus(await rb("privacy_get"));
@@ -2099,8 +2944,52 @@
       $("privacy-foot").textContent = friendly(e);
     }
     await refreshFingerprint();
+    await refreshDivergenceSite();
     await refreshPermissions();
   }
+
+  // ---- clear cookies for every site -------------------------------------
+  //
+  // The browser-wide counterpart to "Forget this site". Same three-step shape
+  // as that control -- click, confirm, act -- and deliberately the same shape
+  // rather than the shared askConfirm() dialog: this one has to show a warning
+  // Rust wrote, and askConfirm takes a single message string.
+  //
+  // The result line is CLEARED whenever the confirm is reopened, so a "cleared"
+  // notice from an earlier click can never sit under a fresh confirmation and
+  // read as though it belongs to it.
+
+  function closeForgetAll() {
+    $("forget-all-confirm").hidden = true;
+  }
+
+  $("btn-forget-all-cookies").addEventListener("click", () => {
+    $("forget-all-result").hidden = true;
+    $("forget-all-confirm").hidden = false;
+  });
+  $("forget-all-cancel").addEventListener("click", closeForgetAll);
+  $("forget-all-yes").addEventListener("click", async () => {
+    const btn = $("forget-all-yes");
+    btn.disabled = true;
+    try {
+      const data = await rb("cookies_forget_all");
+      closeForgetAll();
+      // Written from the REPLY, never from the click, and worded by Rust
+      // (cookie_control::cleared_line). The fallback is only for a reply that
+      // somehow arrives without one; it says the same thing rather than
+      // inventing a second, looser claim.
+      $("forget-all-result").hidden = false;
+      $("forget-all-result").textContent =
+        data.message || "Cookies cleared for every site.";
+    } catch (e) {
+      // The confirm stays OPEN on failure. Nothing was cleared, so closing it
+      // would leave the panel looking exactly like the success case with only
+      // a toast to tell them apart.
+      toast(friendly(e), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
 
   // ---- site permissions -----------------------------------------------------
   // Deny-by-default, session-only. Rendered from permission_status rather than
@@ -2211,6 +3100,25 @@
     for (const t of PRIVACY_TOGGLES) {
       $(t.id).checked = !!st[t.key];
     }
+
+    // The browser-wide cookie control's wording, written verbatim from what
+    // Rust sent (state.rs's privacy_status, worded by cookie_control). Every
+    // one of these elements is empty in index.html, so there is no second,
+    // unchecked set of words here to drift from the Rust one.
+    //
+    // Written UNCONDITIONALLY, empty string included, rather than under an
+    // `if (st.forget_all)`. A reply that arrives without the copy is a Rust
+    // bug, and the guard would hide it in the worst possible way: the section
+    // keeps whatever a PREVIOUS reply put there, so a warning could outlive
+    // the payload it came from and describe a version of the feature that is
+    // no longer what the button does. Blank is legible and safe; stale is
+    // neither.
+    const copy = st.forget_all || {};
+    $("pv-forget-all-desc").textContent = copy.intro || "";
+    $("btn-forget-all-cookies").textContent = copy.button || "";
+    $("forget-all-warn").textContent = copy.warning || "";
+    $("forget-all-yes").textContent = copy.confirm || "";
+    $("forget-all-cancel").textContent = copy.cancel || "";
 
     // A protection this engine cannot enforce is shown, disabled, and
     // explained. Hiding it would misrepresent the product; leaving it live
@@ -2425,7 +3333,7 @@
     const banner = $("lock-warning");
     if (banner && !banner.hidden) {
       banner.hidden = true;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -2446,7 +3354,7 @@
     paint();
     if (banner.hidden) {
       banner.hidden = false;
-      syncChromeHeight();
+      syncChromeInsets();
     }
     if (lockCountdown) clearInterval(lockCountdown);
     lockCountdown = setInterval(() => {
@@ -2621,7 +3529,92 @@
     $("premium-confirm").hidden = true;
   }
 
+  // ---- Premium controls in the toolbar ------------------------------------
+  //
+  // A gated control renders LOCKED rather than looking ordinary and refusing
+  // after the click. Marked in the markup with data-premium, so a new Premium
+  // control is covered by adding the attribute and nothing here changes.
+  //
+  // THE STATE THAT MATTERS IS "locked". The licence session dies with the
+  // vault, so a paying customer whose vault is closed reads as no-licence to
+  // the GATE, which is correct and fail-closed. Saying "upgrade" to that
+  // person would be telling someone to buy what they already own, so the
+  // locked vault gets its own sentence.
+  //
+  // Nothing is for sale before launch, so `on_sale` decides whether the
+  // wording may point at a purchase at all.
+  let premiumState = { state: "locked", premium: false, on_sale: false };
+
+  function premiumLockNote(st) {
+    if (st.state === "locked") {
+      return "Unlock your vault to use Premium features.";
+    }
+    // Phase 4: paid and ACTIVE, but not activated on THIS device. Never a
+    // purchase prompt (they already paid); the Vault panel says why.
+    if (st.state === "unactivated") {
+      return "Premium is not activated on this device yet. Open the Vault panel to activate it.";
+    }
+    if (!st.on_sale) {
+      return "A Premium feature, arriving the day Premium launches.";
+    }
+    return st.state === "lapsed"
+      ? "Your Premium has ended. Renew to use this again."
+      : "A Premium feature. Upgrade to Premium to use it.";
+  }
+
+  // Each control's OWN description, captured from the markup once, before any
+  // lock note can overwrite a title. Capturing lazily at first lock instead
+  // made the saved value depend on when the first lock happened, so a title
+  // set while locked could be restored over the real one. Markup is the
+  // single source for this wording, so read it once and never again.
+  for (const el of document.querySelectorAll("[data-premium]")) {
+    el.setAttribute("data-premium-title", el.getAttribute("title") || "");
+  }
+
+  function applyPremiumState(st) {
+    premiumState = st;
+    const note = premiumLockNote(st);
+    for (const el of document.querySelectorAll("[data-premium]")) {
+      if (st.premium) {
+        el.classList.remove("premium-locked");
+        el.removeAttribute("aria-disabled");
+        // Restore the control's own description, captured above.
+        const own = el.getAttribute("data-premium-title");
+        if (own !== null) el.setAttribute("title", own);
+      } else {
+        el.classList.add("premium-locked");
+        // aria-disabled, NOT the disabled property: a disabled button cannot
+        // be focused or clicked, so a keyboard user could not reach it to
+        // find out WHY it is unavailable. It stays reachable and explains.
+        el.setAttribute("aria-disabled", "true");
+        el.setAttribute("title", note);
+      }
+    }
+  }
+
+  // Returns true when the click was swallowed by the lock. Every gated
+  // control calls this FIRST; the Rust arm still gates independently, so a
+  // chrome that forgot this cannot actually unlock anything.
+  function premiumBlocked() {
+    if (premiumState.premium) return false;
+    toast(premiumLockNote(premiumState));
+    return true;
+  }
+
+  async function refreshPremium() {
+    try {
+      applyPremiumState(await rb("premium_status"));
+    } catch {
+      // An unreadable state must not unlock the toolbar: leave whatever is
+      // rendered, which starts locked.
+    }
+  }
+
   async function refreshLicence() {
+    // Every path that renders the Premium row is also a path where the
+    // licence may have just changed (unlock, paste, remove), so the toolbar
+    // is refreshed from the same place rather than from three call sites.
+    refreshPremium();
     const row = $("premium-row");
     try {
       const lic = await rb("licence_get");
@@ -2635,11 +3628,77 @@
       row.hidden = false;
       $("premium-head").textContent = lic.row_head;
       $("premium-sub").textContent = lic.row_sub || "";
+      renderActivation(lic);
     } catch (e) {
       clearLicenceConfirm();
       row.hidden = true;
     }
   }
+
+  // Phase 4: the activation line under the row. Rust decides the state and
+  // words the note; this only chooses which of the two buttons applies.
+  //   activated    -> "Activated on this device." + Release
+  //   unactivated  -> the Rust sentence + Activate now (unless a call is
+  //                   already running, when the sentence says so)
+  //   not_needed   -> hidden (free or lapsed: nothing to activate)
+  function renderActivation(lic) {
+    const box = $("premium-activation");
+    const note = $("premium-activation-note");
+    const activate = $("premium-activate");
+    const release = $("premium-release");
+    if (!box || !note || !activate || !release) return;
+    if (lic.activation === "activated") {
+      box.hidden = false;
+      note.textContent =
+        "Activated on this device. A license can be active on up to 5 devices.";
+      activate.hidden = true;
+      release.hidden = false;
+      release.disabled = !!lic.activation_busy;
+      return;
+    }
+    if (lic.activation === "unactivated") {
+      box.hidden = false;
+      note.textContent = lic.activation_note || "";
+      release.hidden = true;
+      activate.hidden = false;
+      activate.disabled = !!lic.activation_busy;
+      return;
+    }
+    box.hidden = true;
+    note.textContent = "";
+    activate.hidden = true;
+    release.hidden = true;
+  }
+
+  $("premium-activate").addEventListener("click", async () => {
+    $("premium-activate").disabled = true;
+    try {
+      await rb("licence_activate", {});
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+    // The outcome arrives as licence_changed; until then the row shows
+    // "Activating this device..." from Rust.
+    await refreshLicence();
+  });
+
+  $("premium-release").addEventListener("click", async () => {
+    // Destructive for THIS machine (Premium goes off here), so it asks.
+    const yes = await askConfirm(
+      "Release this device? Premium turns off on this computer and the " +
+        "slot becomes free for another one. You can activate again later " +
+        "if a slot is free.",
+      "Release",
+    );
+    if (!yes) return;
+    $("premium-release").disabled = true;
+    try {
+      await rb("licence_release", {});
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+    await refreshLicence();
+  });
 
   async function submitLicenceToken(token, confirm) {
     const args = { token };
@@ -2743,6 +3802,10 @@
     renderCreds();
     renderNotes();
     showState("locked");
+    // The licence session died with the vault, so the toolbar must relock in
+    // the same breath. Without this the controls would stay unlocked-looking
+    // until something else happened to refresh them.
+    refreshPremium();
   }
 
   // ---- create / unlock / lock --------------------------------------------------
@@ -3499,7 +4562,7 @@
     "tunnel-warning",
   ];
 
-  function syncChromeHeight() {
+  function syncChromeInsets() {
     const base = openPanelName
       ? panels.get(openPanelName).heightPx
       : closedChromePx();
@@ -3519,7 +4582,23 @@
         extra += Math.ceil(banner.getBoundingClientRect().height);
       }
     }
-    rb("set_chrome_height", { px: base + extra }).catch(() => {});
+    const top = base + extra;
+    rb("set_chrome_insets", { top, left: closedChromeLeftPx() }).catch(
+      () => {},
+    );
+    // The exact number Rust was given, for the stylesheet.
+    //
+    // A modal card is capped against the viewport with `100vh`, and that is
+    // only the same thing as the chrome's own space where the chrome is
+    // RAISED above the page. Where it is not -- GTK always, Windows without
+    // the translucent lift -- the page covers everything below `top`, so a
+    // card sized against the viewport extends underneath it and its lower
+    // half is simply not there, with no scrollbar to reach it. The
+    // stylesheet cannot measure this; it can only be told.
+    document.documentElement.style.setProperty(
+      "--chrome-height-px",
+      top + "px",
+    );
   }
 
   // RE-MEASURE WHEN THE MEASUREMENT CAN CHANGE. `closedChromePx` reads laid-out
@@ -3529,11 +4608,11 @@
   // row of Segoe UI occupies. Both would otherwise leave Rust holding a height
   // that was right once.
   //
-  // Cheap and idempotent: syncChromeHeight sends one small IPC message and
+  // Cheap and idempotent: syncChromeInsets sends one small IPC message and
   // does nothing else, and Rust clamps whatever arrives.
-  window.addEventListener("resize", syncChromeHeight);
+  window.addEventListener("resize", syncChromeInsets);
   if (document.fonts && document.fonts.ready) {
-    document.fonts.ready.then(syncChromeHeight).catch(() => {});
+    document.fonts.ready.then(syncChromeInsets).catch(() => {});
   }
 
   // ---- from the privsurface draft ----
@@ -3659,7 +4738,7 @@
     const banner = $("tls-warning");
     if (banner.hidden !== !intercepted) {
       banner.hidden = !intercepted;
-      syncChromeHeight();
+      syncChromeInsets();
     }
     $("tab-tls-desc").textContent =
       st.tls === "normal"
@@ -4695,7 +5774,7 @@
     open.remove();
     bmbarOpenFolder = null;
     // Give the room back.
-    if (typeof syncChromeHeight === "function") syncChromeHeight();
+    if (typeof syncChromeInsets === "function") syncChromeInsets();
   }
 
   function bookmarkFolders(items) {
@@ -4775,7 +5854,7 @@
         const maxLeft = Math.max(4, (window.innerWidth || 1000) - width - 8);
         menu.style.left = Math.min(Math.max(4, btnBox.left), maxLeft) + "px";
         // Measured after it is laid out, so the strip grows by what it needs.
-        syncChromeHeight();
+        syncChromeInsets();
       });
       bar.appendChild(btn);
     }
@@ -4836,27 +5915,135 @@
       const data = await rb("download_list");
       // Store order is insertion order; newest first reads better.
       downloadItems = (data.items || []).slice().reverse();
+      // Whether comparing with a contact is possible AT ALL: the public
+      // build has no chat transport compiled in, so the control must not
+      // appear there rather than appear and fail. Both reads are allowed to
+      // fail quietly, which leaves the feature hidden -- the safe direction.
+      try {
+        const chat = await rb("chat_status");
+        downloadCompareAvailable = !!(chat && chat.compiled);
+      } catch {
+        downloadCompareAvailable = false;
+      }
+      if (downloadCompareAvailable) {
+        try {
+          const contacts = await rb("chat_contacts", {});
+          chatContacts = (contacts && contacts.items) || [];
+        } catch {
+          chatContacts = [];
+        }
+      }
       renderDownloads();
     } catch (e) {
       /* ignore */
     }
   }
 
+  // ---- fuzzy matching, shared by bookmark search and the tab switcher ----
+  //
+  /// score(query, candidate) -> number | null. null means no match; a
+  /// higher number is a better match. Case-insensitive, and safe on
+  /// non-ASCII text: both sides are lowercased and scanned by code point
+  /// (Array.from), never by UTF-16 half -- a UTF-16 scan can false-match a
+  /// query's surrogate halves across two different characters. The
+  /// trade-off is documented rather than fixed: casefolds that change the
+  /// character count (the German sharp s folding to "ss" is the usual
+  /// example) simply do not match, the same limitation the Rust side
+  /// accepted.
+  ///
+  /// The rules, in weight order, each with its reason:
+  ///  1. A contiguous substring beats a scattered subsequence: typing
+  ///     "wiki" almost always means the word, not w...i...k...i spread
+  ///     across a string.
+  ///  2. A match starting at a word boundary (the start, or right after a
+  ///     space, '/', '.' or '-') beats one mid-word, because those
+  ///     boundaries are where a person mentally starts a name.
+  ///  3. An earlier first match beats a later one: the identifying part
+  ///     of a title or URL sits near the front.
+  ///  4. At equal evidence, a shorter candidate beats a longer one: the
+  ///     match fills more of it.
+  ///
+  /// The weights are spaced (1e6, 1e4, one point per character of
+  /// position, a fraction of a point per character of length) AND the two
+  /// lower-order terms are CLAMPED below the tier above them, so the rule
+  /// order holds for every input, not merely realistic ones -- an
+  /// unclamped position term would let a 10,000-character prefix drag a
+  /// word-start match below a mid-word one. Simple and predictable on
+  /// purpose -- no per-character bonuses beyond these four.
+  function fuzzyScore(query, candidate) {
+    const needle = String(query == null ? "" : query).toLowerCase();
+    const haystack = String(candidate == null ? "" : candidate).toLowerCase();
+    if (!needle) return 0; // an empty query matches everything, neutrally
+    if (!haystack) return null;
+
+    const h = Array.from(haystack);
+    const q = Array.from(needle);
+    let first = -1;
+    let contiguous = false;
+    const at = haystack.indexOf(needle);
+    if (at >= 0) {
+      // Checked before the subsequence scan because the greedy scan below
+      // can find a scattered match even when a contiguous one exists later
+      // in the string.
+      contiguous = true;
+      // indexOf answers in UTF-16 units and the scan answers in code
+      // points; convert so the two meanings of "position" never mix.
+      first = Array.from(haystack.slice(0, at)).length;
+    } else {
+      // Greedy earliest subsequence: each needle character takes the first
+      // position the remaining characters can still follow.
+      let qi = 0;
+      for (let hi = 0; hi < h.length && qi < q.length; hi++) {
+        if (h[hi] === q[qi]) {
+          if (qi === 0) first = hi;
+          qi++;
+        }
+      }
+      if (qi < q.length) return null;
+    }
+
+    const before = first > 0 ? h[first - 1] : "";
+    const wordStart =
+      first === 0 ||
+      before === " " ||
+      before === "/" ||
+      before === "." ||
+      before === "-";
+    return (
+      (contiguous ? 1000000 : 0) +
+      (wordStart ? 10000 : 0) -
+      Math.min(first, 9999) -
+      Math.min(h.length, 9999) / 10000
+    );
+  }
+
   // ---- from the bookmarks draft ----
-  /// Case-insensitive substring match over the two things a person actually
-  /// remembers about a bookmark: what it was called and where it went. The
-  /// host is covered by the URL test, so "wikipedia" finds a page whose title
-  /// never mentions it.
+  /// Fuzzy match over the two things a person actually remembers about a
+  /// bookmark -- what it was called and where it went -- plus its tags.
+  /// The host is covered by the URL test, so "wikipedia" finds a page
+  /// whose title never mentions it. Tags are searched because grouping is
+  /// only useful if typing the group name finds the group; they are
+  /// already lowercased by the store, and fuzzyScore lowercases anyway.
+  /// Returns the best field's score, or null when nothing matches.
+  function bookmarkMatchScore(item, needle) {
+    const fields = [
+      fuzzyScore(needle, String(item.title || "")),
+      fuzzyScore(needle, String(item.url || "")),
+      Array.isArray(item.tags) ? fuzzyScore(needle, item.tags.join(" ")) : null,
+    ];
+    let best = null;
+    for (const score of fields) {
+      if (score !== null && (best === null || score > best)) best = score;
+    }
+    return best;
+  }
+
+  /// Boolean form kept for callers that only need yes/no. The live-query
+  /// path in managerVisibleItems uses bookmarkMatchScore directly so it
+  /// can rank; everything else should not have to know scores exist.
   function bookmarkMatches(item, needle) {
     if (!needle) return true;
-    const title = String(item.title || "").toLowerCase();
-    const url = String(item.url || "").toLowerCase();
-    // Tags are searched too: grouping is only useful if typing the group
-    // name finds the group. They are already lowercased by the store.
-    const tags = Array.isArray(item.tags) ? item.tags.join(" ") : "";
-    return (
-      title.includes(needle) || url.includes(needle) || tags.includes(needle)
-    );
+    return bookmarkMatchScore(item, needle) !== null;
   }
 
   function renderBookmarks() {
@@ -5180,6 +6367,375 @@
     );
   });
 
+  // ---- read text on this page (Premium region mode) -----------------------
+  //
+  // The panel asks Rust to capture the page into memory, shows the capture
+  // as an image served over the chrome protocol, and lets the user drag a
+  // rectangle to read. The drag happens ON THE IMAGE, so the rect maps to
+  // capture pixels with one ratio (naturalWidth / clientWidth) and no
+  // chrome-to-content coordinate arithmetic exists to get wrong.
+  //
+  // premium_required is a STATE the panel shows (#region-premium stays up),
+  // never only a toast -- same rule as the findtabs and switcher notes.
+
+  const REGION_OPEN_PX = 500;
+  let regionCapture = null; // {token, w, h} of the capture on display
+  let regionDrag = null; // {x0, y0} in displayed-image pixels during a drag
+
+  function regionReset() {
+    regionCapture = null;
+    regionDrag = null;
+    $("region-stage").hidden = true;
+    $("region-selbox").hidden = true;
+    $("region-result-wrap").hidden = true;
+    $("region-scope").hidden = true;
+    $("region-result").textContent = "";
+    $("region-status").textContent = "";
+    // Dropping the src releases the decoded image; the buffer itself is
+    // freed by ocr_region_close when the panel closes.
+    $("region-img").removeAttribute("src");
+  }
+
+  async function regionStart() {
+    regionReset();
+    // Re-read the licence at the moment of use rather than trusting the
+    // cached value the dimming is drawn from: the vault may have auto-locked
+    // since the toolbar last refreshed, and acting on a stale "unlocked"
+    // would fire a request Rust is about to refuse anyway.
+    await refreshPremium();
+    // The panel still carries its own standing note for the refusal that
+    // comes back from Rust; this is the earlier, quieter stop, so a locked
+    // control does not flash a capture attempt first.
+    if (premiumBlocked()) {
+      $("region-premium").hidden = false;
+      syncChromeInsets();
+      return;
+    }
+    $("region-premium").hidden = true;
+    $("region-status").textContent = "Capturing the page...";
+    try {
+      await rb("ocr_region_capture");
+      // The outcome arrives as region_capture_ready; the reply only
+      // confirms the engine was asked.
+    } catch (e) {
+      $("region-status").textContent = "";
+      if (e && e.message === "premium_required") {
+        $("region-premium").hidden = false;
+        syncChromeInsets();
+      } else {
+        $("region-status").textContent = friendly(e);
+      }
+    }
+  }
+
+  function onRegionCaptureReady(data) {
+    if (openPanelName !== "region") {
+      // The panel closed while the engine was capturing; the buffer will be
+      // released by the close arm, and painting into a closed panel would
+      // only confuse the next open.
+      return;
+    }
+    if (!data.ok) {
+      $("region-status").textContent =
+        ERROR_TEXT[data.error] || "The capture failed.";
+      return;
+    }
+    regionCapture = { token: data.token, w: data.w, h: data.h };
+    // Relative URL, so the platform-specific chrome origin resolves it on
+    // both engines. Cache-safe: every capture has a fresh token. Set as an
+    // ATTRIBUTE so setting and removing are the same vocabulary.
+    $("region-img").setAttribute(
+      "src",
+      "/region-capture/" + data.token + ".png",
+    );
+    $("region-stage").hidden = false;
+    $("region-scope").hidden = false;
+    $("region-scope").textContent =
+      "Showing the " +
+      (data.scope || "capture") +
+      ". Drag a rectangle around the text to read.";
+    $("region-status").textContent = "";
+    syncChromeInsets();
+  }
+
+  // The drag state machine. Pointer events on the image only; a stray
+  // click (no meaningful drag) is ignored rather than scanned.
+  const regionImg = $("region-img");
+  const regionSelbox = $("region-selbox");
+
+  function regionDisplayedRect(ev) {
+    const x1 = Math.max(0, Math.min(ev.offsetX, regionImg.clientWidth));
+    const y1 = Math.max(0, Math.min(ev.offsetY, regionImg.clientHeight));
+    const x = Math.min(regionDrag.x0, x1);
+    const y = Math.min(regionDrag.y0, y1);
+    return {
+      x,
+      y,
+      w: Math.abs(x1 - regionDrag.x0),
+      h: Math.abs(y1 - regionDrag.y0),
+    };
+  }
+
+  regionImg.addEventListener("pointerdown", (ev) => {
+    if (!regionCapture || ev.button !== 0) return;
+    regionDrag = { x0: ev.offsetX, y0: ev.offsetY };
+    regionImg.setPointerCapture(ev.pointerId);
+    regionSelbox.hidden = false;
+    ev.preventDefault();
+  });
+  regionImg.addEventListener("pointermove", (ev) => {
+    if (!regionDrag) return;
+    const r = regionDisplayedRect(ev);
+    regionSelbox.style.left = r.x + "px";
+    regionSelbox.style.top = r.y + "px";
+    regionSelbox.style.width = r.w + "px";
+    regionSelbox.style.height = r.h + "px";
+  });
+  regionImg.addEventListener("pointerup", async (ev) => {
+    if (!regionDrag || !regionCapture) return;
+    const r = regionDisplayedRect(ev);
+    regionDrag = null;
+    regionSelbox.hidden = true;
+    // A sub-3px drag is a click, and a click is not a selection.
+    if (r.w < 3 || r.h < 3) return;
+    // One ratio per axis maps displayed pixels to capture pixels; clamping
+    // guards the right/bottom edge where rounding could land one past.
+    const sx = regionCapture.w / regionImg.clientWidth;
+    const sy = regionCapture.h / regionImg.clientHeight;
+    const x = Math.min(regionCapture.w - 1, Math.round(r.x * sx));
+    const y = Math.min(regionCapture.h - 1, Math.round(r.y * sy));
+    const w = Math.max(1, Math.min(regionCapture.w - x, Math.round(r.w * sx)));
+    const h = Math.max(1, Math.min(regionCapture.h - y, Math.round(r.h * sy)));
+    $("region-status").textContent = "Reading your selection...";
+    try {
+      const reply = await rb("ocr_region_scan", {
+        capture: regionCapture.token,
+        x,
+        y,
+        w,
+        h,
+      });
+      ocrPending.set(reply.token, (data) => {
+        if (!data.ok) {
+          $("region-status").textContent =
+            ERROR_TEXT[data.error] || "Could not read that selection.";
+          return;
+        }
+        if (!data.text || !data.text.trim()) {
+          $("region-status").textContent =
+            "No readable text in that selection. Try a larger area.";
+          return;
+        }
+        $("region-status").textContent = "";
+        $("region-result").textContent = data.text;
+        $("region-result-wrap").hidden = false;
+        syncChromeInsets();
+      });
+    } catch (e) {
+      $("region-status").textContent = "";
+      if (e && e.message === "premium_required") {
+        $("region-premium").hidden = false;
+        syncChromeInsets();
+      } else {
+        $("region-status").textContent = friendly(e);
+      }
+    }
+  });
+
+  $("region-copy").addEventListener("click", async () => {
+    const text = $("region-result").textContent;
+    try {
+      await navigator.clipboard.writeText(text);
+      $("region-status").textContent = "Copied.";
+    } catch {
+      // Select-and-copy still works on the visible text; say so instead of
+      // failing silently.
+      $("region-status").textContent =
+        "Clipboard is unavailable. Select the text above and copy it directly.";
+    }
+  });
+  $("region-again").addEventListener("click", regionStart);
+
+  registerPanel("region", {
+    el: $("region-panel"),
+    button: $("btn-ocr-region"),
+    heightPx: REGION_OPEN_PX,
+    onOpen: regionStart,
+    onClose: () => {
+      regionReset();
+      // Releases the in-memory capture. Fire-and-forget: failing to free
+      // is not something the user can act on.
+      rb("ocr_region_close").catch(() => {});
+    },
+  });
+
+  // ---- Deep Recall --------------------------------------------------------
+  //
+  // Save a page as a picture plus the text read off it; find it later by a
+  // word. Two commands do the work and both are gated; deleting is not,
+  // because removing your own data must never wait on a licence.
+  //
+  // The list shows either EVERYTHING saved or the answer to a search, never
+  // a silent mixture: an empty query lists, a query searches, and the two
+  // empty states say different things.
+
+  let recallSearching = false;
+
+  function recallRow(item, snippets) {
+    const li = el("li", "item");
+    const head = el("div", "item-head");
+    head.appendChild(el("span", "item-title", item.title || item.url));
+    head.appendChild(
+      el(
+        "span",
+        "item-sub",
+        fmtTime(item.created_at) + " · " + hostOf(item.url),
+      ),
+    );
+    li.appendChild(head);
+
+    if (snippets && snippets.length) {
+      for (const snippet of snippets.slice(0, 3)) {
+        // Composed from text nodes, never markup: the match is bolded by
+        // splitting the string, the same way the cross-tab rows do it.
+        const line = el("div", "item-sub");
+        line.appendChild(
+          document.createTextNode(
+            (snippet.cut_start ? "..." : "") +
+              snippet.text.slice(0, snippet.match_start),
+          ),
+        );
+        const hit = el(
+          "strong",
+          null,
+          snippet.text.slice(snippet.match_start, snippet.match_end),
+        );
+        line.appendChild(hit);
+        line.appendChild(
+          document.createTextNode(
+            snippet.text.slice(snippet.match_end) +
+              (snippet.cut_end ? "..." : ""),
+          ),
+        );
+        li.appendChild(line);
+      }
+    } else if (item.words === 0) {
+      li.appendChild(
+        el(
+          "div",
+          "item-sub",
+          "No text was read from this picture. The page is saved and findable by title and address.",
+        ),
+      );
+    }
+
+    const row = el("div", "item-row");
+    const del = el("button", "small", "Delete");
+    del.type = "button";
+    del.addEventListener("click", async () => {
+      if (
+        !(await askConfirm(
+          "Delete this saved page and its picture? This cannot be undone.",
+        ))
+      ) {
+        return;
+      }
+      try {
+        await rb("archive_delete", { id: item.id });
+        await recallRefresh();
+      } catch (e) {
+        $("recall-status").textContent = friendly(e);
+      }
+    });
+    row.appendChild(del);
+    li.appendChild(row);
+    return li;
+  }
+
+  function recallRender(items, searching) {
+    const list = $("recall-list");
+    list.textContent = "";
+    $("recall-empty").hidden = searching || items.length > 0;
+    $("recall-none").hidden = !searching || items.length > 0;
+    for (const item of items) {
+      list.appendChild(recallRow(item, item.snippets));
+    }
+    syncChromeInsets();
+  }
+
+  async function recallRefresh() {
+    const query = $("recall-query").value.trim();
+    recallSearching = query.length > 0;
+    try {
+      const reply = recallSearching
+        ? await rb("archive_search", { q: query })
+        : await rb("archive_list");
+      recallRender(reply.items || [], recallSearching);
+    } catch (e) {
+      if (e && e.message === "premium_required") {
+        $("recall-premium").hidden = false;
+        syncChromeInsets();
+        return;
+      }
+      $("recall-status").textContent = friendly(e);
+    }
+  }
+
+  $("recall-save").addEventListener("click", async () => {
+    await refreshPremium();
+    if (premiumBlocked()) {
+      $("recall-premium").hidden = false;
+      syncChromeInsets();
+      return;
+    }
+    $("recall-status").textContent = "Capturing the page...";
+    try {
+      await rb("archive_save");
+      // The outcome arrives as archive_saved: the reading takes about a
+      // second, so the reply only confirms the capture started.
+      $("recall-status").textContent = "Reading the text...";
+    } catch (e) {
+      $("recall-status").textContent = friendly(e);
+    }
+  });
+
+  $("recall-query").addEventListener("input", () => {
+    recallRefresh();
+  });
+
+  function onArchiveSaved(data) {
+    if (openPanelName !== "recall") return;
+    if (!data.ok) {
+      $("recall-status").textContent =
+        ERROR_TEXT[data.error] || "The page could not be saved.";
+      return;
+    }
+    // Says what was actually read, since "saved" alone hides the difference
+    // between a page full of words and one the reader found nothing in.
+    $("recall-status").textContent =
+      data.words > 0
+        ? "Saved. " + data.words + " words read from this page."
+        : "Saved. No text was read from this picture.";
+    recallRefresh();
+  }
+
+  registerPanel("recall", {
+    el: $("recall-panel"),
+    button: $("btn-recall"),
+    heightPx: 560,
+    onOpen: async () => {
+      $("recall-status").textContent = "";
+      $("recall-premium").hidden = true;
+      await refreshPremium();
+      if (!premiumState.premium) {
+        $("recall-premium").hidden = false;
+        syncChromeInsets();
+        return;
+      }
+      recallRefresh();
+    },
+  });
+
   // ---- who resolves DNS ---------------------------------------------------
   //
   // A restart is genuinely required, not a shortcut: WebView2 takes DNS
@@ -5349,6 +6905,68 @@
     "slate",
     "purple",
   ];
+  // ---- the palette, resolved and reported ----
+  // The stylesheet is the only place a theme is DEFINED (nine accents, three
+  // schemes, color-mix tokens between them), and two things outside this
+  // document wear it too: the OS title bar and border on Windows, and the
+  // scrollbars of pages. Rust holds no table of hex values -- it would drift
+  // -- so after every wear this reads what the tokens computed to, off the
+  // live document, and reports the bytes (chrome_palette_set).
+  //
+  // Read through a probe's `color`, because getPropertyValue on a custom
+  // property returns the token TEXT ("color-mix(...)"), not a colour. The
+  // computed colour comes back as legacy "rgb(r, g, b)" or, for a mix, as
+  // "color(srgb r g b)" on 0..1 -- both are parsed, and anything else means
+  // "send nothing", never a guess: a partial palette would be two themes at
+  // once, and Rust refuses one anyway.
+  const PALETTE_TOKENS = {
+    border: "--accent", // the window's border, continuing the frame
+    caption: "--sf-tabstrip-a", // the title bar, continuing the tab strip
+    text: "--tx-bright", // title text, legible on the caption in every scheme
+    scrollbar: "--accent", // page scrollbar thumb, matching the frame
+  };
+  function parseCssColor(text) {
+    let m = /^rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/.exec(text);
+    if (m) return [Number(m[1]), Number(m[2]), Number(m[3])];
+    m = /^color\(srgb\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)/.exec(text);
+    if (m) {
+      return [m[1], m[2], m[3]].map((v) =>
+        Math.max(0, Math.min(255, Math.round(Number(v) * 255))),
+      );
+    }
+    return null;
+  }
+  function resolveToken(token) {
+    const probe = document.createElement("span");
+    probe.style.color = "var(" + token + ")";
+    document.documentElement.appendChild(probe);
+    const computed = getComputedStyle(probe).color;
+    probe.remove();
+    return parseCssColor(computed);
+  }
+  function publishChromePalette() {
+    const palette = {};
+    for (const key of Object.keys(PALETTE_TOKENS)) {
+      const rgb = resolveToken(PALETTE_TOKENS[key]);
+      if (!rgb) return;
+      palette[key] = rgb;
+    }
+    rb("chrome_palette_set", palette)
+      .then((r) => {
+        // With the OS caption wearing the strip's tint (Windows 11), the
+        // ring's top edge is the OS border above the caption, and our own
+        // 2px line under it would be a second colour band. Hidden on that
+        // answer; shown wherever the caption stays the system's.
+        const tinted = !!(r && r.caption_tinted);
+        if (tinted) {
+          document.documentElement.dataset.captionTint = "on";
+        } else {
+          delete document.documentElement.dataset.captionTint;
+        }
+      })
+      .catch(() => {});
+  }
+
   function wearTheme(name) {
     if (name === "default") {
       delete document.documentElement.dataset.theme;
@@ -5358,6 +6976,7 @@
     for (const t of ACCENT_THEMES) {
       $("accent-" + t).classList.toggle("active", t === name);
     }
+    publishChromePalette();
   }
   async function refreshAccent() {
     try {
@@ -5380,6 +6999,11 @@
   refreshAccent();
   refreshToolbarLabels();
   refreshBookmarkBar();
+  // The placement comes with chrome_caps rather than from its own get, so a
+  // Left user's first paint is their layout instead of the top one visibly
+  // rearranging itself. refreshToolbarPlacement is the fallback for a caps
+  // reply that does not carry it.
+  refreshChromeCaps();
 
   // ---- chrome scheme ----
   // Same contract as the accent: worn via a data-scheme attribute on the
@@ -5396,6 +7020,9 @@
     for (const s of CHROME_SCHEMES) {
       $("scheme-" + s).classList.toggle("active", s === name);
     }
+    // The scheme changes what the accent tokens MIX WITH, so the resolved
+    // palette moves with it.
+    publishChromePalette();
   }
   // Toolbar labels. Same three-part shape as the scheme above: a wear
   // function that owns the attribute and the button marking, a refresher
@@ -5430,6 +7057,164 @@
         toast(friendly(e), true);
       }
     });
+  }
+
+  // ---- toolbar placement -------------------------------------------------
+  //
+  // Same three-part shape again -- wear, refresh, click handlers that
+  // re-dress from the REPLY -- with one thing the accent and the scheme do
+  // not have: the buttons physically MOVE.
+  //
+  // They move rather than being duplicated because there is one #btn-vault
+  // in this document and everything else in this file finds it by id.
+  // A second copy in the sidebar would mean two elements answering to one
+  // name, two aria-pressed states to keep in step, and a permanent question
+  // about which of them a listener was attached to. Changing a node's parent
+  // keeps its listeners, its attributes and its identity; nothing else in
+  // this file needs to know the feature exists.
+  //
+  // ABSENT means top, deliberately: a failed read leaves the toolbar where
+  // every build before this setting put it.
+  const TOOLBAR_PLACEMENTS = ["top", "left"];
+  // Source order of the movable buttons, captured before anything moves.
+  // Restoring the top layout has to put them back in the order the markup
+  // declared -- which is the order the toolbar gate asserts, and the order
+  // the row was designed in -- not the order they happened to be swept up.
+  let toolbarOrder = null;
+
+  // The buttons that belong in the sidebar: everything after the row break.
+  // Read from the DOM rather than listed here, so a button added to the
+  // second row later needs no edit in this file. update.js and integrity.js
+  // append at the end of #toolbar, which is why they land in this set for
+  // free.
+  function movableButtons() {
+    const bar = $("toolbar");
+    const brk = bar && bar.querySelector(".toolbar-break");
+    if (!bar || !brk) return [];
+    const after = [];
+    let seen = false;
+    for (const el of Array.from(bar.children)) {
+      if (el === brk) {
+        seen = true;
+        continue;
+      }
+      if (seen) after.push(el);
+    }
+    return after;
+  }
+
+  function rememberToolbarOrder() {
+    const bar = $("toolbar");
+    if (!bar || toolbarOrder) return;
+    toolbarOrder = Array.from(bar.children);
+  }
+
+  // Move everything after the break into the rail, or put it back.
+  //
+  // Restoring is done against the remembered source order rather than by
+  // appending, because appending would leave the two runtime-added buttons
+  // in whatever order the sweep found them and silently reorder the row.
+  function placeButtons(placement) {
+    const bar = $("toolbar");
+    const rail = $("sidebar");
+    if (!bar || !rail) return;
+    if (placement === "left") {
+      for (const el of movableButtons()) rail.appendChild(el);
+      rail.hidden = false;
+      return;
+    }
+    rail.hidden = true;
+    if (!toolbarOrder) {
+      // Nothing was ever moved, so there is nothing to restore.
+      return;
+    }
+    // Re-append in source order. Elements added at runtime after the order
+    // was captured are appended by the loop below rather than lost.
+    for (const el of toolbarOrder) {
+      if (el.parentNode === bar || el.parentNode === rail) bar.appendChild(el);
+    }
+    for (const el of Array.from(rail.children)) bar.appendChild(el);
+  }
+
+  function wearToolbarPlacement(placement) {
+    rememberToolbarOrder();
+    if (placement === "top") {
+      delete document.documentElement.dataset.toolbarPlacement;
+    } else {
+      document.documentElement.dataset.toolbarPlacement = placement;
+    }
+    placeButtons(placement);
+    for (const p of TOOLBAR_PLACEMENTS) {
+      const btn = $("placement-" + p);
+      if (btn) btn.classList.toggle("active", p === placement);
+    }
+    // The labels row below only applies to the top layout, and saying so is
+    // the difference between a setting that is scoped and one that looks
+    // broken. The preference itself is untouched, so choosing Top again
+    // gives back whatever was set.
+    const note = $("placement-note");
+    if (note) {
+      note.hidden = placement !== "left";
+      note.textContent =
+        placement === "left"
+          ? "Down the left, buttons are icons only. The choice below applies on top."
+          : "";
+    }
+    publishChromeMetric();
+    syncChromeInsets();
+  }
+
+  async function refreshToolbarPlacement() {
+    try {
+      const r = await rb("toolbar_placement_get");
+      if (r && TOOLBAR_PLACEMENTS.includes(r.placement)) {
+        wearToolbarPlacement(r.placement);
+      }
+    } catch (_) {}
+  }
+
+  for (const p of TOOLBAR_PLACEMENTS) {
+    const btn = $("placement-" + p);
+    if (!btn) continue;
+    btn.addEventListener("click", async () => {
+      try {
+        const r = await rb("toolbar_placement_set", { placement: p });
+        wearToolbarPlacement(r.placement);
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+  }
+
+  // THE TWO BUTTONS THAT ARRIVE LATE. update.js and integrity.js are
+  // deferred scripts that append to #toolbar when they run, which may be
+  // after the placement has already been worn -- so in the left layout they
+  // would land in a container that is not on screen in that layout, and be
+  // invisible with no error. The observer sweeps anything that appears after
+  // the break into the rail while the rail is the toolbar.
+  //
+  // Guarded because the DOM harness the gates run in has no MutationObserver:
+  // an unguarded constructor here throws at boot and takes every gate with
+  // it, which is a worse failure than the one it prevents.
+  if (typeof MutationObserver !== "undefined") {
+    const bar = $("toolbar");
+    if (bar) {
+      new MutationObserver((records) => {
+        if (!sidebarShowing()) return;
+        let moved = false;
+        for (const rec of records) {
+          for (const node of Array.from(rec.addedNodes || [])) {
+            if (node.nodeType !== 1 || node === $("sidebar")) continue;
+            $("sidebar").appendChild(node);
+            moved = true;
+          }
+        }
+        if (moved) {
+          publishChromeMetric();
+          syncChromeInsets();
+        }
+      }).observe(bar, { childList: true });
+    }
   }
 
   // Bookmark folder bar toggle, same shape as the labels trio above.
@@ -5537,7 +7322,7 @@
     }
     if (banner.hidden !== !show) {
       banner.hidden = !show;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -5574,13 +7359,13 @@
     }
     if (banner.hidden !== !show) {
       banner.hidden = !show;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
   $("update-banner-open").addEventListener("click", () => {
     $("update-banner").hidden = true;
-    syncChromeHeight();
+    syncChromeInsets();
     // The Updates button is built by update.js, so it may not exist in a
     // stripped build; clicking nothing is better than throwing.
     const button = document.getElementById("btn-update");
@@ -5588,7 +7373,7 @@
   });
   $("update-banner-dismiss").addEventListener("click", () => {
     $("update-banner").hidden = true;
-    syncChromeHeight();
+    syncChromeInsets();
   });
 
   // ---- page zoom -----------------------------------------------------------
@@ -5605,13 +7390,13 @@
     if (!percent) return;
     if (percent === 100) {
       chip.hidden = true;
-      syncChromeHeight();
+      syncChromeInsets();
       return;
     }
     chip.textContent = percent + "%";
     if (chip.hidden) {
       chip.hidden = false;
-      syncChromeHeight();
+      syncChromeInsets();
     }
     // No auto-hide: a zoomed page STAYS zoomed, so an indicator that faded
     // would leave the user wondering why text is the wrong size with nothing
@@ -5663,7 +7448,7 @@
     const banner = $("blocked-warning");
     if (banner.hidden) {
       banner.hidden = false;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -5671,7 +7456,7 @@
     const banner = $("blocked-warning");
     if (!banner.hidden) {
       banner.hidden = true;
-      syncChromeHeight();
+      syncChromeInsets();
     }
   }
 
@@ -5838,6 +7623,11 @@
   // Capability probe. Both controls stay hidden unless the models are
   // actually installed AND the platform can show a file chooser, because a
   // button that cannot work is worse than no button.
+  // The toolbar's Premium controls start LOCKED in the markup's default
+  // state and are unlocked only by an answer from Rust, so a failed or slow
+  // startup leaves them locked rather than briefly usable.
+  refreshPremium();
+
   (async () => {
     try {
       const st = await rb("ocr_status");
@@ -5960,9 +7750,155 @@
       });
       row.appendChild(verifyBtn);
       row.appendChild(result);
+
+      // Ask a contact what THEY got from the same address. Only rendered in
+      // a build that has a chat transport, and only when a contact exists:
+      // a button whose only outcome is "add a contact first" is a button
+      // that should not be there yet.
+      if (downloadCompareAvailable && chatContacts.length > 0) {
+        const askBtn = el("button", "small", "Ask a contact");
+        askBtn.type = "button";
+        askBtn.setAttribute("data-premium", "1");
+        askBtn.setAttribute(
+          "title",
+          "Compare this download with a contact's copy",
+        );
+        const picker = el("select", "small");
+        for (const contact of chatContacts) {
+          const opt = document.createElement("option");
+          opt.value = contact.id;
+          opt.textContent = contact.label;
+          picker.appendChild(opt);
+        }
+        askBtn.addEventListener("click", async () => {
+          await refreshPremium();
+          if (premiumBlocked()) return;
+          const target = compareSlot(item.id);
+          target.className = "item-sub";
+          target.textContent = "Asking...";
+          // Claimed BEFORE the request so an answer that arrives while the
+          // await is still settling has a row to land in.
+          compareAwaiting = item.id;
+          try {
+            await rb("download_compare_request", {
+              id: item.id,
+              contact_id: picker.value,
+            });
+          } catch (e) {
+            compareAwaiting = null;
+            target.className = "error";
+            target.textContent = friendly(e);
+          }
+        });
+        row.appendChild(picker);
+        row.appendChild(askBtn);
+      }
+
       li.appendChild(row);
+      // Where this download's comparison answer lands. One slot per record,
+      // found by id, so an answer can never be painted onto another row.
+      const slot = el("div", "item-sub", "");
+      slot.id = "dlcmp-" + item.id;
+      li.appendChild(slot);
       list.appendChild(li);
     }
+    // Newly built rows start in whatever state the licence is in.
+    applyPremiumState(premiumState);
+  }
+
+  // ---- download corroboration ---------------------------------------------
+  //
+  // The verdict's WORDS come from Rust (the corroborate crate's own Display
+  // output). Nothing here composes a claim about what a hash difference
+  // means; this file places the sentence and the standing caveats beside it.
+
+  let downloadCompareAvailable = false;
+  let chatContacts = [];
+
+  const DOWNLOAD_COMPARE_CAVEATS = [
+    "This compares what two people were served. It cannot tell you whether either copy is safe.",
+    "It trusts your contact to report honestly what they downloaded.",
+    "Different versions, per-platform builds and stale mirrors all produce different files innocently.",
+    "Matching hashes mean the server treated you both alike, nothing more.",
+  ];
+
+  function compareSlot(id) {
+    return $("dlcmp-" + id) || el("div", "item-sub", "");
+  }
+
+  // The answer arrives keyed by peer, not by download, so it lands in the
+  // row whose question is outstanding. One question at a time per contact is
+  // what the backend allows, so this cannot be ambiguous.
+  let compareAwaiting = null;
+
+  function renderCompareVerdict(data) {
+    const slot = compareAwaiting ? compareSlot(compareAwaiting) : null;
+    if (!slot) {
+      // THE RESPONDER SIDE. This browser answered a contact's question, so
+      // no row of ours is waiting. Dropping it here would silently break
+      // the design's promise that both sides learn the same thing at the
+      // same time, and would leave the person who answered knowing less
+      // than the person who asked. The crate's sentence carries its own
+      // hedges, so it is safe to show alone.
+      toast(data.text);
+      return;
+    }
+    slot.textContent = "";
+    slot.className = "item-sub";
+    const line = el("div", data.kind === "hash_differs" ? "error" : "ok");
+    // Rust's wording, verbatim. Written through textContent like every other
+    // peer-adjacent string in this file.
+    line.textContent = data.text;
+    slot.appendChild(line);
+    if (!data.byte_len_equal) {
+      slot.appendChild(
+        el("div", "item-sub", "The two files are also different sizes."),
+      );
+    }
+    if (data.recorded_gap_seconds > 0) {
+      slot.appendChild(
+        el(
+          "div",
+          "item-sub",
+          "The two downloads were recorded " +
+            fmtGap(data.recorded_gap_seconds) +
+            " apart.",
+        ),
+      );
+    }
+    const ul = el("ul", "caveats");
+    for (const text of DOWNLOAD_COMPARE_CAVEATS) {
+      ul.appendChild(el("li", null, text));
+    }
+    slot.appendChild(ul);
+    compareAwaiting = null;
+  }
+
+  function fmtGap(seconds) {
+    if (seconds < 90) return seconds + " seconds";
+    if (seconds < 5400) return Math.round(seconds / 60) + " minutes";
+    if (seconds < 172800) return Math.round(seconds / 3600) + " hours";
+    return Math.round(seconds / 86400) + " days";
+  }
+
+  const DOWNLOAD_COMPARE_NOTES = {
+    no_download:
+      "Your contact has no record of downloading from this address. That is not evidence of anything.",
+    record_untrusted:
+      "Your contact's own record of that download failed its integrity check, so their copy's fingerprint cannot be trusted for this comparison.",
+    unsupported: "Your contact's build cannot answer this.",
+    bad_message: "Your contact's answer could not be read.",
+    unexpected:
+      "An answer arrived for a comparison this browser did not ask for. Nothing was compared.",
+  };
+
+  function renderCompareNote(data) {
+    const slot = compareAwaiting ? compareSlot(compareAwaiting) : null;
+    compareAwaiting = null;
+    if (!slot) return;
+    slot.className = "item-sub";
+    slot.textContent =
+      DOWNLOAD_COMPARE_NOTES[data.reason] || DOWNLOAD_COMPARE_NOTES.bad_message;
   }
 
   // ---- from the bookmarks draft ----
@@ -6058,8 +7994,10 @@
   registerPanel("library", {
     el: $("bookmarks-panel"),
     button: $("btn-library"),
-    // The manager is wide and tall; 720 is the ceiling the Rust side clamps
-    // a chrome height request to.
+    // The manager is wide and tall. 720 was the ceiling the Rust side
+    // clamped to; the ceiling is 800 now (CHROME_TOP_RANGE), so this is a
+    // height chosen for the panel rather than a value pressed against a
+    // limit -- it stays where it is because that is what the manager needs.
     heightPx: 720,
     onOpen: refreshLibrary,
   });
@@ -6165,7 +8103,19 @@
       items = folderMembers(managerSelected);
     }
     const needle = managerQuery.trim().toLowerCase();
-    items = items.filter((item) => bookmarkMatches(item, needle));
+    if (needle) {
+      // A live query ranks by match strength instead of the dropdown
+      // sort: "most likely what was meant" is the better order while
+      // someone is typing, and the dropdown takes the order back the
+      // moment the box is cleared.
+      const scored = [];
+      for (const item of items) {
+        const score = bookmarkMatchScore(item, needle);
+        if (score !== null) scored.push({ item, score });
+      }
+      scored.sort((a, b) => b.score - a.score);
+      return scored.map((entry) => entry.item);
+    }
     if (managerSort === "title") {
       items.sort((a, b) =>
         String(a.title || a.url || "").localeCompare(

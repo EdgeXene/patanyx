@@ -75,6 +75,12 @@ fn counts_as_presence(cmd: &str) -> bool {
             // presence by this list's default, and the pinning test names
             // them.
             | "licence_get"
+            // Passive too, and polled far more often than licence_get: the
+            // toolbar refreshes it at startup and on every vault transition,
+            // none of which is the user doing something. Counting it as
+            // presence would re-arm the vault's idle deadline from a
+            // background refresh and the vault would never auto-lock.
+            | "premium_status"
             // Polled on EVERY tab status update, because the toolbar's fill
             // button has to know whether this site has a saved password before
             // the user asks -- that is the whole point of putting it on the
@@ -680,6 +686,27 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
         "tab_list" => Ok(state.tab_list()),
+        // The switcher reads the SAME list through its own gated arm
+        // rather than putting the gate on tab_list: the tab strip is
+        // rendered from tab_list and the strip is not Premium, so a gate
+        // there would take the strip away from free users. The gate must
+        // also live server-side -- a chrome-side licence check is text
+        // anyone can edit -- so the Premium surface gets an arm of its
+        // own whose first statement refuses.
+        "tabs_switcher_list" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            Ok(state.tab_list())
+        }
+        // A gate that does nothing else, on purpose. What Premium sells
+        // here is the multi-select AFFORDANCE on the tab strip; the batch
+        // actions themselves (close, bookmark, set aside) are the same
+        // ungated arms a free user already drives one tab at a time, so
+        // entry is the moment to refuse, and the refusal has to be
+        // server-side to mean anything.
+        "tabs_batch_enter" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            Ok(json!({}))
+        }
 
         // SET-ASIDE SHELVES. One action stores the window's tabs as a named
         // shelf and closes them; restore reopens a shelf's entries, delete
@@ -696,6 +723,24 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // the record, and a tab must never be closed on the strength of
             // a write that cannot happen. store_open's own error says why.
             store_open(state)?;
+            // Optional `ids`: the tab strip's select mode sets only those
+            // tabs aside. Absent means the whole window, exactly as
+            // before -- existing callers and tests are untouched. A
+            // present value that is not an array of u64s is a malformed
+            // call; ids that name no live tab simply match nothing, the
+            // same tolerance the close loop below shows for tabs that
+            // have gone away.
+            let only: Option<Vec<u64>> = match args.get("ids") {
+                None => None,
+                Some(raw) => {
+                    let list = raw.as_array().ok_or("bad_args")?;
+                    let mut ids = Vec::with_capacity(list.len());
+                    for value in list {
+                        ids.push(value.as_u64().ok_or("bad_args")?);
+                    }
+                    Some(ids)
+                }
+            };
             let plan = {
                 let candidates: Vec<crate::shelf::Candidate> = state
                     .tabs
@@ -707,7 +752,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         url: &tab.url,
                     })
                     .collect();
-                let plan = crate::shelf::plan_create(&candidates);
+                let plan = crate::shelf::plan_create(&candidates, only.as_deref());
                 if plan.entries.is_empty() {
                     // Everything here is ephemeral or internal, so there is
                     // nothing the feature may remember. Nothing was
@@ -1306,27 +1351,44 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(state.privacy_status())
         }
 
-        "set_chrome_height" => {
-            let px = args.get("px").and_then(Value::as_i64).ok_or("bad_args")?;
-            // Upper bound = the tallest panel (chat's conversation view,
-            // 640 -- chat.js pins CHAT_OPEN_PX to this comment) PLUS 80 of
-            // banner allowance. The ceiling used to be exactly 640, which
-            // made banner heights on top of an open chat vanish IN FULL: the
-            // JS side sends base + visible banners through one clamp, and a
-            // ceiling equal to the tallest base leaves banners zero room --
-            // on Linux, where this value is the literal chrome box height,
-            // that is a genuinely clipped banner. 80 covers two stacked
-            // banners, which is as many as co-occur in practice.
-            //
-            // Still a clamp rather than a free value: a STRIP must never be
-            // able to take the whole window by arithmetic. The panel that
-            // once grew this chrome by 300px of empty band is why the guard
-            // exists, and 720 stays under even a short laptop window.
-            // Covering the window is possible, but only by asking for it by
-            // name -- see `chrome_overlay`. Keeping the two apart is the
-            // point: no number sent here, however wrong, can hide the page.
-            let px = px.clamp(120, 720) as i32;
-            state.set_chrome_height(px);
+        // WHAT THE CHROME IS USING, on both axes, in one message.
+        //
+        // Two numbers rather than two commands, because they describe one
+        // rectangle: switching the toolbar to the left changes both at once,
+        // and applying them one at a time lays the page out in an
+        // intermediate position that was never a real layout. That flicker
+        // is the same class of defect as the stale height the arrangement
+        // guard in state.rs exists to stop.
+        //
+        // Upper bound on `top` = the tallest panel (the theme panel, now that
+        // it carries the toolbar section -- chrome.js pins THEME_OPEN_PX to
+        // this comment) PLUS banner allowance. The ceiling used to be exactly
+        // the tallest panel, which made banner heights on top of an open one
+        // vanish IN FULL: the JS side sends base + visible banners through
+        // one clamp, and a ceiling equal to the tallest base leaves banners
+        // zero room -- on Linux, where this value is the literal inset, that
+        // is a genuinely clipped banner.
+        //
+        // Still a clamp rather than a free value: a STRIP must never be able
+        // to take the whole window by arithmetic. The panel that once grew
+        // this chrome by 300px of empty band is why the guard exists.
+        // Covering the window is possible, but only by asking for it by name
+        // -- see `chrome_overlay`. Keeping the two apart is the point: no
+        // number sent here, however wrong, can hide the page.
+        //
+        // The floor moved 120 -> 80 with the sidebar: a closed strip with the
+        // feature buttons in the sidebar measures ~88, and a floor above the
+        // real chrome would have quietly padded the page down by the
+        // difference in the layout it was meant to serve.
+        "set_chrome_insets" => {
+            let top = args.get("top").and_then(Value::as_i64).ok_or("bad_args")?;
+            // Absent means zero: a chrome that has not measured a sidebar has
+            // no sidebar, which is exactly the Top layout.
+            let left = args.get("left").and_then(Value::as_i64).unwrap_or(0);
+            use crate::platform::{CHROME_LEFT_RANGE as LEFT, CHROME_TOP_RANGE as TOP};
+            let top = top.clamp(*TOP.start(), *TOP.end()) as i32;
+            let left = left.clamp(*LEFT.start(), *LEFT.end()) as i32;
+            state.set_chrome_insets(top, left);
             Ok(json!({}))
         }
 
@@ -1393,6 +1455,34 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // built to avoid.
         "chrome_caps" => Ok(json!({
             "translucent_overlay": crate::platform::translucent_overlay_supported(),
+            // Whether the page draws OVER the chrome, which decides how far a
+            // modal card may extend. On Windows with the lift armed the
+            // chrome is raised above the page and the whole window is its
+            // canvas; everywhere else -- and on GTK always, which never lifts
+            // -- the page covers whatever the chrome is not using, so a card
+            // laid out against the viewport would run underneath it. The
+            // stylesheet needs to know which world it is in; it cannot
+            // measure this.
+            "page_covers_chrome": !crate::platform::translucent_overlay_supported(),
+            // Whether the toolbar can be moved to the left edge. True on both
+            // backends: the page's rectangle is computed by one shared
+            // function and both can inset it. Asked before the choice is
+            // offered, per the standing rule that a control the platform
+            // cannot honour is explained or hidden, never shown and inert.
+            "sidebar": crate::platform::sidebar_supported(),
+            // The saved placement, handed over with the capabilities rather
+            // than fetched separately. Both are needed before the first
+            // paint, and one round trip is the difference between a Left
+            // user seeing their own layout and seeing the top one rearrange
+            // itself in front of them.
+            "toolbar_placement": crate::prefs::load().toolbar_placement.as_str(),
+            // Whether the accent reaches the scrollbars of pages: "live" on
+            // WebView2 (registration for the next document plus a host-to-
+            // page message for the current one), "unsupported" on WebKitGTK,
+            // which does not implement `scrollbar-color` at all. The theme
+            // panel words its accent copy from this rather than claiming the
+            // same thing on both.
+            "page_scrollbar": crate::platform::page_scrollbar_support(),
         })),
 
 
@@ -1613,9 +1703,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "find_start" => {
             let query = arg_str(args, "query")?;
             let cmd = {
-                // The borrow of state.find ends here; the webview borrow
-                // below must not overlap it.
-                match state.find.on_query(query) {
+                // The borrows of state.find and state.find_gen end here; the
+                // webview borrow below must not overlap them.
+                match state.find.on_query(query, &mut state.find_gen) {
                     crate::find::FindCmd::Start(_) => crate::find::FindCmd::Start(query),
                     other => other,
                 }
@@ -1623,7 +1713,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let Some(webview) = state.active_webview() else {
                 // No tab to search: whatever on_query just recorded is
                 // unstartable; roll it back so a retry is not Ignored.
-                state.find.stop();
+                state.find.stop(&mut state.find_gen);
                 return Err("no_tab");
             };
             match cmd {
@@ -1636,7 +1726,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         // Without this rollback the same query would be
                         // Ignored on retry and F3 would step a session that
                         // does not exist.
-                        state.find.stop();
+                        state.find.stop(&mut state.find_gen);
                     }
                     Ok(json!({ "available": available }))
                 }
@@ -1672,11 +1762,102 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // Idempotent on purpose: bar close, tab switch and tab close can
             // all ask, in any order, and only the first one touches the
             // engine.
-            if state.find.stop() {
+            if state.find.stop(&mut state.find_gen) {
                 if let Some(webview) = state.active_webview() {
                     crate::platform::find_stop(webview);
                 }
             }
+            Ok(json!({}))
+        }
+
+        // ---- find across tabs ----
+        // The first premium-gated commands in the browser, so the gate is
+        // the FIRST statement of both arms: a session without premium must
+        // not learn even whether tabs exist. The query goes into pure Rust
+        // matching (tab_search.rs) and, on goto, into the engine's find API
+        // on the now-active tab -- never into a script string, and no
+        // content webview is ever evaluated; page bytes arrive only through
+        // the main-resource channel page_integrity already owns.
+        //
+        // There is deliberately NO stop command: nothing runs between
+        // events except engine byte-reads already in flight, a new search
+        // replaces the scan wholesale, and a vault lock drops it -- a
+        // stop's only job would be cancelling tokens, and answers quoting a
+        // dead scan id are refused on their own.
+        "find_tabs_search" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            // Capability next, before any state changes: where page bytes
+            // are not honestly obtainable the answer is unsupported, never
+            // a guess -- the same rule begin_fetch_for_active enforces.
+            if !crate::platform::page_bytes_supported() {
+                return Err("unsupported");
+            }
+            let query = crate::tab_search::check_query(arg_str(args, "query")?)?;
+            let (ids, skipped_quarantine) = state.tab_scan_candidates();
+            if ids.is_empty() {
+                return Err("no_tab");
+            }
+            // A new search REPLACES any live scan wholesale. The id comes
+            // from the same GenSeq as every find generation, which is what
+            // lets the old scan's late reads be refused by id instead of
+            // cancelled one by one.
+            let scan = crate::tab_search::TabScan::start(state.find_gen.next(), query, &ids);
+            let scan_id = scan.id();
+            state.start_tab_scan(scan, skipped_quarantine);
+            let proxy = state.proxy();
+            for &tab_id in &ids {
+                let token = crate::page_integrity::issue_tab_search_fetch(state, tab_id, scan_id);
+                // The ids name live tabs one statement old; a vanished tab
+                // would be a bug, but skipping it honestly leaves its row
+                // Pending ("Still loading") rather than panicking dispatch.
+                if let Some(webview) = state.tab_webview(tab_id) {
+                    crate::platform::request_main_resource_bytes(webview, token, &proxy);
+                }
+            }
+            // The reply is the FIRST snapshot -- every row pending -- in
+            // the same shape the find_tabs_state events carry, so the
+            // chrome renders one shape from the first paint.
+            Ok(state.find_tabs_state())
+        }
+        "find_tabs_goto" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let id = args.get("id").and_then(Value::as_u64).ok_or("bad_args")?;
+            let query = arg_str(args, "query")?;
+            // Refusing the empty query up front is what makes the Start-only
+            // handling below provably complete: switch_tab stops any live
+            // session, so a non-empty query can only be a Start (an empty
+            // one would be the sole path to Ignore).
+            if query.is_empty() {
+                return Err("bad_args");
+            }
+            // The scan never lists quarantine tabs, so a goto must never
+            // land on one: an ephemeral id reads exactly like a closed one.
+            if !state.tab_is_searchable(id) {
+                return Err("not_found");
+            }
+            state.switch_tab(id)?;
+            // Hand the query to the ordinary single-tab find on the
+            // now-active tab, through the SAME session + generation path as
+            // find_start -- never around it.
+            if let crate::find::FindCmd::Start(q) =
+                state.find.on_query(query, &mut state.find_gen)
+            {
+                let generation = state.find.generation();
+                let started = match state.active_webview() {
+                    Some(webview) => {
+                        crate::platform::find_start(webview, q, generation, &state.proxy())
+                    }
+                    None => false,
+                };
+                if !started {
+                    // find_start's rollback: without it a retry is Ignored
+                    // and F3 steps a session that does not exist.
+                    state.find.stop(&mut state.find_gen);
+                }
+            }
+            // The chrome opens the ordinary bar and adopts the live
+            // session; counts arrive as ordinary find_state events.
+            state.emit("find_adopt", json!({ "query": query }));
             Ok(json!({}))
         }
 
@@ -1712,6 +1893,46 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "chrome_theme_get" => Ok(json!({
             "theme": crate::prefs::load().chrome_theme.as_str(),
         })),
+
+        // WHAT THE ACCENT RESOLVES TO, reported by the chrome after it wears
+        // a theme or a scheme (chrome.js `publishChromePalette`), for the
+        // parts of the window the chrome document cannot paint: the OS
+        // title bar and border, and the scrollbars of pages. Four RGB
+        // triples, bytes each. Rust holds no table of hex values of its own
+        // -- the stylesheet is the only place a theme is defined, and this
+        // is how its answer reaches the rest of the window. See
+        // `platform::ChromePalette`.
+        //
+        // Every triple is required and every byte must be 0..=255: a chrome
+        // that could not resolve a colour sends nothing rather than a guess,
+        // and a partial palette would paint the title bar in one theme and
+        // the scrollbars in another.
+        "chrome_palette_set" => {
+            fn triple(args: &Value, key: &str) -> Result<[u8; 3], &'static str> {
+                let arr = args.get(key).and_then(Value::as_array).ok_or("bad_args")?;
+                if arr.len() != 3 {
+                    return Err("bad_args");
+                }
+                let mut out = [0u8; 3];
+                for (slot, v) in out.iter_mut().zip(arr) {
+                    let n = v.as_u64().ok_or("bad_args")?;
+                    *slot = u8::try_from(n).map_err(|_| "bad_args")?;
+                }
+                Ok(out)
+            }
+            let palette = crate::platform::ChromePalette {
+                border: triple(args, "border")?,
+                caption: triple(args, "caption")?,
+                text: triple(args, "text")?,
+                scrollbar: triple(args, "scrollbar")?,
+            };
+            // `caption_tinted`: whether the OS title bar took the tint. The
+            // chrome hides its own inner accent line on true, so the ring
+            // has one top edge (the OS border) rather than two colours
+            // stacked under the caption.
+            let caption_tinted = state.set_chrome_palette(palette);
+            Ok(json!({ "caption_tinted": caption_tinted }))
+        }
 
         // Chrome scheme (Dark/White/Black): same shape as the accent pair
         // above, same no-engine-involvement, worn via data-scheme.
@@ -1759,6 +1980,32 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             "mode": crate::prefs::load().toolbar_labels.as_str(),
         })),
 
+        // Where the feature buttons live. Same chrome-only shape as the
+        // labels above -- saved here, worn by chrome.js as a data attribute
+        // -- with one addition: returning to Top must give the page its left
+        // edge back, and the chrome re-measuring and reporting zero is a
+        // round trip away. Setting the inset here closes that gap, so the
+        // page never spends a frame indented past a sidebar that is gone.
+        //
+        // The top inset is left alone: it is whatever the chrome last
+        // measured, and the chrome will send both numbers again the moment
+        // its own layout settles.
+        "toolbar_placement_set" => {
+            let placement = crate::prefs::ToolbarPlacement::parse(arg_str(args, "placement")?)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.toolbar_placement = placement;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            if matches!(placement, crate::prefs::ToolbarPlacement::Top) {
+                state.set_chrome_insets(state.chrome_height(), 0);
+            }
+            Ok(json!({ "placement": placement.as_str() }))
+        }
+
+        "toolbar_placement_get" => Ok(json!({
+            "placement": crate::prefs::load().toolbar_placement.as_str(),
+        })),
+
         "chrome_scheme_get" => Ok(json!({
             "scheme": crate::prefs::load().chrome_scheme.as_str(),
         })),
@@ -1800,6 +2047,81 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             "enabled": crate::prefs::load().fingerprint_noise,
         })),
 
+        // Per-site Fingerprint Divergence. The GLOBAL toggle above stays
+        // free: it ships today, and taking it away would break the promise
+        // that free features remain free. Only choosing per site is Premium.
+        "divergence_site_set" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let host = arg_str(args, "host")?;
+            let off = args.get("off").and_then(Value::as_bool).unwrap_or(false);
+            let level = if off {
+                patanyx_store::DivergenceLevel::Off
+            } else {
+                patanyx_store::DivergenceLevel::Default
+            };
+            let store = store_open(state)?;
+            store.set_divergence_override(host, level).map_err(store_code)?;
+            state.refresh_divergence_snapshot();
+            Ok(json!({}))
+        }
+        "divergence_site_clear" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let host = arg_str(args, "host")?;
+            let store = store_open(state)?;
+            store.clear_divergence_override(host).map_err(store_code)?;
+            state.refresh_divergence_snapshot();
+            Ok(json!({}))
+        }
+        "divergence_sites_list" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let store = store_open(state)?;
+            let items: Vec<Value> = store
+                .divergence_overrides()
+                .iter()
+                .map(|o| {
+                    json!({
+                        "host": o.host,
+                        "off": matches!(o.level, patanyx_store::DivergenceLevel::Off),
+                    })
+                })
+                .collect();
+            Ok(json!({ "items": items }))
+        }
+        // What this tab actually got, not what was configured.
+        //
+        // Modelled on the engine-confirmed rows: it reports REGISTRATION,
+        // and the copy has to say so. It proves the script was installed
+        // with a given profile; it does not prove a site was fooled, which
+        // only the live test page can show.
+        "divergence_proof_get" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let url = state.active_url();
+            let host = crate::state::host_of(&url).unwrap_or_default();
+            let overrides = crate::state::divergence_overrides_snapshot();
+            let off_here = overrides.contains(&format!("\"{host}\":\"off\""));
+            Ok(json!({
+                "host": host,
+                "enabled_globally": crate::prefs::load().fingerprint_noise,
+                "off_for_this_site": off_here,
+                "registered": state.active_divergence_registered(),
+                "surfaces": ["canvas", "audio", "graphics", "element measurement"],
+            }))
+        }
+
+        // What the toolbar needs to render its Premium controls: one state
+        // word, the gate's own answer, and whether a purchase is even
+        // possible yet. Deliberately NOT gated -- a control cannot explain
+        // why it is unavailable if asking why is itself refused.
+        //
+        // `premium` is read from the same `premium_active()` every gated arm
+        // reads, rather than derived from `state` here, so the chrome can
+        // never disagree with the gate about who gets in.
+        "premium_status" => Ok(json!({
+            "state": crate::licence_control::gate_state(),
+            "premium": crate::licence_control::premium_active(),
+            "on_sale": crate::licence_control::PREMIUM_ON_SALE,
+        })),
+
         // Save a picture of the current page. The capture is async in the
         // engine; the reply only confirms it started. The outcome (picker,
         // write, or an honest refusal) arrives as a toast from the event
@@ -1825,6 +2147,142 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({ "started": true }))
         }
 
+        // The Premium region-read: capture the page into memory (never disk)
+        // so the panel can display it and the user can drag a rectangle to
+        // read. Gate FIRST, before any capture state is touched.
+        "ocr_region_capture" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let url = state.active_url();
+            if let Some(code) = crate::capture::refuse_capture(&url) {
+                return Err(code);
+            }
+            if crate::capture::CAPTURE_IN_FLIGHT
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                // A losing racer must not repaint the intent of the capture
+                // that is already running, so the flag is won BEFORE the
+                // intent is written.
+                return Err("busy");
+            }
+            state.capture_intent = crate::capture::CaptureIntent::Region;
+            let Some(webview) = state.active_webview() else {
+                // Undo both: this refusal never started a capture, and the
+                // next SaveFile capture must not inherit a Region intent.
+                crate::capture::CAPTURE_IN_FLIGHT
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state.capture_intent = crate::capture::CaptureIntent::SaveFile;
+                return Err("no_tab");
+            };
+            crate::platform::capture_page(webview, &state.proxy());
+            Ok(json!({ "started": true }))
+        }
+        // Read the text inside one rectangle of the pending region capture.
+        "ocr_region_scan" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            crate::ocr_support::ipc_region_scan(state, args)
+        }
+        // Leaving the mode releases the in-memory capture. Deliberately
+        // UNGATED: freeing memory the gated flow allocated must never itself
+        // require a licence, or a lapsed session would pin the buffer.
+        "ocr_region_close" => {
+            crate::capture::clear_region();
+            Ok(json!({}))
+        }
+
+        // Deep Recall. Save the page: capture it, read it for text, store
+        // both. The outcome arrives as an `archive_saved` event, because the
+        // reading takes about a second.
+        "archive_save" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let url = state.active_url();
+            if let Some(code) = crate::capture::refuse_capture(&url) {
+                return Err(code);
+            }
+            if state.store.is_none() {
+                return Err("not_unlocked");
+            }
+            if crate::capture::CAPTURE_IN_FLIGHT
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err("busy");
+            }
+            state.capture_intent = crate::capture::CaptureIntent::Archive;
+            let Some(webview) = state.active_webview() else {
+                crate::capture::CAPTURE_IN_FLIGHT
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                state.capture_intent = crate::capture::CaptureIntent::SaveFile;
+                return Err("no_tab");
+            };
+            crate::platform::capture_page(webview, &state.proxy());
+            Ok(json!({ "started": true }))
+        }
+        // Find saved pages by a word. Gated: this is the half of Deep Recall
+        // that does the remembering.
+        "archive_search" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let query = arg_str(args, "q")?;
+            let store = store_open(state)?;
+            let hits = crate::archive::search(store.archive(), query)?;
+            let items: Vec<Value> = hits
+                .iter()
+                .map(|hit| {
+                    json!({
+                        "id": hit.id,
+                        "url": hit.url,
+                        "title": hit.title,
+                        "created_at": hit.created_at,
+                        "in_metadata": hit.in_metadata,
+                        "match_count": hit.match_count,
+                        "match_count_capped": hit.match_count_capped,
+                        // Same field names the cross-tab panel already
+                        // renders, so one chrome helper can draw a row from
+                        // either search rather than two near-identical ones.
+                        "snippets": hit.snippets.iter().map(|s| json!({
+                            "text": s.text,
+                            "match_start": s.match_start,
+                            "match_end": s.match_end,
+                            "cut_start": s.cut_start,
+                            "cut_end": s.cut_end,
+                        })).collect::<Vec<Value>>(),
+                    })
+                })
+                .collect();
+            Ok(json!({ "items": items }))
+        }
+        // Listing what is saved is gated with the rest of the feature.
+        "archive_list" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let store = store_open(state)?;
+            let items: Vec<Value> = store
+                .archive()
+                .iter()
+                .rev()
+                .map(|record| {
+                    json!({
+                        "id": record.id,
+                        "url": record.url,
+                        "title": record.title,
+                        "created_at": record.created_at,
+                        "scope": record.scope,
+                        "has_picture": record.has_picture,
+                        "words": record.text.split_whitespace().count(),
+                    })
+                })
+                .collect();
+            Ok(json!({ "items": items, "count": store.archive().len(),
+                       "max": patanyx_store::MAX_ARCHIVE_RECORDS }))
+        }
+        // UNGATED, deliberately, exactly like ocr_region_close and for a
+        // stronger reason: removing your own data must never depend on a
+        // licence. A lapsed user who cannot delete what they saved would be
+        // locked out of their own archive.
+        "archive_delete" => {
+            let id = arg_str(args, "id")?;
+            let store = store_open(state)?;
+            store.delete_archive(id).map_err(store_code)?;
+            Ok(json!({}))
+        }
+
         "tab_status" => Ok(state.active_tab_status()),
         "tab_freeze" => state.freeze_active_tab(),
         "tab_unfreeze" => state.unfreeze_active_tab(),
@@ -1845,6 +2303,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // `forget_active_tab_cookies`, never from anything the caller could
         // supply -- see that function's doc for why.
         "site_forget_cookies" => state.forget_active_tab_cookies(),
+        // The browser-wide clear. Takes no arguments for the same reason the
+        // per-site arm above takes none, arrived at from the other end: there
+        // is no scope to narrow, so there is nothing a caller could name that
+        // would mean anything. Every string it puts on screen is worded by
+        // `cookie_control` and assembled here; see `forget_all_cookies` for
+        // why it will not run against a quarantine tab.
+        "cookies_forget_all" => state.forget_all_cookies(),
         "tab_quarantine" => {
             if state.tabs.len() >= crate::state::MAX_TABS {
                 return Err("bad_args");
@@ -2179,6 +2644,20 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             };
             Ok(json!({ "record_ok": record_ok, "file": file }))
         }
+        // Ask a contact what THEY got from the same address. Gate first,
+        // before the vault, the store, or the peer are even consulted.
+        #[cfg(feature = "chat")]
+        "download_compare_request" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            crate::download_compare::ipc_request(state, args)
+        }
+        // Change Cross-Check: ask a contact whether a bookmarked page
+        // changed for them too.
+        #[cfg(feature = "chat")]
+        "change_compare_request" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            crate::page_integrity::ipc_change_request(state, args)
+        }
 
         // ---- integrity ----
         // ---- page integrity & peer corroboration --------------------------
@@ -2480,10 +2959,40 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             unlocked(state)?
                 .set_licence_record(None)
                 .map_err(|_| "io")?;
+            // The receipts go with the token: they are receipts FOR it.
+            unlocked(state)?
+                .set_activation_records(Vec::new())
+                .map_err(|_| "io")?;
             // Re-evaluate: no record evaluates FREE, so the session state
             // and the row reflect the removal immediately.
             crate::licence_control::on_vault_unlocked(state);
             Ok(json!({}))
+        }
+        // Phase 4: the user's explicit "Activate now" for THIS device. The
+        // call runs on a worker; the reply only says whether it started,
+        // and the outcome arrives as a `licence_changed` event, after which
+        // the panel re-reads licence_get. Nothing to do when the session
+        // does not need activating (free, lapsed, already activated) or a
+        // call is already running.
+        "licence_activate" => {
+            unlocked(state)?;
+            let started = crate::licence_control::activate_now(state);
+            Ok(json!({ "started": started }))
+        }
+        // Release this device's slot at EdgeXene and delete the local
+        // receipt: Premium goes off HERE, which is what release means. The
+        // slot is then free for another device. Only meaningful while
+        // activated; otherwise nothing starts.
+        "licence_release" => {
+            unlocked(state)?;
+            let activated = crate::licence_control::current()
+                .map(|s| s.activation == crate::licence_control::ActivationState::Activated)
+                .unwrap_or(false);
+            if !activated || crate::licence_control::activation_in_flight() {
+                return Ok(json!({ "started": false }));
+            }
+            let started = crate::activation::start_release(state);
+            Ok(json!({ "started": started }))
         }
 
         // The privacy receipt: refused-request counts for the session (all
@@ -2859,6 +3368,283 @@ pub fn smoke_tab_sequence(state: &mut AppState) -> Result<(), String> {
         return Err("fingerprint_noise_get lost the value set moments earlier".into());
     }
     smoke_step(state, "fingerprint_noise_set", json!({ "enabled": before }))?;
+
+    // Toolbar placement through the real dispatch surface, and the layout it
+    // drives. Same flip-and-RESTORE discipline as the pref above, for the
+    // same reason -- a smoke run must not leave somebody's toolbar somewhere
+    // they did not put it.
+    //
+    // What this actually proves is the part a DOM gate cannot reach: that
+    // `set_chrome_insets` survives a round trip through dispatch, clamps,
+    // and reaches the layout without panicking on a backend where the
+    // window may not even be mapped.
+    let placed = smoke_step(state, "toolbar_placement_get", json!({}))?["placement"]
+        .as_str()
+        .ok_or("toolbar_placement_get returned no string")?
+        .to_owned();
+    let other = if placed == "left" { "top" } else { "left" };
+    let flipped = smoke_step(state, "toolbar_placement_set", json!({ "placement": other }))?;
+    if flipped["placement"] != json!(other) {
+        return Err("toolbar_placement_set did not move the toolbar".into());
+    }
+    if smoke_step(state, "toolbar_placement_get", json!({}))?["placement"] != json!(other) {
+        return Err("toolbar_placement_get lost the value set moments earlier".into());
+    }
+    // An out-of-range pair must be clamped rather than refused or obeyed:
+    // this is the frame that would otherwise hide the page behind its own
+    // chrome.
+    smoke_step(state, "set_chrome_insets", json!({ "top": 99_999, "left": -5 }))?;
+    smoke_step(state, "set_chrome_insets", json!({ "top": 148, "left": 0 }))?;
+    smoke_step(state, "toolbar_placement_set", json!({ "placement": placed }))?;
+
+    // The palette through the real dispatch surface. What this proves is
+    // the part no unit test reaches: `set_chrome_palette` fans out to the
+    // window (a DWM call on Windows, nothing on GTK) and to every open tab's
+    // scrollbar registration without panicking on a live backend. Sent as
+    // the DEFAULT palette so the smoke run leaves the prefs file describing
+    // the same chrome it found; and a byte out of range must be refused
+    // rather than clamped, because a partial palette is two themes at once.
+    let default = crate::platform::ChromePalette::default();
+    smoke_step(
+        state,
+        "chrome_palette_set",
+        json!({
+            "border": default.border,
+            "caption": default.caption,
+            "text": default.text,
+            "scrollbar": default.scrollbar,
+        }),
+    )?;
+    if smoke_step(
+        state,
+        "chrome_palette_set",
+        json!({ "border": [256, 0, 0], "caption": [0, 0, 0], "text": [0, 0, 0], "scrollbar": [0, 0, 0] }),
+    )
+    .is_ok()
+    {
+        return Err("chrome_palette_set accepted a byte out of range".into());
+    }
+    Ok(())
+}
+
+/// Smoke-test only: the licence gate, end to end, through the real dispatch.
+///
+/// This is the one place the whole chain is exercised together -- ring,
+/// parse, vault store, session re-evaluation, and a gated arm actually
+/// opening -- in the real binary rather than in unit tests that each hold
+/// one link. Two environment variables drive it, and BOTH are optional so
+/// the ordinary smoke run (ci-trixie, a developer's `scripts/smoke.sh`)
+/// proves the rest of the surface without needing a token to hand:
+///
+/// - `PATANYX_SMOKE_LICENCE_TOKEN`: a token this build's ring MUST accept.
+///   Pasting it turns Premium on; a gated arm that refused a moment earlier
+///   must now answer; removing it must close the gate again.
+/// - `PATANYX_SMOKE_FOREIGN_TOKEN`: a well-formed token this build's ring
+///   MUST refuse as not issued. This is how a shipped build proves it does
+///   not honour a token minted by anyone but the ceremony's key.
+///
+/// The end-to-end procedure that supplies them is
+/// `scripts/premium-e2e-gate.sh`: a throwaway server mints on a throwaway
+/// seed, a throwaway BUILD carries that seed's verifying key, and the two
+/// tokens are handed to two builds -- the throwaway one, which must accept,
+/// and the ordinary one, which must refuse. Neither production secret is
+/// touched at any point.
+///
+/// Requires the vault UNLOCKED, which is how `smoke_vault_sequence` leaves
+/// it. Restores what it touched: the token is removed at the end.
+pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
+    let accept = std::env::var("PATANYX_SMOKE_LICENCE_TOKEN").ok();
+    let foreign = std::env::var("PATANYX_SMOKE_FOREIGN_TOKEN").ok();
+    if accept.is_none() && foreign.is_none() {
+        return Ok(());
+    }
+
+    // The gate must start CLOSED: no token, so a Premium arm refuses. The
+    // switcher list is the cheapest gated arm (no capture, no archive).
+    let before = smoke_step(state, "premium_status", json!({}))?;
+    if before["premium"] != json!(false) {
+        return Err("premium_status: Premium is on before any token was pasted".into());
+    }
+    if smoke_step(state, "tabs_switcher_list", json!({})).is_ok() {
+        return Err("tabs_switcher_list answered with no licence: the gate is open".into());
+    }
+
+    if let Some(token) = foreign {
+        // A token signed by some other key. Well-formed, so it reaches the
+        // signature check, and the ring must say "not issued by us".
+        let reply = smoke_step(state, "licence_paste", json!({ "token": token }))?;
+        if reply["accepted"] != json!(false) || reply["code"] != json!("licence_not_issued") {
+            return Err(format!(
+                "a token from a foreign key was not refused as not-issued: {reply}"
+            ));
+        }
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+            return Err("a refused token turned Premium on".into());
+        }
+        // Printed so the gate can tell this proof RAN: the sequence is a
+        // no-op with nothing to prove when no token reaches it, and SMOKE OK
+        // alone would not distinguish the two.
+        println!("SMOKE licence: foreign token refused");
+    }
+
+    if let Some(token) = accept {
+        let reply = smoke_step(state, "licence_paste", json!({ "token": token }))?;
+        if reply["accepted"] != json!(true) {
+            return Err(format!("licence_paste refused the token this build must accept: {reply}"));
+        }
+        let state_word = reply["state"].as_str().unwrap_or("");
+        if state_word != "active" && state_word != "perpetual" {
+            return Err(format!("pasted token evaluated to {state_word:?}, not active"));
+        }
+        // Phase 4: an ACTIVE token alone must NOT open the gate. Until this
+        // device holds a receipt the state is "unactivated" and the arm
+        // still refuses. (The paste itself started the one silent
+        // activation attempt on a worker; its answer lands on the event
+        // loop later and is idempotent with the synchronous one below.)
+        let status = smoke_step(state, "premium_status", json!({}))?;
+        if status["premium"] != json!(false) || status["state"] != json!("unactivated") {
+            return Err(format!(
+                "an active token opened Premium before this device was activated: {status}"
+            ));
+        }
+        if smoke_step(state, "tabs_switcher_list", json!({})).is_ok() {
+            return Err("tabs_switcher_list answered before activation: the gate is open".into());
+        }
+        // Activate THIS device synchronously against the licence server the
+        // gate points PATANYX_LICENCE_ORIGIN at: the real client, the real
+        // receipt, the real vault write, the real offline re-evaluation.
+        // Only the worker-thread hop is skipped.
+        let device_id = crate::activation::device_id_or_mint(&state.vault_path)
+            .map_err(|e| format!("device id: {e:?}"))?;
+        let outcome = crate::activation::activate_blocking(&token, &device_id);
+        let license_id_hex = crate::licence_control::current_license_id_hex()
+            .ok_or("no licence id in the session after an accepted paste")?;
+        let device_id_hex = crate::activation::hex_encode_16(&device_id);
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Activate,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
+                activate: Some(outcome.clone()),
+                release: None,
+            },
+        );
+        if !matches!(outcome, crate::activation::ActivateOutcome::Activated { .. }) {
+            return Err(format!("activation did not succeed: {outcome:?}"));
+        }
+        let status = smoke_step(state, "premium_status", json!({}))?;
+        if status["premium"] != json!(true) {
+            return Err(format!("premium_status still says off after activation: {status}"));
+        }
+        let lic = smoke_step(state, "licence_get", json!({}))?;
+        if lic["activation"] != json!("activated") {
+            return Err(format!("licence_get does not report this device activated: {lic}"));
+        }
+        // THE POINT: the arm that refused a moment ago now answers.
+        smoke_step(state, "tabs_switcher_list", json!({}))?;
+        println!("SMOKE licence: device activated, receipt bound offline");
+        // A receipt for ANOTHER device must not count here: ask the server
+        // for a real, honestly signed receipt for a different device id
+        // (a synced vault would carry exactly this), put ONLY that one in
+        // the vault, re-evaluate, and the gate must shut. Then put ours back.
+        {
+            let mut mine = unlocked(state).map_err(|e| e.to_string())?.activation_records();
+            let other_device = [0x0fu8; 16];
+            let foreign_receipt = match crate::activation::activate_blocking(&token, &other_device) {
+                crate::activation::ActivateOutcome::Activated { receipt_text } => receipt_text,
+                other => return Err(format!("could not obtain a foreign-device receipt: {other:?}")),
+            };
+            let foreign = vec![patanyx_vault::ActivationRecord {
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: crate::activation::hex_encode_16(&other_device),
+                receipt_text: foreign_receipt,
+            }];
+            unlocked(state)
+                .map_err(|e| e.to_string())?
+                .set_activation_records(foreign)
+                .map_err(|e| format!("vault: {e}"))?;
+            crate::licence_control::on_vault_unlocked(state);
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+                return Err("a receipt for another device id kept Premium on".into());
+            }
+            unlocked(state)
+                .map_err(|e| e.to_string())?
+                .set_activation_records(std::mem::take(&mut mine))
+                .map_err(|e| format!("vault: {e}"))?;
+            crate::licence_control::on_vault_unlocked(state);
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+                return Err("restoring this device's receipt did not reopen the gate".into());
+            }
+        }
+        // Release this device: the slot goes back to the server and Premium
+        // goes off HERE, then re-activation is possible again.
+        let released = crate::activation::release_blocking(&token, &device_id)
+            .map_err(|e| format!("release: {e}"))?;
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Release,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
+                activate: None,
+                release: Some(Ok(released)),
+            },
+        );
+        if !released {
+            return Err("the server did not count this device as active at release".into());
+        }
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+            return Err("release left Premium on".into());
+        }
+        let outcome = crate::activation::activate_blocking(&token, &device_id);
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Activate,
+                license_id_hex,
+                device_id_hex,
+                activate: Some(outcome),
+                release: None,
+            },
+        );
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+            return Err("re-activation after release did not reopen the gate".into());
+        }
+        println!("SMOKE licence: foreign-device receipt refused, release and re-activation round-trip");
+        // A copy of the same token with one character changed must be
+        // refused, and the stored good token must stay in force. The CRC
+        // covers everything before it and is checked before the signature,
+        // so any single-character change is caught THERE and reported as
+        // "not a token" -- the paste-time integrity check. (The signature
+        // check is what the FOREIGN token above proves; this is not it.)
+        // A character in the MIDDLE of the text, not the last one: the final
+        // character of a 126-char base64url body carries four must-be-zero
+        // bits, so flipping it can fail decoding before the CRC ever runs.
+        // Mid-string, decoding succeeds and the CRC is what catches it.
+        let mut chars: Vec<char> = token.chars().collect();
+        let mid = chars.len() / 2;
+        chars[mid] = if chars[mid] == 'A' { 'B' } else { 'A' };
+        let mangled: String = chars.into_iter().collect();
+        let reply = smoke_step(state, "licence_paste", json!({ "token": mangled }))?;
+        if reply["accepted"] != json!(false) || reply["code"] != json!("licence_not_a_token") {
+            return Err(format!(
+                "a token with one character changed was not refused by the CRC: {reply}"
+            ));
+        }
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+            return Err("a refused paste switched the good token off".into());
+        }
+        // Restore, and prove the gate closes again.
+        smoke_step(state, "licence_remove", json!({}))?;
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+            return Err("licence_remove left Premium on".into());
+        }
+        if smoke_step(state, "tabs_switcher_list", json!({})).is_ok() {
+            return Err("tabs_switcher_list still answers after the token was removed".into());
+        }
+        println!("SMOKE licence: token accepted, gate opened and closed");
+    }
     Ok(())
 }
 
@@ -3164,6 +3950,8 @@ fn licence_payload(state: &mut AppState) -> Value {
             state: patanyx_licence::LicenceState::Free,
             keys_available,
             diagnostic: None,
+            activation: crate::licence_control::ActivationState::NotNeeded,
+            license_id_hex: None,
         }
     });
     let (row_head, row_sub) = crate::licence_control::row_copy_for(&session.state);
@@ -3172,10 +3960,25 @@ fn licence_payload(state: &mut AppState) -> Value {
         patanyx_licence::LicenceState::Active { days_left } => {
             ("active", json!(days_left), Value::Null)
         }
+        // Its own state name rather than "active" with a null count: the
+        // panel must be able to tell a licence with no expiry from one
+        // whose remaining days simply were not reported.
+        patanyx_licence::LicenceState::Perpetual => ("perpetual", Value::Null, Value::Null),
         patanyx_licence::LicenceState::Lapsed { expires_day } => (
             "lapsed",
             Value::Null,
             json!(crate::licence_control::ended_display_for(expires_day)),
+        ),
+    };
+    // Phase 4: whether THIS device holds a slot, and the sentence for it.
+    // `activation_note` is Rust-worded (licence_control::activation_copy),
+    // written by the chrome verbatim.
+    let (activation, activation_note) = match session.activation {
+        crate::licence_control::ActivationState::NotNeeded => ("not_needed", Value::Null),
+        crate::licence_control::ActivationState::Activated => ("activated", Value::Null),
+        crate::licence_control::ActivationState::Unactivated { reason } => (
+            "unactivated",
+            json!(crate::licence_control::activation_copy(reason)),
         ),
     };
     json!({
@@ -3186,6 +3989,9 @@ fn licence_payload(state: &mut AppState) -> Value {
         "has_token": has_token,
         "ended_display": ended_display,
         "keys_available": keys_available,
+        "activation": activation,
+        "activation_note": activation_note,
+        "activation_busy": crate::licence_control::activation_in_flight(),
     })
 }
 
@@ -3231,6 +4037,7 @@ pub(crate) fn store_code(error: StoreError) -> &'static str {
         StoreError::AlreadyExists(_) => "io",
         StoreError::AuthFailed => "store_bad_format",
         StoreError::BadFormat(_) => "store_bad_format",
+        StoreError::Full(_) => "archive_full",
     }
 }
 
@@ -3312,6 +4119,10 @@ mod tests {
             // Fired by the vault panel to render the Premium row; a passive
             // read, like tunnel_get.
             "licence_get",
+            // Fired by the TOOLBAR on startup and on every vault transition
+            // to decide which controls render locked. None of that is the
+            // user doing anything.
+            "premium_status",
         ] {
             assert!(
                 !super::counts_as_presence(cmd),
@@ -3407,6 +4218,16 @@ mod tests {
             // as it gets; a vault that locks mid-search misread the room.
             "find_start",
             "find_next",
+            // Opening the cross-tab scan and jumping to a hit are as
+            // deliberate as typing in the bar. A future status poll for the
+            // panel (say find_tabs_status) would need an EXEMPTION in
+            // counts_as_presence itself, not silence here.
+            "find_tabs_search",
+            "find_tabs_goto",
+            // The switcher's list read and select-mode entry are clicks on
+            // palette rows; the same no-silent-poll rule applies.
+            "tabs_switcher_list",
+            "tabs_batch_enter",
             "shelf_create",
             "shelf_restore",
         ] {
@@ -3766,6 +4587,11 @@ mod tests {
             include_str!("ocr_support.rs"),
             include_str!("page_integrity.rs"),
             include_str!("updater.rs"),
+            // Download corroboration returns its own refusals through the
+            // download_compare_request arm. Adding the module here is the
+            // whole point of the note above: a new module's codes are
+            // invisible to a fixed list until somebody extends it.
+            include_str!("download_compare.rs"),
         ];
         let mut missing: Vec<&str> = Vec::new();
         let mut checked: Vec<&str> = Vec::new();

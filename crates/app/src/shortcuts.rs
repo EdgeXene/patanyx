@@ -95,6 +95,11 @@ pub enum Shortcut {
     /// the active tab directly, so they work with chrome focus or page
     /// focus, no round trip through the UI.
     OpenFind,
+    /// Find across every open tab (the premium cross-tab search). Bound
+    /// natively for the same reason OpenFind is, and resolved shift-first:
+    /// the OpenFind arm does not exclude shift, so arm order is the only
+    /// thing keeping Ctrl+Shift+F from opening the single-tab bar.
+    OpenFindAcrossTabs,
     FindNext,
     FindPrevious,
 }
@@ -196,6 +201,11 @@ pub fn resolve(mods: Mods, key: Key) -> Option<Shortcut> {
         Key::R if mods.ctrl && !mods.alt => Some(Shortcut::Reload),
         Key::K if mods.ctrl && !mods.alt => Some(Shortcut::OpenCommandPalette),
         Key::P if mods.ctrl && !mods.alt => Some(Shortcut::Print),
+        // Ctrl+Shift+F searches across tabs; Ctrl+F searches the one page.
+        // Checked shift-first so the more specific binding wins -- the
+        // un-shifted arm below does not exclude shift, exactly like the
+        // Ctrl+Shift+L / Ctrl+L pair above.
+        Key::F if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::OpenFindAcrossTabs),
         // Swallowing Ctrl+F takes the key away from pages that implement
         // their own find. That is deliberate: the engine's default find UI
         // is suppressed (windows.rs), so a page-side find would open nothing,
@@ -490,6 +500,20 @@ mod tests {
         assert_eq!(resolve(NONE, Key::F), None, "typing \"f\" belongs to the page");
         // AltGr reports as Ctrl+Alt on many layouts; it must not open find.
         assert_eq!(resolve(Mods::new(true, false, true), Key::F), None);
+    }
+
+    #[test]
+    fn ctrl_shift_f_opens_find_across_tabs_not_the_single_tab_bar() {
+        // The hazard the arm order fixes: the Ctrl+F arm does not exclude
+        // shift, so the two chords are distinct only because the shift arm
+        // is checked first -- before that arm existed, Ctrl+Shift+F opened
+        // the single-tab bar.
+        assert_eq!(
+            resolve(Mods::new(true, true, false), Key::F),
+            Some(Shortcut::OpenFindAcrossTabs)
+        );
+        // And with alt held it belongs to nobody, like every other binding.
+        assert_eq!(resolve(Mods::new(true, true, true), Key::F), None);
     }
 
     #[test]

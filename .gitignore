@@ -5,3 +5,11 @@
 freeze-probe-log.txt
 
 /target-publish
+
+# Tranco popularity snapshot: build-box only, never redistributed.
+# See scripts/refresh-tranco.sh and scripts/tranco-snapshot.sha256.
+scripts/tranco-top100k.txt
+
+# Python bytecode from running the review tooling.
+__pycache__/
+*.pyc

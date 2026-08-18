@@ -12,6 +12,17 @@
   </head>
   <body>
     <nav id="tabstrip" aria-label="Tabs">
+      <!-- Select-mode bar for the tab strip (Premium; entry is gated
+           server-side by tabs_batch_enter). Follows the find bar's height
+           contract: every show/hide goes through syncChromeHeight so the
+           content webview is resized before anything paints under it. -->
+      <div id="tabbatch-bar" hidden>
+        <span id="tabbatch-count" aria-live="polite"></span>
+        <button id="tabbatch-close" type="button">Close</button>
+        <button id="tabbatch-bookmark" type="button">Bookmark</button>
+        <button id="tabbatch-shelf" type="button">Set aside</button>
+        <button id="tabbatch-cancel" type="button">Cancel</button>
+      </div>
       <div id="tabs"></div>
       <button id="btn-newtab" type="button" title="New tab">+</button>
     </nav>
@@ -460,6 +471,51 @@
         <span class="feature-label">Library</span>
       </button>
 
+      <!-- Read text on this page: the Premium region-read mode. Opens a
+           panel that captures the page and lets the user drag a rectangle
+           to read, including text inside pictures. Everything local. -->
+      <!-- data-premium marks a control the licence gates. chrome.js reads
+           the attribute rather than a hard-coded list, so a future Premium
+           control is covered by adding it here and nowhere else. -->
+      <button
+        id="btn-ocr-region"
+        class="feature-btn"
+        data-premium="1"
+        type="button"
+        aria-pressed="false"
+        aria-label="Read text on this page"
+        title="Read any text on this page, even inside images"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 5 V2.5 H5" />
+          <path d="M11 2.5 H13.5 V5" />
+          <path d="M13.5 11 V13.5 H11" />
+          <path d="M5 13.5 H2.5 V11" />
+          <path d="M5 6.5 H11" />
+          <path d="M5 9.5 H9" />
+        </svg>
+        <span class="feature-label">Read text</span>
+      </button>
+
+      <!-- Deep Recall. The label is NOT "Save Page": this button opens a
+           panel, and a control that says it saves while it opens is lying
+           about what it does. The saving lives on the button inside. -->
+      <button
+        id="btn-recall"
+        class="feature-btn"
+        data-premium="1"
+        type="button"
+        aria-pressed="false"
+        aria-label="Deep Recall: saved pages"
+        title="Save pages and find them again by any word"
+      >
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3.5 2.5 H12.5 V13.5 L8 10.5 L3.5 13.5 Z" />
+          <path d="M6 6 H10" />
+        </svg>
+        <span class="feature-label">Recall</span>
+      </button>
+
       <!-- LAST, and kept there by `order` rather than by position.
              update.js and integrity.js append their buttons to this container
              at runtime, so anything written last in the markup stops being
@@ -468,6 +524,26 @@
              The sheet is a flex column, so `order` settles it whatever the
              append sequence turns out to be. -->
     </header>
+
+    <!-- THE SIDEBAR, and it is EMPTY on purpose.
+         =====================================================================
+         When the toolbar is set to Left, chrome.js moves the buttons that sit
+         after `.toolbar-break` into here, and moves them back when it is set
+         to Top. Nothing is duplicated: there is one #btn-vault in this
+         document and it changes parent, so every listener, every id lookup
+         and every aria-pressed state follows it without knowing this feature
+         exists.
+
+         Written that way rather than as a second copy of the row because a
+         second copy is two things to keep in step -- and the row is not
+         static: update.js and integrity.js append to #toolbar at runtime, so
+         a markup copy would be missing exactly the two buttons that arrive
+         last. chrome.js watches for those and sweeps them across.
+
+         It is a `nav` with its own label because in Left it IS the toolbar,
+         and a screen reader arriving at an unlabelled group of thirteen
+         icon-only buttons has been told nothing. -->
+    <nav id="sidebar" aria-label="Browser features" hidden></nav>
 
     <!-- BOOKMARKS BAR. Off by default and shown only when asked for: it is a
          third chrome row, and vertical space on a laptop is the thing this
@@ -704,6 +780,19 @@
       <button id="find-next" type="button" title="Next match (Enter)">
         Next
       </button>
+      <!-- Opens the find-across-tabs panel. This is the panel's
+           registerPanel button; there is deliberately no toolbar pill --
+           the palette is the precedent for a panel without one, reachable
+           from here and from Ctrl+Shift+F. toolbar-gate's MUST_BE_VISIBLE
+           list is hand-kept, so a button that is not on the toolbar needs
+           no gate change. -->
+      <button
+        id="find-all"
+        type="button"
+        title="Find across tabs (Ctrl+Shift+F)"
+      >
+        All tabs
+      </button>
       <button id="find-close" type="button" title="Close (Esc)">Close</button>
     </div>
 
@@ -779,6 +868,110 @@
       />
       <ul id="palette-list" class="items" role="listbox"></ul>
       <p class="panel-foot" id="palette-empty" hidden>No matching action.</p>
+    </section>
+
+    <!-- Detached openers for surfaces with no toolbar button of their own.
+         The palette actions "Switch tab..." and "Select tabs..." click
+         these by id -- the palette gate requires the id to resolve -- and
+         registerPanel wires the switcher one to its panel. `hidden` keeps
+         them out of the layout while the ids stay literal in this file,
+         which the id scrape requires. -->
+    <button
+      id="btn-switcher"
+      type="button"
+      data-premium="1"
+      hidden
+      aria-pressed="false"
+    >
+      Switch tab
+    </button>
+    <button
+      id="btn-tabselect"
+      type="button"
+      data-premium="1"
+      hidden
+      aria-pressed="false"
+    >
+      Select tabs
+    </button>
+
+    <!-- Tab switcher (Premium). Same query-plus-list shape as
+         #palette-panel, fed by the gated tabs_switcher_list arm.
+         #switcher-premium replaces the list when Rust refuses, so a free
+         licence never sees an empty list that reads as "no tabs". -->
+    <section id="switcher-panel" hidden>
+      <h1>Switch tab</h1>
+      <input
+        id="switcher-query"
+        type="text"
+        autocomplete="off"
+        autocapitalize="off"
+        spellcheck="false"
+        placeholder="Type a tab's title or address..."
+        aria-label="Search open tabs"
+      />
+      <ul id="switcher-list" class="items" role="listbox"></ul>
+      <p class="panel-foot" id="switcher-empty" hidden>No matching tab.</p>
+      <p class="panel-foot" id="switcher-premium" hidden>
+        The tab switcher is a Premium feature. The Premium row in the Vault
+        panel shows your status.
+      </p>
+    </section>
+
+    <!-- Find-across-tabs panel (Ctrl+Shift+F, or "All tabs" in the find
+         bar). Honesty rules, same as the find bar one level up: every
+         count and every refusal is worded by Rust (find::format_count,
+         tab_search::reason_copy) and rendered VERBATIM -- the chrome never
+         words a count or a reason itself. Snippet lines are built with
+         textContent only, never parsed as markup, because their text is page
+         content arriving in the trusted chrome document; the bolded match
+         is sliced on Rust's UTF-8 byte offsets, converted through
+         TextEncoder/TextDecoder in chrome.js rather than assumed to match
+         JS's UTF-16 string indexing. There is deliberately no stop
+         command: the scan holds no engine sessions and no highlights, a
+         new search replaces it wholesale, and a vault lock drops it. -->
+    <section id="findtabs-panel" hidden>
+      <h1>Find across tabs</h1>
+      <input
+        id="findtabs-query"
+        type="text"
+        autocomplete="off"
+        spellcheck="false"
+        placeholder="Find in every open tab"
+        aria-label="Find in every open tab"
+      />
+      <button id="findtabs-run" type="button">Search every tab</button>
+      <p class="panel-note" id="findtabs-note">
+        Pages are searched as the server delivered them, so text a page builds
+        with scripts after load is not searched. Quarantine tabs are not
+        searched.
+      </p>
+      <p class="panel-note" id="findtabs-premium" hidden>
+        Premium unlocks it when it launches. The Premium row in the Vault panel
+        shows your status.
+      </p>
+      <p id="findtabs-progress" aria-live="polite"></p>
+      <ul id="findtabs-list" class="items" role="list"></ul>
+      <p class="panel-foot" id="findtabs-empty" hidden>
+        No open tab contains that.
+      </p>
+      <p class="panel-foot" id="findtabs-locked" hidden>
+        The vault locked. Search again after unlocking.
+      </p>
+      <!-- The panel ships its OWN close control, at the END on purpose:
+           registerPanel injects one as the first child only when a panel
+           has none, and a first-child Close is what the deferred
+           first-focusable focus lands on. Shipping our own leaves the
+           query box as the first focusable, so opening the panel puts the
+           keyboard where a search panel needs it. -->
+      <button
+        id="findtabs-close"
+        class="panel-close"
+        type="button"
+        aria-label="Close this panel"
+      >
+        Close
+      </button>
     </section>
 
     <!-- Privacy panel. Every row states in plain words what it actually does,
@@ -1072,8 +1265,11 @@
          preference. Moved out of the privacy panel 2026-08-04 when the
          accent set grew and chrome schemes were planned: looks are not a
          protection, and the privacy panel's own rule is that everything in
-         it is one. The expanded accent set is the seed of the future
-         premium theme pack, shipped unlocked. -->
+         it is one. Everything in this panel is FREE and stays that way --
+         the expanded accent set was the seed of a premium theme pack until
+         2026-08-16, when it was freed permanently (the reasoning is in
+         about.rs beside the sentence that binds it). Nothing here takes a
+         `data-premium` marker. -->
     <section id="theme-panel" hidden>
       <h1>Theme</h1>
       <p class="panel-intro">
@@ -1113,92 +1309,161 @@
 
       <section id="accent-choice">
         <h3 class="section-head">Accent color</h3>
+        <!-- The copy names the tab strip and address bar because the accent
+             reaches them now. It used to say "highlight color of this
+             browser's own toolbar and panels", which was accurate while the
+             accent was a 2px line and a focus ring, and stopped being
+             accurate the moment the strips took a tint. -->
+        <!-- "Pages are not affected" was true until the accent reached page
+             scrollbars (2026-08-17). The first sentence names what is true
+             on every backend; the second paragraph is the page-scrollbar
+             fact and is shown ONLY where chrome_caps says the engine honours
+             it (WebView2 -- WebKitGTK has no scrollbar-color). The title bar
+             is deliberately NOT listed: only Windows 11 honours it, and a
+             sentence true on one platform is not copy. -->
         <p class="panel-foot">
-          Changes the highlight color of this browser's own toolbar and panels.
-          Pages are not affected.
+          The color this browser wears: its frame, tab strip, toolbar, address
+          bar and panels. Pages keep their own colors.
         </p>
+        <p class="panel-foot" id="accent-scrollbar-note" hidden>
+          The scrollbars of the pages you open follow it too. A page that sets
+          its own scrollbar color keeps that, and a page can read the color it
+          was given, so the accent you choose is something a site can tell.
+        </p>
+        <!-- EVERY LABEL BELOW IS A LABEL ONLY, and the nine stored values
+             are frozen. `default`, `violet`, `blood_red`, `sky`, `green`,
+             `amber`, `teal`, `slate` and `purple` are what prefs.rs
+             (ChromeTheme), the [data-theme="..."] blocks in chrome.css, the
+             button ids, the data-theme-choice attributes and
+             theme-contrast-gate.py all key on. Renaming a VALUE would drop
+             every saved preference on the floor for a word change; two of
+             these words have already been changed once (Violet -> Lavender,
+             Blood Red -> Red, 2026-08-05) without touching one.
+
+             The names are the colour's own, not a description of it: a
+             palette of nine reads as a set when the words share a world,
+             and as a paint chart when they are "blue, red, green". Greek,
+             because the browser's name is; and each one is the actual
+             ancient word for the thing rather than a mood -- elektron IS
+             amber and is where "electric" comes from, porphyra IS the
+             Tyrian dye, lithos IS stone.
+
+             THE PLAIN COLOUR IS NEVER LOST, and it takes BOTH attributes
+             below to make that true. This comment used to claim the tooltip
+             carried it "which is also what a screen reader announces", and
+             that was wrong in a way worth recording: `title` is the LAST
+             resort in the accessible name computation, used only when
+             nothing else names the element. These buttons have text
+             content, so the name was "Chloris" and the tooltip was at most
+             a description -- which most screen readers do not read out, and
+             which a keyboard-only user never sees at all because `title`
+             does not fire on focus. Against 0.9.62, where the name was
+             "Lavender", that was a regression: a colour word replaced by
+             one that is not.
+
+             So every swatch carries an explicit `aria-label` with both
+             words, which is the pattern the feature buttons in this file
+             already use, and the tooltip keeps the word the previous build
+             shipped where the two differed (sky, teal) so a returning
+             reader can still find the swatch they know. toolbar-gate.js
+             checks all nine, so this cannot rot back. -->
         <div id="theme-choices">
           <button
             id="accent-default"
             type="button"
             class="small theme-swatch"
             data-theme-choice="default"
+            title="PATANYX Original: blue"
+            aria-label="PATANYX Original, blue"
           >
-            <span class="swatch"></span>Blue
+            <span class="swatch"></span>PATANYX Original
           </button>
           <button
             id="accent-violet"
             type="button"
             class="small theme-swatch"
             data-theme-choice="violet"
+            title="Ion: violet"
+            aria-label="Ion, violet"
           >
-            <!-- LABEL ONLY, like Red below: the stored value stays `violet`
-                 (prefs.rs ChromeTheme::Violet, [data-theme="violet"] in
-                 chrome.css, the id above, theme-contrast-gate.py). Renamed
-                 for the reader because "violet" is widely heard as a shade
-                 of purple, and this palette also ships a Purple. -->
-            <span class="swatch"></span>Lavender
+            <!-- The Greek for the violet flower, and the particle. Also
+                 settles what "Lavender" was working around: violet read as
+                 a shade of purple beside a Purple, and this name does not
+                 invite the comparison at all. -->
+            <span class="swatch"></span>Ion
           </button>
           <button
             id="accent-blood_red"
             type="button"
             class="small theme-swatch"
             data-theme-choice="blood_red"
+            title="Sardonyx: deep red"
+            aria-label="Sardonyx, deep red"
           >
-            <!-- LABEL ONLY. The stored value stays `blood_red` (prefs.rs
-                 ChromeTheme::BloodRed, the CSS [data-theme="blood_red"]
-                 block, the id above, and theme-contrast-gate.py all key on
-                 it). Renaming the value would drop every saved preference
-                 on the floor for a word change. -->
-            <span class="swatch"></span>Red
+            <!-- The banded red stone. Ends the way the browser's name does,
+                 which is the one place in this list that is allowed to be a
+                 wink. -->
+            <span class="swatch"></span>Sardonyx
           </button>
           <button
             id="accent-sky"
             type="button"
             class="small theme-swatch"
             data-theme-choice="sky"
+            title="Aether: sky blue"
+            aria-label="Aether, sky blue"
           >
-            <span class="swatch"></span>Sky
+            <span class="swatch"></span>Aether
           </button>
           <button
             id="accent-green"
             type="button"
             class="small theme-swatch"
             data-theme-choice="green"
+            title="Chloris: green"
+            aria-label="Chloris, green"
           >
-            <span class="swatch"></span>Green
+            <span class="swatch"></span>Chloris
           </button>
           <button
             id="accent-amber"
             type="button"
             class="small theme-swatch"
             data-theme-choice="amber"
+            title="Elektron: amber"
+            aria-label="Elektron, amber"
           >
-            <span class="swatch"></span>Amber
+            <span class="swatch"></span>Elektron
           </button>
           <button
             id="accent-teal"
             type="button"
             class="small theme-swatch"
             data-theme-choice="teal"
+            title="Thalassa: teal"
+            aria-label="Thalassa, teal"
           >
-            <span class="swatch"></span>Teal
+            <span class="swatch"></span>Thalassa
           </button>
           <button
             id="accent-slate"
             type="button"
             class="small theme-swatch"
             data-theme-choice="slate"
+            title="Lithos: gray"
+            aria-label="Lithos, gray"
           >
-            <span class="swatch"></span>Slate
+            <span class="swatch"></span>Lithos
           </button>
           <button
             id="accent-purple"
             type="button"
             class="small theme-swatch"
             data-theme-choice="purple"
+            title="Porphyra: purple"
+            aria-label="Porphyra, purple"
           >
-            <span class="swatch"></span>Purple
+            <span class="swatch"></span>Porphyra
           </button>
         </div>
       </section>
@@ -1214,10 +1479,28 @@
            to a reader who already knows the row. Hiding a label never hides
            a name: `title` and `aria-label` are untouched. -->
       <section id="labels-choice">
-        <h3 class="section-head">Toolbar labels</h3>
+        <h3 class="section-head">Toolbar</h3>
+        <!-- TWO ROWS, ONE SECTION, and the order is the argument: where the
+             buttons are, then what they look like. The second question only
+             half applies to the first answer -- a left strip is icons only,
+             because a column wide enough for words is a column taking width
+             from the page -- so the note says so rather than leaving a
+             control that looks live and does nothing. That is the same rule
+             the DNS row follows when the engine cannot honour a resolver. -->
         <p class="panel-foot">
-          Buttons can show their names or just their icons. With names off,
-          hovering a button still tells you what it does.
+          Feature buttons can sit above the page or in a strip down the left.
+          Tabs and the address bar stay at the top either way.
+        </p>
+        <div class="form-buttons">
+          <button id="placement-top" type="button" class="small">Top</button>
+          <button id="placement-left" type="button" class="small">Left</button>
+        </div>
+        <p class="panel-foot" id="placement-note" hidden></p>
+        <!-- The two button labels already say "names or icons", so the note
+             here answers the question they raise instead of repeating them:
+             what you lose by turning the words off, which is nothing. -->
+        <p class="panel-foot">
+          With names off, hovering a button still tells you what it does.
         </p>
         <div class="form-buttons">
           <button id="labels-show" type="button" class="small">
@@ -1231,6 +1514,85 @@
 
       <!-- The bookmark folder bar. Off by default: it is a third chrome row
            and costs vertical space, so it appears only when asked for. -->
+    </section>
+
+    <!-- READ TEXT ON THIS PAGE (Premium region-read). The image is served
+         by Rust over the chrome protocol, token-addressed; nothing in this
+         panel ever sees the page itself, only the capture. Every failure
+         string comes from ERROR_TEXT; the strings written here are the
+         static frame. -->
+    <section id="region-panel" hidden>
+      <h1>Read text on this page</h1>
+      <p class="panel-intro">
+        Captures this page and reads the text you select, even text locked
+        inside images. Every step runs on this device. Nothing leaves it.
+      </p>
+      <p class="panel-note" id="region-premium" hidden>
+        Text Capture is a Premium feature, arriving the day Premium launches.
+        Watch the Premium row in the Vault panel for your status.
+      </p>
+      <p id="region-status" aria-live="polite"></p>
+      <div id="region-stage" hidden>
+        <img
+          id="region-img"
+          alt="Capture of the current page"
+          draggable="false"
+        />
+        <div id="region-selbox" hidden aria-hidden="true"></div>
+      </div>
+      <p class="panel-foot" id="region-scope" hidden></p>
+      <div id="region-result-wrap" hidden>
+        <h3 class="section-head">Text found</h3>
+        <pre id="region-result"></pre>
+        <div class="form-buttons">
+          <button id="region-copy" type="button" class="small">
+            Copy text
+          </button>
+          <button id="region-again" type="button" class="small">
+            New capture
+          </button>
+        </div>
+      </div>
+    </section>
+
+    <!-- DEEP RECALL. Save a page as a picture plus the text read off it,
+         then find it again by a word. Every string here is static frame;
+         every failure sentence comes from ERROR_TEXT. -->
+    <section id="recall-panel" hidden>
+      <h1>Deep Recall</h1>
+      <p class="panel-intro">
+        Save a page as a picture plus the text read off it, stored encrypted on
+        this device. Search later by any word on the page, including words that
+        only appear inside images. Requires an unlocked vault.
+      </p>
+      <p class="panel-note" id="recall-premium" hidden>
+        Deep Recall arrives when Premium launches. Find it in the Premium row of
+        the Vault panel.
+      </p>
+      <div class="form-buttons">
+        <button id="recall-save" type="button" class="small">
+          Save this page
+        </button>
+      </div>
+      <p id="recall-status" aria-live="polite"></p>
+      <!-- aria-label rather than a visually-hidden <label>: this chrome has
+           no sr-only class, and inventing one here would put an untested
+           positioning rule in the stylesheet for a single field. -->
+      <input
+        id="recall-query"
+        type="search"
+        aria-label="Search your saved pages"
+        placeholder="Search your saved pages"
+        autocomplete="off"
+      />
+      <p class="panel-foot" id="recall-empty" hidden>
+        Nothing saved yet. On Windows the picture covers the visible area. On
+        Linux it covers the full page.
+      </p>
+      <p class="panel-foot" id="recall-none" hidden>
+        No saved page has that word. Try another one.
+      </p>
+      <ul id="recall-list" class="items" role="list"></ul>
     </section>
 
     <section id="privacy-panel" hidden>
@@ -1296,6 +1658,41 @@
         </span>
       </label>
 
+      <!-- PER-SITE DIVERGENCE + THE PROOF. Sibling section to
+           #permission-choice above, which is the established shape for "what
+           is true of the site you are on". The copy has to keep two honest
+           limits: the choice reaches the NEXT tab for that site, and the
+           proof reports what was REGISTERED rather than what a site was
+           fooled by. -->
+      <section id="divergence-site">
+        <h3 class="section-head">Fingerprint Divergence on this site</h3>
+        <p class="panel-foot" id="dv-host"></p>
+        <p class="panel-note" id="dv-premium" hidden>
+          Choosing per site is a Premium feature, arriving the day Premium
+          launches. Find it in the Premium row of the Vault panel.
+        </p>
+        <label class="toggle-row" for="dv-off">
+          <input id="dv-off" type="checkbox" />
+          <span class="toggle-text">
+            <span class="toggle-title">Turn it off for this site</span>
+            <span class="toggle-note">
+              For a site that misbehaves under noise. Takes effect the next time
+              you open this site in a new tab. Sites are matched by full name,
+              so www.example.com and example.com are separate.
+            </span>
+          </span>
+        </label>
+        <p class="panel-foot" id="dv-list"></p>
+
+        <h3 class="section-head">What this tab got</h3>
+        <p class="panel-foot" id="dv-proof"></p>
+        <div class="form-buttons">
+          <button id="dv-prove" type="button" class="small">
+            Test it live
+          </button>
+        </div>
+      </section>
+
       <p class="panel-foot" id="privacy-foot"></p>
 
       <!-- Site permissions. Rendered by chrome.js from permission_status:
@@ -1356,6 +1753,43 @@
           Anything it refused says so here.
         </p>
         <ul id="engine-list" class="entry-list"></ul>
+      </section>
+
+      <!-- Cookies, browser-wide. The counterpart to "Forget this site" in the
+           Tab Activity panel, and it lives HERE rather than beside it because
+           this panel's own intro is the scope: "These apply to every tab, open
+           now or opened later." A control that clears every site's cookies
+           inside a panel titled with one tab's hostname would be reading its
+           scope off the wrong heading.
+
+           Every string in this section is EMPTY in the markup and written from
+           the privacy_get reply. Not an oversight and not laziness: the wording
+           is what keeps this feature honest ("cookies", never "site data"), so
+           it is worded in cookie_control.rs where tests pin it, and the chrome
+           writes it verbatim through textContent. Copy typed here would be
+           copy nothing checks. -->
+      <section id="forget-all-choice">
+        <h3 class="section-head">Cookies</h3>
+        <p class="panel-foot" id="pv-forget-all-desc"></p>
+        <div class="form-buttons">
+          <button
+            id="btn-forget-all-cookies"
+            type="button"
+            class="small danger"
+          ></button>
+        </div>
+        <div id="forget-all-confirm" hidden>
+          <p class="destructive-warning" id="forget-all-warn"></p>
+          <div class="form-buttons">
+            <button
+              id="forget-all-yes"
+              type="button"
+              class="small danger"
+            ></button>
+            <button id="forget-all-cancel" type="button" class="small"></button>
+          </div>
+        </div>
+        <p class="ok" id="forget-all-result" hidden></p>
       </section>
 
       <section id="leakcheck" hidden>
@@ -1694,6 +2128,24 @@
         <div id="premium-row" hidden>
           <p id="premium-head" class="panel-intro"></p>
           <p id="premium-sub" class="panel-note"></p>
+          <!-- Phase 4: this device's activation. A licence activates on up
+               to five devices; the sentence is Rust-worded
+               (licence_control::activation_copy) and written verbatim, so
+               one surface words one fact. Hidden unless the token is
+               ACTIVE. "Activate now" repeats the one silent attempt every
+               unlock already makes; "Release this device" frees the slot
+               for another machine and turns Premium off HERE. -->
+          <div id="premium-activation" hidden>
+            <p class="panel-note" id="premium-activation-note"></p>
+            <div class="form-buttons">
+              <button id="premium-activate" type="button" class="small" hidden>
+                Activate now
+              </button>
+              <button id="premium-release" type="button" class="small" hidden>
+                Release this device
+              </button>
+            </div>
+          </div>
           <button id="premium-add" type="button" class="small">
             Add Premium token
           </button>
@@ -1748,9 +2200,10 @@
                claim the code does not make.
 
                It describes the VAULT-UNLOCK requirement only, never licence
-               gating: nothing gates on licence state yet, and copy that
-               implied otherwise would be selling something that does not
-               exist.
+               gating. One exception exists as of the 0.9.63 line: the tab
+               pack (find across tabs, the switcher, select mode) gates on
+               licence state through cross_tab_gate, and ITS copy says so
+               where it refuses -- everything on THIS list is vault-only.
 
                Chat is the only build-conditional row, because chat is the
                only compile-time feature here: the tunnel crate and the
@@ -2323,6 +2776,12 @@
     </div>
 
     <div id="toasts" aria-live="polite"></div>
+
+    <!-- The accent frame's other three edges (the top is #tabstrip::before).
+         Paints nothing but a border and takes no input; Rust insets the page
+         by the same PAGE_FRAME_PX so this line is beside the page, not under
+         it. -->
+    <div id="page-frame" aria-hidden="true"></div>
 
     <script src="chrome.js"></script>
     <script src="integrity.js" defer></script>

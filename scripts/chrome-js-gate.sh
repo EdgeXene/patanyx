@@ -242,6 +242,27 @@ else
 fi
 
 echo
+echo "=== gate 1g2: clear cookies for all sites ==="
+# The browser-wide counterpart to the gate above, and the more dangerous of the
+# two: one click reaches every cookie the browser holds. Two properties nothing
+# else covers -- no IPC before the confirmation, and every string in the section
+# coming from cookie_control.rs rather than the markup, since the sentence
+# "cookies, not your saved passwords" is what keeps the feature honest and is
+# otherwise the one part of it no test reads. Same guard shape as the gates
+# above.
+if [ -f scripts/forget-all-cookies-gate.js ]; then
+  if ! grep -q 'id="forget-all-yes"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/forget-all-cookies-gate.js exists but index.html" >&2
+    echo "  has no #forget-all-yes; the control was removed and this gate" >&2
+    echo "  would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/forget-all-cookies-gate.js
+else
+  echo "  (no forget-all-cookies gate in this tree)"
+fi
+
+echo
 echo "=== gate 1h: command palette ==="
 # Every entry names a real button and runs it directly -- never a second copy
 # of what the action does. Same guard shape as the gates above.
@@ -495,6 +516,41 @@ else
 fi
 
 echo
+echo "=== gate 1o: the find-across-tabs panel ==="
+# The first premium surface. Proven against three planted defects when it
+# landed: always-goto-row-0, clearing the locked notice, and naive UTF-16
+# snippet slicing all fail it. Same guard shape as the gates above.
+if [ -f scripts/cross-tab-find-gate.js ]; then
+  if ! grep -q 'id="findtabs-list"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/cross-tab-find-gate.js exists but index.html has" >&2
+    echo "  no #findtabs-list; the surface was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/cross-tab-find-gate.js
+else
+  echo "  (no cross-tab find gate in this tree)"
+fi
+
+echo
+echo "=== gate 1o1: the find bar ==="
+# The single-tab bar shipped without a gate while every other surface had
+# one, and the cross-tab panel's adopt handoff leans on its honesty rules.
+# Proven against two planted defects: not blanking the count on input, and
+# painting counts for a closed bar.
+if [ -f scripts/find-bar-gate.js ]; then
+  if ! grep -q 'id="find-input"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/find-bar-gate.js exists but index.html has" >&2
+    echo "  no #find-input; the bar was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/find-bar-gate.js
+else
+  echo "  (no find-bar gate in this tree)"
+fi
+
+echo
 echo "=== gate 2: no innerHTML in the chrome ==="
 if grep -rn "innerHTML" "$CHROME"; then
   echo "GATE FAIL: innerHTML in the chrome webview - it holds IPC and the vault" >&2
@@ -579,6 +635,121 @@ if [ -n "$missing_forms" ]; then
   exit 1
 fi
 echo "  every form has one"
+
+echo
+echo "=== gate 1q: Premium controls render locked, and locked is not "buy" ==="
+# The rule worth a gate of its own: the licence session dies with the vault,
+# so a PAYING customer with a closed vault reads as no-licence to the gate.
+# Correct for gating, catastrophic for copy. Proven against three planted
+# defects: folding locked into free, ignoring on_sale, and using the disabled
+# property (which drops the control out of the focus order).
+if [ -f scripts/premium-toolbar-gate.js ]; then
+  if ! grep -q 'data-premium' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/premium-toolbar-gate.js exists but index.html" >&2
+    echo "  marks no [data-premium] control; the marking was removed and" >&2
+    echo "  this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/premium-toolbar-gate.js
+else
+  echo "  (no premium toolbar gate in this tree)"
+fi
+
+echo
+echo "=== gate 1t: Change Cross-Check says where to look, not what happened ==="
+# The finding this feature surfaces is the one most easily turned into an
+# accusation, so this pins the headline as Rust's verbatim, its OWN caveats
+# beside it (change over time has different innocent causes than being
+# served differently now), no accusing words, and a peer's refusal worded
+# here rather than echoed. Proven against three planted defects.
+if [ -f scripts/change-cross-check-gate.js ]; then
+  if [ ! -f "$CHROME/integrity.js" ]; then
+    echo "GATE FAIL: scripts/change-cross-check-gate.js exists but" >&2
+    echo "  $CHROME/integrity.js does not; the panel was renamed or removed" >&2
+    echo "  and this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/change-cross-check-gate.js
+else
+  echo "  (no Change Cross-Check gate in this tree)"
+fi
+
+echo
+echo "=== gate 1s: Deep Recall says what it saved ==="
+# Pins that a locked control never starts a save, that listing and searching
+# have DIFFERENT empty states (an empty archive and a fruitless search are
+# different facts), that a page with no readable text says so, and that a
+# save reports what was actually read. Proven against three planted defects.
+if [ -f scripts/deep-recall-gate.js ]; then
+  if ! grep -q 'id="recall-panel"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/deep-recall-gate.js exists but index.html has" >&2
+    echo "  no #recall-panel; the surface was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/deep-recall-gate.js
+else
+  echo "  (no Deep Recall gate in this tree)"
+fi
+
+echo
+echo "=== gate 1t: per-site divergence claims only registration ==="
+# The proof line reports that a script was INSTALLED in this tab. It is not
+# evidence any site was fooled, and a tab keeps what it started with, so the
+# setting and the tab can honestly disagree. This pins both, plus that a
+# Premium refusal explains itself instead of hiding the section, and that the
+# free global toggle is never described as Premium. Proven against two
+# planted defects (claiming protection with nothing registered, hiding on
+# refusal).
+if [ -f scripts/divergence-site-gate.js ]; then
+  if ! grep -q 'id="divergence-site"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/divergence-site-gate.js exists but index.html" >&2
+    echo "  has no #divergence-site; the surface was removed and this gate" >&2
+    echo "  would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/divergence-site-gate.js
+else
+  echo "  (no per-site divergence gate in this tree)"
+fi
+
+echo
+echo "=== gate 1r: the download-comparison verdict tells the truth ==="
+# A differing hash is EVIDENCE, not a verdict about anyone's conduct. This
+# pins that the sentence comes from Rust verbatim, the caveats are ATTACHED
+# beside it, and a peer's refusal is worded here rather than echoed. Proven
+# against three planted defects (composing the headline in JS, dropping the
+# caveat list, echoing the peer's reason). Its first draft passed two of
+# those three vacuously -- it read every string the run had created rather
+# than the rendered tree -- so it now asserts on the slot's own contents.
+if [ -f scripts/download-compare-gate.js ]; then
+  if ! grep -q 'id="download-list"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/download-compare-gate.js exists but index.html" >&2
+    echo "  has no #download-list; the surface was removed and this gate" >&2
+    echo "  would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/download-compare-gate.js
+else
+  echo "  (no download comparison gate in this tree)"
+fi
+
+echo
+echo "=== gate 1p: the region-read panel ==="
+# The Premium read-text-on-this-page surface. Proven against two planted
+# defects when it landed: dropping the premium-note unhide, and painting a
+# capture into a closed panel. Same guard shape as the gates above.
+if [ -f scripts/ocr-region-gate.js ]; then
+  if ! grep -q 'id="region-panel"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/ocr-region-gate.js exists but index.html has" >&2
+    echo "  no #region-panel; the surface was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/ocr-region-gate.js
+else
+  echo "  (no region-read gate in this tree)"
+fi
 
 echo
 echo "CHROME JS OK"

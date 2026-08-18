@@ -966,6 +966,14 @@ pub struct TabState {
     pub content_script_registered: SettingState,
     /// See `EngineSettings::permissions_registered`.
     pub permissions_registered: SettingState,
+    /// WebView2's id for this tab's registered page-scrollbar script
+    /// (`page_scrollbar_script`), kept so a palette change can REMOVE the
+    /// old registration before adding the new one -- without it every
+    /// accent change would stack another script on the tab, each adopting
+    /// its own sheet on the next load. `None` on unix, where the sheet is
+    /// swapped through the content manager instead, and on a tab whose
+    /// registration the engine refused.
+    pub scrollbar_script_id: Option<String>,
 }
 
 /// One intercepted request's fate.
@@ -1057,6 +1065,7 @@ impl TabState {
             handler_events: 0,
             content_script_registered: SettingState::NotAttempted,
             permissions_registered: SettingState::NotAttempted,
+            scrollbar_script_id: None,
         }
     }
 
@@ -1598,6 +1607,187 @@ pub const GPC_SCRIPT: &str = r#"(function () {
 })();
 "#;
 
+// ---- the page scrollbar wears the chrome's accent -------------------------
+//
+// The one visible piece of a page the browser draws rather than the site --
+// its scrollbar -- used to be the engine's grey beside a chrome in the user's
+// colour. This hands pages ONE declaration: `scrollbar-color: <accent>
+// transparent` on the root, at zero specificity.
+//
+// WHAT IT IS AND IS NOT, stated because it is a courtesy in the same
+// registration category as GPC and the divergence script and must keep to
+// the same trust boundary:
+//
+// - Zero channels. Nothing is read from the page and nothing leaves it: no
+//   fetch, no postMessage, no bridge. The colour is a literal baked in at
+//   registration time. `the_scrollbar_script_has_zero_channels` pins it.
+// - The PAGE'S OWN CHOICE WINS. `:where(html)` has zero specificity, so a
+//   site that sets `scrollbar-color` itself, however weakly, beats this. On
+//   WebKitGTK the sheet is at User level, which author rules beat by
+//   definition; on WebView2 it is a constructed sheet, which is why the
+//   selector carries the `:where`.
+// - Constructed, not an injected <style>: a page's `style-src` would refuse
+//   an inline style element and the courtesy would silently apply only on
+//   permissive sites. CSSOM construction is not governed by CSP.
+// - Inherited, deliberately: `scrollbar-color` inherits, so every scroll
+//   area on the page follows the accent, not only the viewport. Chromium
+//   ignores a site's `::-webkit-scrollbar` styling on any element carrying a
+//   non-auto `scrollbar-color`, so a site's hand-drawn scrollbars are
+//   REPLACED by the accent unless it also sets `scrollbar-color`. The About
+//   disclosure says so.
+// - Readable by the page. `document.adoptedStyleSheets` and
+//   `getComputedStyle` both expose the value, so a page can learn which of
+//   the nine accents this visitor wears. That is a few bits of fingerprint,
+//   accepted knowingly on 2026-08-17 as the price of the feature, and
+//   disclosed in About beside the accent setting itself.
+//
+// LIVE on Windows, in two halves. A registration script cannot reach a
+// document that already exists, and this crate never evaluates script in
+// content, by invariant -- so a palette change (a) re-registers the script
+// for the NEXT document and (b) posts the new colour INTO the current one
+// with `PostWebMessageAsJson`, the same host-to-page channel autofill's fill
+// uses, and the script's listener swaps its own sheet. One direction, host
+// into page: the page learns a colour it could already read, and nothing it
+// sends reaches this listener (a page CAN dispatch a fake event on
+// chrome.webview, and all it can do with it is recolour its own scrollbar).
+// Reloading to see a theme is not a behaviour this browser asks of anyone.
+//
+// On WebKitGTK the sheet is installed at User level and swapped live, but
+// the engine does not implement `scrollbar-color` (2.50.6 checked), so
+// nothing shows there and the panel copy does not claim it:
+// `chrome_caps.page_scrollbar` carries the engine's answer and the sentence
+// is shown only where it is true.
+
+/// The single CSS declaration, for both backends. Its own function so the
+/// two engines cannot drift into styling different things.
+pub fn page_scrollbar_css(rgb: [u8; 3]) -> String {
+    format!(
+        ":where(html){{scrollbar-color:{} transparent}}",
+        super::ChromePalette::hex(rgb)
+    )
+}
+
+/// The message `set_page_scrollbar` posts into a live document, and the
+/// only shape the script's listener acts on. `kind` is the discriminator
+/// (autofill's fill message uses the same field), `color` is `#rrggbb`.
+pub const PAGE_SCROLLBAR_MESSAGE_KIND: &str = "scrollbar_color";
+
+/// The JSON `set_page_scrollbar` posts. Built here so the Rust side and the
+/// listener's checks are pinned against one shape by one test.
+pub fn page_scrollbar_message(rgb: [u8; 3]) -> String {
+    format!(
+        "{{\"kind\":\"{}\",\"color\":\"{}\"}}",
+        PAGE_SCROLLBAR_MESSAGE_KIND,
+        super::ChromePalette::hex(rgb)
+    )
+}
+
+/// The WebView2 form: a document-created script that adopts a constructed
+/// sheet carrying `page_scrollbar_css`, then listens for the host's colour
+/// message and swaps the sheet in place. Fail-open on every path -- an old
+/// engine without constructed sheets, a page that has frozen the array, no
+/// chrome.webview object -- because a courtesy must never throw into page
+/// script. The listener accepts exactly `#` + six lower-case hex digits and
+/// nothing else, so a forged event cannot smuggle CSS into the sheet.
+pub fn page_scrollbar_script(rgb: [u8; 3]) -> String {
+    // The CSS is a fixed shape (`page_scrollbar_css` interpolates six hex
+    // digits and nothing else), so it can be quoted as a JS string literal
+    // without escaping. `the_scrollbar_css_is_a_fixed_shape` pins that.
+    format!(
+        "(function () {{\n\
+         \x20 \"use strict\";\n\
+         \x20 try {{\n\
+         \x20   if (typeof CSSStyleSheet !== \"function\") return;\n\
+         \x20   if (!(\"adoptedStyleSheets\" in document)) return;\n\
+         \x20   var sheet = new CSSStyleSheet();\n\
+         \x20   sheet.replaceSync(\"{css}\");\n\
+         \x20   document.adoptedStyleSheets = document.adoptedStyleSheets.concat(sheet);\n\
+         \x20   var host = window.chrome && window.chrome.webview;\n\
+         \x20   if (!host || typeof host.addEventListener !== \"function\") return;\n\
+         \x20   host.addEventListener(\"message\", function (ev) {{\n\
+         \x20     try {{\n\
+         \x20       var msg = ev && ev.data;\n\
+         \x20       if (!msg || msg.kind !== \"{kind}\") return;\n\
+         \x20       if (typeof msg.color !== \"string\" || !/^#[0-9a-f]{{6}}$/.test(msg.color)) return;\n\
+         \x20       sheet.replaceSync(\":where(html){{scrollbar-color:\" + msg.color + \" transparent}}\");\n\
+         \x20     }} catch (_) {{}}\n\
+         \x20   }});\n\
+         \x20 }} catch (_) {{}}\n\
+         }})();\n",
+        css = page_scrollbar_css(rgb),
+        kind = PAGE_SCROLLBAR_MESSAGE_KIND,
+    )
+}
+
+#[cfg(test)]
+mod page_scrollbar_tests {
+    use super::{page_scrollbar_css, page_scrollbar_message, page_scrollbar_script};
+
+    #[test]
+    fn the_scrollbar_css_is_a_fixed_shape() {
+        // Six lower-case hex digits and nothing a page could inject through:
+        // this string is dropped into a JS string literal unescaped, so any
+        // quote or backslash here would break the script (or worse).
+        for rgb in [[0, 0, 0], [0x4f, 0x8c, 0xff], [255, 255, 255]] {
+            let css = page_scrollbar_css(rgb);
+            assert!(css.starts_with(":where(html){scrollbar-color:#"));
+            assert!(css.ends_with(" transparent}"));
+            assert!(!css.contains('"') && !css.contains('\\') && !css.contains('\n'));
+        }
+        assert_eq!(
+            page_scrollbar_css([0x4f, 0x8c, 0xff]),
+            ":where(html){scrollbar-color:#4f8cff transparent}"
+        );
+    }
+
+    #[test]
+    fn the_page_s_own_choice_wins() {
+        // Zero specificity is the whole contract with sites: `html {}` in an
+        // author sheet must beat this. Pinned as the selector, since a
+        // "cleanup" to `html {` would silently start overriding sites.
+        assert!(page_scrollbar_css([1, 2, 3]).starts_with(":where(html)"));
+    }
+
+    #[test]
+    fn the_scrollbar_script_has_zero_channels_out_of_the_page() {
+        // Same trust boundary as GPC and divergence: nothing leaves the page.
+        // It LISTENS on chrome.webview (host into page, the live recolour)
+        // and never posts on it -- `postMessage` in any form is the banned
+        // token, and the listener is the one allowed use of the object.
+        let script = page_scrollbar_script([0xf0, 0xa8, 0x32]);
+        for forbidden in [
+            "fetch(",
+            "XMLHttpRequest",
+            "import(",
+            "postMessage",
+            "window.ipc",
+            "sendBeacon",
+            "WebSocket",
+        ] {
+            assert!(!script.contains(forbidden), "scrollbar script must not contain {forbidden}");
+        }
+        assert!(script.contains("#f0a832 transparent"));
+        assert!(script.contains("addEventListener(\"message\""));
+        // Constructed, not injected: no <style> element for a page's
+        // style-src to refuse.
+        assert!(!script.contains("createElement"));
+        assert!(script.contains("adoptedStyleSheets"));
+    }
+
+    #[test]
+    fn the_listener_and_the_message_agree_on_one_shape() {
+        // The Rust side posts `page_scrollbar_message`; the listener checks
+        // `kind` and a strict `#rrggbb`. Pinned together so neither can be
+        // renamed without the other, and so a forged event carrying CSS in
+        // `color` is refused by the regex the script embeds.
+        let msg = page_scrollbar_message([0xa1, 0x80, 0xff]);
+        assert_eq!(msg, "{\"kind\":\"scrollbar_color\",\"color\":\"#a180ff\"}");
+        let script = page_scrollbar_script([0, 0, 0]);
+        assert!(script.contains("msg.kind !== \"scrollbar_color\""));
+        assert!(script.contains("/^#[0-9a-f]{6}$/.test(msg.color)"));
+    }
+}
+
 #[cfg(test)]
 mod gpc_tests {
     use super::{GPC_HEADER_NAME, GPC_HEADER_VALUE, GPC_SCRIPT};
@@ -1691,18 +1881,69 @@ fn divergence_session_tokens() -> Option<&'static (String, String)> {
 /// [`divergence_script`], split the way `onboarding_resolved_for` is so tests
 /// never touch the real prefs.json.
 fn divergence_script_with(enabled: bool, ephemeral: bool) -> Option<String> {
+    divergence_script_full(enabled, ephemeral, "{}")
+}
+
+/// The second placeholder: a JSON object of per-site choices, keyed by the
+/// same full lowercase hostname the script derives in-page.
+const DIVERGENCE_OVERRIDES_PLACEHOLDER: &str = "__DIVERGENCE_OVERRIDES__";
+
+/// Builds the script with a per-site override table.
+///
+/// `overrides` is a JSON object literal. An EMPTY table ("{}") must leave
+/// the script behaving exactly as it did before this feature existed: the
+/// in-page code reads it, finds nothing for the host, and falls through to
+/// the same paragraphs it always ran. That is what keeps
+/// scripts/divergence-detect-gate.js honest, since it pins the SET of
+/// techniques that can detect the noise and fails on drift in either
+/// direction.
+fn divergence_script_full(
+    enabled: bool,
+    ephemeral: bool,
+    overrides_json: &str,
+) -> Option<String> {
     if !enabled {
         return None;
     }
     let (normal, eph) = divergence_session_tokens()?;
     let token = if ephemeral { eph } else { normal };
-    Some(DIVERGENCE_TEMPLATE.replacen(DIVERGENCE_TOKEN_PLACEHOLDER, token, 1))
+    Some(
+        DIVERGENCE_TEMPLATE
+            .replacen(DIVERGENCE_TOKEN_PLACEHOLDER, token, 1)
+            .replacen(DIVERGENCE_OVERRIDES_PLACEHOLDER, overrides_json, 1),
+    )
+}
+
+/// Serializes the override table for injection.
+///
+/// Only hosts the script can actually key on: anything with a character
+/// outside a hostname is dropped rather than escaped, because a value that
+/// cannot match a real `location.hostname` can only ever be dead weight in
+/// every page's memory. Serialized with serde, so quoting is not hand-rolled
+/// into a script.
+pub fn divergence_overrides_json(entries: &[(String, bool)]) -> String {
+    let map: std::collections::BTreeMap<&str, &str> = entries
+        .iter()
+        .filter(|(host, _)| {
+            !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        })
+        .map(|(host, off)| (host.as_str(), if *off { "off" } else { "default" }))
+        .collect();
+    serde_json::to_string(&map).unwrap_or_else(|_| "{}".to_string())
 }
 
 /// Called from both platforms' `build_content`. Reads the pref at tab build
 /// time, so a toggle takes effect for the next tab without a restart.
 pub fn divergence_script(ephemeral: bool) -> Option<String> {
-    divergence_script_with(crate::prefs::load().fingerprint_noise, ephemeral)
+    divergence_script_full(
+        crate::prefs::load().fingerprint_noise,
+        ephemeral,
+        &crate::state::divergence_overrides_snapshot(),
+    )
 }
 
 #[cfg(test)]
@@ -1717,6 +1958,58 @@ mod divergence_tests {
             DIVERGENCE_TEMPLATE.matches(DIVERGENCE_TOKEN_PLACEHOLDER).count(),
             1
         );
+    }
+
+    #[test]
+    fn the_overrides_placeholder_appears_exactly_once_and_is_substituted() {
+        use super::{divergence_script_full, DIVERGENCE_OVERRIDES_PLACEHOLDER};
+        // Twice would leave a literal placeholder in the script, which is a
+        // bare identifier and throws, taking every hook down with it. Zero
+        // would mean per-site choices reach no page.
+        assert_eq!(
+            DIVERGENCE_TEMPLATE
+                .matches(DIVERGENCE_OVERRIDES_PLACEHOLDER)
+                .count(),
+            1
+        );
+        let script = divergence_script_full(true, false, "{}").expect("token");
+        assert!(!script.contains(DIVERGENCE_OVERRIDES_PLACEHOLDER));
+    }
+
+    #[test]
+    fn an_empty_table_leaves_the_script_byte_identical_to_the_default_build() {
+        use super::divergence_script_full;
+        // The rule the detectability gate rests on: with no per-site
+        // choices, this feature changes nothing about what any page sees.
+        // If these two ever differ, the pinned 5-of-12 figure is measuring a
+        // script no user runs.
+        let with_empty = divergence_script_full(true, false, "{}").expect("token");
+        let plain = super::divergence_script_with(true, false).expect("token");
+        assert_eq!(with_empty, plain);
+    }
+
+    #[test]
+    fn only_hostname_shaped_keys_reach_the_table() {
+        use super::divergence_overrides_json;
+        let json = divergence_overrides_json(&[
+            ("example.com".to_string(), true),
+            ("sub.example.co.uk".to_string(), false),
+            // None of these can ever match a real location.hostname, so
+            // carrying them would be dead weight in every page's memory,
+            // and the quote-shaped one is the reason this filters rather
+            // than escapes.
+            ("has space.com".to_string(), true),
+            ("UPPER.com".to_string(), true),
+            ("quote\".com".to_string(), true),
+            ("sla/sh.com".to_string(), true),
+            (String::new(), true),
+        ]);
+        assert!(json.contains("example.com"));
+        assert!(json.contains("sub.example.co.uk"));
+        for bad in ["has space", "UPPER", "quote", "sla/sh"] {
+            assert!(!json.contains(bad), "{bad} reached the table: {json}");
+        }
+        assert_eq!(divergence_overrides_json(&[]), "{}");
     }
 
     #[test]

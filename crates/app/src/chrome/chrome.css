@@ -54,7 +54,40 @@ body {
   align-items: flex-end;
   gap: 3px;
   padding: 7px 8px 0;
-  background: var(--sf-tabstrip);
+  background: var(--sf-tabstrip-a);
+  /* For the accent hairline below, which is `position: absolute`. */
+  position: relative;
+}
+
+/* THE ACCENT'S TOP EDGE, and the reason it is a pseudo-element rather than a
+   border: a border on #tabstrip would move every tab down two pixels and
+   change what closedChromePx() measures, which is a number Rust lays the page
+   out against. This paints inside the padding and costs no height.
+
+   It spans the whole window, which is exactly what stops it reading as a
+   control: nothing else in this chrome draws edge to edge, so it cannot be
+   mistaken for a focus ring or a selected state. */
+/* ... except where the OS caption above it already wears the strip's tint
+   (Windows 11, reported back from chrome_palette_set): then the ring's top
+   edge is the OS border above the caption, and this line would be a second
+   accent band stacked under it -- the "two colours up top" that was called
+   out on 2026-08-17. Hidden there; kept where the caption stays the
+   system's (Windows 10, Linux). */
+:root[data-caption-tint="on"] #tabstrip::before {
+  display: none;
+}
+#tabstrip::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 2px;
+  background: var(--accent);
+  /* Under the tabs: an active chip's own top edge must stay readable where
+     the two meet. */
+  z-index: 0;
+  pointer-events: none;
 }
 #tabs {
   display: flex;
@@ -84,7 +117,11 @@ body {
   color: var(--tx-chip-hover);
 }
 .tab-chip.active {
-  background: var(--sf-strip); /* merges into the toolbar below */
+  background: var(--sf-strip-a); /* merges into the toolbar below */
+  /* Above #tabstrip::before, so the chip's own accent edge is what you read
+     where the two meet rather than a doubled line. */
+  position: relative;
+  z-index: 1;
   border-color: var(--ln-strong);
   color: var(--tx-bright);
   /* Accent on the top edge only. Placed where a focus ring never goes, so the
@@ -123,8 +160,14 @@ body {
   flex-wrap: wrap;
   gap: 6px;
   padding: 8px;
-  background: var(--sf-strip);
-  border-bottom: 1px solid var(--ln-soft2);
+  background: var(--sf-strip-a);
+  /* The bottom of the frame. The top is #tabstrip::before, and between them
+     the chrome is bounded by the accent on both sides -- which is what makes
+     it read as a frame rather than as a tinted rectangle. Quieter than the
+     top edge (a mix, not the accent itself) because this line also has a
+     job: it is the boundary between the browser and the page, and the page
+     is the thing you are meant to be looking at. */
+  border-bottom: 1px solid var(--ln-accent-edge);
   /* THE SECOND ROW FILLS FROM THE RIGHT.
    *
    * `justify-content` applies to every row of a wrapping flex container, but
@@ -207,7 +250,13 @@ body.translucent-backdrop.modal-open::before {
   right: 0;
   top: 0;
   height: var(--chrome-closed-px, 148px);
-  background: var(--sf-strip);
+  /* The SAME token the toolbar wears, not the untinted one it used to name.
+     This backing exists to be indistinguishable from the strip above it; the
+     moment the strip took an accent tint and this did not, the twelve pixels
+     came back as a differently-coloured band -- the exact defect the
+     paragraph above describes, reintroduced by a tint instead of by
+     transparency. */
+  background: var(--sf-strip-a);
   z-index: 45;
 }
 body.translucent-backdrop.modal-open::after {
@@ -394,6 +443,12 @@ button.danger:hover {
   align-items: center;
   justify-content: center;
   padding: 5px 7px;
+}
+/* Back, forward, reload and site info carry no identity tint -- they act on
+   the page rather than describing the browser's state -- so hover is the one
+   moment they can show the chosen colour without competing with anything. */
+.nav-btn:hover .ico {
+  stroke: var(--accent-bright);
 }
 
 /* Icon AND label: the label is what makes the control self-explanatory, the
@@ -631,13 +686,17 @@ button.danger:hover {
   background: var(--st-warn);
 }
 
+/* The address bar takes the quiet half of the accent it already wears
+   focused: tinted at rest, fully accented while you are typing in it. The
+   two rungs are far enough apart to read as a state change (28% of the
+   accent against the input line, versus the accent itself). */
 #url {
   flex: 1;
   min-width: 0;
   font: inherit;
   color: var(--tx-bright);
   background: var(--sf-sunken);
-  border: 1px solid var(--ln-input);
+  border: 1px solid var(--ln-accent-a);
   border-radius: 4px;
   padding: 6px 10px;
   outline: none;
@@ -730,10 +789,12 @@ body.loading #url {
    A panel added later belongs HERE, not in a rule of its own. */
 #vault-panel,
 #privacy-panel,
+#recall-panel,
 #dns-panel,
 #tunnel-panel,
 #tab-panel,
 #library-panel,
+#region-panel,
 #about-panel,
 #palette-panel,
 #onboarding-panel,
@@ -957,6 +1018,93 @@ body.loading #url {
 }
 .destructive-warning strong {
   color: var(--st-warn-strong);
+}
+
+/* The standing caveats under a download-comparison verdict. Dimmed and
+   small, but never hidden behind a disclosure: a verdict that can be read
+   without its limits is the failure the corroborate crate's own docs call
+   worse than no feature at all. */
+.caveats {
+  margin: 6px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--dim, #8a8a93);
+  line-height: 1.45;
+}
+
+/* A Premium control the current licence does not open.
+ *
+ * Dimmed and marked, never `disabled`: a disabled button drops out of the
+ * focus order, so a keyboard user could not reach it to learn why it is
+ * unavailable. It stays reachable, says why in its title, and its click is
+ * swallowed by premiumBlocked() in chrome.js.
+ *
+ * The lock glyph is the affordance a dimmed pill alone does not give: at a
+ * glance, dim reads as "temporarily unavailable" and dim-plus-lock reads as
+ * "not yours yet", which is the true state. */
+.premium-locked {
+  opacity: 0.55;
+  cursor: default;
+}
+.premium-locked::after {
+  content: "";
+  display: inline-block;
+  width: 9px;
+  height: 11px;
+  margin-left: 6px;
+  vertical-align: -1px;
+  /* A padlock drawn in CSS rather than shipped as an asset: the shackle is
+     the top border-arc, the body the filled block. */
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  box-shadow: inset 0 3px 0 -1.5px currentColor;
+  opacity: 0.9;
+}
+.premium-locked:hover {
+  /* No hover lift and no glow: the ordinary hover affordance would promise
+     the control is about to do its job. */
+  box-shadow: none;
+  transform: none;
+}
+
+/* Read text on this page (Premium region mode). The stage wraps the served
+   capture; the selection box is positioned in DISPLAYED pixels over the
+   image, whose top-left is the stage's own origin -- keep the img flush
+   (block, no margins) or the drag mapping acquires an offset nothing
+   accounts for. */
+#region-stage {
+  position: relative;
+  max-height: 300px;
+  overflow: auto;
+  border: 1px solid var(--accent-choice-border);
+  border-radius: 4px;
+}
+#region-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0;
+  cursor: crosshair;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
+}
+#region-selbox {
+  position: absolute;
+  border: 1px dashed var(--accent);
+  background: transparent;
+  pointer-events: none;
+}
+#region-result {
+  max-height: 160px;
+  overflow: auto;
+  white-space: pre-wrap;
+  border: 1px solid var(--accent-choice-border);
+  border-radius: 4px;
+  padding: 8px 10px;
+  margin: 6px 0 8px;
+  user-select: text;
+  -webkit-user-select: text;
 }
 
 /* Whole row is the label, so the clickable target is the sentence rather
@@ -1813,10 +1961,112 @@ textarea {
 #tab-panel .panel-note,
 #dns-panel .panel-note,
 #tunnel-panel .panel-note,
-#dns-choice .panel-note {
+#dns-choice .panel-note,
+#findtabs-panel .panel-note {
   color: var(--tx-faint);
   font-size: 12px;
   margin: 6px 0 0;
+}
+
+/* Find-across-tabs panel. Rows reuse .items/.item spacing; the two classes
+   of its own exist because a snippet is a BUTTON (the one clickable thing,
+   per the panel's rules) and buttons do not inherit text layout. The
+   palette from --tx/--sf pairs keeps it inside theme-contrast-gate. */
+#findtabs-panel h1 {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+#findtabs-panel #findtabs-query {
+  width: 100%;
+  max-width: 640px;
+  margin: 6px 0;
+}
+.findtabs-row {
+  background: var(--sf-item);
+  border: 1px solid var(--ln-item);
+  border-radius: 10px;
+  padding: 9px 11px;
+}
+.findtabs-head {
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+.findtabs-snippet {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--tx);
+  font: inherit;
+  padding: 3px 0;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.findtabs-snippet:hover {
+  color: var(--ac);
+}
+.findtabs-snippet b {
+  font-weight: 700;
+}
+
+/* Tab switcher (Premium). Palette-shaped: a query box over a ranked list;
+   .selected must be VISIBLE for the keyboard contract to mean anything. */
+#switcher-panel #switcher-query {
+  width: 100%;
+  max-width: 640px;
+  margin: 6px 0;
+}
+.switcher-row {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  background: var(--sf-item);
+  border: 1px solid var(--ln-item);
+  border-radius: 10px;
+  padding: 7px 11px;
+  cursor: pointer;
+}
+.switcher-row.selected {
+  border-color: var(--ac);
+}
+.switcher-title {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 45%;
+}
+.switcher-url {
+  color: var(--tx-dim2);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tab strip select mode (Premium): a checkbox per chip and the batch bar
+   above the strip. The bar rides the same height contract as the find
+   bar, so its show/hide always passes through syncChromeHeight. */
+.chip-select {
+  margin: 0 4px 0 0;
+}
+#tabbatch-bar {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  padding: 4px 8px;
+}
+#tabbatch-bar[hidden] {
+  display: none;
+}
+#tabbatch-count {
+  color: var(--tx-dim2);
+  font-size: 12px;
+  margin-right: 4px;
 }
 
 /* Resolver panel. Heading and the choice row want breathing room the privacy
@@ -3466,4 +3716,227 @@ textarea {
   --accent-choice-text: #3a1f80;
   --accent-text: #5028a8;
   --accent-tag: #54389e;
+}
+
+/* ---- the accent frame --------------------------------------------------
+   THE ACCENT NOW REACHES THE STRIP IT SITS ON, and this block is the whole
+   of how, deliberately: four derived tokens, defined once.
+
+   Everything above defines two independent axes -- an accent (nine) and a
+   scheme (three) -- and the browser wears one of each. A tint that mixes
+   them cannot be written in either block without writing it twenty-seven
+   times, which is twenty-seven chances to drift. Custom properties are
+   substituted where they are USED, not where they are declared, so a single
+   `color-mix` naming both axes re-resolves for whichever pair is worn. Add a
+   tenth accent or a fourth scheme and these follow it with no edit here.
+
+   The percentages are small on purpose. This is a browser whose colour rule
+   is that green means "a protection is on" and amber means "the engine
+   refused"; a strip washed hard enough to compete with those would cost the
+   one thing the chrome's colour is FOR. Seven percent reads as "this browser
+   is wearing a colour" at a glance and still leaves the pills the loudest
+   thing in the row. The tab strip takes less than the toolbar (four against
+   seven) because the two must stay distinguishable as surfaces -- the active
+   tab merges into the toolbar and the seam is how you see which tab it is.
+
+   Not themed here, and the omission is the point: --sf-body (the page's own
+   backing), every panel surface, and all three state families. */
+:root {
+  /* Toolbar, sidebar, and the active tab that merges into them. */
+  --sf-strip-a: color-mix(in srgb, var(--accent) 7%, var(--sf-strip));
+  /* The tab strip, one shade less so the seam survives. */
+  --sf-tabstrip-a: color-mix(in srgb, var(--accent) 4%, var(--sf-tabstrip));
+  /* The address bar at rest. Its focus ring is already --accent, so this is
+     the quiet half of the same relationship: tinted when idle, accented when
+     you are typing in it. */
+  --ln-accent-a: color-mix(in srgb, var(--accent) 28%, var(--ln-input));
+  /* The hairline along the top of the window, and the sidebar's inner edge.
+     Strong enough to be seen against the strip, never a border you could
+     mistake for a focus ring: it spans the whole window and nothing else
+     does. */
+  --ln-accent-edge: color-mix(in srgb, var(--accent) 55%, var(--ln-soft2));
+}
+
+/* ---- the chrome's own scrollbars ---------------------------------------
+   The panels, the sidebar rail and the folder menus scroll; their bars used
+   to be the engine's grey inside a chrome wearing a colour. `scrollbar-color`
+   inherits, so one declaration on the root reaches every scroll area in
+   this document. Transparent track: the bar sits on whatever surface it
+   scrolls, in every scheme, and only the thumb carries the accent. Pages get
+   the same declaration by another route (privacy.rs page_scrollbar_css);
+   keep the two in step. */
+html {
+  scrollbar-color: var(--accent) transparent;
+}
+
+/* ---- the accent frame's other three edges ------------------------------
+   #tabstrip::before is the top; this is the left, right and bottom, so the
+   accent wraps the whole window rather than underlining its title bar. The
+   same 2px and the same --accent, so the four sides read as ONE frame -- a
+   quieter mix here and the eye reads a strip with a border, which is the
+   thing this replaces.
+
+   Fixed to the window and pointer-events: none, so it paints over whatever
+   is at the edge (the sidebar rail's outer 2px, a modal card that reaches
+   the edge, the docked pane's outer column) and intercepts nothing. Where
+   the page is, it is not painted under the page: Rust insets the page by
+   PAGE_FRAME_PX (platform/mod.rs) on exactly these three edges, so the line
+   sits beside the page. That inset is Rust's constant, not a measurement
+   this stylesheet reports -- keep the two numbers equal by hand. */
+#page-frame {
+  position: fixed;
+  inset: 0;
+  border: 2px solid var(--accent);
+  border-top: none;
+  pointer-events: none;
+  /* Above the rail (50) and the panels (40): a frame is the outermost thing
+     by definition. */
+  z-index: 60;
+}
+
+/* ---- the toolbar down the left edge -------------------------------------
+   Worn as `data-toolbar-placement="left"` on the root, the same way the
+   accent and the scheme are, and the only layout in this file that changes
+   what Rust lays the PAGE out against -- chrome.js reports the rail's width
+   as a left inset, and the page starts there.
+
+   The rail is `position: absolute` rather than a flex child of the body,
+   and that is load-bearing. The body is a column: tab strip, toolbar, then
+   panels and banners. A flex child would have to be a sibling of all of
+   them and would push the whole stack sideways, including the tab strip,
+   which stays full width by design. Absolute takes the rail out of that
+   flow entirely, so the top strip is unchanged and the rail simply occupies
+   the space the page has been told to leave. */
+:root[data-toolbar-placement="left"] #sidebar {
+  position: absolute;
+  left: 0;
+  /* Below the top strip, down to the window's floor. The top is the same
+     measurement Rust was given, so the rail meets the toolbar exactly. */
+  top: var(--chrome-closed-px, 88px);
+  bottom: 0;
+  width: 56px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 0;
+  background: var(--sf-strip-a);
+  border-right: 1px solid var(--ln-accent-edge);
+  /* Above the scrim (30) and the panel (40), matching #toolbar's z-index in
+     the same state: in this layout the rail IS the toolbar, and pressing a
+     feature button to switch panels must reach the button. chrome.js's
+     dismissal handler exempts it for the same reason. */
+  z-index: 50;
+  /* Thirteen buttons on a short window. The rail scrolls rather than
+     clipping, because a button drawn past the bottom edge of a child window
+     is not drawn at all -- the same silent clipping the banner measurement
+     exists to prevent. */
+  overflow-y: auto;
+  overflow-x: hidden;
+}
+
+/* Icon only, and square. A column wide enough for words is a column taking
+   width from the page, which is the trade this layout exists to avoid; the
+   name is in `title` and `aria-label`, untouched, so hovering still says
+   what the button does and a screen reader still reads its full name. */
+:root[data-toolbar-placement="left"] #sidebar .feature-label {
+  display: none;
+}
+:root[data-toolbar-placement="left"] #sidebar .feature-btn,
+:root[data-toolbar-placement="left"] #sidebar .nav-btn {
+  width: 38px;
+  height: 34px;
+  padding: 0;
+  justify-content: center;
+  flex: none;
+}
+/* "You are here", mirrored. The active tab wears its accent on the top
+   edge; a button in a vertical rail wears it on the leading edge, which is
+   the same idea rotated and reads the same way. */
+:root[data-toolbar-placement="left"]
+  #sidebar
+  .feature-btn[aria-pressed="true"] {
+  box-shadow: inset 2px 0 0 var(--accent-bright);
+}
+/* The counter badges (blocked requests, and the vault dot) are positioned
+   against the pill; nothing about them changes here, but a 38px pill has
+   less room, so the badge tucks into the corner rather than sitting beside
+   a label that is no longer there. */
+:root[data-toolbar-placement="left"] #sidebar .feature-btn .count {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+}
+
+/* The padlock becomes a corner badge instead of a glyph in the row.
+   Beside the icon it fought a 38px pill for width and the two read as one
+   smudged shape; in the corner it reads as a state ON the icon, which is
+   what it means -- and it is the same corner the counters use, so a button
+   never has to carry both in the same place. */
+:root[data-toolbar-placement="left"] #sidebar .premium-locked::after {
+  position: absolute;
+  bottom: 3px;
+  right: 3px;
+  margin-left: 0;
+  width: 7px;
+  height: 8px;
+  box-shadow: inset 0 2px 0 -1px currentColor;
+}
+
+/* The break has no row to break: with everything after it gone, it would
+   leave a 6px gap at the end of the top row. */
+:root[data-toolbar-placement="left"] .toolbar-break {
+  display: none;
+}
+
+/* EVERYTHING THE PAGE'S EDGE MOVED, MOVES WITH IT.
+   Banners and the find bar are in the chrome's flow, below the toolbar, and
+   the rail is drawn over that space. Without the margin they render
+   underneath it -- the first ~56px of every warning hidden behind the
+   toolbar, which is the lock-warning defect in a third costume. */
+:root[data-toolbar-placement="left"] #blocked-warning,
+:root[data-toolbar-placement="left"] #update-banner,
+:root[data-toolbar-placement="left"] #resolver-warning,
+:root[data-toolbar-placement="left"] #tls-warning,
+:root[data-toolbar-placement="left"] #save-password-banner,
+:root[data-toolbar-placement="left"] #lock-warning,
+:root[data-toolbar-placement="left"] #tunnel-warning,
+:root[data-toolbar-placement="left"] #findbar {
+  margin-left: var(--chrome-left-px, 0px);
+}
+
+/* A panel is centred on the PAGE, not on the window: centred on the window
+   it would sit 28px left of where the content it describes is, and on a
+   narrow window its left edge would slide under the rail (z 50 beats 40). */
+:root[data-toolbar-placement="left"] .panel-modal {
+  left: calc(50% + var(--chrome-left-px, 0px) / 2);
+  width: min(600px, calc(100vw - var(--chrome-left-px, 0px) - 32px));
+}
+:root[data-toolbar-placement="left"] .panel-modal.panel-wide {
+  width: min(1180px, calc(100vw - var(--chrome-left-px, 0px) - 48px));
+}
+
+/* WHERE THE PAGE COVERS THE CHROME, THE VIEWPORT IS NOT THE CANVAS.
+   ------------------------------------------------------------------------
+   `100vh` is the chrome document's window, which is only the space the
+   chrome can actually paint into where the backend LIFTS the chrome above
+   the page. Where it does not -- GTK always, Windows without the
+   translucent lift -- the page covers everything below the top inset, and a
+   card sized against the viewport has its lower half behind the page: not
+   clipped with a scrollbar, just absent, because as far as the document is
+   concerned it fits.
+
+   So on those backends the card is bounded by what Rust was actually given
+   (--chrome-height-px, published by syncChromeInsets), and the confirmation
+   overlay is bounded the same way -- it centres itself in the body, which
+   without this puts a question the user cannot see at the middle of a
+   window whose middle is page. */
+body.page-covers-chrome .panel-modal {
+  max-height: calc(
+    var(--chrome-height-px, 500px) - var(--chrome-closed-px, 148px) - 24px
+  );
+}
+body.page-covers-chrome #confirm-overlay {
+  height: var(--chrome-height-px, 500px);
+  bottom: auto;
 }

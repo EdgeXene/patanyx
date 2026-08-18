@@ -125,6 +125,36 @@
       }
     }
 
+    // Per-site choices, substituted at tab build time. Default "{}", which
+    // is the whole of what a build before this feature carried, so the
+    // paragraphs below run byte for byte as they always have.
+    //
+    // CLOSURE-LOCAL, and that is load-bearing. This whole file is one IIFE,
+    // so page script cannot read this table: it can see that a wrapper
+    // exists (Function.prototype.toString shows source, which the no-stealth
+    // rule already accepts) but not the values inside the closure. A table
+    // of the user's per-site choices is a list of sites they cared about,
+    // and it must not become readable by the sites themselves.
+    var OVERRIDES = __DIVERGENCE_OVERRIDES__;
+    var LEVEL = "default";
+    try {
+      if (
+        OVERRIDES &&
+        Object.prototype.hasOwnProperty.call(OVERRIDES, topHost)
+      ) {
+        LEVEL = OVERRIDES[topHost];
+      }
+    } catch (eLevel) {
+      LEVEL = "default";
+    }
+    if (LEVEL === "off") {
+      // The user asked for this site to be left alone. Nothing is patched,
+      // so the site sees its real readings. Returning here rather than
+      // skipping each hook keeps the "off" path from depending on every
+      // later branch staying correct.
+      return;
+    }
+
     // Seed mix + PRNG: cyrb128 into sfc32, both public-domain standards.
     // Non-cryptographic ON PURPOSE: SubtleCrypto is async and these hooks
     // must install synchronously before page script runs. A site observes at

@@ -48,6 +48,15 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="0.9.63" date="2026-08-17">
+      <description>
+        <p>The tab pack: Multi-Tab Search finds a word across every open tab and shows a snippet from each; the Tab Switcher finds a tab by a few letters of its title or address; Batch Tab Actions select several tabs and close, bookmark, or shelve them together. These three ask for a Premium license from day one and unlock when Premium launches. Bookmark Search in the Library is free and ranks the closest match first, even with letters missing.</p>
+        <p>Text Capture reads the text inside a box you drag on the page. Deep Recall keeps the pages you choose to save and finds them later by a word you remember. Divergence Exceptions turn fingerprint noise off for named sites; Fingerprint Divergence itself is switched on for everyone in this release. In the separate PATANYX-Premium build, Copy Compare asks a contact whether their download hashes the same as yours, and Change Cross-Check asks whether a page changed for them too. All of these ask for a Premium license from day one.</p>
+        <p>Cookies can be cleared for every site at once. Premium controls now show as locked instead of refusing after the click. A Premium license may carry no expiry. The reported host list is refreshed and the wording is American English throughout.</p>
+        <p>Started without a page, the browser opens PATANYX Search at patanyx.com. A page handed to it on launch opens instead, as before, and new tabs stay blank.</p>
+        <p>The accent color now frames the whole window and tints the tab strip, toolbar and address bar; on Windows 11 the title bar and the window border wear it as well. The browser's own scrollbars follow it, and on Windows so do the scrollbars of the pages you open, which means a page can read the accent you chose. The nine accents have names of their own; all nine, and all three chrome color schemes, are free. The feature buttons can sit in a strip down the left edge instead of above the page. A Premium license will activate on up to five devices: one request when the vault first opens after the token is pasted, retried at the next unlock if it could not get through, and checked offline from then on; releasing a device frees its slot, and a license allows a limited number of activations in all.</p>
+      </description>
+    </release>
     <release version="0.9.62" date="2026-08-08">
       <description>
         <p>Fingerprint Divergence is stronger. The sound reading a site can take of your machine now carries noise that varies across the recording and is tied to what was measured, so it cannot be normalized away or worked out by comparing two readings. Silence stays silent.</p>

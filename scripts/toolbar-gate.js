@@ -55,6 +55,41 @@ new Function(fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8"))();
 const headerAt = html.indexOf('<header id="toolbar"');
 const headerEnd = html.indexOf("</header>");
 const TOOLBAR_SRC = html.slice(headerAt, headerEnd);
+const TOOLBAR_AT = headerAt;
+
+// Press a placement button and let the round trip settle.
+//
+// Through the real control, not by calling an internal: what is under test
+// is the whole path -- click, IPC, reply, wear -- and a gate that reached
+// past the button would keep passing after the button stopped being wired.
+// The stub answers `toolbar_placement_set` by echoing the argument, which is
+// what Rust does.
+// The rail has a width, because nothing here has a layout.
+//
+// The stub measures every element at zero, so `closedChromeLeftPx()` would
+// report 0 for a sidebar that is genuinely showing -- and a gate asserting
+// "the inset is non-zero" would be asserting against the harness rather than
+// the chrome. Planted, the same way blocked-banner-gate plants a banner's
+// height to prove the banner is measured. 56 is the width the stylesheet
+// gives it.
+const RAIL_PX = 56;
+global.$("sidebar").getBoundingClientRect = () => ({
+  height: 0,
+  width: RAIL_PX,
+  top: 0,
+  left: 0,
+});
+
+const wear = async (placement) => {
+  // Rust echoes the value it accepted, and the chrome re-dresses from the
+  // REPLY rather than from the click -- so a stub that answered `{}` would
+  // leave the layout where it was and every check below would fail for the
+  // wrong reason. Seeded per call, which is also what makes a mismatched
+  // echo expressible if anyone wants to test one.
+  global.rbResolve.toolbar_placement_set = { placement };
+  global.$("placement-" + placement)._fire("click");
+  await flush();
+};
 
 // Every control a user chose to have. None of these may be hidden behind
 // anything: that is the whole point of the two-row layout.
@@ -153,6 +188,10 @@ check("no stylesheet rule can move a control across the row break", () => {
   // Source order is the only thing that decides rows now, so `order` must not
   // reappear. If a future layout genuinely needs it, this gate is the thing to
   // change deliberately, with the row check taught to account for it.
+  //
+  // The sidebar layout was that future layout, and it did NOT need it: the
+  // buttons are moved in the DOM rather than reordered in CSS, which is why
+  // the ban still stands and why the checks below can assert on parentage.
   const css = fs
     .readFileSync(path.join(chromeDir, "chrome.css"), "utf8")
     .replace(/\/\*[\s\S]*?\*\//g, "");
@@ -162,6 +201,267 @@ check("no stylesheet rule can move a control across the row break", () => {
     "chrome.css sets `order`, which silently overrides the markup order this " +
       "layout depends on -- a control can be written on row one and render on " +
       "row two with nothing to show for it.",
+  );
+});
+
+// ---- the toolbar can move to the left edge, and come back ----------------
+//
+// The property this layout is FOR is that moving the toolbar moves the SAME
+// buttons -- not copies. A second markup copy of the row would satisfy every
+// check above (each id still exists, each still has a handler) while giving
+// the browser two #btn-vault elements, one of which is wired and one of
+// which is not. So these assert parentage, and that the trip back is exact.
+
+check("every accent swatch names its colour to a screen reader", () => {
+  // THE NAMES ARE GREEK, AND A NAME IS NOT A COLOUR.
+  //
+  // The nine accents are labelled Ion, Sardonyx, Aether and so on. That is
+  // a deliberate choice about how a palette reads, and it costs something
+  // real: "Chloris" tells a reader who does not know the word nothing about
+  // what they are about to pick. The plain colour therefore has to survive
+  // somewhere, for everyone.
+  //
+  // `title` alone does NOT do it, which is the trap this check exists for.
+  // It is the last resort in the accessible name computation, used only
+  // when nothing else names the element -- and these buttons have text
+  // content, so the name is the Greek word and the tooltip is at most a
+  // description most screen readers skip. A keyboard-only user never gets
+  // it at all. Against the build before the rename, whose accessible name
+  // was "Lavender", relying on `title` was a regression.
+  //
+  // So both attributes are required, and each must carry a plain colour
+  // word. A rename that forgets this fails here rather than shipping.
+  const COLOUR_WORDS = [
+    "blue",
+    "violet",
+    "red",
+    "green",
+    "amber",
+    "teal",
+    "gray",
+    "purple",
+  ];
+  const swatches = [
+    ...html.matchAll(/<button\b([^>]*\bclass="[^"]*theme-swatch[^"]*"[^>]*)>/g),
+  ];
+  assert(
+    swatches.length === 9,
+    "expected nine accent swatches, found " + swatches.length,
+  );
+  for (const [, attrs] of swatches) {
+    const id = (attrs.match(/id="([a-z0-9_-]+)"/) || [])[1] || "(no id)";
+    const aria = (attrs.match(/aria-label="([^"]*)"/) || [])[1];
+    const title = (attrs.match(/title="([^"]*)"/) || [])[1];
+    assert(
+      aria,
+      "#" +
+        id +
+        " has no aria-label. Its accessible name is then the Greek " +
+        "word alone, and the colour it picks is unreachable without a mouse.",
+    );
+    assert(
+      title,
+      "#" + id + " has no title, so a hovering reader gets no plain colour",
+    );
+    for (const [what, value] of [
+      ["aria-label", aria],
+      ["title", title],
+    ]) {
+      assert(
+        COLOUR_WORDS.some((w) => value.toLowerCase().includes(w)),
+        "#" +
+          id +
+          "'s " +
+          what +
+          " (" +
+          JSON.stringify(value) +
+          ") names no " +
+          "plain colour. The label is a proper noun; if neither attribute " +
+          "says what colour it is, nothing does.",
+      );
+    }
+  }
+});
+
+check("the sidebar exists, is empty, and starts hidden", () => {
+  const rail = html.indexOf('<nav id="sidebar"');
+  assert(rail !== -1, "there is no #sidebar for the toolbar to move into");
+  assert(
+    rail > TOOLBAR_AT,
+    "#sidebar must come after #toolbar in the markup: the buttons are moved " +
+      "into it at runtime, and a container written first would be the one a " +
+      "reader assumes owns them.",
+  );
+  const tag = html.slice(rail, html.indexOf(">", rail) + 1);
+  assert(
+    / hidden/.test(tag),
+    "#sidebar must start hidden: the default layout is Top, and an empty " +
+      "56px strip down the left of every fresh install is not it.",
+  );
+  assert(
+    /aria-label="/.test(tag),
+    "#sidebar is a nav and needs a label: in the left layout it IS the " +
+      "toolbar, and a screen reader arriving at an unlabelled group of " +
+      "icon-only buttons has been told nothing.",
+  );
+  const inner = html.slice(
+    html.indexOf(">", rail) + 1,
+    html.indexOf("</nav>", rail),
+  );
+  assert(
+    inner.trim() === "",
+    "#sidebar must be EMPTY in the markup. Anything written here is a second " +
+      "copy of a control that already exists in #toolbar, and only one of the " +
+      "two can be the one chrome.js wired.",
+  );
+});
+
+check(
+  "choosing Left moves every second-row control into the sidebar",
+  async () => {
+    await wear("left");
+    const rail = global.$("sidebar");
+    const bar = global.$("toolbar");
+    assert(!rail.hidden, "the sidebar is still hidden after choosing Left");
+    for (const id of ROW_TWO) {
+      const el = global.$(id);
+      assert(
+        el.parentNode === rail,
+        "#" +
+          id +
+          " stayed in the toolbar when the toolbar moved left. In that " +
+          "layout the top strip is not where a feature button is looked for, " +
+          "and a control drawn outside the chrome's own bounds is not drawn.",
+      );
+    }
+    // The two that arrive late, appended by update.js and integrity.js after
+    // the placement may already have been worn.
+    for (const id of ["btn-integrity", "btn-update"]) {
+      const el = global.$(id);
+      if (!el || !el.parentNode) continue;
+      assert(
+        el.parentNode === rail,
+        "#" +
+          id +
+          " is appended to #toolbar at runtime and was not swept into " +
+          "the sidebar. It would render in a container the layout does not show.",
+      );
+    }
+    for (const id of ROW_ONE) {
+      assert(
+        global.$(id).parentNode === bar,
+        "#" +
+          id +
+          " moved to the sidebar. Row one acts on the page in front of " +
+          "you and stays with the address bar in both layouts.",
+      );
+    }
+  },
+);
+
+check("choosing Top puts them back in source order", async () => {
+  const bar = global.$("toolbar");
+  const rail = global.$("sidebar");
+  // Snapshot from the TOP layout: the previous check left the buttons in the
+  // sidebar, and comparing a full row against a half one proves nothing.
+  await wear("top");
+  const before = bar.children.map((c) => c.id).join(",");
+  await wear("left");
+  // SCRAMBLE THE RAIL before coming back, and this is the part that earns
+  // the check.
+  //
+  // Restoring by appending whatever the rail currently holds gives the right
+  // answer as long as the rail's order happens to equal the markup's -- which
+  // it does on a first trip, so a gate that only went left-and-back would
+  // pass against an implementation with no notion of source order at all.
+  // update.js and integrity.js append at runtime and are swept in whenever
+  // they arrive, so "the rail's order" is not a thing that can be relied on.
+  // Moving one button to the front is the cheapest way to make the two
+  // orders genuinely disagree.
+  if (rail.children.length > 1) {
+    rail.insertBefore(
+      rail.children[rail.children.length - 1],
+      rail.children[0],
+    );
+  }
+  await wear("top");
+  const after = bar.children.map((c) => c.id).join(",");
+  assert(
+    global.$("sidebar").hidden,
+    "the sidebar is still showing after choosing Top",
+  );
+  assert(
+    global.$("sidebar").children.length === 0,
+    "the sidebar still holds controls after choosing Top: they are in a " +
+      "hidden container, which is the disclosure this whole gate exists to " +
+      "forbid.",
+  );
+  assert(
+    after === before,
+    "the row came back in a different order than it went out.\n      was: " +
+      before +
+      "\n      now: " +
+      after,
+  );
+});
+
+check("the layout is reported to Rust on both axes", async () => {
+  await wear("left");
+  global.rbCalls.length = 0;
+  await wear("left");
+  const insets = global.rbCalls.filter((c) => c.cmd === "set_chrome_insets");
+  assert(insets.length > 0, "choosing a placement reported no insets to Rust");
+  const last = insets[insets.length - 1].args;
+  assert(
+    typeof last.top === "number" && typeof last.left === "number",
+    "both axes must be reported as numbers; got " + JSON.stringify(last),
+  );
+  // The page's rectangle is Rust's, and the only thing that tells it a
+  // sidebar is there is this number. Zero here means the page is laid out
+  // underneath the toolbar with nothing to show for it.
+  assert(
+    last.left > 0,
+    "the left inset is " +
+      last.left +
+      " in the sidebar layout: the page " +
+      "would be laid out under the toolbar, which does not draw an error, it " +
+      "just puts the first 56px of every page behind a strip.",
+  );
+  await wear("top");
+  const back = global.rbCalls
+    .filter((c) => c.cmd === "set_chrome_insets")
+    .pop().args;
+  assert(
+    back.left === 0,
+    "returning to Top left a " +
+      back.left +
+      "px inset: the page keeps a " +
+      "margin for a toolbar that is no longer there.",
+  );
+});
+
+check("the stylesheet is told what Rust was told", async () => {
+  await wear("left");
+  const vars = global.document.documentElement.style;
+  const left = vars.getPropertyValue("--chrome-left-px");
+  assert(
+    left && left !== "0px",
+    "--chrome-left-px is " +
+      JSON.stringify(left) +
+      ". Banners, the find bar " +
+      "and every panel position off it; unset, they render underneath the " +
+      "sidebar.",
+  );
+  assert(
+    vars.getPropertyValue("--chrome-height-px"),
+    "--chrome-height-px is unset. Where the page draws over the chrome, a " +
+      "modal card sized against the viewport extends underneath it and its " +
+      "lower half is simply not on screen.",
+  );
+  await wear("top");
+  assert(
+    vars.getPropertyValue("--chrome-left-px") === "0px",
+    "--chrome-left-px did not return to 0px in the top layout",
   );
 });
 
@@ -316,11 +616,16 @@ check("every banner in the chrome is measured by syncChromeHeight", () => {
     "found only " + declared.length + " banners; the pattern stopped matching",
   );
   const js = fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8");
-  const listed = js.slice(js.indexOf("const BANNERS"), js.indexOf("]", js.indexOf("const BANNERS")));
+  const listed = js.slice(
+    js.indexOf("const BANNERS"),
+    js.indexOf("]", js.indexOf("const BANNERS")),
+  );
   for (const id of declared) {
     assert(
       listed.includes('"' + id + '"'),
-      "#" + id + " is a banner in index.html but is not in chrome.js's " +
+      "#" +
+        id +
+        " is a banner in index.html but is not in chrome.js's " +
         "BANNERS list. The strip will not grow for it, so it renders outside " +
         "the chrome's own window and is invisible -- except while a modal " +
         "happens to be open.",
@@ -345,6 +650,21 @@ check("the runtime-built buttons land in the toolbar", () => {
 });
 
 check("a pill opens its panel, and Escape closes it", async () => {
+  // START FROM CLOSED, whatever the checks above left open.
+  //
+  // This asserts that a press OPENS, and a press is a toggle -- so arriving
+  // with the vault already open turned the check into "a press closes it",
+  // which failed for a reason that had nothing to do with the property under
+  // test. It passed for a long time on the accident that the preceding
+  // checks happened to leave a different panel open; adding checks above
+  // changed which one, and the accident stopped holding.
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+  assert(
+    global.$("vault-panel").hidden === true,
+    "the vault panel is still open after Escape, so this check cannot tell " +
+      "an open from a toggle",
+  );
   // The pills reach the panels directly now that nothing sits between them.
   global.$("btn-vault")._fire("click");
   await flush();

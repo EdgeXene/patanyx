@@ -122,7 +122,7 @@ type Feature = (&'static str, &'static str, &'static str);
 // that is already running. The body sentence carried the same implication and
 // is reworded with it: the switch turns blocking OFF now, not on.
 const F_ADS: Feature = (
-    "Ad and tracker blocking",
+    "Ads & Tracker Blocker",
     "Automatic",
     "Ads and trackers are blocked from the first time you open \
      PATANYX, and one switch turns it off. A blocked request never leaves \
@@ -133,21 +133,21 @@ const F_ADS: Feature = (
 // with an expiry date on it. This body is completed at runtime from
 // `blocklist::len()`, so the figure is whatever this binary actually carries.
 const F_MALICIOUS: Feature = (
-    "Scam sites refused",
+    "Reported Host List",
     "Automatic",
     "PATANYX will not open a known phishing site, whatever your other \
      settings say. The list updates every hour, and you can open a blocked \
      site anyway if you think it is wrong.",
 );
 const F_LEDGER: Feature = (
-    "See who a page talks to",
+    "Page Connections",
     "Automatic",
     "Open one panel to see every other company the page just contacted, and \
      how many requests were allowed or stopped. Most pages talk to more of \
      them than you would guess.",
 );
 const F_FREEZE: Feature = (
-    "Freeze a tab",
+    "Tab Freeze",
     "On demand",
     "One click and the tab stops sending anything until you let it go \
      again. Handy when a page will not stop chattering in the background.",
@@ -161,7 +161,7 @@ const F_FREEZE: Feature = (
 // qualifier stays: the key that makes it work is published by the SITE, so a
 // site that has not set it up gets no cover from it.
 const F_DNS: Feature = (
-    "Pick who sees your lookups",
+    "Encrypted DNS",
     "Opt-in, Windows",
     "Every site you visit starts with a lookup that normally goes \
      unencrypted to whoever runs your network. Switch it to Mullvad or Quad9 \
@@ -171,13 +171,13 @@ const F_DNS: Feature = (
      it.",
 );
 const F_QUARANTINE: Feature = (
-    "Quarantine tab",
+    "Strict Tab",
     "On demand",
     "One click gives you a tab with blocking on, scripts off, nothing saved \
      and the freeze ready, for a link you do not trust.",
 );
 const F_VAULT: Feature = (
-    "A vault for passwords",
+    "PATANYX Vault",
     // NOT "On demand" any more, and the tag had to move with the behaviour:
     // the legend defines that as a tool you reach for, and since the vault
     // started opening itself at launch it reaches for you. Same tag-inversion
@@ -224,7 +224,7 @@ const F_BOOKMARKS: Feature = (
      you search for.",
 );
 const F_TUNNEL: Feature = (
-    "A tunnel you supply the far end of",
+    "Private Tunnel",
     // FREE (decided 2026-08-05): the tunnel costs EdgeXene
     // nothing to provide -- the user supplies the far end -- so it does not
     // belong behind the paid tier. It was tagged "future Premium" before
@@ -242,14 +242,14 @@ const F_TUNNEL: Feature = (
      the browser.",
 );
 const F_OCR: Feature = (
-    "Check a photo before you send it",
+    "Image Text Review",
     "On demand; future Premium",
     "Point it at an image and it reads the text inside, flagging e-mail \
      addresses, card numbers and keys you may not have noticed. It runs on your \
      machine and sends the picture nowhere.",
 );
 const F_INTEGRITY: Feature = (
-    "Catch a page that changed",
+    "Page Snapshot",
     "On demand",
     "Save a page and PATANYX tells you later whether the site quietly changed \
      it.",
@@ -268,13 +268,106 @@ const F_INTEGRITY: Feature = (
 /// not. That makes this tag a one-way door, which is a deliberate choice and
 /// was made explicitly.
 const F_HIDDEN_TEXT: Feature = (
-    "Find writing that was hidden from you",
+    "Text Capture",
     "On demand; future Premium",
-    "Text can be hidden in a picture by colouring it to match the background: \
-     white on white, or a grey a shade off the paper. Sometimes that is \
+    "Text can be hidden in a picture by coloring it to match the background: \
+     white on white, or a gray a shade off the paper. Sometimes that is \
      careless, and sometimes someone did not want it read. When you check a \
      photo, PATANYX finds text that is too faint to see and shows you what it \
      says. Like the rest of the photo check, this happens on your machine.",
+);
+
+/// The personal archive. Premium-gated from its first appearance, same
+/// one-way reasoning as `F_HIDDEN_TEXT` above, and genuinely enforced rather
+/// than merely intended: `archive_save` and `archive_search` both call
+/// `cross_tab_gate(premium_active())` before touching the store.
+///
+/// THE FIRST SENTENCE IS THE HONESTY GUARD, not decoration. A personal
+/// archive in a privacy browser is only defensible because the user fills it
+/// deliberately, and "History remembers where you went. Deep Recall remembers
+/// what you chose to keep." says that in the same breath as the pitch. Keep it
+/// first. Nothing here may imply PATANYX records browsing on its own, and the
+/// archive is bounded to a few hundred records, so nothing may imply an
+/// unlimited history either.
+const F_ARCHIVE: Feature = (
+    "Deep Recall",
+    "On demand; future Premium",
+    "History remembers where you went. Deep Recall remembers what you chose \
+     to keep. Save a page and PATANYX stores a private snapshot alongside the \
+     text its on-device reader finds inside it, so months later you can type a \
+     word you remember and get the page back, even if that word only appeared \
+     inside an image. It holds only the pages you chose to save, in one \
+     encrypted file on your machine that opens with your vault. Nothing is \
+     uploaded.",
+);
+
+/// Comparing a downloaded file with a contact. Premium-gated from its first
+/// appearance, same one-way reasoning as `F_HIDDEN_TEXT`, and it only exists
+/// in the chat build, so `features()` adds it under the same cfg the chat
+/// feature itself rides.
+///
+/// THE INNOCENT EXPLANATIONS ARE PART OF THE FEATURE, not a hedge appended to
+/// it. A hash that differs is evidence, and the honest reading of that
+/// evidence includes a publisher reissuing a file and a content network
+/// serving a regional build. Copy that let a user walk away believing they had
+/// caught an attack, when the ordinary cause is far likelier, would be selling
+/// alarm. Keep the "look closer, not a verdict" sentence and keep it near the
+/// claim, not at the end.
+const F_DOWNLOAD_COMPARE: Feature = (
+    "Copy Compare",
+    "On demand; future Premium",
+    "Download an installer and a contact who took the same file from the same \
+     address can tell you whether their copy comes out to the same hash as \
+     yours. The case this is built for is the targeted swap: the file everyone \
+     else receives is clean, and the one served to you is not. A difference is \
+     a reason to look closer, not a verdict. Publishers reissue files and \
+     content networks serve regional builds, so compare version numbers and \
+     publisher signatures before you conclude anything.",
+);
+
+/// Asking a contact whether a page changed for them too. Chat build only,
+/// Premium-gated, same reasoning as `F_DOWNLOAD_COMPARE` above.
+///
+/// THE FIRST TWO SENTENCES ARE THE HONESTY GUARD. Page Snapshot on its own
+/// cannot distinguish a site editing a page for everyone from a site editing
+/// it for one reader, and that limit is exactly what this feature addresses.
+/// Stating the limit before the capability is what keeps the capability from
+/// reading like a claim the snapshot alone could already make.
+const F_CHANGE_COMPARE: Feature = (
+    "Change Cross-Check",
+    "On demand; future Premium",
+    "PATANYX can tell you a saved page changed since you last looked at it. It \
+     cannot tell you on its own whether it changed for everyone or only for \
+     you. Ask a contact with the same page open and you get the other half: \
+     whether their copy matches yours now, whether the two of you started from \
+     the same page, and whether theirs changed as well. The comparison goes to \
+     the one contact you asked and nowhere else.",
+);
+
+/// Turning Fingerprint Divergence off for named sites.
+///
+/// TWO LIMITS BELONG IN THE COPY AND ARE LOAD-BEARING. A choice made here
+/// reaches the NEXT tab for that site, because neither engine can re-register
+/// scripts on a view that is already open; and the proof line reports what a
+/// tab was given, which is registration and not a measurement that any site
+/// was fooled. The in-app panel is gated on both by
+/// scripts/divergence-site-gate.js. This entry may not imply either one away.
+///
+/// Note the split: the per-site CHOICE asks for a licence from day one,
+/// while Fingerprint Divergence itself is a Premium SEED -- switched on for
+/// everyone until launch and gated from then on (design preamble
+/// 2026-08-06, reaffirmed 2026-08-16 after a 2026-08-14 About rewrite had
+/// briefly called it "stays free"). Its own entry so the two are not read
+/// as one thing.
+const F_DIVERGENCE_SITES: Feature = (
+    "Divergence Exceptions",
+    "On demand; future Premium",
+    "Fingerprint Divergence adds noise for every site, and a few sites break \
+     under it. Turn it off for just those, named one full hostname at a time, \
+     and leave it on everywhere else. The panel also reports what the tab in \
+     front of you actually received, which is worth knowing because a tab \
+     keeps whatever it started with: a change here reaches the next tab you \
+     open for that site.",
 );
 
 fn features() -> Vec<Feature> {
@@ -293,7 +386,15 @@ fn features() -> Vec<Feature> {
         F_OCR,
         F_INTEGRITY,
         F_HIDDEN_TEXT,
+        F_ARCHIVE,
+        F_DIVERGENCE_SITES,
     ]);
+    // Both of these talk to a contact, so they exist only where chat does.
+    // Listing them in the public build would describe a panel that build has
+    // no code for.
+    if cfg!(feature = "chat") {
+        out.extend([F_DOWNLOAD_COMPARE, F_CHANGE_COMPARE]);
+    }
     out
 }
 
@@ -315,7 +416,7 @@ const LIMITS: &[(&str, &str)] = &[
     ),
     (
         "It is not an anonymity tool",
-        "There is no onion routing, and no defence against someone watching \
+        "There is no onion routing, and no defense against someone watching \
          traffic patterns. The built-in tunnel moves what your local network \
          sees to a server you picked. It changes who can watch, not whether \
          anyone can. If you need nobody in the path to know you reached a \
@@ -349,13 +450,66 @@ const PREMIUM_HEAD: &str = "Free and Premium";
 
 /// Future tense THROUGHOUT, on purpose: nothing is for sale today, and a
 /// page that reads as if it were would be the exact dishonesty the rest of
-/// this file exists to prevent. The one absolute sentence -- "Free features
-/// always remain free." -- is a standing commitment whose exact wording is
-/// deliberate, and the test below pins it so a rewrite cannot soften it
-/// into marketing. When Premium actually launches, this paragraph changes
-/// to present tense IN THE SAME COMMIT as the licensing ships, never before.
-const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Fingerprint Divergence, private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, and accent theme packs will be part of it. Nothing is behind a paywall today: Fingerprint Divergence, theme packs and the photo check are switched on for everyone in this build, and stay that way until Premium launches. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. Every other protection on this page is free. Free features always remain free. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
+/// this file exists to prevent. The one standing commitment -- "Features
+/// designated as part of the free tier will remain free forever." -- has
+/// deliberate wording, and the test below pins it so a rewrite cannot soften
+/// it into marketing.
+///
+/// REWORDED 2026-08-14 from "Free features always remain free." The promise is now SCOPED to the free tier rather
+/// than to whatever happens to be free in a given build. The one-way tiering
+/// rule below is unchanged and still binding: a feature that ships free is
+/// not gated later. What the new wording drops is the accidental reading
+/// that a Premium feature temporarily switched on for everyone (Fingerprint
+/// Divergence and the photo check) had thereby become free
+/// forever. Do not soften it further: it is a published commitment, not
+/// copy. When Premium actually launches, this paragraph changes to present
+/// tense IN THE SAME COMMIT as the licensing ships, never before.
+///
+/// THEME PACKS LEFT THE PREMIUM LIST 2026-08-16, and that is a ONE-WAY DOOR
+/// taken deliberately.
+///
+/// They had been the designated paid extra since 2026-08-04: nine accents
+/// and three chrome schemes, shipped unlocked as the pack's seed, with the
+/// split recorded as a choice to be made the day the gate was flipped. The
+/// question came up because the accent stopped being a highlight -- it now
+/// tints the tab strip, the toolbar and the address bar -- so gating it
+/// later would have reverted a user's whole browser to blue rather than
+/// costing them a detail. Between a loud retraction, grandfathering, and
+/// giving the pack away, giving it away is the only one of the three that
+/// keeps faith with the free-features-stay-free note the public About page
+/// already carried.
+///
+/// The sentence above puts them in the free tier, and the free-tier promise
+/// is what makes this permanent: theme packs can never be sold. That is the
+/// point of writing it here rather than only in a changelog. If the pack is
+/// ever to earn money, it has to be NEW accents and NEW schemes on top of
+/// these, which the wording deliberately leaves room for -- "all nine" and
+/// "all three" are counts of what ships today, not a promise about a tenth.
+const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Fingerprint Divergence, private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, the tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, comparing a downloaded file with a contact, and turning fingerprint noise off for named sites will be part of it. Fingerprint Divergence and the photo check are switched on for everyone in this build, and stay that way until Premium launches. The tab pack works differently, and so do the newer features: reading the text you drag a box around, the archive of pages you chose to keep, comparing a downloaded file with a contact, and turning fingerprint noise off for named sites all ask for a Premium license from day one, and they unlock when Premium launches. Fingerprint Divergence itself is not among them: it stays switched on for everyone until Premium launches, and asks for a license from then on. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. How this browser looks is free: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever. A Premium license will activate on up to five devices: the first time your vault opens after you paste the token, PATANYX makes one request to EdgeXene to activate that device, trying again at the next unlock if it could not reach us, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot; a license allows a limited number of activations in all, and the Vault panel says so if you reach it. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
 
+
+/// One sentence more on the accent, ON WINDOWS ONLY: there the accent is
+/// handed to the scrollbars of pages (privacy.rs, page_scrollbar_css), and
+/// a page can read the colour it was given -- a few bits a site can learn
+/// about this visitor, accepted knowingly on 2026-08-17 as the price of the
+/// feature and said here beside the choice that causes it. WebKitGTK does not implement
+/// `scrollbar-color` at all, so on Linux the sentence would describe a thing
+/// that does not happen, and it is compiled out rather than hedged: the
+/// same rule as `engine_name` -- each build tells its own truth.
+#[cfg(windows)]
+const ACCENT_REACH: &str = "The accent also reaches the scrollbars of the pages you open, and a page can read that color, so the accent you choose is something a site can tell.";
+#[cfg(not(windows))]
+const ACCENT_REACH: &str = "";
+
+/// `PREMIUM` with the platform's accent sentence, for the two places that
+/// present it. Empty sentence, no trailing space.
+fn premium_text() -> String {
+    if ACCENT_REACH.is_empty() {
+        PREMIUM.to_string()
+    } else {
+        format!("{PREMIUM} {ACCENT_REACH}")
+    }
+}
 const DISCLOSURE_HEAD: &str = "What it is built from";
 
 /// The engine caveat, in the published page's own words. "Reports a minimum of
@@ -374,13 +528,22 @@ const DISCLOSURE_HEAD: &str = "What it is built from";
 /// "only", and someone who runs a packet capture the way this product invites
 /// them to would find a third destination and be right to say the page was
 /// wrong. Naming it costs one clause.
+///
+/// THE LAUNCH PAGE IS THE FOURTH, since 0.9.63: started without a page, the
+/// browser opens PATANYX Search at patanyx.com (main.rs, HOME_URL), a site we
+/// operate. Same reasoning: it is self-initiated, a capture finds it, and the
+/// sentence says "only". Named as what it is -- a page you can see open, not
+/// a check -- and with the fact that lets it be harmless: the server writes
+/// no log line for that page or what it loads.
 const DISCLOSURE: &str = "One Rust program, with nothing downloaded at runtime. PATANYX itself \
 collects nothing about you. The only things it reaches out for on its own are \
 an anonymous, signed update check and blocklist refreshes, plus an occasional \
 check that the resolver is still reachable if you have chosen an encrypted \
-one. Web pages are drawn by software your computer already has and updates \
-itself. One caveat: on Windows, Microsoft's WebView2 engine reports a minimum \
-of component health data that no application is allowed to switch off.";
+one. Started without a page, it opens PATANYX Search at patanyx.com, which \
+we run and which keeps no log of that page or what it loads. Web pages are \
+drawn by software your computer already has and updates itself. One caveat: \
+on Windows, Microsoft's WebView2 engine reports a minimum of component health \
+data that no application is allowed to switch off.";
 
 fn pairs(list: &[(&str, &str)]) -> Vec<Value> {
     list.iter()
@@ -473,7 +636,7 @@ fn all_copy() -> String {
     out.push(' ');
     out.push_str(HONESTY);
     out.push(' ');
-    out.push_str(PREMIUM);
+    out.push_str(&premium_text());
     out.push(' ');
     out.push_str(DISCLOSURE);
     out
@@ -492,7 +655,7 @@ pub fn ipc_info() -> Result<Value, &'static str> {
         "limits_intro": LIMITS_INTRO,
         "limits": pairs(LIMITS),
         "premium_head": PREMIUM_HEAD,
-        "premium": PREMIUM,
+        "premium": premium_text(),
         "disclosure_head": DISCLOSURE_HEAD,
         "disclosure": DISCLOSURE,
         "engine": engine_name(),
@@ -603,8 +766,24 @@ mod tests {
         // SECOND: the standing free-forever commitment, exact and brittle on
         // purpose -- a rewrite must look this sentence in the eye.
         assert!(
-            lowered.contains("free features always remain free"),
-            "the free-forever commitment must stay verbatim"
+            lowered.contains(
+                "features designated as part of the free tier will remain free forever"
+            ),
+            "the free-tier commitment must stay verbatim"
+        );
+        // THIRD (Phase 4, 2026-08-17): the device count and the one
+        // activation request are stated, because the browser now makes
+        // that request and a page that hid it would be describing an
+        // older browser. "up to five devices", never "at most" (releasing
+        // a slot does not switch off the device that had it).
+        assert!(
+            lowered.contains("up to five devices")
+                && lowered.contains("one request to edgexene"),
+            "the premium section must state the five-device activation honestly"
+        );
+        assert!(
+            !lowered.contains("at most five devices") && !lowered.contains("at most 5 devices"),
+            "the honest claim is 'up to', never 'at most'"
         );
     }
 
@@ -661,6 +840,16 @@ mod tests {
              resolver_probe.rs sends an HTTPS request to the chosen resolver on \
              a failed navigation, so 'the only network activity is updates and \
              blocklist refreshes' is not true once encrypted DNS is on."
+        );
+        // The fourth: the page a plain launch opens. main.rs HOME_URL is
+        // patanyx.com, so a launch contacts a server we run before the user
+        // has done anything; leave it unnamed and "only" is false again.
+        assert!(
+            lowered.contains("opens patanyx search at patanyx.com"),
+            "the disclosure must name the launch page. main.rs opens \
+             https://patanyx.com/ in the first tab of a plain launch, so a \
+             sentence listing what the browser reaches out for on its own has \
+             to include it."
         );
     }
 

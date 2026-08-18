@@ -122,16 +122,33 @@ pub fn font_height_px(scale: f64) -> i32 {
 /// A window with no area yields a zero rectangle rather than a negative one, so
 /// a caller that shows it anyway draws nothing instead of asking Windows to
 /// create a window with a negative dimension.
-pub fn readout_rect(client_w: i32, client_h: i32, text_w: i32, line_h: i32) -> (i32, i32, i32, i32) {
+///
+/// `left_px` is what the chrome is using down the left edge, in the SAME
+/// pixel space as the client area. It is what makes this the page's
+/// bottom-left corner rather than the window's: with the feature buttons in a
+/// sidebar those are different points, and a readout pinned to x=0 would be
+/// covered by the sidebar -- silently, because a child window clipped by a
+/// sibling reports nothing. Zero for the top layout, which is every caller
+/// before the sidebar existed.
+pub fn readout_rect(
+    client_w: i32,
+    client_h: i32,
+    left_px: i32,
+    text_w: i32,
+    line_h: i32,
+) -> (i32, i32, i32, i32) {
     if client_w <= 0 || client_h <= 0 {
         return (0, 0, 0, 0);
     }
 
+    // An inset wider than the window leaves no page to sit in front of; the
+    // clamp keeps the readout inside rather than off the right edge.
+    let x = left_px.clamp(0, client_w);
     let h = (line_h.max(0) + 2 * PAD_Y).min(client_h);
-    let w = (text_w.max(0) + 2 * PAD_X).min(client_w);
+    let w = (text_w.max(0) + 2 * PAD_X).min(client_w - x);
     let y = (client_h - h).max(0);
 
-    (0, y, w, h)
+    (x, y, w, h)
 }
 
 #[cfg(test)]
@@ -248,30 +265,62 @@ mod tests {
     #[test]
     fn readout_rect_stays_inside_the_window() {
         // Ordinary case: bottom-left, padded, narrower than the window.
-        let (x, y, w, h) = readout_rect(1000, 700, 300, 16);
+        let (x, y, w, h) = readout_rect(1000, 700, 0, 300, 16);
         assert_eq!((x, w, h), (0, 300 + 2 * PAD_X, 16 + 2 * PAD_Y));
         assert_eq!(y, 700 - h);
         assert!(y + h <= 700 && x + w <= 1000);
 
         // Text wider than the window is clipped to the window, never past it.
-        let (x, y, w, h) = readout_rect(400, 300, 5_000, 16);
+        let (x, y, w, h) = readout_rect(400, 300, 0, 5_000, 16);
         assert_eq!(w, 400, "width is capped at the client area");
         assert!(x + w <= 400 && y + h <= 300);
 
         // A window shorter than the readout itself: still no negative y.
-        let (_, y, _, h) = readout_rect(400, 10, 100, 40);
+        let (_, y, _, h) = readout_rect(400, 10, 0, 100, 40);
         assert_eq!(y, 0);
         assert!(h <= 10, "height is capped at the client area");
 
         // Degenerate windows produce nothing, not a negative-sized window.
         for (cw, ch) in [(0, 0), (0, 500), (500, 0), (-10, -10)] {
-            assert_eq!(readout_rect(cw, ch, 100, 16), (0, 0, 0, 0), "{cw}x{ch}");
+            assert_eq!(readout_rect(cw, ch, 0, 100, 16), (0, 0, 0, 0), "{cw}x{ch}");
         }
 
         // Negative measurements from a failed text measurement must not
         // produce a negative width.
-        let (_, _, w, h) = readout_rect(800, 600, -50, -50);
+        let (_, _, w, h) = readout_rect(800, 600, 0, -50, -50);
         assert!(w >= 0 && h >= 0);
+    }
+
+    /// With the toolbar down the left edge, the page's bottom-left corner is
+    /// not the window's, and this is the whole of the difference.
+    #[test]
+    fn a_sidebar_moves_the_readout_off_the_window_edge() {
+        // Started at the page's edge, not the window's.
+        let (x, _, w, _) = readout_rect(1000, 700, 112, 300, 16);
+        assert_eq!(x, 112, "the readout starts where the page does");
+        assert!(x + w <= 1000, "and still ends inside the window");
+
+        // Long text is now capped by what is LEFT of the window, not by the
+        // whole of it: the old cap would have run the readout past the right
+        // edge by exactly the sidebar's width.
+        let (x, _, w, _) = readout_rect(1000, 700, 112, 5_000, 16);
+        assert_eq!(w, 1000 - 112);
+        assert_eq!(x + w, 1000);
+
+        // An inset that swallows the window leaves nothing to draw in, and
+        // must not produce a negative width.
+        for left in [1000, 4096, -20] {
+            let (x, y, w, h) = readout_rect(1000, 700, left, 300, 16);
+            assert!(w >= 0 && h >= 0, "left={left} gave a negative size");
+            assert!(x + w <= 1000 && y + h <= 700, "left={left} escaped the window");
+        }
+
+        // Zero is what every caller passed before the sidebar existed, and
+        // it must be exactly the old behaviour.
+        assert_eq!(
+            readout_rect(1000, 700, 0, 300, 16),
+            (0, 700 - (16 + 2 * PAD_Y), 300 + 2 * PAD_X, 16 + 2 * PAD_Y)
+        );
     }
 
     #[test]

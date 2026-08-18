@@ -1,0 +1,275 @@
+# PATANYX blocklist allowlist -- hosts that must never reach the shipped list.
+#
+# WHY THIS EXISTS. Upstream feeds report popular, legitimate services from time
+# to time, usually because phishing was once hosted on one. A listed host also
+# covers its subdomains, so importing such a report unchanged would take a whole
+# service with it. This file is where those reports are refused.
+#
+# The failure mode is silent, which is why the refusal has to be deliberate: a
+# blocklist has no way to report what it blocked in error. The user simply sees
+# a site that does not work, and PATANYX ships no appeal path.
+#
+# The existing guard, PROTECTED_SUFFIXES in hostrules.rs, is a different tool
+# for a different failure: it catches a feed listing a bare PLATFORM suffix
+# (`github.io`), where the accident is structural and the blast radius is a
+# hosting provider. It is twenty-eight hand-picked entries and was never meant
+# to know that `yotpo.com` is a real business. This file covers the other case:
+# a popular, legitimate site that a feed reported because phishing was hosted
+# on it once.
+#
+# WHAT AN ENTRY MEANS. "This exact host does not belong on a PHISHING
+# blocklist." That is narrower than "this host is safe, or reputable, or
+# pleasant", and the difference is load-bearing. PATANYX blocks hosts REPORTED
+# AS PHISHING and says exactly that on the banner; it is not a content filter,
+# a gambling filter or a reputation service. A host can be adult, ad-choked,
+# high-risk or simply unpleasant and still not be phishing, and blocking it here
+# tells the user something untrue about it. Removing such a host is a
+# correction, not an endorsement.
+#
+# It removes the host from the merged list; it does NOT remove subdomains. That asymmetry
+# is deliberate and it is the whole reason exact-match is safe here:
+# `gravatar.com` stops being blocked while a feed entry for
+# `phish.gravatar.com` goes on being blocked, because the subdomain is a claim
+# about a specific attacker page rather than about the service.
+#
+# ADDING AN ENTRY IS A DECISION TO STOP PROTECTING SOMETHING. Every line needs
+# a reason and a source, because the failure mode of a careless allowlist is
+# silent and unbounded: an attacker who gets a domain in here buys permanent
+# immunity across every install. Rank figures are Tranco top-1M positions on
+# the date given. Prefer removing the reason for the listing (report the false
+# positive upstream) over carrying an entry here forever.
+#
+# Format: one host per line. Blank lines and lines beginning with # ignored.
+
+# --- Tranco top-10k review, 2026-08-10 ------------------------------------
+# Reported by Phishing.Database. Ranks are Tranco positions at time of review.
+
+gravatar.com            # 147   avatar service; breaks avatars across WordPress
+name.com                # 405   mainstream ICANN registrar
+nflxvideo.net           # 430   video CDN for a major streaming service
+mercadolibre.com.ar     # 927   largest LATAM marketplace
+mercadolibre.cl         # 3118  same operator, Chile
+telegra.ph              # 2034  Telegraph publishing platform
+getpocket.com           # 2599  Pocket read-later service
+yotpo.com               # 2690  reviews/marketing SaaS
+pastebin.com            # 3011  paste service; abused constantly, not malicious
+angelfire.com           # 3127  legacy free host, still serving
+linklist.bio            # 3411  link-in-bio service
+apkpure.com             # 3672  Android APK distribution
+filesusr.com            # 5322  Wix user-content CDN
+infura-ipfs.io          # 5393  Infura IPFS gateway
+amazon.ie               # 5536  Amazon Ireland storefront
+plesk.page              # 6023  Plesk default-page domain
+lynk.id                 # 6972  Indonesian link-in-bio/commerce
+unstoppabledomains.com  # 7906  Web3 naming service
+mez.ink                 # 9344  link-in-bio service
+
+# --- PhishDestroy onboarding review, 2026-08-10 ---------------------------
+# Adding PhishDestroy brought ten top-10k hosts to the tripwire, none of them
+# corroborated by another feed. Five are plainly legitimate services and are
+# allowed here; the rest were reviewed separately, see blocklist-confirm.txt.
+# A single-source report on a widely used host is the weakest evidence this
+# pipeline handles, which is why the tripwire holds it for a person.
+
+pypi.org                # 2729  Python Package Index; the default source for
+                        #       pip installs
+calendly.com            # 372   mainstream scheduling SaaS
+taplink.cc              # 9541  link-in-bio service, same class as mez.ink and
+                        #       linklist.bio already above
+me-qr.com               # 6882  QR-code generator; abused to make phishing
+                        #       codes, which is not the same as being phishing
+linkvertise.com         # 5870  link monetisation gateway. Widely disliked and
+                        #       ad-heavy, but an operating business rather than
+                        #       a phishing host, and this list means "reported
+                        #       as phishing" specifically
+
+# Reviewed 2026-08-10. Each of these is here because it fails the PHISHING test
+# specifically, not because it was judged harmless. See "WHAT AN ENTRY MEANS".
+
+kingbokep.tv            # 1588  adult content, verified rather than inferred
+                        #       from the name. Not phishing, and PATANYX is not
+                        #       a content filter.
+                        #       CAVEAT: a related host, cdn.kingbokep.video, is
+                        #       reported as a decoy for an OKX credential-
+                        #       harvesting operation. Different domain, and
+                        #       this entry cannot shelter it: allowlisting is
+                        #       exact-match, so kingbokep.video is untouched
+                        #       here. It is absent from the shipped list only
+                        #       because no feed reports it -- a coverage gap,
+                        #       not something this file caused.
+potok.cash              # 8635  gambling, rated high-risk on review but with no
+                        #       phishing finding. High-risk is not this list's
+                        #       question
+# --- Review-queue batch, 2026-08-10 ---------------------------------------
+# Surfaced by scripts/review-blocklist-fps.py, which ranks on registration age,
+# single-source reporting and blast radius, then checked and cleared by hand. Every one is a single-source allegation; ages are RDAP on the exact
+# domain. Ranks are Tranco.
+#
+# ON THE STRENGTH OF THIS EVIDENCE: a browser visit is good evidence and weaker
+# than it feels, because phishing kits routinely cloak -- serving an innocuous
+# page to anyone who does not match the targeted geography, referrer or user
+# agent. It is decisive here because it agrees with the offline signals rather
+# than standing alone: a 35-year registration behind an enterprise certificate
+# is not a kit, whatever the page shows.
+
+capital.com             # 23298 CFD broker, 35.2y, DigiCert OV certificate.
+                        #       PhishDestroy-only allegation
+zangi.com               # 20820 messaging app, 22.1y. PhishDestroy-only
+appbrain.com            # 19011 Android app analytics, 16.6y. PhishDestroy-only
+asurion.com             # 11121 Asurion, device insurance, 25.6y. PDB-only
+mercadolibre.com.uy     # 15953 the Uruguayan storefront. Its .com.ar and .cl
+                        #       siblings were allowlisted on this same date and
+                        #       this one was missed -- when a feed reports one
+                        #       country domain of a business it tends to report
+                        #       several, so check the family, not the entry
+geocities.ws            # 16712 legacy free host, same class as angelfire.com
+                        #       already above
+dweb.link               # 17240 IPFS gateway (Protocol Labs). Blocking the apex
+                        #       blocks every piece of content anyone reaches
+                        #       through the gateway, not a site. Gateways do
+                        #       serve phishing, because they serve whatever
+                        #       hash they are asked for, but that is an
+                        #       argument about IPFS rather than about this
+                        #       host. THE DECIDING POINT IS CONSISTENCY: the
+                        #       other three gateways are already unblocked --
+                        #       infura-ipfs.io by hand above, cf-ipfs.com and
+                        #       cloudflare-ipfs.com by the public-suffix
+                        #       screen. dweb.link survived only because it is
+                        #       a `*.dweb.link` rule, so its apex is
+                        #       registrable and the screen cannot see it. That
+                        #       is an accident of mechanism, not a judgement,
+                        #       and one gateway blocked out of four is the
+                        #       worst of both worlds.
+
+glorioushop.com         # 9043  reviewed, no evidence of phishing found.
+                        #       BEWARE THE LOOKALIKE when re-checking this one:
+                        #       glorisshop.com, one letter different, does carry
+                        #       scam reports. Reputation data for that domain
+                        #       says nothing about this one, and a careless
+                        #       lookup is exactly how a clean host acquires
+                        #       someone else's record.
+
+# NOT ALLOWLISTED, and the reasoning is worth keeping: googll.store (Tranco
+# #8544) was on this list for one draft, justified by its rank alone. That
+# justification was wrong. A high Tranco position measures TRAFFIC, and a
+# convincing `google` typosquat earns enormous accidental traffic -- so for
+# this class of name, a top-10k rank is evidence FOR the listing, not against
+# it. Checked 2026-08-10: reported by Phishing.Database, absent from both
+# PhishDestroy and phishunt, fronted by Cloudflare so the origin is hidden.
+# Inconclusive.
+#
+# THE TIE-BREAK IS ASYMMETRY OF HARM, and it decides every ambiguous case here.
+# A wrong block is visible and recoverable: the user sees the banner and takes
+# the per-tab override. A wrong allow is silent and permanent -- no banner, no
+# signal, protection quietly absent on every install. So an entry needs
+# positive evidence that a host is legitimate; "not obviously malicious" is not
+# enough, and popularity is not evidence.
+
+# --- Warn-band review, 2026-08-13 ------------------------------------------
+# Surfaced by the 2026-08-11 refresh and ranked by review-blocklist-fps.py.
+# Single-source (PhishDestroy only; neither other feed corroborates), and the
+# tie-break above asks for positive evidence, which this entry carries:
+
+zeusx.com               # 71091 game-currency/account marketplace, registered
+                        #       2007 and continuously operating since -- an
+                        #       18-year-old exact-domain registration is the
+                        #       strongest age signal in the review window. A
+                        #       marketplace can be high-risk commerce and
+                        #       still not be phishing, and the banner's claim
+                        #       is "reported as phishing", which review found
+                        #       untrue. Human adjudication, 2026-08-13.
+
+# Second pass over the same queue, human adjudication 2026-08-13. All three
+# PhishDestroy-only, uncorroborated, registrable apexes:
+
+qrco.de                 # 15855 QR Code Generator's shortener domain. Abused
+                        #       to carry phishing redirects, which is not the
+                        #       same as being phishing -- the same distinction
+                        #       me-qr.com above already records for this
+                        #       exact service class.
+storage.money           # 10639 registered 2015, 11-year exact registration,
+                        #       continuously serving. Closest entry to the
+                        #       refuse line (10,000): left blocked it would
+                        #       wedge hourly publishing the day its rank
+                        #       climbs 640 places.
+solscan.io              # 26076 the primary Solana block explorer, a
+                        #       reference tool the crypto ecosystem links to
+                        #       constantly. Phishing clones of it exist and
+                        #       stay blockable as their own hosts; the real
+                        #       explorer being blocked tells users something
+                        #       untrue.
+
+# Third pass, human adjudication 2026-08-13. These three are reported by
+# Phishing.Database rather than PhishDestroy, single-source like the passes
+# above. The first two carry the strongest legitimacy evidence this queue has
+# produced: organization-validated TLS naming the entity itself, which DV
+# certificates (deliberately discounted above) do not.
+
+banrisul.com.br         # 32327 Banco do Estado do Rio Grande do Sul -- a
+                        #       Brazilian state bank, registered 1995, OV
+                        #       certificate issued to the bank by name.
+                        #       Phishing against a bank lives on lookalike
+                        #       hosts; blocking the bank itself is the
+                        #       queue's textbook false positive.
+ccm.net                 # 32033 CommentCaMarche / CCM Benchmark Group, French
+                        #       tech-media publisher, registered 1995, OV
+                        #       certificate naming the group.
+altin.in                # 20979 Turkish gold-price tracker, registered 2010
+                        #       and continuously serving. Weaker evidence
+                        #       than the two above (DV certificate only);
+                        #       adjudicated legitimate.
+
+# --- Refuse-band arrivals, 2026-08-13 ---------------------------------------
+# Four new PhishDestroy entries hit the top-10k refuse tripwire on 2026-08-12
+# and held hourly publishing for ~36 hours -- the tripwire doing exactly what
+# it is for. All four uncorroborated, no subdomain reports in any feed.
+# Human adjudication 2026-08-13.
+
+libero.it               # 2958  Libero Mail, one of Italy's largest webmail
+                        #       and portal services (Italiaonline). A national
+                        #       email provider reported by one feed is the
+                        #       banrisul.com.br class of false positive.
+tiscali.it              # 5642  Tiscali, major Italian ISP and portal. Same
+                        #       profile and same call as libero.it.
+telegram.com            # 6388  the Worcester Telegram & Gazette, a
+                        #       Massachusetts newspaper -- verified by
+                        #       fetching the page, which serves the paper's
+                        #       own masthead. An automated brand collision
+                        #       with Telegram the messenger, which lives at
+                        #       telegram.org.
+teletype.in             # 9362  Teletype blogging platform. Phishing pages
+                        #       hosted by its users are that page's problem,
+                        #       not the platform's -- the telegra.ph and
+                        #       pastebin.com entries above record the same
+                        #       reasoning.
+
+# Refuse-band arrival, 2026-08-14. PhishDestroy-only, uncorroborated, no
+# subdomain reports; held publishing from 06:01 until adjudicated.
+
+mail.com                # 4845  major free webmail provider. A mailbox host is
+                        #       phished constantly by name, which is how the
+                        #       apex gets swept in; blocking it takes every
+                        #       customer's mail with it. Human
+                        #       adjudication, 2026-08-14.
+
+# --- First-party hosts, 2026-08-15 -----------------------------------------
+# The browser opens patanyx.com on a plain launch (crates/app/src/main.rs,
+# HOME_URL) and links to patanyx.net from its own chrome. A feed that ever
+# reported either would make the browser refuse its own front page on every
+# start. Neither is phishing by construction: we operate both. Exact-match
+# only, as everywhere in this file; subdomains are not covered.
+
+patanyx.com             # first-party: PATANYX Search, the launch page
+patanyx.net             # first-party: the product site
+
+# --- Refuse-band arrival at the 0.9.63 rebuild, 2026-08-17 -----------------
+# Surfaced by BLOCKLIST_REQUIRE_TRIPWIRE=1 during the release build; the
+# tripwire held the build until adjudicated.
+
+wa.me                   # 71    WhatsApp's own click-to-chat short-link host.
+                        #       Phishing lures carry wa.me links by the
+                        #       thousand, which is how the apex gets swept
+                        #       into a feed; blocking it breaks every "chat
+                        #       on WhatsApp" link for every user. Exact match
+                        #       only: an abusive subdomain stays blocked.
+                        #       Adjudicated at the rebuild, 2026-08-17.

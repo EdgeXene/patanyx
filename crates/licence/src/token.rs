@@ -23,6 +23,23 @@ const DOMAIN_SEPARATOR: &[u8] = b"PATANYX-LICENSE-V1";
 /// 0x01 = premium. All other values are reserved (design 2.2).
 pub const TIER_PREMIUM: u8 = 0x01;
 
+/// An `expires_day` of `u32::MAX` means the licence NEVER EXPIRES.
+///
+/// A sentinel rather than a new tier byte, deliberately. `parse` refuses
+/// every tier except [`TIER_PREMIUM`], so a new tier value would be rejected
+/// outright by every build already published and by the relay's token check.
+/// The maximum day number cannot be rejected by any of them: every expiry
+/// rule in this system is `today_utc <= expires_day`, and no reachable day
+/// number exceeds this one. So a perpetual token verifies and grants Premium
+/// on builds that predate this constant; they simply render the remaining
+/// time as an absurd day count instead of naming it. New builds say what it
+/// is. That is the graceful direction for the failure to run in.
+///
+/// The date it nominally names is in the year 11,749,398. Treating it as a
+/// date rather than a sentinel is what produces "Premium Time Left:
+/// 4294967295 days", which is why [`evaluate`] checks for it first.
+pub const NEVER_EXPIRES: u32 = u32::MAX;
+
 /// Binary token length: 1 + 16 + 1 + 4 + 4 + 64 + 4.
 pub const TOKEN_LEN: usize = 94;
 
@@ -365,6 +382,11 @@ pub enum LicenceState {
     /// `today_utc <= expires_day`. `days_left` counts the expiry day
     /// itself (3.3 step 5), so it is 1 on the final day.
     Active { days_left: u32 },
+    /// The token carries [`NEVER_EXPIRES`]: Premium with no end date, and
+    /// no renewal to miss. Gates exactly like `Active` and is a separate
+    /// state only so the vault row can name it instead of counting down
+    /// from a number nobody can read.
+    Perpetual,
     /// The token is still VALID and stays stored -- it carries the
     /// license_id the renewal path needs (3.2 step 8) and `expires_day`
     /// so the vault row can say when Premium ended. It entitles the user
@@ -381,7 +403,7 @@ impl LicenceState {
     /// JetBrains-style fallback keyed on `features_until_day`, and that
     /// rule is dead; the field is reserved in the layout, ignored here.
     pub fn premium_active(&self) -> bool {
-        matches!(*self, LicenceState::Active { .. })
+        matches!(*self, LicenceState::Active { .. } | LicenceState::Perpetual)
     }
 }
 
@@ -398,6 +420,10 @@ impl LicenceState {
 pub fn evaluate(token: Option<&Token>, today_utc: u32) -> LicenceState {
     match token {
         None => LicenceState::Free,
+        // Checked BEFORE the date comparison. The sentinel would otherwise
+        // satisfy it and report a days_left in the billions, which is the
+        // whole reason this state exists.
+        Some(token) if token.expires_day == NEVER_EXPIRES => LicenceState::Perpetual,
         Some(token) if today_utc <= token.expires_day => LicenceState::Active {
             days_left: (token.expires_day - today_utc).saturating_add(1),
         },
@@ -825,6 +851,55 @@ mod tests {
             }
         );
         assert_eq!(evaluate(None, TEST_EXPIRES_DAY), LicenceState::Free);
+    }
+
+    #[test]
+    fn a_never_expiring_token_is_perpetual_on_every_day_and_grants_premium() {
+        let token = Token::mint(&test_signing_key(), 0, TEST_LICENSE_ID, NEVER_EXPIRES);
+        // The sentinel is a STATE, not a very distant date: no day number
+        // reachable by any clock turns it into a countdown.
+        for today in [0, TEST_EXPIRES_DAY, NEVER_EXPIRES - 1, NEVER_EXPIRES] {
+            assert_eq!(
+                evaluate(Some(&token), today),
+                LicenceState::Perpetual,
+                "day {today} must read as perpetual, never as a countdown"
+            );
+            assert!(evaluate(Some(&token), today).premium_active());
+        }
+        // It can never become Lapsed: there is no later day to test with,
+        // and that is the point of choosing the maximum as the sentinel.
+        assert_eq!(NEVER_EXPIRES, u32::MAX);
+    }
+
+    #[test]
+    fn one_day_below_the_sentinel_still_counts_down_normally() {
+        // The boundary that proves the sentinel is exact rather than a
+        // range: the largest ordinary expiry still behaves like an expiry.
+        let token = Token::mint(&test_signing_key(), 0, TEST_LICENSE_ID, NEVER_EXPIRES - 1);
+        assert_eq!(
+            evaluate(Some(&token), NEVER_EXPIRES - 1),
+            LicenceState::Active { days_left: 1 }
+        );
+        assert_eq!(
+            evaluate(Some(&token), NEVER_EXPIRES),
+            LicenceState::Lapsed {
+                expires_day: NEVER_EXPIRES - 1,
+            }
+        );
+    }
+
+    #[test]
+    fn a_perpetual_token_survives_the_wire_and_text_round_trips() {
+        // Nothing about the sentinel is special to the codec: it is an
+        // ordinary u32 in the signed payload, so a perpetual token must
+        // parse back byte-identically through both forms a real token takes.
+        let token = Token::mint(&test_signing_key(), 0, TEST_LICENSE_ID, NEVER_EXPIRES);
+        let keys = test_ring();
+        let back = Token::parse(&token.to_text(), &keys).expect("text round trip");
+        assert_eq!(back.expires_day(), NEVER_EXPIRES);
+        assert_eq!(back.tier(), TIER_PREMIUM);
+        let back = Token::parse_wire(&token.to_wire_bytes(), &keys).expect("wire round trip");
+        assert_eq!(back.expires_day(), NEVER_EXPIRES);
     }
 
     #[test]

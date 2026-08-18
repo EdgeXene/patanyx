@@ -10,6 +10,10 @@
 //! itself (P3). P3 adds ONLY the 90-byte wire form (`parse_wire` /
 //! `to_wire_bytes`): the layout keeps exactly one implementation, shared by
 //! signer, browser, and relay.
+//! Phase 4 (2026-08-17) adds the 106-byte activation RECEIPT (`prx1-`,
+//! `receipt.rs`): the server's signed statement that one device holds one
+//! of a licence's five activation slots, verified offline against the same
+//! ring under its own domain separator.
 //!
 //! Security posture, stated once here and enforced below:
 //!
@@ -35,9 +39,14 @@ mod days;
 mod error;
 mod hex;
 mod keys;
+mod receipt;
 mod token;
 
 pub use days::{civil_from_day_number, day_number_from_civil};
 pub use error::LicenceError;
 pub use keys::{licence_keys, LicenceKeys, LICENCE_KEYS};
-pub use token::{evaluate, LicenceState, Token, TIER_PREMIUM, TOKEN_LEN, TOKEN_TEXT_LEN, WIRE_LEN};
+pub use receipt::{Receipt, RECEIPT_LEN, RECEIPT_TEXT_LEN};
+pub use token::{
+    evaluate, LicenceState, Token, NEVER_EXPIRES, TIER_PREMIUM, TOKEN_LEN, TOKEN_TEXT_LEN,
+    WIRE_LEN,
+};

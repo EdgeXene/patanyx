@@ -41,6 +41,7 @@
 /// attribution is chosen by `cfg`, so a build cannot describe another build's
 /// dependency set.
 mod about;
+mod activation;
 /// Known-malicious hosts, refused in the navigation handler. Present in every
 /// build: this is the protection for users who change no settings.
 mod blocklist;
@@ -49,6 +50,18 @@ mod blocklist;
 /// dependency and this module is the only place the app references it.
 #[cfg(feature = "chat")]
 mod chat_panel;
+/// Searching the personal archive: which archived pages answer a query, and
+/// what each row shows. Pure logic over records the store owns.
+mod archive;
+/// Every user-facing string the cookie-clearing controls say. Pure copy with
+/// the wording pinned by tests, so the sentence that keeps "clears cookies"
+/// from becoming "clears everything" is checked rather than remembered.
+mod cookie_control;
+/// Download corroboration: comparing what two people were served from the
+/// same address. Rides the chat transport, so it exists only in the build
+/// that has one.
+#[cfg(feature = "chat")]
+mod download_compare;
 mod ipc;
 mod ocr_support;
 mod prefs;
@@ -70,10 +83,14 @@ mod hover_style;
 mod shelf;
 mod shortcuts;
 mod state;
+/// Cross-tab text search over each tab's visible text: pure matching,
+/// snippet shaping and refusal wording, identical on every platform.
+mod tab_search;
 /// Engine-side tunnel lifecycle: bind the proxy port before the vault
 /// exists, start the tunnel when it opens. Unconditional, like the tunnel
 /// crate itself.
 mod licence_control;
+mod net;
 mod tunnel_control;
 /// Signed update checking. Verification is `patanyx-update`; this is the
 /// fetch, decide and prompt layer around it.
@@ -131,6 +148,12 @@ enum UserEvent {
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
     AutoLockTick,
+    /// The window finished a maximize or a restore a moment ago; the title
+    /// bar colours are re-applied AFTER Windows has repainted the frame in
+    /// the system colour, which it does on that transition (see
+    /// `AppState::relayout`). Posted from a short timer so it lands after
+    /// the transition, not inside the resize that announces it.
+    WindowFrameSettled,
     /// The user chose something from the right-click menu.
     ///
     /// Carries the target URL the menu was built from rather than re-reading
@@ -158,6 +181,21 @@ enum UserEvent {
     /// doing it inline would freeze the browser before it could even paint
     /// the "scanning" state. See ocr_support.rs.
     Ocr(ocr_support::OcrEvent),
+    /// A finished Premium activation or release call (Phase 4). The call
+    /// runs on a worker so an unreachable server never freezes the event
+    /// loop; the result lands here and activation.rs writes the vault.
+    Activation(activation::ActivationEvent),
+    /// A Deep Recall capture has been read for text and is ready to store.
+    /// Carries the picture back with it: the archive writes both halves in
+    /// one place, so the bytes travel rather than being parked somewhere the
+    /// storing code would have to find them again.
+    ArchiveRead {
+        png: Vec<u8>,
+        url: String,
+        title: String,
+        scope: &'static str,
+        text: String,
+    },
     /// A finished (or failed) page capture, from the engine's async callback.
     Capture(capture::CaptureEvent),
     /// An engine find callback, normalised by the platform layer. Carries the
@@ -231,6 +269,30 @@ fn chrome_devtools_opted_in() -> bool {
 }
 
 fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> {
+    // The region-read panel's image. Token-addressed, chrome-origin only (this
+    // protocol exists on no other webview), and served from the in-memory
+    // capture -- the CSP's img-src 'self' stays exactly as it is, and the PNG
+    // never crosses the IPC boundary as a string. A token that names nothing
+    // (stale panel, replaced capture) is a plain 404.
+    if let Some(name) = request.uri().path().strip_prefix("/region-capture/") {
+        let png = name
+            .strip_suffix(".png")
+            .and_then(|t| t.parse::<u64>().ok())
+            .and_then(capture::region_png);
+        return match png {
+            Some(bytes) => http::Response::builder()
+                .header("Content-Type", "image/png")
+                .header("Content-Security-Policy", CSP)
+                .body(Cow::Owned(bytes))
+                .expect("region capture response"),
+            None => http::Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Security-Policy", CSP)
+                .body(Cow::Borrowed(&b"not found"[..]))
+                .expect("static 404 response"),
+        };
+    }
     let (mime, body): (&str, &[u8]) = match request.uri().path() {
         "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
         "/chrome.css" => ("text/css; charset=utf-8", CHROME_CSS.as_bytes()),
@@ -393,6 +455,50 @@ fn window_title() -> &'static str {
     }
 }
 
+/// The page the first tab opens when the browser is started on its own:
+/// PATANYX Search, which we operate. Its front page and that page's own
+/// assets are served without access logging, so a launch does not write the
+/// person's address anywhere; the privacy policy (Part A s2.1, Part B B.2)
+/// says so and this constant is what has to stay true for it to be right.
+const HOME_URL: &str = "https://patanyx.com/";
+
+/// What the first tab opens. A URL or search handed on the command line
+/// wins outright. With none, the smoke run stays on `about:blank` because
+/// its blocking probe has to be the ONLY page load of the run (see the
+/// `probe_url` comment in `main`); every other launch opens `HOME_URL`.
+fn choose_start_url(positional: Option<String>, smoke_mode: bool) -> String {
+    match positional {
+        Some(url) => url,
+        None if smoke_mode => "about:blank".to_string(),
+        None => HOME_URL.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod start_url_tests {
+    use super::{choose_start_url, HOME_URL};
+
+    #[test]
+    fn a_plain_launch_opens_the_home_page() {
+        assert_eq!(choose_start_url(None, false), HOME_URL);
+        assert!(HOME_URL.starts_with("https://patanyx.com/"));
+    }
+
+    #[test]
+    fn a_page_on_the_command_line_wins() {
+        let given = "https://example.com/x".to_string();
+        assert_eq!(choose_start_url(Some(given.clone()), false), given);
+        assert_eq!(choose_start_url(Some(given.clone()), true), given);
+    }
+
+    /// The smoke sequence proves blocking by making its probe the only page
+    /// load; a home page opened first would make that proof ambiguous.
+    #[test]
+    fn the_smoke_run_keeps_the_first_tab_blank() {
+        assert_eq!(choose_start_url(None, true), "about:blank");
+    }
+}
+
 fn main() {
     // Publishing helper: write the compiled-in blocklist hashes and exit.
     //
@@ -425,11 +531,15 @@ fn main() {
     // profile an earlier build left beside the executable.
     platform::report_stray_profile();
     // Optional positional argument: URL or search terms to open at startup.
-    let start_url = std::env::args()
+    // That is how the OS starts the default browser when someone clicks a
+    // link in another application, so when it is present it is the page the
+    // person asked for and nothing else opens in its place.
+    let positional = std::env::args()
         .skip(1)
         .find(|arg| !arg.starts_with("--"))
-        .map(|raw| ipc::normalize_input(&raw))
-        .unwrap_or_else(|| "about:blank".to_string());
+        .map(|raw| ipc::normalize_input(&raw));
+    let opened_with_url = positional.is_some();
+    let start_url = choose_start_url(positional, smoke_mode);
 
     // A probe URL is only meaningful in smoke mode: it is navigated to AFTER
     // ad blocking is on, which is the whole point.
@@ -529,13 +639,12 @@ fn main() {
     // measured from startup, not from the first event to arrive.
     let mut schedule = schedule::Schedule::new(std::time::Instant::now());
     let mut app = AppState::new(chrome, hosts, proxy.clone(), smoke_mode);
-    // Was this launch handed a page to open? That is how the OS starts the
-    // default browser when someone clicks a link in another application, and
-    // the chrome uses it to decide whether opening the vault would be
-    // welcome or an interruption. Compared against the same `about:blank`
-    // fallback `start_url` was built with, so "no argument" is the only thing
-    // that reads as opened-on-its-own.
-    app.opened_with_url = start_url != "about:blank";
+    // Was this launch handed a page to open? The chrome uses it to decide
+    // whether opening the vault would be welcome or an interruption. It is
+    // whether an ARGUMENT was given, not whether the first tab has a URL: a
+    // plain launch now opens the home page, and that is still the browser
+    // opened on its own.
+    app.opened_with_url = opened_with_url;
     // First tab: active and visible; further tabs are built via the same
     // factory (tab_new IPC / OpenInNewTab event).
     //
@@ -681,6 +790,7 @@ fn main() {
                 if app.smoke_mode && app.ping_count == 1 && !app.smoke_vault_done {
                     app.smoke_vault_done = true;
                     let result = ipc::smoke_vault_sequence(&mut app)
+                        .and_then(|()| ipc::smoke_licence_sequence(&mut app))
                         .and_then(|()| ipc::smoke_tab_sequence(&mut app))
                         .and_then(|()| ipc::smoke_readout_sequence(&mut app));
                     match result {
@@ -768,6 +878,18 @@ fn main() {
             }
             Event::UserEvent(UserEvent::Ocr(event)) => {
                 ocr_support::handle_event(&mut app, event);
+            }
+            Event::UserEvent(UserEvent::Activation(event)) => {
+                activation::handle_event(&mut app, event);
+            }
+            Event::UserEvent(UserEvent::ArchiveRead {
+                png,
+                url,
+                title,
+                scope,
+                text,
+            }) => {
+                app.finish_archive(png, url, title, scope, text);
             }
             Event::UserEvent(UserEvent::Find(event)) => {
                 app.on_find_event(event);
@@ -860,6 +982,11 @@ fn main() {
                     Shortcut::Print => app.print_active_tab(),
                     // The chrome owns the bar; the key only asks it to open.
                     Shortcut::OpenFind => app.emit("find_open", json!({})),
+                    // Same shape as OpenFind: the chrome owns the panel, the
+                    // key only asks it to open, and the premium gate lives
+                    // in the find_tabs_search arm -- the key is never a way
+                    // around the licence.
+                    Shortcut::OpenFindAcrossTabs => app.emit("find_tabs_open", json!({})),
                     // The session gate keeps F3 a true no-op when nothing was
                     // ever searched; the platform layer is also a quiet no-op,
                     // so this is belt and braces, not load-bearing.
@@ -901,6 +1028,9 @@ fn main() {
                 if crate::prefs::load().vault_lock_on_session_lock {
                     app.lock_vault();
                 }
+            }
+            Event::UserEvent(UserEvent::WindowFrameSettled) => {
+                app.refresh_window_accent();
             }
             Event::UserEvent(UserEvent::AutoLockTick) => {
                 app.check_autolock();

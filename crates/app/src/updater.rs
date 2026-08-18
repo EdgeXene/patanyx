@@ -455,7 +455,7 @@ pub fn check_now() -> Value {
             let phase = run_check_with(&keys, &FLOOR, current, platform, || {
                 net::get(&url, MAX_MANIFEST_FETCH_BYTES, net::MANIFEST_TIMEOUT)
             });
-            // Background download, the Firefox shape MINUS the silent apply:
+            // Background download, the mainstream shape MINUS the silent apply:
             // when a verified offer lands and the pref allows it, fetch and
             // stage NOW so the user's consent click is an instant restart
             // rather than a wait. What does NOT change: nothing installs
@@ -1087,39 +1087,15 @@ pub(crate) mod net {
     /// bounds time. A stalled server then fails the download instead of
     /// parking the worker thread forever.
     pub const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(600);
-    const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
     pub fn get(url: &str, cap: u64, timeout: Duration) -> Result<Vec<u8>, FetchError> {
-        let mut builder = ureq::AgentBuilder::new()
-            .timeout_connect(CONNECT_TIMEOUT)
-            .timeout(timeout)
-            // Redirects are NOT followed: a redirect target is outside the
-            // signed manifest's guarantees and could silently drop TLS. If
-            // the CDN needs redirects, add an https-only redirect policy
-            // here as its own reviewed change.
-            .redirects(0)
-            // A user agent is data about the user; carry the minimum.
-            .user_agent("patanyx");
-        // ureq never consults the engine's proxy, so before this line the
-        // updater LEFT OUTSIDE an imported tunnel -- flagged when the tunnel
-        // was designed, closed when downloads became automatic (a hole that
-        // needed a click is a hole; one that fires on a schedule is a
-        // policy violation). engine_proxy_port() is the engine's own rule:
-        // Some(port) whenever the user chose or is running a tunnel -- the
-        // dead port when the tunnel is down, so this FAILS CLOSED exactly
-        // like a page load -- and None only when direct is sanctioned.
-        if let Some(port) = crate::tunnel_control::engine_proxy_port() {
-            match ureq::Proxy::new(format!("socks5://127.0.0.1:{port}")) {
-                Ok(proxy) => builder = builder.proxy(proxy),
-                // Refusing to fetch is the only safe answer to "could not
-                // express the proxy": going direct here is the one
-                // unacceptable outcome.
-                Err(e) => return Err(FetchError::Network(format!(
-                    "tunnel proxy could not be configured ({e}); refusing a direct connection"
-                ))),
-            }
-        }
-        let agent = builder.build();
+        // The agent comes from crate::net, the ONE place that knows the
+        // tunnel rule (proxy when the engine says so, fail closed when it
+        // cannot be expressed, no redirects). It used to be built here;
+        // extracted when the activation call needed the same rule, so the
+        // hole the tunnel design flagged cannot reopen as a second copy.
+        let agent = crate::net::agent(timeout)
+            .map_err(|e| FetchError::Network(e.to_string()))?;
         let response = agent.get(url).call().map_err(|e| match e {
             ureq::Error::Status(code, _) => FetchError::Http(code),
             ureq::Error::Transport(t) => FetchError::Network(t.to_string()),

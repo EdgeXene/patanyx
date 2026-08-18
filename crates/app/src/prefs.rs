@@ -186,10 +186,19 @@ impl PageTheme {
 /// meaning. (Chrome SCHEMES may re-tune them per background; an accent may
 /// not.)
 ///
-/// The set beyond the original four (BloodRed onward, minus the removed
-/// Rose) is the SEED of the future premium theme pack. It ships unlocked:
-/// nothing may gate it until the licence server exists and the gate is
-/// flipped deliberately.
+/// ALL NINE ARE FREE, and this is settled rather than pending.
+///
+/// The set beyond the original four was the SEED of a future premium theme
+/// pack from 2026-08-04, shipped unlocked, with the note that nothing might
+/// gate it until the licence server existed and the gate was flipped
+/// deliberately. On 2026-08-16 it was decided not to flip it: theme packs
+/// left the Premium list and joined the free tier, which the
+/// promise in `about.rs::PREMIUM` makes permanent. The reasoning is
+/// recorded there, next to the sentence that binds it.
+///
+/// So there is no gate to add here, and adding one later would break a
+/// published commitment. A paid pack, if there is ever to be one, is NEW
+/// accents on top of these nine.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChromeTheme {
@@ -247,7 +256,8 @@ impl ChromeTheme {
 /// has always had; White and Black landed 2026-08-04 with the neutral
 /// lift. Manual pick only, by deliberate decision -- nothing here follows
 /// the OS (page colors already do that job for PAGES, deliberately).
-/// Part of the premium theme-pack seed; ships unlocked.
+/// Was part of the premium theme-pack seed; free for good since 2026-08-16,
+/// on the same decision that freed the accents. See `ChromeTheme` above.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChromeScheme {
@@ -314,6 +324,52 @@ impl ToolbarLabels {
         match s {
             "show" => Some(Self::Show),
             "hide" => Some(Self::Hide),
+            _ => None,
+        }
+    }
+}
+
+/// Where the feature buttons live: along the top, or down the left edge.
+///
+/// `Top` is the shape every build has shipped and stays the default. `Left`
+/// moves the SECOND toolbar row -- the browser's standing state, everything
+/// after `.toolbar-break` -- into a vertical strip, and leaves the tab strip,
+/// the navigation buttons and the address bar where they are. An address bar
+/// wants width; a column of pills does not.
+///
+/// This is a layout choice, so it is worn the same way the accent and the
+/// scheme are: a data attribute on the chrome's root element, with the CSS
+/// doing the arrangement. What makes it more than CSS is that the page is a
+/// SEPARATE webview whose rectangle Rust owns, so the chrome has to tell Rust
+/// how much of the window it is now using on each axis -- see
+/// `AppState::set_chrome_insets`.
+///
+/// Left is ICON-ONLY by construction, and [`ToolbarLabels`] therefore applies
+/// only while this is `Top`. That is stated in the panel rather than left to
+/// be discovered: a setting that silently does nothing is the thing this
+/// browser's rule about inert controls exists to prevent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolbarPlacement {
+    /// Two rows above the page, the shape every build has shipped.
+    #[default]
+    Top,
+    /// Feature buttons in a strip down the left; everything else stays put.
+    Left,
+}
+
+impl ToolbarPlacement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Top => "top",
+            Self::Left => "left",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "top" => Some(Self::Top),
+            "left" => Some(Self::Left),
             _ => None,
         }
     }
@@ -554,8 +610,8 @@ pub struct Prefs {
     /// Download a verified update in the background the moment a check
     /// offers one, so the consent click is an instant restart instead of a
     /// wait. INSTALLING still requires that click -- this flag never
-    /// touches that. Default ON (the Firefox shape); the update panel
-    /// carries the switch for metered or minimal setups.
+    /// touches that. Default ON, the shape mainstream browsers settled on;
+    /// the update panel carries the switch for metered or minimal setups.
     pub update_background_download: bool,
     /// Lock the vault when the workstation locks or the machine suspends.
     ///
@@ -591,6 +647,23 @@ pub struct Prefs {
     /// Same shape as `page_theme` and unlike `vault_lock_on_session_lock`,
     /// where the derived default is the weaker posture.
     pub toolbar_labels: ToolbarLabels,
+    /// Where the feature buttons live: along the top, or down the left edge.
+    ///
+    /// Same absent-field reasoning as `toolbar_labels`: the derived default
+    /// is `Top`, which is the layout every prefs.json written before this
+    /// field existed was describing. Moving somebody's toolbar on upgrade is
+    /// the one wrong answer here.
+    pub toolbar_placement: ToolbarPlacement,
+    /// The chrome's resolved colours, as chrome.js last reported them
+    /// (`chrome_palette_set`): the title bar, the window border, and the
+    /// scrollbar thumb pages are given. Persisted so the FIRST tab of the
+    /// next launch -- built before the chrome document has run -- wears the
+    /// colours the user chose rather than the default blue until a reload.
+    /// Absent reads the default palette, which is what chrome.css resolves
+    /// to with no theme chosen; a prefs.json from before this field describes
+    /// exactly that chrome. Not a choice of its own: it is derived from
+    /// `chrome_theme` + `chrome_scheme` and re-derived on every change.
+    pub chrome_palette: crate::platform::ChromePalette,
 }
 
 // Hand-written rather than derived, because `#[derive(Default)]` would give
@@ -614,7 +687,9 @@ impl Default for Prefs {
             vault_lock_on_session_lock: lock_on_session_lock_default(),
             fingerprint_noise: fingerprint_noise_default(),
             toolbar_labels: ToolbarLabels::default(),
+            toolbar_placement: ToolbarPlacement::default(),
             bookmarks_bar: false,
+            chrome_palette: crate::platform::ChromePalette::default(),
         }
     }
 }
@@ -936,6 +1011,56 @@ mod tests {
         assert_eq!(ToolbarLabels::parse("show"), Some(ToolbarLabels::Show));
         assert_eq!(ToolbarLabels::parse("icons"), None);
         assert_eq!(ToolbarLabels::Hide.as_str(), "hide");
+    }
+
+    #[test]
+    fn old_prefs_json_without_toolbar_placement_reads_top() {
+        // Nobody's toolbar moves on upgrade. A prefs.json written before
+        // this setting existed describes a browser with two rows above the
+        // page, and that is what it must read back as -- including one that
+        // already carries the neighbouring layout setting, which is the
+        // realistic shape of an existing install's file.
+        for old in [r#"{"dns":"system"}"#, r#"{"toolbar_labels":"hide"}"#] {
+            let prefs: Prefs = serde_json::from_str(old).expect("old prefs must parse");
+            assert_eq!(prefs.toolbar_placement, ToolbarPlacement::Top);
+        }
+        assert_eq!(Prefs::default().toolbar_placement, ToolbarPlacement::Top);
+    }
+
+    #[test]
+    fn toolbar_placement_round_trips_and_unknown_is_refused() {
+        let mut prefs = Prefs::default();
+        prefs.toolbar_placement = ToolbarPlacement::Left;
+        let text = serde_json::to_string(&prefs).unwrap();
+        let back: Prefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.toolbar_placement, ToolbarPlacement::Left);
+        // Wire names are the contract with chrome.js; a typo must not
+        // silently become a default, and must not silently become the OTHER
+        // value either -- "side" and "sidebar" are the two words a reader
+        // would guess, and both must be refused rather than assumed.
+        assert_eq!(ToolbarPlacement::parse("left"), Some(ToolbarPlacement::Left));
+        assert_eq!(ToolbarPlacement::parse("top"), Some(ToolbarPlacement::Top));
+        assert_eq!(ToolbarPlacement::parse("side"), None);
+        assert_eq!(ToolbarPlacement::parse("sidebar"), None);
+        assert_eq!(ToolbarPlacement::parse("Left"), None);
+        assert_eq!(ToolbarPlacement::Left.as_str(), "left");
+        // The stored spelling is what a later build will read back.
+        assert!(text.contains(r#""toolbar_placement":"left""#));
+    }
+
+    #[test]
+    fn the_two_layout_settings_are_independent() {
+        // Labels apply only while the toolbar is on top, and that is a UI
+        // rule, not a storage one: choosing Left must not quietly discard a
+        // label preference the user set earlier and would get back by
+        // choosing Top again.
+        let mut prefs = Prefs::default();
+        prefs.toolbar_labels = ToolbarLabels::Hide;
+        prefs.toolbar_placement = ToolbarPlacement::Left;
+        let text = serde_json::to_string(&prefs).unwrap();
+        let back: Prefs = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.toolbar_labels, ToolbarLabels::Hide);
+        assert_eq!(back.toolbar_placement, ToolbarPlacement::Left);
     }
 
     #[test]

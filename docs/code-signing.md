@@ -103,9 +103,9 @@ finds stale pages.
 **The certificate names a PERSON, not EdgeXene.** The EdgeXene LLC was formed in
 2026 and organization validation requires roughly three years of verifiable
 operating history, so individual validation was the only available route. The
-subject is therefore `CN=Rhoda Faye Tomines, O=Rhoda Faye Tomines, L=Hammond,
-S=IN`, and a custom CN or O is not supported by the service. Windows will name
-that individual as publisher on every signed binary. The certificate profile
+subject therefore names the individual who holds the account (CN and O both),
+and a custom CN or O is not supported by the service. Windows will name that
+individual as publisher on every signed binary. The certificate profile
 happens to be _named_ EdgeXene, which changes nothing -- a profile name never
 appears in a signature. Any download-page or About copy presenting EdgeXene as
 the publisher should be read against this before v1.0. Revisit around 2029, when

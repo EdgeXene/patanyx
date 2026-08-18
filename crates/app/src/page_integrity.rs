@@ -92,6 +92,13 @@ enum Pending {
         url: String,
         bookmark_id: String,
     },
+    /// One tab's byte read for the live cross-tab scan. No url is captured:
+    /// the snapshot joins rows with live tab titles/urls at emit time, so
+    /// there is nothing here to go stale. `scan` is the TabScan id the read
+    /// was issued under; TabScan::record refuses an answer quoting any
+    /// other scan, which is what lets a scan be replaced or dropped without
+    /// cancelling reads one by one.
+    TabSearch { tab_id: u64, scan: u64 },
     #[cfg(feature = "chat")]
     CorroborateBegin {
         peer_hash: String,
@@ -105,6 +112,29 @@ enum Pending {
         own_url: String,
         request: patanyx_corroborate::CompareRequest,
     },
+    /// Change Cross-Check, asking side: reading OUR page now, so the
+    /// request can carry both what we saved and what we see.
+    #[cfg(feature = "chat")]
+    ChangeBegin {
+        peer_hash: String,
+        contact_id: Option<String>,
+        url: String,
+        baseline: ContentDigest,
+        baseline_recorded_at: u64,
+    },
+    /// Change Cross-Check, answering side: reading OUR page now, so the
+    /// answer can say whether it changed for us.
+    #[cfg(feature = "chat")]
+    ChangeRespond {
+        peer_hash: String,
+        contact_id: Option<String>,
+        request: patanyx_corroborate::ChangeCompareRequest,
+        /// Absent when we have no bookmark for that address. The answer is
+        /// still worth sending: a current reading with no baseline says
+        /// what we see now, which is half the matrix.
+        baseline: Option<ContentDigest>,
+        baseline_recorded_at: Option<u64>,
+    },
 }
 
 #[cfg(feature = "chat")]
@@ -112,7 +142,10 @@ impl Pending {
     fn is_corroboration(&self) -> bool {
         matches!(
             self,
-            Pending::CorroborateBegin { .. } | Pending::CorroborateRespond { .. }
+            Pending::CorroborateBegin { .. }
+                | Pending::CorroborateRespond { .. }
+                | Pending::ChangeBegin { .. }
+                | Pending::ChangeRespond { .. }
         )
     }
 }
@@ -125,6 +158,11 @@ pub struct IntegrityState {
     /// restarted app simply forgets a comparison was ever asked.
     #[cfg(feature = "chat")]
     pending_corroborations: HashMap<String, patanyx_corroborate::CompareRequest>,
+    /// Change Cross-Check requests we sent, same shape and same lifetime as
+    /// the map above. Separate rather than merged: an answer to one kind of
+    /// question must never be matched against the other.
+    #[cfg(feature = "chat")]
+    pending_changes: HashMap<String, patanyx_corroborate::ChangeCompareRequest>,
 }
 
 impl Default for IntegrityState {
@@ -134,6 +172,8 @@ impl Default for IntegrityState {
             pending: HashMap::new(),
             #[cfg(feature = "chat")]
             pending_corroborations: HashMap::new(),
+            #[cfg(feature = "chat")]
+            pending_changes: HashMap::new(),
         }
     }
 }
@@ -259,6 +299,18 @@ fn begin_fetch_for_active(state: &mut AppState, purpose: Pending) -> Result<(), 
     Ok(())
 }
 
+/// Register one tab of the live cross-tab scan for a byte read and return
+/// the token the caller hands to `request_main_resource_bytes`. This is the
+/// per-tab half of begin_fetch_for_active's issue-and-ask, for tabs that
+/// are not the active one; it lives here because `Pending` and the token
+/// registry are this module's own, and a second token space answering the
+/// same platform callback is how tokens get routed to the wrong owner. The
+/// capability gate stays in the find_tabs_search arm: one "unsupported"
+/// refusal up front, not N per-tab surprises half-way through issuing.
+pub fn issue_tab_search_fetch(state: &mut AppState, tab_id: u64, scan: u64) -> u64 {
+    state.integrity.issue(Pending::TabSearch { tab_id, scan })
+}
+
 /// The corroborate crate deliberately never reads a clock; the app supplies
 /// unix seconds at CAPTURE time.
 ///
@@ -352,6 +404,53 @@ pub fn ipc_corroborate_request(state: &mut AppState, args: &Value) -> Result<Val
     Ok(json!({}))
 }
 
+/// Fold one tab's byte read into the live cross-tab scan and re-emit the
+/// snapshot when a row changed. Every refusal is a quiet no-op, each for a
+/// reason: a token whose scan is gone (replaced by a newer search, dropped
+/// by the vault lock) meets no scan; an answer quoting a REPLACED scan's id
+/// is refused by TabScan::record even when the live scan covers the same
+/// tab -- without that, bytes captured under the old scan (or a pre-lock
+/// licence session) would be presented as the tab's current content.
+fn finish_tab_search_row(
+    state: &mut AppState,
+    tab_id: u64,
+    scan_id: u64,
+    result: Result<Vec<u8>, PageBytesError>,
+) {
+    let changed = {
+        let Some(scan) = state.tab_scan.as_mut() else {
+            return;
+        };
+        let row = match &result {
+            Ok(bytes) => match patanyx_integrity::visible_text(bytes) {
+                Ok(text) => crate::tab_search::ScanRow::Done(crate::tab_search::find_snippets(
+                    &text,
+                    scan.query(),
+                )),
+                // visible_text's only error is its input cap (the enum has
+                // one variant); the reason key is the one the byte-level
+                // TooLarge already uses, so the wording stays single-authored.
+                Err(patanyx_integrity::IntegrityError::InputTooLarge { .. }) => {
+                    crate::tab_search::ScanRow::Unsearchable("too_large")
+                }
+            },
+            // The keys come from tab_search's own mapping, so the wording
+            // stays single-authored in reason_copy.
+            Err(e) => crate::tab_search::ScanRow::Unsearchable(
+                crate::tab_search::unsearchable_reason(Some(&Err(*e)))
+                    .expect("every PageBytesError maps to a reason key"),
+            ),
+        };
+        scan.record(scan_id, tab_id, row)
+    };
+    // No change means a stale scan id, a late duplicate or an unknown tab:
+    // nothing to repaint. When the scan completes there is nothing further
+    // to do -- the snapshot carries the `scanning` flag.
+    if changed {
+        state.emit_tab_scan_state();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Event handling (UserEvent::Integrity dispatch from main.rs)
 // ---------------------------------------------------------------------------
@@ -373,6 +472,9 @@ pub fn handle_event(state: &mut AppState, event: IntegrityEvent) {
                 Pending::MarkSeen { url, bookmark_id } => {
                     finish_mark_seen(state, url, bookmark_id, result)
                 }
+                Pending::TabSearch { tab_id, scan } => {
+                    finish_tab_search_row(state, tab_id, scan, result)
+                }
                 #[cfg(feature = "chat")]
                 Pending::CorroborateBegin {
                     peer_hash,
@@ -386,6 +488,38 @@ pub fn handle_event(state: &mut AppState, event: IntegrityEvent) {
                     own_url,
                     request,
                 } => finish_corroborate_respond(state, peer_hash, contact_id, own_url, request, result),
+                #[cfg(feature = "chat")]
+                Pending::ChangeBegin {
+                    peer_hash,
+                    contact_id,
+                    url,
+                    baseline,
+                    baseline_recorded_at,
+                } => finish_change_begin(
+                    state,
+                    peer_hash,
+                    contact_id,
+                    url,
+                    baseline,
+                    baseline_recorded_at,
+                    result,
+                ),
+                #[cfg(feature = "chat")]
+                Pending::ChangeRespond {
+                    peer_hash,
+                    contact_id,
+                    request,
+                    baseline,
+                    baseline_recorded_at,
+                } => finish_change_respond(
+                    state,
+                    peer_hash,
+                    contact_id,
+                    request,
+                    baseline,
+                    baseline_recorded_at,
+                    result,
+                ),
             }
         }
     }
@@ -739,7 +873,7 @@ pub(crate) fn hex_encode(bytes: &[u8]) -> String {
 }
 
 #[cfg(feature = "chat")]
-fn hex_decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn hex_decode(text: &str) -> Option<Vec<u8>> {
     // Peer-supplied: cap BEFORE allocating (from_bytes caps again at the
     // protocol's 64 KiB after decoding).
     if text.len() % 2 != 0 || text.len() > 2 * patanyx_corroborate::MAX_MESSAGE_BYTES {
@@ -843,4 +977,349 @@ mod tests {
         assert_eq!(sanitize_reason("no_page"), "no_page");
         assert_eq!(sanitize_reason("<script>alert(1)</script>"), "bad_message");
     }
+}
+
+// ---------------------------------------------------------------------------
+// Change Cross-Check
+//
+// The same shape as peer corroboration one section up, with one difference
+// that matters: corroboration compares what two people are being served NOW,
+// while this compares what each of them SAVED against what each of them sees.
+// So both sides read their own page, and the answer carries two digests
+// rather than one.
+// ---------------------------------------------------------------------------
+
+/// `change_compare_request` — ask a contact whether a bookmarked page
+/// changed for them too.
+///
+/// Requires a baseline of our own. Without one there is no change to
+/// cross-check, and asking would be asking the contact to answer a question
+/// this browser has not asked itself.
+#[cfg(feature = "chat")]
+pub fn ipc_change_request(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
+    let peer_hash = crate::chat_panel::resolve_peer_hash(state, args)?;
+    let contact_id = args
+        .get("contact_id")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let url = state.active_url();
+    if patanyx_corroborate::normalize_url(&url).is_err() {
+        return Err("bad_args");
+    }
+    let (_, baseline, baseline_recorded_at) =
+        stored_snapshot(state, &url).ok_or("no_snapshot")?;
+    begin_fetch_for_active(
+        state,
+        Pending::ChangeBegin {
+            peer_hash,
+            contact_id,
+            url,
+            baseline,
+            baseline_recorded_at,
+        },
+    )?;
+    Ok(json!({ "state": "sent" }))
+}
+
+/// Our page has been read: send what we saved and what we see.
+#[cfg(feature = "chat")]
+#[allow(clippy::too_many_arguments)]
+fn finish_change_begin(
+    state: &mut AppState,
+    peer_hash: String,
+    contact_id: Option<String>,
+    url: String,
+    baseline: ContentDigest,
+    baseline_recorded_at: u64,
+    result: Result<Vec<u8>, PageBytesError>,
+) {
+    let Ok(url) = patanyx_corroborate::normalize_url(&url) else {
+        return emit_change_error(state, "bad_args");
+    };
+    // A failed read is not fatal here: the question can still be asked from
+    // the baseline alone, and the contact's answer is the point. This is the
+    // one place a byte-read failure degrades rather than refuses.
+    let current = result.ok().and_then(|bytes| digest(&bytes).ok());
+    let request = patanyx_corroborate::ChangeCompareRequest::new(
+        &url,
+        baseline,
+        baseline_recorded_at,
+        current,
+        now_secs(),
+    );
+    let Ok(bytes) = request.to_bytes() else {
+        return emit_change_error(state, "bad_message");
+    };
+    let payload = crate::chat_panel::ChatPayload::ChangeCompareRequest {
+        url: url.as_str().to_string(),
+        data: hex_encode(&bytes),
+    };
+    if crate::chat_panel::send_payload(state, &peer_hash, &payload).is_err() {
+        return emit_change_error(state, "send_failed");
+    }
+    state
+        .integrity
+        .pending_changes
+        .insert(peer_hash.clone(), request);
+    state.emit(
+        "change_compare_status",
+        json!({ "peer_hash": peer_hash, "contact_id": contact_id, "state": "sent" }),
+    );
+}
+
+/// A contact asked whether a page changed for us. Answered automatically,
+/// and visibly: the transparency event goes out BEFORE the message is even
+/// decoded, exactly as the other two peer features do it.
+#[cfg(feature = "chat")]
+pub fn handle_change_request(
+    state: &mut AppState,
+    peer_hash: String,
+    contact_id: Option<String>,
+    url: String,
+    data: String,
+) {
+    state.emit(
+        "change_compare_request_received",
+        json!({ "peer_hash": peer_hash, "contact_id": contact_id, "url": url }),
+    );
+    let Some(raw) = hex_decode(&data) else {
+        return send_change_note(state, &peer_hash, "bad_message");
+    };
+    let request = match patanyx_corroborate::ChangeCompareRequest::from_bytes(&raw) {
+        Ok(request) => request,
+        Err(_) => return send_change_note(state, &peer_hash, "bad_message"),
+    };
+    // Our own baseline for that address, if we have one. Absent is an
+    // ordinary answer, not a refusal: what we see NOW is still half the
+    // matrix, and refusing would hide it.
+    let own = stored_snapshot(state, &request.url)
+        .map(|(_, digest, at)| (digest, at))
+        .or_else(|| {
+            tab_url_for_normalized(state, &request.url)
+                .and_then(|typed| stored_snapshot(state, &typed))
+                .map(|(_, digest, at)| (digest, at))
+        });
+    let (baseline, baseline_recorded_at) = match own {
+        Some((digest, at)) => (Some(digest), Some(at)),
+        None => (None, None),
+    };
+    // Read the page ONLY if it is already open. Fetching it now would be
+    // fetching on a peer's say-so, which is the thing peer corroboration
+    // refuses to do and for the same reason.
+    let open_here = tab_url_for_normalized(state, &request.url);
+    if open_here.is_none() {
+        // Nothing to read, but a baseline may still answer.
+        if baseline.is_none() {
+            return send_change_note(state, &peer_hash, "no_baseline");
+        }
+        send_change_answer(
+            state,
+            &peer_hash,
+            &request,
+            baseline,
+            baseline_recorded_at,
+            None,
+        );
+        return;
+    }
+    if !crate::platform::page_bytes_supported() {
+        return send_change_note(state, &peer_hash, "unsupported");
+    }
+    let own_url = open_here.expect("checked above");
+    let note_hash = peer_hash.clone();
+    let token = state.integrity.issue(Pending::ChangeRespond {
+        peer_hash,
+        contact_id,
+        request,
+        baseline,
+        baseline_recorded_at,
+    });
+    let proxy = state.proxy();
+    match tab_webview_for_url(state, &own_url) {
+        Some(webview) => crate::platform::request_main_resource_bytes(webview, token, &proxy),
+        None => {
+            state.integrity.pending.remove(&token);
+            send_change_note(state, &note_hash, "no_page");
+        }
+    }
+}
+
+/// Our page has been read on the answering side: send both digests.
+#[cfg(feature = "chat")]
+#[allow(clippy::too_many_arguments)]
+fn finish_change_respond(
+    state: &mut AppState,
+    peer_hash: String,
+    contact_id: Option<String>,
+    request: patanyx_corroborate::ChangeCompareRequest,
+    baseline: Option<ContentDigest>,
+    baseline_recorded_at: Option<u64>,
+    result: Result<Vec<u8>, PageBytesError>,
+) {
+    let current = result.ok().and_then(|bytes| digest(&bytes).ok());
+    let Some(response) = send_change_answer(
+        state,
+        &peer_hash,
+        &request,
+        baseline,
+        baseline_recorded_at,
+        current,
+    ) else {
+        // The answer did not go out. Emitting a verdict here would show
+        // this side a comparison the other side never received.
+        return;
+    };
+    // The responder sees the verdict too, the same rule Copy Compare
+    // follows: both sides learn the same thing at the same time, and hiding
+    // it from whoever answered would make the feature feel like
+    // surveillance. The verdict is computed from the SENT response, so the
+    // two sides are reading the same two messages.
+    if let Ok(verdict) = patanyx_corroborate::change_verdict(&request, &response) {
+        state.emit(
+            "change_compare_verdict",
+            change_verdict_json(&peer_hash, contact_id.as_deref(), &request.url, &verdict),
+        );
+    }
+}
+
+/// Assembles and sends one answer.
+#[cfg(feature = "chat")]
+fn send_change_answer(
+    state: &mut AppState,
+    peer_hash: &str,
+    request: &patanyx_corroborate::ChangeCompareRequest,
+    baseline: Option<ContentDigest>,
+    baseline_recorded_at: Option<u64>,
+    current: Option<ContentDigest>,
+) -> Option<patanyx_corroborate::ChangeCompareResponse> {
+    let Ok(url) = patanyx_corroborate::normalize_url(&request.url) else {
+        send_change_note(state, peer_hash, "bad_message");
+        return None;
+    };
+    let response = patanyx_corroborate::ChangeCompareResponse::new(
+        &url,
+        baseline,
+        baseline_recorded_at,
+        current,
+        now_secs(),
+    );
+    let Ok(bytes) = response.to_bytes() else {
+        send_change_note(state, peer_hash, "bad_message");
+        return None;
+    };
+    let payload = crate::chat_panel::ChatPayload::ChangeCompareResponse {
+        data: hex_encode(&bytes),
+    };
+    if crate::chat_panel::send_payload(state, peer_hash, &payload).is_err() {
+        return None;
+    }
+    Some(response)
+}
+
+/// Our question was answered: request plus response become the matrix.
+#[cfg(feature = "chat")]
+pub fn handle_change_response(
+    state: &mut AppState,
+    peer_hash: String,
+    contact_id: Option<String>,
+    data: String,
+) {
+    let Some(raw) = hex_decode(&data) else {
+        return emit_change_error(state, "bad_message");
+    };
+    let response = match patanyx_corroborate::ChangeCompareResponse::from_bytes(&raw) {
+        Ok(response) => response,
+        Err(_) => return emit_change_error(state, "bad_message"),
+    };
+    let Some(request) = state.integrity.pending_changes.remove(&peer_hash) else {
+        state.emit(
+            "change_compare_note",
+            json!({
+                "peer_hash": peer_hash,
+                "contact_id": contact_id,
+                "local": true,
+                "reason": "unexpected",
+            }),
+        );
+        return;
+    };
+    match patanyx_corroborate::change_verdict(&request, &response) {
+        Ok(verdict) => state.emit(
+            "change_compare_verdict",
+            change_verdict_json(&peer_hash, contact_id.as_deref(), &request.url, &verdict),
+        ),
+        Err(_) => emit_change_error(state, "url_mismatch"),
+    }
+}
+
+/// A contact could not answer. The reason is peer-supplied, so it is pinned
+/// to a closed set before it can reach the chrome.
+#[cfg(feature = "chat")]
+pub fn handle_change_note(
+    state: &mut AppState,
+    peer_hash: String,
+    contact_id: Option<String>,
+    reason: &str,
+) {
+    state.integrity.pending_changes.remove(&peer_hash);
+    let reason = match reason {
+        "no_baseline" | "no_page" | "unsupported" | "bad_message" => reason,
+        _ => "bad_message",
+    };
+    state.emit(
+        "change_compare_note",
+        json!({
+            "peer_hash": peer_hash,
+            "contact_id": contact_id,
+            "local": false,
+            "reason": reason,
+        }),
+    );
+}
+
+#[cfg(feature = "chat")]
+fn send_change_note(state: &mut AppState, peer_hash: &str, reason: &str) {
+    let payload = crate::chat_panel::ChatPayload::ChangeCompareNote {
+        reason: reason.to_string(),
+    };
+    let _ = crate::chat_panel::send_payload(state, peer_hash, &payload);
+}
+
+#[cfg(feature = "chat")]
+fn emit_change_error(state: &AppState, code: &'static str) {
+    state.emit(
+        "change_compare_error",
+        json!({ "op": "change_compare", "code": code }),
+    );
+}
+
+/// One shape for the matrix, so the chrome never assembles a claim. `text`
+/// is the crate's own headline, shown verbatim.
+#[cfg(feature = "chat")]
+fn change_verdict_json(
+    peer_hash: &str,
+    contact_id: Option<&str>,
+    url: &str,
+    verdict: &patanyx_corroborate::ChangeVerdict,
+) -> Value {
+    let cell = |c: Option<patanyx_corroborate::Cell>| match c {
+        None => Value::Null,
+        Some(patanyx_corroborate::Cell::Same) => json!("same"),
+        Some(patanyx_corroborate::Cell::TextSameMarkupDiffers) => json!("same_text"),
+        Some(patanyx_corroborate::Cell::TextDiffers { .. }) => json!("text_differs"),
+    };
+    json!({
+        "peer_hash": peer_hash,
+        "contact_id": contact_id,
+        "url": url,
+        "text": verdict.to_string(),
+        "now": cell(verdict.now),
+        "baselines": cell(verdict.baselines),
+        "their_change": cell(verdict.their_change),
+        "my_change": cell(verdict.my_change),
+        "baseline_gap_seconds": verdict.baseline_gap_seconds,
+    })
 }

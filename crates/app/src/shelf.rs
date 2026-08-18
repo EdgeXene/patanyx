@@ -53,10 +53,21 @@ pub(crate) fn shelf_name(count: usize) -> String {
     }
 }
 
-pub(crate) fn plan_create<'a>(tabs: &'a [Candidate<'a>]) -> Plan<'a> {
+/// `only` restricts the plan to the listed tab ids; `None` considers
+/// every tab, which is the behavior existing callers and tests were
+/// written against. Tabs excluded by the filter are NOT counted in
+/// `left_out`: that count answers "of the tabs in scope, how many could
+/// not be stored", and a tab the caller never asked about was not left
+/// out of anything.
+pub(crate) fn plan_create<'a>(tabs: &'a [Candidate<'a>], only: Option<&[u64]>) -> Plan<'a> {
     let mut entries = Vec::new();
     let mut left_out = 0;
     for tab in tabs {
+        if let Some(ids) = only {
+            if !ids.contains(&tab.id) {
+                continue;
+            }
+        }
         // Ephemeral is checked first: that exclusion is a privacy promise,
         // not a filter preference, so no URL shape may ever relax it.
         if tab.ephemeral || !is_storable_url(tab.url) {
@@ -103,7 +114,7 @@ mod tests {
     #[test]
     fn ephemeral_tabs_are_left_out_even_with_storable_urls() {
         let tabs = [cand(1, true, "https://example.com/")];
-        let plan = plan_create(&tabs);
+        let plan = plan_create(&tabs, None);
         assert!(plan.entries.is_empty());
         assert_eq!(plan.left_out, 1);
     }
@@ -117,7 +128,7 @@ mod tests {
             cand(4, false, ""),
             cand(5, false, "https://c.example/"),
         ];
-        let plan = plan_create(&tabs);
+        let plan = plan_create(&tabs, None);
         let ids: Vec<u64> = plan.entries.iter().map(|entry| entry.id).collect();
         assert_eq!(ids, vec![1, 5]);
         assert_eq!(plan.entries[0].url, "https://a.example/");
@@ -131,7 +142,7 @@ mod tests {
             cand(1, false, "about:blank"),
             cand(2, true, "https://a.example/"),
         ];
-        let plan = plan_create(&tabs);
+        let plan = plan_create(&tabs, None);
         assert!(plan.entries.is_empty());
         assert_eq!(plan.left_out, 2);
         // The IPC arm turns exactly this plan into the "no_storable_tabs"
@@ -144,7 +155,7 @@ mod tests {
             cand(1, false, "https://a.example/"),
             cand(2, false, "https://b.example/"),
         ];
-        let plan = plan_create(&tabs);
+        let plan = plan_create(&tabs, None);
         assert_eq!(plan.entries.len(), 2);
         assert_eq!(plan.left_out, 0);
     }
@@ -154,5 +165,55 @@ mod tests {
         // Exact phrasing per the spec, count included, nothing else.
         assert_eq!(shelf_name(1), "Set aside 1 tab");
         assert_eq!(shelf_name(12), "Set aside 12 tabs");
+    }
+    #[test]
+    fn subset_keeps_only_the_listed_tabs() {
+        let tabs = vec![
+            cand(1, false, "https://a.example/"),
+            cand(2, false, "https://b.example/"),
+            cand(3, false, "https://c.example/"),
+        ];
+        let plan = plan_create(&tabs, Some(&[1, 3]));
+        let ids: Vec<u64> = plan.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, vec![1, 3]);
+        assert_eq!(plan.left_out, 0, "unlisted tabs were never in scope");
+    }
+
+    #[test]
+    fn subset_still_refuses_ephemeral_and_internal() {
+        // The filter narrows scope; it never widens what qualifies. The
+        // privacy promise outranks the user's tick.
+        let tabs = vec![
+            cand(1, true, "https://a.example/"),
+            cand(2, false, "about:blank"),
+            cand(3, false, "https://c.example/"),
+        ];
+        let plan = plan_create(&tabs, Some(&[1, 2, 3]));
+        let ids: Vec<u64> = plan.entries.iter().map(|entry| entry.id).collect();
+        assert_eq!(ids, vec![3]);
+        assert_eq!(plan.left_out, 2);
+    }
+
+    #[test]
+    fn subset_tolerates_unknown_ids() {
+        // An id that names no live tab matches nothing, the same tolerance
+        // the close loop shows for tabs that have gone away.
+        let tabs = vec![cand(1, false, "https://a.example/")];
+        let plan = plan_create(&tabs, Some(&[1, 99]));
+        assert_eq!(plan.entries.len(), 1);
+        let empty = plan_create(&tabs, Some(&[99]));
+        assert!(empty.entries.is_empty());
+        assert_eq!(empty.left_out, 0);
+    }
+
+    #[test]
+    fn no_filter_is_the_previous_behavior() {
+        let tabs = vec![
+            cand(1, false, "https://a.example/"),
+            cand(2, true, "https://b.example/"),
+        ];
+        let plan = plan_create(&tabs, None);
+        assert_eq!(plan.entries.len(), 1);
+        assert_eq!(plan.left_out, 1);
     }
 }

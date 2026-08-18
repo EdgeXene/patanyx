@@ -31,13 +31,36 @@
 //! * NO ENFORCEMENT: `premium_active` is landed fully tested and CALLED
 //!   BY NOTHING. Flipping any feature switch is a later, deliberate
 //!   deliberate act.
+//! * FIVE DEVICES (Phase 4, 2026-08-17): an ACTIVE token alone no longer
+//!   opens the gate. `premium_active` is the token being ACTIVE **and** a
+//!   signed activation receipt in the vault that binds to THIS device
+//!   (`activation.rs`). The receipt is re-verified offline at every unlock
+//!   exactly like the token; while a device is unactivated, each unlock
+//!   makes ONE silent activation attempt and otherwise the state is named
+//!   honestly (`ActivationState`), never guessed.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
-use patanyx_licence::{evaluate, LicenceKeys, LicenceState, Token};
+use patanyx_licence::{evaluate, LicenceKeys, LicenceState, Receipt, Token};
 use zeroize::Zeroize as _;
 
 use crate::state::AppState;
+
+/// Whether THIS device holds a slot under the current licence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActivationState {
+    /// FREE or LAPSED: there is nothing to activate.
+    NotNeeded,
+    /// A receipt in the vault verifies and binds to this device.
+    Activated,
+    /// The token is ACTIVE and no receipt binds here. `reason` names why
+    /// (see `activation_copy`): "pending" before the first attempt answers,
+    /// "offline", "slots_full", "grants_exhausted", "expired", "bad_token",
+    /// "device_id_unreadable", "device_id_io", "vault_io", "released",
+    /// "release_offline", "refused".
+    Unactivated { reason: &'static str },
+}
 
 /// The unlock-time evaluation result, held for the session (design 3.3:
 /// "held in memory for the session; feature gates read it").
@@ -55,12 +78,29 @@ pub struct SessionLicence {
     /// against). NEVER the token text; `eprintln!`-ed at evaluation time
     /// and otherwise only read by tests.
     pub diagnostic: Option<String>,
+    /// Phase 4: whether this device holds an activation slot. Decided from
+    /// the vault's receipts and the device id, offline, at every unlock.
+    pub activation: ActivationState,
+    /// The verified token's licence id, lowercase hex, so the activation
+    /// worker can tell whether its result still belongs to the licence in
+    /// the vault when it lands. `None` when there is no verified token.
+    pub license_id_hex: Option<String>,
 }
 
 /// The session state. `None` means "locked" (or never evaluated): nothing
 /// licence-related may survive a lock, so `on_vault_locked` clears it and
 /// every reader treats `None` as FREE.
 static SESSION: Mutex<Option<SessionLicence>> = Mutex::new(None);
+
+/// One activation (or release) worker at a time.
+static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+/// The reason the LAST attempt ended unactivated, shown until the next
+/// attempt answers. Cleared at lock.
+static LAST_ACTIVATION_RESULT: Mutex<Option<&'static str>> = Mutex::new(None);
+/// The licence id the silent per-unlock retry already ran for, so an
+/// evaluation triggered by the retry's own result does not start another.
+/// Cleared at lock, so the next unlock retries once more.
+static RETRIED_FOR: Mutex<Option<String>> = Mutex::new(None);
 
 /// Poisoning is not fatal here: a panic elsewhere must not make the
 /// licence state unreadable.
@@ -104,6 +144,8 @@ fn evaluate_stored(
             state: LicenceState::Free,
             keys_available,
             diagnostic: None,
+            activation: ActivationState::NotNeeded,
+            license_id_hex: None,
         };
     };
     let keys = match keys {
@@ -119,6 +161,8 @@ fn evaluate_stored(
                 diagnostic: Some(format!(
                     "the stored licence token could not be verified: {why}"
                 )),
+                activation: ActivationState::NotNeeded,
+                license_id_hex: None,
             };
         }
     };
@@ -134,6 +178,10 @@ fn evaluate_stored(
         .as_ref()
         .err()
         .map(|error| format!("a stored licence token failed re-verification at unlock: {error}"));
+    let license_id_hex = verified
+        .as_ref()
+        .ok()
+        .map(|token| crate::activation::hex_encode_16(&token.license_id()));
     let state = match verified {
         Ok(token) => evaluate(Some(&token), today),
         // PLANTED-DEFECT GATE TARGET (scripts/licence-planted-defect-gate.sh,
@@ -148,6 +196,51 @@ fn evaluate_stored(
         state,
         keys_available,
         diagnostic,
+        // Decided by `activation_state` once the caller has the receipts
+        // and the device id; `evaluate_stored` stays the token-only half.
+        activation: ActivationState::NotNeeded,
+        license_id_hex,
+    }
+}
+
+/// The Phase 4 half, pure: given the verified token's text, the ring, the
+/// vault's receipts, THIS device's id (if the install has one) and the
+/// reason the last attempt ended, decide whether this device is activated.
+/// No clock (a receipt has no expiry of its own; it dies with the token,
+/// which `evaluate_stored` already judged).
+fn activation_state(
+    session_state: &LicenceState,
+    token_text: Option<&str>,
+    keys: Option<&LicenceKeys>,
+    receipts: &[String],
+    device_id: Option<[u8; 16]>,
+    last_result: Option<&'static str>,
+) -> ActivationState {
+    if !session_state.premium_active() {
+        return ActivationState::NotNeeded;
+    }
+    let unactivated = ActivationState::Unactivated {
+        reason: last_result.unwrap_or("pending"),
+    };
+    let (Some(text), Some(keys), Some(device_id)) = (token_text, keys, device_id) else {
+        return unactivated;
+    };
+    let Ok(token) = Token::parse(text, keys) else {
+        return unactivated;
+    };
+    // PLANTED-DEFECT GATE TARGET (scripts/licence-planted-defect-gate.sh,
+    // P5 phase): `binds` is the activation's teeth -- a receipt that
+    // verifies but names another device or another licence must NOT count.
+    // The gate rewrites this to ignore `binds` and asserts the suite fails.
+    let bound = receipts.iter().any(|receipt_text| {
+        Receipt::parse(receipt_text, keys)
+            .map(|receipt| receipt.binds(&token, &device_id))
+            .unwrap_or(false)
+    });
+    if bound {
+        ActivationState::Activated
+    } else {
+        unactivated
     }
 }
 
@@ -166,11 +259,49 @@ pub fn on_vault_unlocked(state: &AppState) {
         .as_ref()
         .and_then(|vault| vault.licence_record());
     let keys = patanyx_licence::licence_keys();
-    let session = evaluate_stored(
+    let mut session = evaluate_stored(
         record.as_ref().map(|record| record.token_text.as_str()),
         keys.as_ref().map_err(|error| error.to_string()),
         today_utc_day_number(),
     );
+    // Phase 4: is THIS device activated? Receipts come from the vault, the
+    // device id from beside it (read only, never minted here: an unlock
+    // must not create an identifier). Both are wiped once read.
+    if session.state.premium_active() {
+        let mut receipts: Vec<String> = state
+            .vault
+            .as_ref()
+            .map(|vault| {
+                vault
+                    .activation_records()
+                    .into_iter()
+                    .map(|r| r.receipt_text)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let device_id = match crate::activation::device_id_if_present(&state.vault_path) {
+            Ok(id) => id,
+            Err(crate::activation::DeviceIdError::Unreadable) => {
+                *lock(&LAST_ACTIVATION_RESULT) = Some("device_id_unreadable");
+                None
+            }
+            Err(crate::activation::DeviceIdError::Io) => {
+                *lock(&LAST_ACTIVATION_RESULT) = Some("device_id_io");
+                None
+            }
+        };
+        session.activation = activation_state(
+            &session.state,
+            record.as_ref().map(|record| record.token_text.as_str()),
+            keys.as_ref().ok(),
+            &receipts,
+            device_id,
+            *lock(&LAST_ACTIVATION_RESULT),
+        );
+        for receipt in &mut receipts {
+            receipt.zeroize();
+        }
+    }
     if let Some(record) = record.as_mut() {
         record.token_text.zeroize();
     }
@@ -178,7 +309,109 @@ pub fn on_vault_unlocked(state: &AppState) {
         // Local-only diagnostics, never the token.
         eprintln!("patanyx licence: {diagnostic}");
     }
+    let needs_retry = matches!(session.activation, ActivationState::Unactivated { .. })
+        && !matches!(
+            *lock(&LAST_ACTIVATION_RESULT),
+            Some("device_id_unreadable" | "device_id_io" | "released")
+        );
+    let license_id_hex = session.license_id_hex.clone();
     *lock(&SESSION) = Some(session);
+    // ONE silent retry per unlock while unactivated: the first unlock after
+    // a paste is what activates a device in the normal case, and a lost
+    // answer costs nothing (the server is idempotent per device). Keyed by
+    // licence id so the evaluation the retry's own result triggers does not
+    // start a second one; a new token pasted mid-session gets its own try.
+    if needs_retry {
+        if let Some(id) = license_id_hex {
+            let already = lock(&RETRIED_FOR).as_deref() == Some(id.as_str());
+            if !already {
+                *lock(&RETRIED_FOR) = Some(id);
+                crate::activation::start_activation(state);
+            }
+        }
+    }
+}
+
+/// Phase 4 bookkeeping for the activation worker (`activation.rs`).
+pub fn activation_in_flight() -> bool {
+    ACTIVATION_IN_FLIGHT.load(Ordering::SeqCst)
+}
+pub fn mark_activation_in_flight() {
+    ACTIVATION_IN_FLIGHT.store(true, Ordering::SeqCst);
+}
+pub fn clear_activation_in_flight() {
+    ACTIVATION_IN_FLIGHT.store(false, Ordering::SeqCst);
+}
+
+/// Record how the last attempt ended and reflect it in the session state
+/// (only while the session is Unactivated; an activated session is decided
+/// by the vault, not by a result string).
+pub fn set_activation_result(reason: &'static str) {
+    *lock(&LAST_ACTIVATION_RESULT) = Some(reason);
+    if let Some(session) = lock(&SESSION).as_mut() {
+        if matches!(session.activation, ActivationState::Unactivated { .. }) {
+            session.activation = ActivationState::Unactivated { reason };
+        }
+    }
+}
+
+/// The verified token's licence id, for the worker's "does my result still
+/// belong here" check.
+pub fn current_license_id_hex() -> Option<String> {
+    lock(&SESSION)
+        .as_ref()
+        .and_then(|session| session.license_id_hex.clone())
+}
+
+/// The user's explicit "Activate now": forget the last result, then let the
+/// worker start. Returns whether it started.
+pub fn activate_now(state: &AppState) -> bool {
+    *lock(&LAST_ACTIVATION_RESULT) = None;
+    if let Some(session) = lock(&SESSION).as_mut() {
+        if matches!(session.activation, ActivationState::Unactivated { .. }) {
+            session.activation = ActivationState::Unactivated { reason: "pending" };
+        }
+    }
+    crate::activation::start_activation(state)
+}
+
+/// The sentence the vault row shows under an unactivated licence. Rust
+/// words it; the chrome writes it verbatim. Every reason has one.
+pub fn activation_copy(reason: &str) -> &'static str {
+    match reason {
+        "pending" => "Activating this device...",
+        "offline" => {
+            "This device is not activated yet. PATANYX could not reach EdgeXene to \
+             activate it; it will try again at the next unlock, or use Activate now."
+        }
+        "slots_full" => {
+            "This license is already active on 5 devices. Release one of them from its \
+             own Vault panel, then activate this one."
+        }
+        "grants_exhausted" => {
+            "This license has used all of its activations. Contact EdgeXene from the \
+             About page."
+        }
+        "expired" => "This license has ended, so it cannot be activated.",
+        "bad_token" => {
+            "EdgeXene did not recognize this token. Check that you pasted the whole of it."
+        }
+        "device_id_unreadable" => {
+            "The device-id file next to your vault is damaged. PATANYX will not replace \
+             it on its own; delete it to let this install mint a new one (that uses one \
+             activation)."
+        }
+        "device_id_io" => "PATANYX could not read or write the device-id file next to your vault.",
+        "vault_io" => "The receipt could not be saved to your vault.",
+        "released" => {
+            "This device released its activation. Premium is off here until you activate \
+             again."
+        }
+        "release_offline" => {
+            "PATANYX could not reach EdgeXene to release this device; nothing changed."
+        }
+        _ => "EdgeXene refused to activate this device.",
+    }
 }
 
 /// The vault has just locked: the session state dies with it, for the same
@@ -187,6 +420,8 @@ pub fn on_vault_unlocked(state: &AppState) {
 /// may survive the lock in memory.
 pub fn on_vault_locked() {
     *lock(&SESSION) = None;
+    *lock(&LAST_ACTIVATION_RESULT) = None;
+    *lock(&RETRIED_FOR) = None;
 }
 
 /// The current session state, if the vault is unlocked and has been
@@ -194,6 +429,45 @@ pub fn on_vault_locked() {
 /// as an error.
 pub fn current() -> Option<SessionLicence> {
     lock(&SESSION).clone()
+}
+
+/// Whether Premium can be BOUGHT yet. False until launch day.
+///
+/// The toolbar's locked controls need to say something, and what they may
+/// honestly say depends on this: with nothing for sale, "Upgrade to Premium"
+/// is a call to action pointing at a page that does not exist, and the
+/// project's rule is that copy never implies a purchase before one is
+/// possible. Flipping this to `true` is part of the launch, alongside the
+/// purchase page going live.
+pub const PREMIUM_ON_SALE: bool = false;
+
+/// The one word the TOOLBAR needs, so the decision has a single author the
+/// way `cross_tab_gate` gives the refusal a single author.
+///
+/// `locked` is its own answer and must never be folded into `free`. The
+/// session dies at vault lock, so a paying customer with a locked vault is
+/// indistinguishable from a free user *to `premium_active`* — that is
+/// correct for GATING (an absence of information must not gate anything on)
+/// and catastrophic for COPY: it would show someone who already paid a
+/// prompt to buy. The gate stays fail-closed; the toolbar says "unlock" for
+/// that state instead of "upgrade".
+pub fn gate_state() -> &'static str {
+    match current() {
+        None => "locked",
+        // Phase 4: a paid, ACTIVE licence that is not activated on this
+        // device is its own word. Folding it into "active" would show
+        // Premium features as available while the gate is shut; folding it
+        // into "free" would tell a payer to buy.
+        Some(session) if matches!(session.activation, ActivationState::Unactivated { .. }) => {
+            "unactivated"
+        }
+        Some(session) => match session.state {
+            LicenceState::Perpetual => "perpetual",
+            LicenceState::Active { .. } => "active",
+            LicenceState::Lapsed { .. } => "lapsed",
+            LicenceState::Free => "free",
+        },
+    }
 }
 
 /// Whether this build carries a usable verification key ring. P1 ships an
@@ -210,14 +484,24 @@ pub fn keys_available() -> bool {
 /// never-evaluated session reads as FREE: an absence of information must
 /// never gate anything ON.
 ///
-/// CALLED BY NOTHING yet — and that is deliberate. P2 lands the machinery
-/// fully tested but with NO enforcement: nothing in this phase switches
-/// chat, the tunnel, OCR, or themes off for any licence state. Flipping a
-/// feature switch is a later, deliberate deliberate act.
+/// First enforced by the cross-tab search: the find_tabs_search and
+/// find_tabs_goto IPC arms gate on this through tab_search::cross_tab_gate.
+/// History: the machinery landed fully tested with NO enforcement on
+/// purpose -- flipping a feature switch was reserved as a later, deliberate
+/// act, and the cross-tab search is that act. Nothing else gates yet; the
+/// features shipped unlocked as Premium seeds (divergence, the photo check)
+/// still flip only at the actual Premium launch. Theme packs left that list
+/// on 2026-08-16 and are free permanently -- there is no switch here to flip
+/// for them, and adding one would break a published promise. The reasoning
+/// is in `about.rs::PREMIUM`.
 pub fn premium_active() -> bool {
     lock(&SESSION)
         .as_ref()
-        .map(|session| session.state.premium_active())
+        // PLANTED-DEFECT GATE TARGET (P5): the activation conjunct. Without
+        // it a token alone opens the gate on any number of machines.
+        .map(|session| {
+            session.state.premium_active() && session.activation == ActivationState::Activated
+        })
         .unwrap_or(false)
 }
 
@@ -247,6 +531,14 @@ fn row_copy(state: &LicenceState, today: u32) -> (String, String) {
         LicenceState::Active { days_left } => {
             (format!("Premium Time Left: {days_left} days"), String::new())
         }
+        // No countdown and no date: naming the state is the whole message.
+        // The sub line is the same promise the Free and Lapsed rows carry,
+        // because it is equally true here and a row that drops it would
+        // read as though perpetual buyers are outside that promise.
+        LicenceState::Perpetual => (
+            "Premium License: Perpetual".to_string(),
+            "Free features always remain free.".to_string(),
+        ),
         LicenceState::Lapsed { expires_day } => (
             format!("Premium ended {}.", ended_display(expires_day, today)),
             "Free features always remain free.".to_string(),
@@ -499,23 +791,89 @@ mod tests {
             state: LicenceState::Active { days_left: 3 },
             keys_available: true,
             diagnostic: None,
+            activation: ActivationState::Activated,
+            license_id_hex: None,
         });
         assert!(premium_active());
+        // Phase 4: ACTIVE but not activated on THIS device gates CLOSED. A
+        // token alone must not open the gate on any number of machines.
+        *lock(&SESSION) = Some(SessionLicence {
+            state: LicenceState::Active { days_left: 3 },
+            keys_available: true,
+            diagnostic: None,
+            activation: ActivationState::Unactivated { reason: "pending" },
+            license_id_hex: None,
+        });
+        assert!(!premium_active(), "unactivated means NO premium features here");
+        assert_eq!(gate_state(), "unactivated");
         // LAPSED gates exactly like FREE: no fallback license (settled
         // 2026-08-05).
         *lock(&SESSION) = Some(SessionLicence {
             state: LicenceState::Lapsed { expires_day: 20669 },
             keys_available: true,
             diagnostic: None,
+            activation: ActivationState::NotNeeded,
+            license_id_hex: None,
         });
         assert!(!premium_active(), "lapsed means NO premium features at all");
         *lock(&SESSION) = Some(SessionLicence {
             state: LicenceState::Free,
             keys_available: true,
             diagnostic: None,
+            activation: ActivationState::NotNeeded,
+            license_id_hex: None,
         });
         assert!(!premium_active());
         *lock(&SESSION) = None;
+    }
+
+    /// The toolbar's whole reason for existing as a separate answer: a
+    /// LOCKED vault must not look like a FREE one, or a paying customer is
+    /// shown a prompt to buy what they already own.
+    #[test]
+    fn gate_state_never_calls_a_locked_vault_free() {
+        let _serial = lock(&SERIAL);
+        *lock(&SESSION) = None;
+        assert_eq!(gate_state(), "locked");
+        assert!(
+            !premium_active(),
+            "locked still gates CLOSED; only the wording differs"
+        );
+
+        let session = |state: LicenceState| {
+            let activation = if state.premium_active() {
+                ActivationState::Activated
+            } else {
+                ActivationState::NotNeeded
+            };
+            *lock(&SESSION) = Some(SessionLicence {
+                state,
+                keys_available: true,
+                diagnostic: None,
+                activation,
+                license_id_hex: None,
+            });
+        };
+        session(LicenceState::Free);
+        assert_eq!(gate_state(), "free");
+        session(LicenceState::Active { days_left: 3 });
+        assert_eq!(gate_state(), "active");
+        session(LicenceState::Perpetual);
+        assert_eq!(gate_state(), "perpetual");
+        session(LicenceState::Lapsed { expires_day: 20669 });
+        assert_eq!(gate_state(), "lapsed");
+        *lock(&SESSION) = None;
+    }
+
+    /// Nothing is for sale until launch day, so no surface may word itself
+    /// as though a purchase were possible. Pinned rather than remembered:
+    /// this flips exactly once, deliberately, alongside the purchase page.
+    #[test]
+    fn premium_is_not_on_sale_yet() {
+        assert!(
+            !PREMIUM_ON_SALE,
+            "flipping this is a launch act: the purchase page must exist first"
+        );
     }
 
     #[test]
@@ -525,8 +883,145 @@ mod tests {
             state: LicenceState::Active { days_left: 3 },
             keys_available: true,
             diagnostic: None,
+            activation: ActivationState::Activated,
+            license_id_hex: None,
         });
         on_vault_locked();
         assert_eq!(current(), None, "nothing licence-related survives a lock");
+    }
+
+    // ---- Phase 4: activation_state, pure ------------------------------------
+
+    const DEVICE: [u8; 16] = [0xd1; 16];
+    const OTHER_DEVICE: [u8; 16] = [0xd2; 16];
+
+    fn mint_receipt(seed: &[u8; 32], license_id: [u8; 16], device: [u8; 16]) -> String {
+        Receipt::mint(&SigningKey::from_bytes(seed), 0, license_id, device, EXPIRES - 10)
+            .to_text()
+    }
+
+    #[test]
+    fn a_receipt_that_binds_activates_and_one_for_another_device_does_not() {
+        let ring = test_ring();
+        let text = mint_text(&RING_SEED, EXPIRES);
+        let active = LicenceState::Active { days_left: 3 };
+        let mine = mint_receipt(&RING_SEED, LICENSE_ID, DEVICE);
+        let theirs = mint_receipt(&RING_SEED, LICENSE_ID, OTHER_DEVICE);
+        assert_eq!(
+            activation_state(
+                &active,
+                Some(&text),
+                Some(&ring),
+                std::slice::from_ref(&mine),
+                Some(DEVICE),
+                None
+            ),
+            ActivationState::Activated
+        );
+        // A synced vault: the other machine's receipt is here, mine is not.
+        assert_eq!(
+            activation_state(
+                &active,
+                Some(&text),
+                Some(&ring),
+                std::slice::from_ref(&theirs),
+                Some(DEVICE),
+                None
+            ),
+            ActivationState::Unactivated { reason: "pending" }
+        );
+        // Both present: mine is found among them.
+        assert_eq!(
+            activation_state(
+                &active,
+                Some(&text),
+                Some(&ring),
+                &[theirs, mine],
+                Some(DEVICE),
+                None
+            ),
+            ActivationState::Activated
+        );
+    }
+
+    #[test]
+    fn a_receipt_for_another_licence_or_from_another_key_does_not_activate() {
+        let ring = test_ring();
+        let text = mint_text(&RING_SEED, EXPIRES);
+        let active = LicenceState::Active { days_left: 3 };
+        let other_licence = mint_receipt(&RING_SEED, [0x42; 16], DEVICE);
+        let forged = mint_receipt(&WRONG_SEED, LICENSE_ID, DEVICE);
+        assert_eq!(
+            activation_state(
+                &active,
+                Some(&text),
+                Some(&ring),
+                &[other_licence],
+                Some(DEVICE),
+                Some("offline")
+            ),
+            ActivationState::Unactivated { reason: "offline" }
+        );
+        assert_eq!(
+            activation_state(&active, Some(&text), Some(&ring), &[forged], Some(DEVICE), None),
+            ActivationState::Unactivated { reason: "pending" }
+        );
+    }
+
+    #[test]
+    fn no_device_id_yet_means_unactivated_and_free_or_lapsed_need_nothing() {
+        let ring = test_ring();
+        let text = mint_text(&RING_SEED, EXPIRES);
+        let mine = mint_receipt(&RING_SEED, LICENSE_ID, DEVICE);
+        assert_eq!(
+            activation_state(
+                &LicenceState::Active { days_left: 3 },
+                Some(&text),
+                Some(&ring),
+                std::slice::from_ref(&mine),
+                None,
+                None
+            ),
+            ActivationState::Unactivated { reason: "pending" }
+        );
+        assert_eq!(
+            activation_state(&LicenceState::Free, None, Some(&ring), &[], None, None),
+            ActivationState::NotNeeded
+        );
+        assert_eq!(
+            activation_state(
+                &LicenceState::Lapsed { expires_day: 1 },
+                Some(&text),
+                Some(&ring),
+                &[mine],
+                Some(DEVICE),
+                None
+            ),
+            ActivationState::NotNeeded
+        );
+    }
+
+    #[test]
+    fn every_activation_reason_has_a_sentence_and_none_names_a_purchase() {
+        for reason in [
+            "pending",
+            "offline",
+            "slots_full",
+            "grants_exhausted",
+            "expired",
+            "bad_token",
+            "device_id_unreadable",
+            "device_id_io",
+            "vault_io",
+            "released",
+            "release_offline",
+            "refused",
+        ] {
+            let copy = activation_copy(reason);
+            assert!(!copy.is_empty());
+            assert!(!copy.to_lowercase().contains("buy"), "{reason}: {copy}");
+            assert!(!copy.contains("never free"), "{reason}");
+            assert!(!copy.contains('\u{2014}'), "no em dashes: {reason}");
+        }
     }
 }

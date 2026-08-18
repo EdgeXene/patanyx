@@ -74,6 +74,10 @@ pub enum OcrError {
     ModelsInvalid(String),
     /// Input bytes are not a decodable image, or exceed the pixel cap.
     ImageDecode,
+    /// A `recognize_region` rect that is empty or falls outside the image.
+    /// Its own class because the image was FINE -- reporting it as a decode
+    /// failure would send whoever reads the diagnostic to the wrong code.
+    BadRegion,
     /// Model ran but failed or returned an unexpected shape.
     Inference(String),
 }
@@ -88,6 +92,7 @@ impl std::fmt::Display for OcrError {
             Self::ModelsMissing(p) => write!(f, "OCR model file missing: {p}"),
             Self::ModelsInvalid(d) => write!(f, "OCR models unusable: {d}"),
             Self::ImageDecode => write!(f, "not a decodable image, or too large"),
+            Self::BadRegion => write!(f, "region rect empty or outside the image"),
             Self::Inference(d) => write!(f, "OCR inference failed: {d}"),
         }
     }
@@ -205,19 +210,61 @@ impl OcrEngine {
     /// in reading order with boxes in original-image pixels.
     pub fn recognize(&self, bytes: &[u8]) -> Result<Vec<TextRegion>, OcrError> {
         let img = decode_image(bytes)?;
-        let boxes = self.detect(&img)?;
+        self.recognize_pixels(&img)
+    }
+
+    /// Recognizes text inside one rectangle of an encoded image, decoding
+    /// exactly once: decode, crop in pixel space, run the same pipeline.
+    /// Returned boxes are in ORIGINAL-image pixels (offset back by the
+    /// rect's corner), so a caller drawing results over the full image needs
+    /// no second coordinate space.
+    ///
+    /// The rect must lie inside the image and be non-empty; a violation is
+    /// `BadRegion`, its own error class, because the caller validated user
+    /// input against dimensions it holds -- reaching here out of bounds is a
+    /// caller bug and must not be reported as a broken image.
+    pub fn recognize_region(
+        &self,
+        bytes: &[u8],
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+    ) -> Result<Vec<TextRegion>, OcrError> {
+        let img = decode_image(bytes)?;
+        let (iw, ih) = img.dimensions();
+        let in_bounds = w > 0
+            && h > 0
+            && x.checked_add(w).is_some_and(|r| r <= iw)
+            && y.checked_add(h).is_some_and(|r| r <= ih);
+        if !in_bounds {
+            return Err(OcrError::BadRegion);
+        }
+        let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
+        let mut regions = self.recognize_pixels(&crop)?;
+        for r in &mut regions {
+            r.x += x;
+            r.y += y;
+        }
+        Ok(regions)
+    }
+
+    /// The shared pipeline behind both entry points: detect, then recognize
+    /// each detected line, on pixels that are already decoded.
+    fn recognize_pixels(&self, img: &RgbImage) -> Result<Vec<TextRegion>, OcrError> {
+        let boxes = self.detect(img)?;
         let mut regions = Vec::new();
         for (x, y, w, h) in boxes.into_iter().take(MAX_BOXES) {
             if w < 2 || h < 2 {
                 continue;
             }
-            let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
+            let crop = image::imageops::crop_imm(img, x, y, w, h).to_image();
             let text = self.recognize_line(&crop)?;
             if !text.trim().is_empty() {
                 // Measured here, on the page that is already decoded and in
                 // scope. Doing it later would mean handing the caller the bytes
                 // and decoding a second time.
-                let color = color::region_color(&img, x, y, w, h);
+                let color = color::region_color(img, x, y, w, h);
                 regions.push(TextRegion {
                     text,
                     x,
@@ -695,5 +742,50 @@ mod embedded_tests {
             96,
             "rec_dict must hold 96 entries for the 97-class CTC head"
         );
+    }
+
+    /// Encodes a plain white image as PNG bytes, for the region-rect tests.
+    /// No text in it: these tests pin the RECT contract, not recognition.
+    fn white_png(w: u32, h: u32) -> Vec<u8> {
+        let img = RgbImage::from_pixel(w, h, image::Rgb([255, 255, 255]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .expect("encode test png");
+        bytes
+    }
+
+    #[test]
+    fn region_rects_outside_the_image_or_empty_are_bad_region_not_bad_image() {
+        let engine = OcrEngine::load_embedded().expect("embedded models must load");
+        let png = white_png(64, 48);
+        // Empty, overflowing-right, overflowing-bottom, and u32-overflow
+        // rects all refuse with the rect's own error class.
+        for (x, y, w, h) in [
+            (0, 0, 0, 10),
+            (0, 0, 10, 0),
+            (60, 0, 10, 10),
+            (0, 40, 10, 10),
+            (u32::MAX, 0, 2, 2),
+        ] {
+            match engine.recognize_region(&png, x, y, w, h) {
+                Err(OcrError::BadRegion) => {}
+                other => panic!("rect ({x},{y},{w},{h}) gave {other:?}, wanted BadRegion"),
+            }
+        }
+        // An in-bounds rect on a blank image is an ordinary empty result --
+        // the crop ran, the pipeline ran, there was simply nothing to read.
+        let regions = engine
+            .recognize_region(&png, 8, 8, 32, 24)
+            .expect("in-bounds rect must run");
+        assert!(regions.is_empty());
+        // Undecodable bytes keep their own class even with a plausible rect.
+        match engine.recognize_region(b"not an image", 0, 0, 1, 1) {
+            Err(OcrError::ImageDecode) => {}
+            other => panic!("garbage bytes gave {other:?}, wanted ImageDecode"),
+        }
     }
 }

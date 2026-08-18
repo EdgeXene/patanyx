@@ -149,7 +149,13 @@ function mainSandbox() {
     sb.__workers.push(this);
   };
   vm.createContext(sb);
-  vm.runInContext(template.replace("__DIVERGENCE_TOKEN__", TOKEN), sb);
+  // Both placeholders; see the note in divergence-detect-gate.js.
+  vm.runInContext(
+    template
+      .replace("__DIVERGENCE_TOKEN__", TOKEN)
+      .replace("__DIVERGENCE_OVERRIDES__", "{}"),
+    sb,
+  );
   return sb;
 }
 

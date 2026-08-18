@@ -680,7 +680,15 @@ pub fn build_chrome(
     connect_shortcuts(&webview, proxy);
     // Child webviews get no automatic layout; the chrome strip gets its
     // initial bounds here and layout() keeps them current from then on.
-    let _ = webview.set_bounds(chrome_rect(&hosts.window, CHROME_HEIGHT_PX));
+    // A top strip with no sidebar: the chrome has not measured itself yet, so
+    // there is nothing else this could honestly seed from. The first
+    // set_chrome_insets replaces both numbers within a round trip.
+    let _ = webview.set_bounds(chrome_rect(
+        &hosts.window,
+        CHROME_HEIGHT_PX,
+        0,
+        ChromeLayout::Strip,
+    ));
     // No privacy policy on the chrome webview: it is our own UI, not web
     // content (needs JavaScript, talks IPC).
     arm_translucent_overlay(hosts, &webview);
@@ -817,7 +825,7 @@ pub fn translucent_overlay_supported() -> bool {
 // closure and cannot hold &Hosts. Everything is only ever touched on the UI
 // thread; the atomics are for Rust's benefit, not for concurrency.
 
-use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
 /// The readout's own child HWND. Zero = never created = feature off.
 static READOUT_CHILD: AtomicIsize = AtomicIsize::new(0);
@@ -837,6 +845,11 @@ static READOUT_SCALE: AtomicU64 = AtomicU64::new(0);
 /// floating over a modal would describe a link the user can neither see nor
 /// click, and it would fight the raised chrome for z-order.
 static READOUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
+/// Logical pixels the chrome is using down the left edge, so the readout can
+/// sit at the PAGE's bottom-left rather than the window's. Zero in the Top
+/// layout, which is what every build before the sidebar reported. Written by
+/// layout(), read by the callback, same contract as READOUT_SCALE.
+static READOUT_LEFT: AtomicI32 = AtomicI32::new(0);
 /// Palette, as Win32 COLORREFs (0x00BBGGRR -- hover_style::colorref does the
 /// swap and its tests are what stop these being orange).
 static READOUT_FG: AtomicU32 = AtomicU32::new(0);
@@ -1031,8 +1044,13 @@ fn readout_apply(text: Option<&str>) {
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
         return;
     }
+    // The inset is stored in LOGICAL pixels (it is what the chrome measured
+    // in CSS pixels and Rust lays out with); this path is physical throughout,
+    // so it is scaled here and nowhere else.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let left_px = (f64::from(READOUT_LEFT.load(Ordering::Relaxed)) * readout_scale()) as i32;
     let (x, y, w, h) =
-        crate::hover_style::readout_rect(client.right, client.bottom, text_w, line_h);
+        crate::hover_style::readout_rect(client.right, client.bottom, left_px, text_w, line_h);
 
     // HWND_TOP on every show: content webviews are created AFTER this window
     // (arm runs before the first tab), and siblings later in creation order
@@ -1389,7 +1407,9 @@ pub fn build_content(
     // fresh WebView2 child defaults to visible, so hide it before it can
     // paint over the chrome strip or another tab.
     let _ = webview.set_visible(false);
-    let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX));
+    // Seeded, not final: the tab is hidden here and AppState calls layout()
+    // when it activates one, which is where the current insets are applied.
+    let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX, 0, 0));
 
     let state = Rc::new(RefCell::new(TabState::new(policy)));
     {
@@ -1438,6 +1458,10 @@ pub fn build_content(
     // below for the same reason the handlers are: the first document must
     // not be created before the registration lands.
     install_divergence_script(&webview, policy.ephemeral);
+    // The page-scrollbar courtesy: same registration category, same
+    // all-frames path, same place in the order so the first document
+    // already has it.
+    install_scrollbar_script(&webview, &state);
     // The first navigation happens HERE, not on the builder, and the
     // ordering is the whole point: wry issues `Navigate` inside
     // `build_as_child` when the builder carries a url, which is before any
@@ -1514,6 +1538,100 @@ fn install_divergence_script(webview: &WebView, ephemeral: bool) {
     if result.is_err() {
         diag("divergence: AddScriptToExecuteOnDocumentCreated call failed; this tab reads clean fingerprints");
     }
+}
+
+/// Registers the page-scrollbar courtesy (`privacy::page_scrollbar_script`)
+/// for every document this tab will create, all frames, and remembers the
+/// engine's id for it so `set_page_scrollbar` can replace it later.
+///
+/// Same raw `AddScriptToExecuteOnDocumentCreated` as the divergence script,
+/// for the same all-frames reason: a scrollable iframe is a scrollbar too.
+/// The colour is whatever the chrome last reported (persisted in prefs), so
+/// the first tab of a launch -- built before the chrome document runs --
+/// already wears the user's accent.
+///
+/// The id arrives in the completion callback, asynchronously; until then a
+/// palette change finds `None` and simply adds a second registration, whose
+/// sheet is redundant rather than wrong (both set the same declaration; the
+/// later one wins). That window is one COM round trip at tab creation and
+/// not worth a queue.
+fn install_scrollbar_script(webview: &WebView, state: &Rc<RefCell<TabState>>) {
+    let rgb = crate::prefs::load().chrome_palette.scrollbar;
+    add_scrollbar_script(webview, state, rgb);
+}
+
+fn add_scrollbar_script(webview: &WebView, state: &Rc<RefCell<TabState>>, rgb: [u8; 3]) {
+    use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
+    use wry::WebViewExtWindows;
+
+    let source = privacy::page_scrollbar_script(rgb);
+    let core = webview.webview();
+    let source_wide: Vec<u16> = source.encode_utf16().chain(std::iter::once(0)).collect();
+    let remember = Rc::clone(state);
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |hr, script_id| {
+            if hr.is_err() {
+                diag("page scrollbar: registration REFUSED by the engine; this tab keeps the engine's scrollbar");
+                return Ok(());
+            }
+            remember.borrow_mut().scrollbar_script_id = Some(script_id);
+            Ok(())
+        },
+    ));
+    let result = unsafe {
+        core.AddScriptToExecuteOnDocumentCreated(
+            windows::core::PCWSTR(source_wide.as_ptr()),
+            &handler,
+        )
+    };
+    if result.is_err() {
+        diag("page scrollbar: AddScriptToExecuteOnDocumentCreated call failed; this tab keeps the engine's scrollbar");
+    }
+}
+
+/// See `chrome_caps`: Chromium implements `scrollbar-color`, and a palette
+/// change reaches every open page at once (`set_page_scrollbar`).
+pub fn page_scrollbar_support() -> &'static str {
+    "live"
+}
+
+/// Recolours this tab's page scrollbar, now and for every document after.
+///
+/// Two halves, because no single mechanism covers both: a registration
+/// script cannot reach a document that already exists, and this crate never
+/// evaluates script in a content webview (state.rs's `evaluate_script`
+/// invariant). So the CURRENT document is told the colour through
+/// `PostWebMessageAsJson` -- host into page, one direction, the same channel
+/// `fill_credential` uses -- and the registered script's listener swaps its
+/// sheet; and the registration is replaced for the NEXT document, by the
+/// remembered id, so a user who tries all nine accents does not leave nine
+/// registrations on the tab. A tab whose current document has no listener
+/// (a page that replaced `adoptedStyleSheets`, or one loaded before the
+/// engine honoured the registration) simply keeps its colour until it
+/// navigates; the message is dropped by the engine, not by us.
+pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
+    use windows::core::{HSTRING, PCWSTR};
+    use wry::WebViewExtWindows;
+    {
+        let core = webview.webview();
+        let text = HSTRING::from(privacy::page_scrollbar_message(rgb));
+        if unsafe { core.PostWebMessageAsJson(PCWSTR(text.as_ptr())) }.is_err() {
+            diag("page scrollbar: PostWebMessageAsJson refused; this tab recolours on its next load");
+        }
+    }
+    let previous = view.state.borrow_mut().scrollbar_script_id.take();
+    if let Some(id) = previous {
+        let id_wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+        let core = webview.webview();
+        // A failed removal is diag'd and the add still happens: a stale
+        // duplicate is a redundant sheet, a missing one is a grey scrollbar.
+        if unsafe { core.RemoveScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(id_wide.as_ptr())) }
+            .is_err()
+        {
+            diag("page scrollbar: could not remove the previous registration; the new one is added beside it");
+        }
+    }
+    add_scrollbar_script(webview, &view.state, rgb);
 }
 
 /// Receives what `CONTENT_AUTOFILL_SCRIPT` posts UP from this tab.
@@ -2802,6 +2920,59 @@ pub fn forget_site_cookies(webview: &WebView, host: &str) -> bool {
             Err(error) => {
                 diag(&format!(
                     "forget_site: DeleteCookiesWithDomainAndPath({host}) FAILED ({error})"
+                ));
+                false
+            }
+        }
+    }
+}
+
+/// Deletes every cookie in the profile `webview` belongs to -- and ONLY
+/// cookies. The browser-wide counterpart to `forget_site_cookies` above,
+/// asked for by the user rather than run at startup.
+///
+/// COOKIES ONLY, for the same reason and with the same ceiling as the
+/// per-site call: `ClearBrowsingData` is the API that would also reach
+/// history, cache and site data, and it is deliberately not used here. The
+/// user asked to clear cookies; clearing anything else would be this browser
+/// deciding on their behalf what else they meant. `cookie_control` holds the
+/// copy that must keep saying so.
+///
+/// WHICH PROFILE THIS HITS, WHICH IS NOT A DETAIL. A `CookieManager` belongs
+/// to the profile of the webview it was reached through, and an ephemeral
+/// (quarantine) tab is built `with_incognito(true)` -- its cookies live in the
+/// in-private store, not the saved one. Called through a quarantine tab this
+/// would clear that tab's in-memory cookies, leave every saved cookie in
+/// place, and report success. The caller is responsible for handing over a
+/// persistent tab's webview; `AppState::forget_all_cookies` does that, and
+/// refuses rather than guessing when there is none.
+pub fn forget_all_cookies(webview: &WebView) -> bool {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Profile6, ICoreWebView2_13};
+    use windows::core::Interface;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    unsafe {
+        let Ok(v13) = core.cast::<ICoreWebView2_13>() else {
+            diag("forget_all: no ICoreWebView2_13 on this runtime; cookies were NOT cleared");
+            return false;
+        };
+        let Ok(profile) = v13.Profile() else {
+            diag("forget_all: could not reach the profile; cookies were NOT cleared");
+            return false;
+        };
+        let Ok(manager) = profile
+            .cast::<ICoreWebView2Profile6>()
+            .and_then(|p6| p6.CookieManager())
+        else {
+            diag("forget_all: no CookieManager on this runtime; cookies were NOT cleared");
+            return false;
+        };
+        match manager.DeleteAllCookies() {
+            Ok(()) => true,
+            Err(error) => {
+                diag(&format!(
+                    "forget_all: DeleteAllCookies FAILED ({error}); cookies REMAIN"
                 ));
                 false
             }
@@ -4929,18 +5100,225 @@ pub fn remove_tab(view: &TabView, webview: &WebView) {
     privacy::fold_closed_tab(std::mem::take(&mut view.state.borrow_mut().ledger));
 }
 
-/// The chrome height lives in AppState and is applied by layout(); there is
-/// no GTK size-request to update here.
+/// The chrome insets live in AppState and are applied by layout(); there is
+/// no GTK widget to update here.
 pub fn set_chrome_height(_hosts: &Hosts, _px: i32) {}
 
-/// Re-apply bounds for the chrome strip (top `chrome_height` logical
-/// pixels, full width) and the active tab's webview (the rest). Inactive
+/// See `set_chrome_height`: same no-op, other axis.
+pub fn set_chrome_left(_hosts: &Hosts, _px: i32) {}
+
+/// The three attribute writes on their own: what `set_window_accent` does
+/// with a report and a frame refresh around it, and what `reapply_window_
+/// accent` does bare. Returns each outcome as text and whether any refused.
+fn write_window_accent(
+    hwnd: windows::Win32::Foundation::HWND,
+    palette: &super::ChromePalette,
+) -> (Vec<String>, bool) {
+    use windows::Win32::Foundation::COLORREF;
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_CAPTION_COLOR,
+    };
+    let mut outcomes: Vec<String> = Vec::with_capacity(2);
+    let mut refused = false;
+    // BORDER AND CAPTION ONLY. Not the text colour, and not the immersive
+    // dark-mode attribute, both of which were written here once. Found on
+    // Windows 11 Pro, 2026-08-17, driving the window directly: with the
+    // caption colour set from OUTSIDE the process (caption attribute alone,
+    // our exact dark value), the maximized, active caption painted dark with
+    // white text; the moment this function wrote its set, the same caption
+    // came up in the light theme's white. Border was cleared by the same
+    // outside test (border + caption together painted). Text colour was the
+    // remaining difference, and Windows picks a legible caption text on its
+    // own from the caption colour, so it was never needed. Windowed and
+    // inactive-maximized never showed the fault, which is why it took a
+    // desktop session to find. Do not add attributes here without repeating
+    // that active-maximized check on hardware.
+    for (name, attr, rgb) in [
+        ("border", DWMWA_BORDER_COLOR, palette.border),
+        ("caption", DWMWA_CAPTION_COLOR, palette.caption),
+    ] {
+        let value = COLORREF(super::colorref(rgb));
+        // SAFETY: hwnd is this process's top-level window; the attribute
+        // takes a COLORREF by pointer and size, which is what is passed.
+        let result = unsafe {
+            DwmSetWindowAttribute(
+                hwnd,
+                attr,
+                std::ptr::from_ref(&value).cast(),
+                std::mem::size_of::<COLORREF>() as u32,
+            )
+        };
+        match result {
+            Ok(()) => outcomes.push(format!("{name}={} ok", super::ChromePalette::hex(rgb))),
+            Err(error) => {
+                refused = true;
+                outcomes.push(format!("{name}={} {error}", super::ChromePalette::hex(rgb)));
+            }
+        }
+    }
+    (outcomes, refused)
+}
+
+/// Whether the top-level window is maximized right now, for `relayout`'s
+/// title-bar re-apply.
+pub fn window_is_maximized(hosts: &Hosts) -> bool {
+    hosts.window.is_maximized()
+}
+
+/// The deferred re-apply after a maximize or restore.
+///
+/// DWM treats an attribute written with its current value as a no-op, and
+/// after that transition it has repainted the frame in the system colour
+/// while still holding ours -- so writing ours again does nothing, and a
+/// DIFFERENT value from any process paints (checked with a red caption on
+/// the maximized window, 2026-08-17). So: first a value one step off in
+/// every channel, which no eye can tell apart and DWM must treat as a
+/// change, then the real palette through `set_window_accent`, refresh
+/// included.
+pub fn refresh_window_accent(hosts: &Hosts, palette: &super::ChromePalette) {
+    fn nudge(rgb: [u8; 3]) -> [u8; 3] {
+        [rgb[0] ^ 1, rgb[1] ^ 1, rgb[2] ^ 1]
+    }
+    let nudged = super::ChromePalette {
+        border: nudge(palette.border),
+        caption: nudge(palette.caption),
+        text: nudge(palette.text),
+        scrollbar: palette.scrollbar,
+    };
+    let _ = write_window_accent(window_hwnd(hosts), &nudged);
+    let _ = set_window_accent(hosts, palette);
+}
+
+/// Re-applies the title-bar colours without a report or a frame refresh.
+///
+/// Called from every layout pass, because Windows 11 was seen (2026-08-17)
+/// dropping the caption colour on maximize: the same window, coloured
+/// windowed, came up with the system caption when maximized, while a
+/// DwmSetWindowAttribute from ANOTHER process painted it red in that state.
+/// So the attributes are not lost so much as not carried across the
+/// transition, and every transition arrives as a resize. Three attribute
+/// writes per layout is nothing; the frame refresh is deliberately NOT
+/// repeated here -- SWP_FRAMECHANGED inside a live resize would flicker,
+/// and the resize itself repaints the frame.
+pub fn reapply_window_accent(hosts: &Hosts, palette: &super::ChromePalette) {
+    let _ = write_window_accent(window_hwnd(hosts), palette);
+}
+
+/// The title bar and the window border wear the chrome's accent.
+///
+/// The one part of the window the chrome document cannot paint is the part
+/// the OS draws: the caption with its title and buttons, and the 1px border
+/// around everything. Without this the accent frame stops at the top of the
+/// client area and the title bar sits above it in the system's grey, which
+/// is the "applied to the top as well" the frame was asked for.
+///
+/// `DwmSetWindowAttribute` with the three colour attributes Windows 11
+/// added (build 22000): border, caption, caption text. Each is a `COLORREF`,
+/// which is `0x00BBGGRR` -- the bytes arrive as R,G,B and are packed here;
+/// get the order wrong and every accent comes out as its complement, so the
+/// packing has a test.
+///
+/// Refusal is expected and silent below Windows 11: the attributes do not
+/// exist there and the call returns `E_INVALIDARG`. Nothing falls back,
+/// because there is nothing to fall back to -- the system title bar is the
+/// system's -- and nothing is claimed anywhere in the UI, so there is no
+/// engine-confirmed row to keep honest. Logged to the diag ring once per
+/// process rather than per theme change.
+/// Returns whether the caption tint is IN EFFECT: the attributes were
+/// accepted, so the OS title bar is wearing the tab strip's colour. The
+/// chrome hides its own inner top line on that answer (chrome.js
+/// `data-caption-tint`): with the caption tinted the ring's top edge is the
+/// OS border above it, and a second accent line under the caption was the
+/// "two colours up top" that a Windows 11 build showed.
+pub fn set_window_accent(hosts: &Hosts, palette: &super::ChromePalette) -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static REPORTED_ONCE: AtomicBool = AtomicBool::new(false);
+
+    let hwnd = window_hwnd(hosts);
+    let (mut outcomes, refused) = write_window_accent(hwnd, palette);
+    // THE FRAME DOES NOT REPAINT ON ITS OWN. Seen 2026-08-17 on Windows 11
+    // Pro: all three attributes returned S_OK on the top-level window and
+    // the caption stayed white until something else touched the frame. tao
+    // meets the same thing when it sets the immersive dark-mode attribute
+    // and answers it by forcing a non-client redraw (dark_mode.rs,
+    // `redraw_title_bar`). SWP_FRAMECHANGED is the documented way to ask for
+    // exactly that -- "the frame changed, recompute and repaint the
+    // non-client area" -- with every geometry and z-order flag held, so the
+    // window does not move, resize, activate, or reorder.
+    if !refused {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            SetWindowPos, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+            SWP_NOSIZE, SWP_NOZORDER,
+        };
+        // SAFETY: hwnd is this process's live top-level window; no size or
+        // position is read from the zeroed arguments because the flags say
+        // to keep both.
+        if unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                0,
+                0,
+                0,
+                0,
+                SWP_FRAMECHANGED
+                    | SWP_NOMOVE
+                    | SWP_NOSIZE
+                    | SWP_NOZORDER
+                    | SWP_NOOWNERZORDER
+                    | SWP_NOACTIVATE,
+            )
+        }
+        .is_err()
+        {
+            outcomes.push("frame refresh FAILED".to_string());
+        }
+        // And tao's own answer to the same problem, verbatim in spirit: a
+        // WM_NCACTIVATE round trip through the default procedure, which is
+        // what actually repaints the caption on some builds where
+        // SWP_FRAMECHANGED recomputes it and paints nothing. Ending on the
+        // window's real activation state, so it does not flip to inactive
+        // colours.
+        use windows::Win32::Foundation::{LPARAM, WPARAM};
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow;
+        use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_NCACTIVATE};
+        let active = unsafe { GetActiveWindow() } == hwnd;
+        // SAFETY: DefWindowProcW on this process's own window with the two
+        // documented WM_NCACTIVATE payloads.
+        unsafe {
+            let _ = DefWindowProcW(hwnd, WM_NCACTIVATE, WPARAM(usize::from(!active)), LPARAM(0));
+            let _ = DefWindowProcW(hwnd, WM_NCACTIVATE, WPARAM(usize::from(active)), LPARAM(0));
+        }
+    }
+    // Reported once per process either way -- refused OR applied -- so a
+    // diagnostics export shows what was passed and what the engine said. A
+    // successful call that painted nothing until the frame was refreshed is
+    // exactly what this line caught on 2026-08-17, and it stays.
+    if !REPORTED_ONCE.swap(true, Ordering::Relaxed) {
+        diag(&format!(
+            "window accent: DwmSetWindowAttribute on hwnd {:#x}: {}{}",
+            hwnd.0 as isize,
+            outcomes.join(", "),
+            if refused {
+                " (refused: Windows 10 or older keeps the system title bar)"
+            } else {
+                ""
+            }
+        ));
+    }
+    !refused
+}
+
+
+/// Re-apply bounds for the chrome and the active tab's webview. Inactive
 /// tabs stay hidden and get correct bounds when next activated.
 pub fn layout(
     hosts: &Hosts,
     chrome: &WebView,
     active: Option<&WebView>,
     chrome_height: i32,
+    chrome_left: i32,
     arrangement: ChromeLayout,
 ) {
     // THE ONE FACT EVERY ARRANGEMENT BELOW RESTS ON: content webviews are
@@ -4968,6 +5346,14 @@ pub fn layout(
         Ordering::Relaxed,
     );
     READOUT_SCALE.store(hosts.window.scale_factor().to_bits(), Ordering::Relaxed);
+    // The readout describes a link in the PAGE, so it belongs at the page's
+    // bottom-left, not the window's. With the toolbar down the left edge
+    // those stopped being the same point, and a readout at x=0 would sit
+    // under the sidebar -- clipped, with no error, which is how the other
+    // invisible-UI defects in this file happened. It is positioned from
+    // statics rather than from state (see `readout_apply`), so the inset has
+    // to be published the same way.
+    READOUT_LEFT.store(chrome_left.max(0), Ordering::Relaxed);
     readout_apply(None);
 
     let size = hosts
@@ -4976,11 +5362,25 @@ pub fn layout(
         .to_logical::<f64>(hosts.window.scale_factor());
 
     match arrangement {
+        // A strip, and -- when the feature buttons are down the left edge --
+        // a column with it. The chrome takes the window in that case for the
+        // reason `chrome_covers_window` states: an L is not a rectangle, and
+        // the page drawing over the chrome is what carves the L out.
         ChromeLayout::Strip => {
             let _ = set_chrome_z(hosts, false);
-            let _ = chrome.set_bounds(chrome_rect(&hosts.window, chrome_height));
+            let _ = chrome.set_bounds(chrome_rect(
+                &hosts.window,
+                chrome_height,
+                chrome_left,
+                arrangement,
+            ));
             if let Some(webview) = active {
-                let _ = webview.set_bounds(content_rect(&hosts.window, chrome_height));
+                let _ = webview.set_bounds(content_rect(
+                    &hosts.window,
+                    chrome_height,
+                    chrome_left,
+                    0,
+                ));
             }
         }
 
@@ -5088,20 +5488,23 @@ pub fn layout(
         // trap rather than a control.
         ChromeLayout::Split { pane_width } => {
             set_chrome_z(hosts, false);
-            let top = f64::from(chrome_height.max(0));
             let max_pane = (size.width * MAX_PANE_FRACTION).max(0.0);
             let pane = f64::from(pane_width.max(0)).clamp(0.0, max_pane);
-            let page_width = (size.width - pane).max(0.0);
 
             let _ = chrome.set_bounds(Rect {
                 position: LogicalPosition::new(0.0, 0.0).into(),
                 size: LogicalSize::new(size.width, size.height).into(),
             });
             if let Some(webview) = active {
-                let _ = webview.set_bounds(Rect {
-                    position: LogicalPosition::new(0.0, top).into(),
-                    size: LogicalSize::new(page_width, (size.height - top).max(0.0)).into(),
-                });
+                // The pane is on the right and the sidebar on the left, so
+                // the two coexist: the page is what is left between them.
+                #[allow(clippy::cast_possible_truncation)]
+                let _ = webview.set_bounds(content_rect(
+                    &hosts.window,
+                    chrome_height,
+                    chrome_left,
+                    pane as i32,
+                ));
             }
         }
     }
@@ -5166,20 +5569,41 @@ fn set_chrome_z(hosts: &Hosts, top: bool) -> bool {
     true
 }
 
-fn chrome_rect(window: &Window, chrome_height: i32) -> Rect {
+/// The chrome's rectangle: a strip across the top, or the whole window.
+///
+/// It is the whole window whenever the chrome is painting something no
+/// rectangle describes -- a modal, a docked pane, or the L of a sidebar plus
+/// its top strip. That is not a compromise: the page is created after the
+/// chrome and draws over it, so a chrome given the window shows through in
+/// exactly the shape the page does not cover.
+fn chrome_rect(window: &Window, chrome_height: i32, chrome_left: i32, arrangement: ChromeLayout) -> Rect {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
+    let height = if crate::platform::chrome_covers_window(chrome_left, arrangement) {
+        size.height
+    } else {
+        f64::from(chrome_height.max(0))
+    };
     Rect {
         position: LogicalPosition::new(0.0, 0.0).into(),
-        size: LogicalSize::new(size.width, f64::from(chrome_height.max(0))).into(),
+        size: LogicalSize::new(size.width, height).into(),
     }
 }
 
-fn content_rect(window: &Window, chrome_height: i32) -> Rect {
+/// The page's rectangle. The arithmetic lives in `platform::page_rect`, which
+/// is pure and tested; this only supplies the window's size.
+fn content_rect(window: &Window, chrome_height: i32, chrome_left: i32, pane: i32) -> Rect {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-    let top = f64::from(chrome_height.max(0));
+    let (x, y, w, h) = crate::platform::page_rect(
+        size.width,
+        size.height,
+        chrome_height,
+        chrome_left,
+        pane,
+        crate::platform::PAGE_FRAME_PX,
+    );
     Rect {
-        position: LogicalPosition::new(0.0, top).into(),
-        size: LogicalSize::new(size.width, (size.height - top).max(0.0)).into(),
+        position: LogicalPosition::new(x, y).into(),
+        size: LogicalSize::new(w, h).into(),
     }
 }
 

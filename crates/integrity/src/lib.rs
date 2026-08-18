@@ -109,6 +109,31 @@ pub fn digest(html: &[u8]) -> Result<ContentDigest, IntegrityError> {
     })
 }
 
+/// The visible text of `html`, exactly as level 3 of the digest ladder sees
+/// it: entity-decoded, whitespace-collapsed, with
+/// script/style/title/noscript/template content suppressed.
+///
+/// This is byte-for-byte the string level 3 hashes, exposed so a text
+/// search can read it: "what the text search reads" and "what the text
+/// digest covers" are the same string by construction and can never drift
+/// apart.
+///
+/// Same contract as [`digest`]: malformed or non-UTF-8 input is normalized,
+/// never rejected; the only error is [`IntegrityError::InputTooLarge`].
+pub fn visible_text(html: &[u8]) -> Result<String, IntegrityError> {
+    if html.len() > MAX_INPUT_BYTES {
+        return Err(IntegrityError::InputTooLarge {
+            len: html.len(),
+            max: MAX_INPUT_BYTES,
+        });
+    }
+    // The same lossy decode digest uses: the search must read exactly the
+    // characters the digest covered, U+FFFD replacements included.
+    let decoded = String::from_utf8_lossy(html);
+    let events = tokenize::tokenize(&decoded);
+    Ok(normalize::normalize(&events).visible_text)
+}
+
 /// The strongest ladder level at which two digests match.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Verdict {
@@ -353,5 +378,58 @@ mod tests {
         let json = serde_json::to_string(&d).unwrap();
         let back: ContentDigest = serde_json::from_str(&json).unwrap();
         assert_eq!(d, back);
+    }
+
+    #[test]
+    fn visible_text_is_exactly_what_level_three_hashes() {
+        // The doc-comment promise, pinned: the exposed string IS the level-3
+        // input, byte for byte, so a text search and the text digest can
+        // never drift apart.
+        let html = b"<html><head><title>chrome</title></head><body><p>Hello <b>brave</b>   world &amp; friends</p><script>x()</script></body></html>";
+        let text = visible_text(html).expect("in-crate test input is small");
+        assert_eq!(sha256(text.as_bytes()), digest_unwrap(html).text);
+    }
+
+    #[test]
+    fn visible_text_decodes_entities() {
+        // A named entity and a decimal numeric reference.
+        let text = visible_text(b"<p>a &amp; b &#65;</p>").unwrap();
+        assert_eq!(text, "a & b A");
+    }
+
+    #[test]
+    fn visible_text_never_contains_invisible_tag_content() {
+        // Script and style bodies are raw text the tokenizer drops; title,
+        // noscript and template are chrome or inert text the normalizer
+        // suppresses. None of it is words the user is reading.
+        let text = visible_text(
+            b"<html><head><title>chrome words</title><style>.a{color:red}</style></head><body><p>real words</p><script>var s = 1;</script><noscript>fallback words</noscript><template>inert words</template></body></html>",
+        )
+        .unwrap();
+        assert_eq!(text, "real words");
+    }
+
+    #[test]
+    fn visible_text_collapses_whitespace() {
+        let text = visible_text(b"<p>Hello   \n\t world</p><p>again</p>").unwrap();
+        assert_eq!(text, "Hello world again");
+        // A plain non-breaking space behaves like a space.
+        let text = visible_text("<p>a\u{00A0}\u{00A0}b</p>".as_bytes()).unwrap();
+        assert_eq!(text, "a b");
+    }
+
+    #[test]
+    fn visible_text_refuses_oversized_input() {
+        // Same guard as digest: one cap, one error.
+        let big = vec![b'a'; MAX_INPUT_BYTES + 1];
+        match visible_text(&big) {
+            Err(IntegrityError::InputTooLarge { len, max }) => {
+                assert_eq!(len, MAX_INPUT_BYTES + 1);
+                assert_eq!(max, MAX_INPUT_BYTES);
+            }
+            other => panic!("expected InputTooLarge, got {other:?}"),
+        }
+        let at_cap = vec![b'a'; MAX_INPUT_BYTES];
+        assert!(visible_text(&at_cap).is_ok());
     }
 }

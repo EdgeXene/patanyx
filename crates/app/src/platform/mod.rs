@@ -486,10 +486,177 @@ pub mod menu_compose {
 }
 
 /// Initial height of the chrome strip in logical pixels (IPC clamps updates
-/// to 120..=600). AppState stores the current value because Windows must
-/// re-apply it on every resize, unlike GTK where the size request persists
-/// on the widget.
+/// to `CHROME_TOP_RANGE`). AppState stores the current value because Windows
+/// must re-apply it on every resize, unlike GTK where the inset persists on
+/// the widget.
 pub const CHROME_HEIGHT_PX: i32 = 120;
+
+/// What the IPC will accept as a top inset, in logical pixels.
+///
+/// The floor is below the ~136 a closed two-row strip measures and the ~88 a
+/// closed strip measures with the feature buttons in the sidebar, because
+/// both are real chromes; the ceiling is the tallest panel plus its banners.
+/// It exists to bound a malformed or hostile frame, not to express a design
+/// opinion -- a chrome taller than the window is the failure this stops, and
+/// on GTK it is now a real one: the page is inset by this number rather than
+/// pushing the window taller, so an unbounded value would hide the page
+/// instead of growing the window as it used to.
+pub const CHROME_TOP_RANGE: std::ops::RangeInclusive<i64> = 80..=800;
+
+/// What the IPC will accept as a left inset, in logical pixels.
+///
+/// Zero is the whole of the Top layout and must stay reachable. The ceiling
+/// is far above the ~56 the sidebar asks for, and is deliberately not a
+/// fraction of the window: a page squeezed to nothing is the `Split` clamp's
+/// problem, and this one only has to stop a number that could not be a
+/// toolbar.
+pub const CHROME_LEFT_RANGE: std::ops::RangeInclusive<i64> = 0..=400;
+
+/// The chrome's colours, resolved, for the parts of the window the chrome
+/// document does not paint: the OS title bar and border, and the scrollbars
+/// of pages.
+///
+/// RESOLVED BY THE CHROME, NOT BY RUST. The nine accents and three schemes
+/// are `color-mix` tokens in chrome.css and only the stylesheet knows what a
+/// pair resolves to; chrome.js reads the computed values off the live
+/// document after it wears a theme and reports them (`chrome_palette_set`).
+/// Rust never has a second table of hex values to drift out of step with the
+/// first. Plain sRGB bytes, because that is what both consumers take
+/// (`COLORREF` and a `scrollbar-color` literal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ChromePalette {
+    /// The window's 1px border, and the frame it continues: the accent.
+    pub border: [u8; 3],
+    /// The title bar: the tab strip's own tinted surface, so the strip reads
+    /// as continuing up into it rather than sitting under a stranger.
+    pub caption: [u8; 3],
+    /// Title-bar text, legible on `caption` in the current scheme.
+    pub text: [u8; 3],
+    /// The scrollbar thumb PAGES are given (`page_scrollbar_css`).
+    pub scrollbar: [u8; 3],
+}
+
+/// The default accent on the default scheme, exactly as chrome.css resolves
+/// it: the values the chrome reports on a first boot before anybody has
+/// chosen anything, so a tab created before the chrome has spoken wears the
+/// same colours the chrome is about to. Kept in step with chrome.css by
+/// hand; the tab-strip surface with 4% of the accent mixed in is what the
+/// stylesheet computes for `--sf-tabstrip-a`.
+impl Default for ChromePalette {
+    fn default() -> Self {
+        Self {
+            border: [0x4f, 0x8c, 0xff],
+            caption: [0x1b, 0x1f, 0x28],
+            text: [0xe9, 0xe9, 0xee],
+            scrollbar: [0x4f, 0x8c, 0xff],
+        }
+    }
+}
+
+impl ChromePalette {
+    /// `#rrggbb` for a channel triple. Lower-case, six digits, always -- this
+    /// is interpolated into CSS and a script, and a fixed shape is what makes
+    /// the injected text predictable.
+    pub fn hex(rgb: [u8; 3]) -> String {
+        format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])
+    }
+}
+
+/// `COLORREF` packing for the Windows title-bar colours: `0x00BBGGRR`, the
+/// reverse of how the bytes are written. Here rather than beside its one
+/// caller so the Linux build machine's tests pin it -- the Windows backend
+/// does not compile here, and a channel order is exactly the kind of thing
+/// that is right by luck until it is not.
+pub fn colorref(rgb: [u8; 3]) -> u32 {
+    u32::from(rgb[0]) | (u32::from(rgb[1]) << 8) | (u32::from(rgb[2]) << 16)
+}
+
+/// The accent frame around the page, in logical pixels.
+///
+/// The chrome paints a line in the accent along every edge of the window
+/// (`#page-frame` in chrome.css; the top edge is `#tabstrip::before`), and
+/// the page is inset by this much on the three edges the strip does not
+/// already own so that line is not painted under it. It is the same 2px as
+/// the top edge, so the four sides read as one frame rather than a strip
+/// with a border. Nothing else in the layout is allowed to change this: the
+/// chrome does not report it and the IPC does not accept it, because a
+/// frame the page could ask to widen is a page that can hide itself.
+pub const PAGE_FRAME_PX: i32 = 2;
+
+/// Where the page goes, given the window and what the chrome is using.
+///
+/// THE ONE PLACE THE PAGE'S RECTANGLE IS DECIDED, and pure so it can be
+/// tested from a machine with neither backend. Windows calls it to set real
+/// bounds; GTK calls it to position the content overlay. Everything is
+/// logical pixels.
+///
+/// `top` and `left` are what the chrome reported it is using. `pane` is the
+/// docked pane on the RIGHT, which is a different axis from `left` and can
+/// coexist with it. `frame` is the accent frame (`PAGE_FRAME_PX`; tests pass
+/// zero to check the insets on their own): it takes the left edge only when
+/// no sidebar does, the right edge only when no pane does, and the bottom
+/// always -- the sidebar and the pane sit INSIDE the frame and their own
+/// inner borders are the boundary with the page, so a second line there
+/// would be a double rule. Every number is clamped into the window, and the
+/// result is never negative: a window smaller than its own chrome yields an
+/// empty page rectangle rather than an inverted one.
+pub fn page_rect(
+    win_w: f64,
+    win_h: f64,
+    top: i32,
+    left: i32,
+    pane: i32,
+    frame: i32,
+) -> (f64, f64, f64, f64) {
+    let win_w = win_w.max(0.0);
+    let win_h = win_h.max(0.0);
+    let frame = f64::from(frame.max(0));
+    let top = f64::from(top.max(0)).min(win_h);
+    let left = if left > 0 { f64::from(left) } else { frame }.min(win_w);
+    let right = if pane > 0 { f64::from(pane) } else { frame }.min(win_w - left);
+    let bottom = frame.min((win_h - top).max(0.0));
+    (
+        left,
+        top,
+        (win_w - left - right).max(0.0),
+        (win_h - top - bottom).max(0.0),
+    )
+}
+
+/// Whether the chrome must be given the WHOLE window rather than a strip.
+///
+/// The chrome is one webview and the layout it paints is not a rectangle:
+/// a strip along the top, a column down the left when the toolbar lives
+/// there, and -- always -- the accent frame along the other three edges of
+/// the window. On Windows that is not a problem to solve but a fact to use:
+/// the page is created after the chrome and draws over it, so handing the
+/// chrome the window and the page its inset rectangle leaves the chrome
+/// visible in exactly the shape it paints. `Split` already relies on this
+/// for its pane; the sidebar is the same trick on the other edge, and the
+/// frame is the same trick on all of them, which is why this is now true
+/// for every arrangement. The parameters stay so the reasoning is still
+/// stated per case and a frame width of zero would give the old answer.
+///
+/// GTK needs no equivalent, which is why this carries a cfg: there the
+/// chrome widget is the root overlay's main child and always fills the
+/// window, so covering is its resting state rather than a decision. Same
+/// shape as the other Windows-only helpers in this module.
+#[cfg(any(windows, test))]
+pub fn chrome_covers_window(left: i32, arrangement: ChromeLayout) -> bool {
+    PAGE_FRAME_PX > 0 || left > 0 || !matches!(arrangement, ChromeLayout::Strip)
+}
+
+/// Whether the toolbar can be laid out down the left edge.
+///
+/// True on both backends, and shared here rather than written twice: both
+/// inset the page through `page_rect`, so there is one answer and no way for
+/// the two to drift into disagreeing. It is still ASKED (see `chrome_caps`)
+/// rather than assumed, because this browser's rule is that a control the
+/// platform cannot honour is explained or hidden, never shown and inert --
+/// and a future backend that cannot do it needs somewhere to say so.
+pub fn sidebar_supported() -> bool {
+    true
+}
 
 /// Chrome UI origin. WebKitGTK serves custom protocols at their real
 /// scheme, but WebView2 cannot register non-standard schemes and wry
@@ -565,6 +732,181 @@ impl EngineInfo {
 /// then micro. Split out from the FFI so it is testable without an engine.
 pub fn below_floor(found: (u32, u32, u32), floor: (u32, u32, u32)) -> bool {
     found < floor
+}
+
+/// The page's rectangle, checked without a window.
+///
+/// Both backends compute it here, and one of them cannot be run on the
+/// machine this is developed on. That makes these tests the only place the
+/// Windows arithmetic is checked before it reaches hardware, which is why
+/// they cover the degenerate cases rather than just the happy one -- a
+/// window smaller than its own chrome is what a user does with the mouse in
+/// half a second.
+#[cfg(test)]
+mod page_rect_tests {
+    use super::{
+        chrome_covers_window, page_rect, ChromeLayout, CHROME_LEFT_RANGE, CHROME_TOP_RANGE,
+        PAGE_FRAME_PX,
+    };
+
+    #[test]
+    fn a_top_strip_leaves_the_page_the_full_width() {
+        // The shape every build has shipped: nothing on the left axis.
+        assert_eq!(
+            page_rect(1100.0, 780.0, 148, 0, 0, 0),
+            (0.0, 148.0, 1100.0, 632.0)
+        );
+    }
+
+    #[test]
+    fn a_sidebar_moves_the_page_right_and_narrows_it_by_the_same_amount() {
+        // The two must move together. Insetting the origin without taking
+        // the width off is how a page ends up running off the right edge of
+        // the window, which is invisible until something is scrolled to.
+        let (x, y, w, h) = page_rect(1100.0, 780.0, 88, 56, 0, 0);
+        assert_eq!((x, y), (56.0, 88.0));
+        assert_eq!(x + w, 1100.0, "the page must still end at the window edge");
+        assert_eq!(y + h, 780.0);
+    }
+
+    #[test]
+    fn a_docked_pane_and_a_sidebar_take_from_opposite_edges() {
+        // Different axes, and they have to be able to coexist: the pane is
+        // on the right, the sidebar on the left, and each takes only its
+        // own side.
+        let (x, _, w, _) = page_rect(1000.0, 700.0, 88, 56, 300, 0);
+        assert_eq!(x, 56.0);
+        assert_eq!(w, 644.0);
+        assert_eq!(x + w, 700.0, "the pane's column is left for the chrome");
+    }
+
+    #[test]
+    fn a_window_smaller_than_its_chrome_yields_an_empty_page_not_a_negative_one() {
+        // Dragging a window small enough that the chrome does not fit is a
+        // half-second of mouse movement. A negative width here reaches
+        // set_bounds as a garbage rectangle.
+        for r in [
+            page_rect(40.0, 40.0, 148, 56, 0, 0),
+            page_rect(0.0, 0.0, 148, 56, 0, 0),
+            page_rect(200.0, 100.0, 800, 400, 0, 0),
+        ] {
+            assert!(r.2 >= 0.0 && r.3 >= 0.0, "negative page rectangle: {r:?}");
+            assert!(r.0 >= 0.0 && r.1 >= 0.0, "negative page origin: {r:?}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_placed_outside_the_window() {
+        // Every clamp in one assertion, over a spread that includes insets
+        // larger than the window and a pane larger than what is left.
+        for (w, h) in [(1100.0, 780.0), (320.0, 240.0), (10.0, 10.0)] {
+            for top in [0, 88, 148, 800] {
+                for left in [0, 56, 400] {
+                    for pane in [0, 300, 4096] {
+                        let (x, y, pw, ph) = page_rect(w, h, top, left, pane, 0);
+                        assert!(x + pw <= w + 0.001, "page runs past the right edge");
+                        assert!(y + ph <= h + 0.001, "page runs past the bottom edge");
+                        assert!(pw >= 0.0 && ph >= 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn negative_insets_are_treated_as_none() {
+        // The IPC clamps, but this function is also called with values from
+        // state that a future caller could set directly.
+        assert_eq!(
+            page_rect(1100.0, 780.0, -50, -20, -5, 0),
+            page_rect(1100.0, 780.0, 0, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn the_chrome_takes_the_window_in_every_arrangement_because_of_the_frame() {
+        // A sidebar makes the chrome an L, and no rectangle is an L; the
+        // accent frame makes it a ring, and no rectangle is a ring either.
+        // The page draws over the chrome, so covering the window is what
+        // leaves the chrome visible in exactly the shape it paints -- and
+        // with a frame that is every arrangement, the plain strip included.
+        assert!(PAGE_FRAME_PX > 0, "the frame is the reason the strip covers");
+        assert!(chrome_covers_window(0, ChromeLayout::Strip));
+        assert!(chrome_covers_window(56, ChromeLayout::Strip));
+        assert!(chrome_covers_window(0, ChromeLayout::Overlay));
+        assert!(chrome_covers_window(0, ChromeLayout::Split { pane_width: 300 }));
+        assert!(chrome_covers_window(56, ChromeLayout::Split { pane_width: 300 }));
+    }
+
+    #[test]
+    fn the_frame_insets_the_page_on_the_three_edges_the_strip_does_not_own() {
+        // The top edge is the strip's; the other three are the frame's. The
+        // page starts PAGE_FRAME_PX in from the left, ends that much short of
+        // the right, and that much short of the bottom, so the chrome's line
+        // is painted beside the page rather than under it.
+        let f = f64::from(PAGE_FRAME_PX);
+        assert_eq!(
+            page_rect(1100.0, 780.0, 148, 0, 0, PAGE_FRAME_PX),
+            (f, 148.0, 1100.0 - 2.0 * f, 632.0 - f)
+        );
+    }
+
+    #[test]
+    fn a_sidebar_or_a_pane_replaces_the_frame_on_its_own_edge() {
+        // The sidebar and the pane sit INSIDE the frame and carry their own
+        // inner border, so the page abuts them directly: no second line, no
+        // 2px gap of body colour between the rail and the page.
+        let (x, _, w, _) = page_rect(1000.0, 700.0, 88, 56, 300, PAGE_FRAME_PX);
+        assert_eq!(x, 56.0, "the page starts at the sidebar's edge, not past a frame");
+        assert_eq!(x + w, 700.0, "the page ends at the pane's edge, not short of it");
+        // Bottom is the frame's regardless.
+        let (_, y, _, h) = page_rect(1000.0, 700.0, 88, 56, 300, PAGE_FRAME_PX);
+        assert_eq!(y + h, 700.0 - f64::from(PAGE_FRAME_PX));
+    }
+
+    #[test]
+    fn a_frame_never_makes_a_negative_page() {
+        for (w, h) in [(1100.0, 780.0), (3.0, 3.0), (0.0, 0.0)] {
+            for top in [0, 148, 800] {
+                for left in [0, 56] {
+                    for pane in [0, 300] {
+                        let (x, y, pw, ph) = page_rect(w, h, top, left, pane, PAGE_FRAME_PX);
+                        assert!(pw >= 0.0 && ph >= 0.0, "negative page: {:?}", (x, y, pw, ph));
+                        assert!(x + pw <= w + 0.001 && y + ph <= h + 0.001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn colorref_is_bgr_and_hex_is_rgb() {
+        // The two consumers of a palette triple read the bytes in opposite
+        // orders. Pinned so a refactor cannot swap one and turn every accent
+        // into its complement on one platform.
+        assert_eq!(super::colorref([0x4f, 0x8c, 0xff]), 0x00ff_8c4f);
+        assert_eq!(super::colorref([0, 0, 0]), 0);
+        assert_eq!(super::ChromePalette::hex([0x4f, 0x8c, 0xff]), "#4f8cff");
+        assert_eq!(super::ChromePalette::hex([0, 0, 0]), "#000000");
+    }
+
+    #[test]
+    fn the_accepted_insets_cover_both_real_chromes() {
+        // ~136 closed with the buttons on top, ~88 closed with them in the
+        // sidebar, and the tallest panel plus its banners. If a future panel
+        // grows past the ceiling it is clamped and renders below the fold --
+        // this is the assertion that says which numbers were meant.
+        assert!(CHROME_TOP_RANGE.contains(&88));
+        assert!(CHROME_TOP_RANGE.contains(&148));
+        assert!(CHROME_TOP_RANGE.contains(&740));
+        assert!(!CHROME_TOP_RANGE.contains(&0));
+        assert!(!CHROME_TOP_RANGE.contains(&4096));
+        // Zero is the whole of the Top layout and must stay reachable.
+        assert!(CHROME_LEFT_RANGE.contains(&0));
+        assert!(CHROME_LEFT_RANGE.contains(&56));
+        assert!(!CHROME_LEFT_RANGE.contains(&-1));
+        assert!(!CHROME_LEFT_RANGE.contains(&4096));
+    }
 }
 
 #[cfg(test)]

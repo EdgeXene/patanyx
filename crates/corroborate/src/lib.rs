@@ -42,6 +42,8 @@
 //! A feature that overclaims here is worse than no feature. Every string
 //! this crate produces is written to be safe to show a user verbatim.
 
+mod change;
+mod download;
 mod url;
 
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,14 @@ use std::fmt;
 // and is removed rather than left as a second way to name the same crate.
 use patanyx_integrity::{compare, digest, ContentDigest, IntegrityError, Verdict as IntegrityVerdict};
 
+pub use change::{
+    change_verdict, Cell, ChangeCompareRequest, ChangeCompareResponse, ChangeVerdict,
+    CHANGE_PROTOCOL_VERSION,
+};
+pub use download::{
+    download_verdict, DownloadCompareRequest, DownloadCompareResponse, DownloadCorroboration,
+    DownloadRefusal, DownloadVerdict, DOWNLOAD_PROTOCOL_VERSION,
+};
 pub use url::{normalize_url, NormalizedUrl};
 
 /// Bumped when the message shapes change incompatibly. Decoding rejects any

@@ -44,6 +44,22 @@ python3 ./scripts/theme-contrast-gate.py
 # suite FAILS there (after proving the unmodified copies pass). Needs
 # network or a warm cargo cache: the copies resolve deps standalone.
 ./scripts/licence-planted-defect-gate.sh
+# The licence flow END TO END in the real binary, on a throwaway key: a
+# server mints, the real ring refuses the foreign token, a build carrying
+# the throwaway key accepts it and a gated arm opens. Needs the licence
+# server checkout beside this repo, which the public tree does not carry;
+# guarded so an outside contributor is not stopped by a sibling they do not
+# have, and reported so its absence is visible rather than silent.
+if [ -x ../patanyx-licence-server/scripts/smoke-throwaway.sh ]; then
+  ./scripts/premium-e2e-gate.sh
+else
+  echo "premium-e2e-gate: SKIPPED (no ../patanyx-licence-server checkout)"
+fi
+# The launch-day flip stays OFF the branch until the release that sells, and
+# stays applicable while it waits: fails if the branch drifts so the patch
+# no longer applies, or if PREMIUM_ON_SALE flips early. Delete this line and
+# the patch in the launch commit itself.
+./scripts/premium-launch-flip.sh check
 # The relay's token-logging gate LEFT THIS REPOSITORY with the relay itself
 # (commit e7f2a5a, the OSS split). It ran unconditionally here for a while
 # after that, which aborts this script under `set -e` before every gate

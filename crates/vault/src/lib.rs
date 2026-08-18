@@ -33,8 +33,9 @@ pub use recovery::{RecoveryKey, RECOVERY_LEN};
 pub use backup::{ExportError, PLAINTEXT_EXPORT_CONFIRMATION};
 pub use lock::{LockError, VaultLock};
 pub use model::{
-    Contact, ContactBook, CredentialEntry, CredentialMeta, LicenceRecord, NoteMeta, RelaySettings,
-    SecretNote, TunnelSettings, VaultData, MAX_LABEL_CHARS, MAX_PEER_HASH_CHARS,
+    ActivationRecord, Contact, ContactBook, CredentialEntry, CredentialMeta, LicenceRecord,
+    NoteMeta, RelaySettings, SecretNote, TunnelSettings, VaultData, MAX_LABEL_CHARS,
+    MAX_PEER_HASH_CHARS,
 };
 
 use std::fs;
@@ -919,6 +920,27 @@ impl Vault {
         self.save()
     }
 
+    /// The Premium activation receipts, cloned. The caller owns wiping the
+    /// clones (the `licence_record` rule): the app layer zeroizes each
+    /// receipt text once the unlock-time check has read it.
+    pub fn activation_records(&self) -> Vec<ActivationRecord> {
+        self.data.activation.clone()
+    }
+
+    /// Replace the receipt list, persist-on-write. The app layer keeps it
+    /// pruned to the current licence and to at most one row per device;
+    /// the vault stores what it is handed. Old rows are wiped first.
+    pub fn set_activation_records(
+        &mut self,
+        records: Vec<ActivationRecord>,
+    ) -> Result<(), VaultError> {
+        for old in &mut self.data.activation {
+            old.receipt_text.zeroize();
+        }
+        self.data.activation = records;
+        self.save()
+    }
+
     /// Sets a contact's free-text note, replacing whatever was there.
     ///
     /// A hash number is unmemorable by design, so this is where the user
@@ -987,6 +1009,9 @@ impl Drop for Vault {
         // guard: same treatment.
         if let Some(licence) = &mut self.data.licence {
             licence.token_text.zeroize();
+        }
+        for record in &mut self.data.activation {
+            record.receipt_text.zeroize();
         }
     }
 }

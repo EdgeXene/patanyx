@@ -35,6 +35,17 @@ use zeroize::Zeroize;
 ///           of — on its next save. The field is UNCONDITIONAL for the
 ///           same reason `contacts` and `tunnel` are: a build that cannot
 ///           verify tokens must still round-trip the record.
+///   6 -> 7  added `activation`, the Premium activation receipts (Phase 4,
+///           2026-08-17: a licence activates on up to five devices, and
+///           each device's signed `prx1-` receipt lives here so the next
+///           unlock re-verifies it OFFLINE). A `Vec`, not an `Option`,
+///           on purpose: a vault synced between machines holds one receipt
+///           PER DEVICE, and a single slot would have each machine
+///           overwrite the other's and re-activate at every unlock forever.
+///           A new top-level key, so the 2 -> 3 hazard applies undiluted:
+///           a build that predates the field would drop every receipt on
+///           its next save, and the user would have to spend an activation
+///           grant to get it back. UNCONDITIONAL like the rest.
 ///
 /// Old payloads simply lack the newer keys; `#[serde(default)]` fills them in
 /// on read and the next save rewrites the file at the current version. See
@@ -50,7 +61,7 @@ use zeroize::Zeroize;
 ///
 /// ADDING A FIELD MEANS BUMPING THIS. `top_level_keys_are_pinned_to_the_schema`
 /// below fails if you forget.
-pub const SCHEMA_VERSION: u32 = 6;
+pub const SCHEMA_VERSION: u32 = 7;
 
 /// Maximum contact label length, in CHARACTERS (not bytes).
 ///
@@ -142,6 +153,43 @@ pub struct VaultData {
     /// `licence` at all, and `Vault::drop` / `set_licence_record` wipe it.
     #[serde(default)]
     pub licence: Option<LicenceRecord>,
+    /// Premium activation receipts, at most one per device that activated
+    /// under the current licence. Empty until this install (or another
+    /// install sharing this vault) activates. Which one is THIS device's
+    /// is decided by the app layer against the device id kept OUTSIDE the
+    /// vault (`<vault dir>/device-id`), so copying a vault to a second
+    /// machine carries the receipts along and binds none of them there.
+    ///
+    /// UNCONDITIONAL under exactly the rule `contacts` documents. Not
+    /// projected by `to_plaintext_export`; wiped by `Vault::drop` and
+    /// `set_activation_records`.
+    #[serde(default)]
+    pub activation: Vec<ActivationRecord>,
+}
+
+/// One device's Premium activation receipt (schema 7). Vault-owned, like
+/// `LicenceRecord`, so the vault never depends on the licence crate and
+/// every build round-trips the shape.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActivationRecord {
+    /// 32 lowercase hex: which licence this receipt was issued under, so
+    /// the app can prune receipts of a replaced licence without parsing.
+    pub license_id_hex: String,
+    /// 32 lowercase hex: which install this receipt binds to.
+    pub device_id_hex: String,
+    /// The `prx1-...` text form exactly as the server returned it. Signed
+    /// by EdgeXene, verified offline at every unlock. Redacted from Debug
+    /// and never exported: with the token, it is what makes a machine
+    /// Premium.
+    pub receipt_text: String,
+}
+
+impl std::fmt::Debug for ActivationRecord {
+    /// Same rule as `LicenceRecord`: `VaultData` derives Debug, so this
+    /// must not print identifiers or the receipt.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ActivationRecord").finish_non_exhaustive()
+    }
 }
 
 /// A stored Premium licence token, text form exactly as pasted.
@@ -294,7 +342,9 @@ impl VaultData {
             // keys are key material exactly like the chat secrets.
             // `licence` is not projected either: a bearer credential is key
             // material in the same sense — a file whose whole point is being
-            // readable by anyone must not be able to spend it.
+            // readable by anyone must not be able to spend it. `activation`
+            // travels with `licence`: a receipt is useless without the token
+            // and an identifier with it.
             "omitted": "Chat and WireGuard tunnel private keys are deliberately \
         not included in a plaintext export. Without them this file cannot be used to \
         impersonate you.",
@@ -313,6 +363,7 @@ impl Default for VaultData {
             relay: RelaySettings::default(),
             tunnel: None,
             licence: None,
+            activation: Vec::new(),
         }
     }
 }
@@ -606,6 +657,7 @@ mod schema_guard_tests {
         assert_eq!(
             keys,
             [
+                "activation",
                 "chat_identity",
                 "contacts",
                 "credentials",
@@ -621,12 +673,12 @@ mod schema_guard_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 6,
-            "the key set above is the one recorded for schema 6, whose new \
-             field `licence` IS a new top-level key -- like schema 5's \
-             `tunnel`, and unlike schema 4's `origin`, which was nested \
-             inside `credentials` and left this list unchanged; see \
-             credential_entry_keys_are_pinned_to_the_schema"
+            SCHEMA_VERSION, 7,
+            "the key set above is the one recorded for schema 7, whose new \
+             field `activation` IS a new top-level key -- like schema 6's \
+             `licence` and schema 5's `tunnel`, and unlike schema 4's \
+             `origin`, which was nested inside `credentials` and left this \
+             list unchanged; see credential_entry_keys_are_pinned_to_the_schema"
         );
     }
 
@@ -679,7 +731,7 @@ mod schema_guard_tests {
     /// against DOWNgrade, and must not break upgrade.
     #[test]
     fn an_older_payload_still_loads_and_is_rewritten_current() {
-        for old in [1u32, 2, 3] {
+        for old in [1u32, 2, 3, 6] {
             let json = serde_json::json!({
                 "schema": old,
                 "credentials": [],
@@ -691,7 +743,7 @@ mod schema_guard_tests {
             // The missing keys come back as defaults rather than failing.
             assert!(data.contacts.list().is_empty());
             data.schema = SCHEMA_VERSION;
-            assert_eq!(data.schema, 6, "the next save rewrites it current");
+            assert_eq!(data.schema, 7, "the next save rewrites it current");
         }
     }
 
@@ -769,6 +821,43 @@ mod schema_guard_tests {
         LicenceRecord {
             token_text: "ptx1-THETOKENc2VjcmV0LXBheWxvYWQtc3R1ZmY".to_string(),
         }
+    }
+
+    fn sample_activation() -> ActivationRecord {
+        ActivationRecord {
+            license_id_hex: "00112233445566778899aabbccddeeff".to_string(),
+            device_id_hex: "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1".to_string(),
+            receipt_text: "prx1-THERECEIPTc2VjcmV0LXBheWxvYWQtc3R1ZmY".to_string(),
+        }
+    }
+
+    /// Schema 7: receipts and their identifiers stay out of the export and
+    /// out of Debug, exactly like the licence token.
+    #[test]
+    fn plaintext_export_and_debug_never_contain_an_activation_receipt() {
+        let mut data = VaultData::default();
+        data.activation.push(sample_activation());
+        let exported =
+            serde_json::to_string(&data.to_plaintext_export()).expect("export serializes");
+        assert!(!exported.contains("prx1-THERECEIPT"));
+        assert!(!exported.contains("d1d1d1d1"));
+        assert!(!exported.contains("\"activation\""));
+        let debugged = format!("{data:?}");
+        assert!(!debugged.contains("prx1-THERECEIPT"));
+        assert!(!debugged.contains("d1d1d1d1"));
+    }
+
+    /// A schema-6 payload (no `activation` key) opens and reads as "no
+    /// receipts": the 6 -> 7 bump protects the other direction, where a
+    /// build that predates the field must REFUSE the file (parse_payload's
+    /// newer-than-me rule) instead of dropping the receipts on save.
+    #[test]
+    fn a_schema_6_payload_reads_as_no_activations() {
+        let mut json = serde_json::to_value(VaultData::default()).unwrap();
+        json.as_object_mut().unwrap().remove("activation");
+        json["schema"] = serde_json::json!(6);
+        let data: VaultData = serde_json::from_value(json).unwrap();
+        assert!(data.activation.is_empty());
     }
 
     /// The property `to_plaintext_export` exists to guarantee, proven for

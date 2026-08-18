@@ -59,6 +59,7 @@
 //! passphrase does. Same shape as the vault, same atomic-write and 0600
 //! rules.
 
+mod blob;
 mod crypto;
 mod error;
 mod format;
@@ -67,7 +68,8 @@ pub mod provenance;
 
 pub use error::StoreError;
 pub use model::{
-    normalize_folder_name, Bookmark, DownloadRecord, RecordedDigest, Shelf, ShelfTab, StoreData,
+    normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
+    DownloadRecord, RecordedDigest, Shelf, ShelfTab, StoreData,
 };
 // Re-exported so callers of the bookmark API don't need to name the
 // integrity crate in their own manifests.
@@ -817,6 +819,128 @@ mod tests {
         Store::create_with_params(path, passphrase, 8192, 1, 1).unwrap()
     }
 
+    // ---- the archive ----------------------------------------------------
+
+    /// The archive's blob directory sits beside the store file, so tests
+    /// clean up the whole parent rather than the file alone.
+    fn archive_store(tag: &str) -> (PathBuf, Store) {
+        let dir = test_path(tag);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("store.rbs");
+        let store = make_store(&path, "pw");
+        (dir, store)
+    }
+
+    #[test]
+    fn an_archived_page_keeps_its_text_and_its_picture_together() {
+        let (dir, mut store) = archive_store("archive-add");
+        let png = b"\x89PNG\r\n\x1a\n pretend pixels";
+        let id = store
+            .add_archive(
+                "https://example.com/report",
+                "Quarterly report",
+                "visible area",
+                "Revenue 4,182,000",
+                Some(png),
+            )
+            .unwrap();
+        let record = store.get_archive(&id).expect("record");
+        assert_eq!(record.text, "Revenue 4,182,000");
+        assert!(record.has_picture);
+        assert!(record.picture_bytes > png.len() as u64, "header and tag");
+        assert_eq!(&store.archive_picture(&id).unwrap()[..], png);
+        // It survives a lock/unlock cycle, which is the whole point of
+        // putting it in the store rather than in memory.
+        let reopened = Store::unlock(&dir.join("store.rbs"), "pw").unwrap();
+        assert_eq!(reopened.archive().len(), 1);
+        assert_eq!(reopened.get_archive(&id).unwrap().text, "Revenue 4,182,000");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_page_can_be_archived_with_no_picture_at_all() {
+        // OCR finding nothing, or a capture that failed, still leaves
+        // something worth keeping.
+        let (dir, mut store) = archive_store("archive-nopic");
+        let id = store
+            .add_archive("https://a.example/", "Title", "full page", "read words", None)
+            .unwrap();
+        let record = store.get_archive(&id).unwrap();
+        assert!(!record.has_picture);
+        assert_eq!(record.picture_bytes, 0);
+        assert!(store.archive_picture(&id).is_err(), "there is no picture");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn deleting_a_page_takes_its_picture_with_it() {
+        let (dir, mut store) = archive_store("archive-del");
+        let id = store
+            .add_archive("https://a.example/", "t", "full page", "x", Some(b"pixels"))
+            .unwrap();
+        assert!(dir.join("archive").join(&id).is_file());
+        store.delete_archive(&id).unwrap();
+        assert!(store.get_archive(&id).is_none());
+        assert!(
+            !dir.join("archive").join(&id).exists(),
+            "the picture outlived its record"
+        );
+        assert!(store.delete_archive(&id).is_err(), "deleting twice is not silent");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_full_archive_refuses_rather_than_evicting_the_oldest_page() {
+        // The rule that matters: throwing away something the user saved, to
+        // make room for something else they saved, is a decision they did
+        // not make.
+        let (dir, mut store) = archive_store("archive-full");
+        for i in 0..MAX_ARCHIVE_RECORDS {
+            store
+                .add_archive(&format!("https://a.example/{i}"), "t", "full page", "x", None)
+                .unwrap();
+        }
+        let first = store.archive()[0].id.clone();
+        let verdict = store.add_archive("https://a.example/extra", "t", "full page", "x", None);
+        assert!(matches!(verdict, Err(StoreError::Full(_))));
+        assert_eq!(store.archive().len(), MAX_ARCHIVE_RECORDS);
+        assert!(store.get_archive(&first).is_some(), "the oldest was evicted");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_blob_no_record_names_is_swept_and_a_named_one_is_kept() {
+        let (dir, mut store) = archive_store("archive-reconcile");
+        let kept = store
+            .add_archive("https://a.example/", "t", "full page", "x", Some(b"pixels"))
+            .unwrap();
+        // Debris of the shape an interrupted write leaves behind.
+        fs::write(dir.join("archive").join("0123456789abcdef"), b"orphan").unwrap();
+        assert_eq!(store.reconcile_archive().unwrap(), 1);
+        assert!(dir.join("archive").join(&kept).is_file(), "swept a live blob");
+        assert!(store.archive_picture(&kept).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archive_ids_are_usable_as_blob_filenames() {
+        // The two modules agree on the alphabet: a generated id must pass
+        // the blob module's own validator, or a save would fail at the last
+        // step for a reason the user cannot act on.
+        let (dir, mut store) = archive_store("archive-ids");
+        for _ in 0..16 {
+            let id = store
+                .add_archive("https://a.example/", "t", "full page", "x", Some(b"p"))
+                .unwrap();
+            assert!(
+                id.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                "id {id:?} is not blob-safe"
+            );
+        }
+        fs::remove_dir_all(&dir).ok();
+    }
+
     fn page_digest(words: &str) -> ContentDigest {
         patanyx_integrity::digest(format!("<p>{words}</p>").as_bytes()).unwrap()
     }
@@ -1241,5 +1365,213 @@ mod tests {
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "store file must be owner-only");
         let _ = fs::remove_dir_all(&path);
+    }
+}
+
+// ---- the archive: a page's metadata here, its picture in a blob ----------
+//
+// Two stores of different shapes, kept in step by this impl block. The
+// record is the truth about what exists; a blob without a record is debris
+// (swept by `reconcile_archive`), and a record whose blob is missing still
+// lists and still searches, because the TEXT is the part that answers a
+// search and the picture is the part that can be lost without lying.
+
+/// Bounded on purpose, both ways. Records bound the whole-file rewrite the
+/// store does on every mutation; bytes bound the disk. Reaching either is a
+/// refusal, never a silent eviction: deleting the user's oldest saved page
+/// to make room for a new one is a decision they did not make.
+pub const MAX_ARCHIVE_RECORDS: usize = 200;
+pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
+
+impl Store {
+    /// The blob directory sits beside the store file. Opened on demand
+    /// rather than held: it is a path plus a derived key, so constructing
+    /// it costs one hash, and a store whose archive directory cannot be
+    /// created must still open for bookmarks.
+    fn blobs(&self) -> Result<blob::BlobStore, StoreError> {
+        let dir = self
+            .path
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("archive");
+        blob::BlobStore::open(&dir, &self.key)
+    }
+
+    pub fn archive(&self) -> &[ArchiveRecord] {
+        &self.data.archive
+    }
+
+    pub fn get_archive(&self, id: &str) -> Option<&ArchiveRecord> {
+        self.data.archive.iter().find(|record| record.id == id)
+    }
+
+    /// Bytes currently held by archived pictures, from the records rather
+    /// than from the disk: the cap is enforced against what this store
+    /// believes it owns, and debris on disk is not the user's fault to pay
+    /// for.
+    pub fn archive_bytes(&self) -> u64 {
+        self.data
+            .archive
+            .iter()
+            .map(|record| record.picture_bytes)
+            .sum()
+    }
+
+    /// Saves one page. The picture is optional: OCR text alone is a
+    /// legitimate archive entry, and is what remains if a capture failed.
+    ///
+    /// ORDER MATTERS. The blob is written FIRST, and the record is added
+    /// only if that succeeded, so a record can never name a picture that was
+    /// never written. If the store's own save then fails, the blob is
+    /// removed again and the in-memory record rolled back, which is the same
+    /// all-or-nothing shape `add_shelf` uses.
+    pub fn add_archive(
+        &mut self,
+        url: &str,
+        title: &str,
+        scope: &str,
+        text: &str,
+        picture: Option<&[u8]>,
+    ) -> Result<String, StoreError> {
+        if self.data.archive.len() >= MAX_ARCHIVE_RECORDS {
+            return Err(StoreError::Full(format!(
+                "the archive holds its limit of {MAX_ARCHIVE_RECORDS} pages"
+            )));
+        }
+        let incoming = picture.map(|bytes| bytes.len() as u64).unwrap_or(0);
+        if self.archive_bytes().saturating_add(incoming) > MAX_ARCHIVE_BYTES {
+            return Err(StoreError::Full(format!(
+                "archived pictures would pass the limit of {} MB",
+                MAX_ARCHIVE_BYTES / (1024 * 1024)
+            )));
+        }
+
+        let id = random_id();
+        let mut picture_bytes = 0u64;
+        let mut has_picture = false;
+        if let Some(bytes) = picture {
+            picture_bytes = self.blobs()?.put(&id, bytes)?;
+            has_picture = true;
+        }
+        self.data.archive.push(ArchiveRecord {
+            id: id.clone(),
+            url: url.to_string(),
+            title: title.to_string(),
+            created_at: now_unix(),
+            scope: scope.to_string(),
+            text: text.to_string(),
+            picture_bytes,
+            has_picture,
+        });
+        if let Err(e) = self.save() {
+            self.data.archive.pop();
+            if has_picture {
+                let _ = self.blobs().and_then(|blobs| blobs.delete(&id));
+            }
+            return Err(e);
+        }
+        Ok(id)
+    }
+
+    /// The decrypted picture for one record.
+    pub fn archive_picture(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let record = self
+            .get_archive(id)
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        if !record.has_picture {
+            return Err(StoreError::NotFound(format!("{id} has no picture")));
+        }
+        self.blobs()?.get(id)
+    }
+
+    /// Removes a record and its picture.
+    ///
+    /// The RECORD goes first here, the opposite order from adding, and for
+    /// the same reason: whichever half is written last must be the one whose
+    /// absence is harmless. A record with no blob still lists and searches;
+    /// a blob with no record is invisible debris that `reconcile_archive`
+    /// sweeps. Neither leaves a dangling promise.
+    pub fn delete_archive(&mut self, id: &str) -> Result<(), StoreError> {
+        let index = self
+            .data
+            .archive
+            .iter()
+            .position(|record| record.id == id)
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let record = self.data.archive.remove(index);
+        if let Err(e) = self.save() {
+            self.data.archive.insert(index, record);
+            return Err(e);
+        }
+        if record.has_picture {
+            let _ = self.blobs().and_then(|blobs| blobs.delete(id));
+        }
+        Ok(())
+    }
+
+    /// Deletes blobs no record names, and returns how many went.
+    ///
+    /// Runs at unlock. Debris is possible whenever a write is interrupted
+    /// between the two stores, and a picture the user cannot see or delete
+    /// through any UI is exactly the kind of thing that should not sit on
+    /// disk encrypted-but-forgotten.
+    pub fn reconcile_archive(&self) -> Result<usize, StoreError> {
+        let keep: Vec<String> = self
+            .data
+            .archive
+            .iter()
+            .filter(|record| record.has_picture)
+            .map(|record| record.id.clone())
+            .collect();
+        self.blobs()?.prune(&keep)
+    }
+}
+
+// ---- per-site Fingerprint Divergence ------------------------------------
+
+impl Store {
+    pub fn divergence_overrides(&self) -> &[DivergenceOverride] {
+        &self.data.divergence_overrides
+    }
+
+    /// Sets one site's level, replacing any previous choice for that host.
+    ///
+    /// The host is lowercased here so a user typing `Example.com` and the
+    /// in-page key `example.com` cannot become two entries for one site.
+    pub fn set_divergence_override(
+        &mut self,
+        host: &str,
+        level: DivergenceLevel,
+    ) -> Result<(), StoreError> {
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty() || host.contains('/') || host.contains(char::is_whitespace) {
+            return Err(StoreError::NotFound(format!("unusable host: {host:?}")));
+        }
+        let before = self.data.divergence_overrides.clone();
+        self.data.divergence_overrides.retain(|o| o.host != host);
+        self.data
+            .divergence_overrides
+            .push(DivergenceOverride { host, level });
+        if let Err(e) = self.save() {
+            self.data.divergence_overrides = before;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// Removes a site's choice, returning it to the global setting. Absent
+    /// is success: the caller wanted it gone.
+    pub fn clear_divergence_override(&mut self, host: &str) -> Result<(), StoreError> {
+        let host = host.trim().to_ascii_lowercase();
+        let before = self.data.divergence_overrides.clone();
+        self.data.divergence_overrides.retain(|o| o.host != host);
+        if before.len() == self.data.divergence_overrides.len() {
+            return Ok(());
+        }
+        if let Err(e) = self.save() {
+            self.data.divergence_overrides = before;
+            return Err(e);
+        }
+        Ok(())
     }
 }

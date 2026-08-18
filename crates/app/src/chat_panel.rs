@@ -130,6 +130,29 @@ pub enum ChatPayload {
     /// unsupported, ...) so the asking side is not left waiting forever.
     /// `reason` is pinned to a fixed vocabulary by the receiver.
     CorroborateNote { reason: String },
+    /// "I downloaded a file from `url`; here is what I recorded. What did
+    /// you get?" The url travels in clear for the same reason the page
+    /// version does: the receiver matches it against its OWN download
+    /// records, and tells its user what is being compared, before decoding
+    /// anything.
+    DownloadCompareRequest { url: String, data: String },
+    /// The other side's record for the same address.
+    DownloadCompareResponse { data: String },
+    /// Machine-readable "cannot answer" (no such download here, the record
+    /// failed its own integrity check, ...). Pinned to a fixed vocabulary by
+    /// the receiver, exactly like `CorroborateNote`.
+    DownloadCompareNote { reason: String },
+    /// "Did this page change for you too?" Carries what we saved and what
+    /// we see; the url travels alongside for the same reason the other two
+    /// comparisons carry it, so the receiver can match it against its own
+    /// bookmarks and say what is being compared before decoding.
+    ChangeCompareRequest { url: String, data: String },
+    /// The other side's saved and current readings for that address.
+    ChangeCompareResponse { data: String },
+    /// Machine-readable "cannot answer" (nothing saved here for that
+    /// address, the page is not open, ...). Closed vocabulary, sanitized by
+    /// the receiver.
+    ChangeCompareNote { reason: String },
     /// "I am away" / "I am back": the AFK marker, the ONLY writer of a
     /// peer's away flag. Purely a courtesy signal — delivery is unaffected
     /// (spec: messages to an AFK contact are delivered normally). It rides
@@ -954,6 +977,24 @@ fn handle_message(state: &mut AppState, from: Fingerprint, text: String) {
         }
         ChatPayload::CorroborateNote { reason } => {
             crate::page_integrity::handle_corroborate_note(state, hash, contact_id, &reason);
+        }
+        ChatPayload::DownloadCompareRequest { url, data } => {
+            crate::download_compare::handle_request(state, hash, contact_id, url, data);
+        }
+        ChatPayload::DownloadCompareResponse { data } => {
+            crate::download_compare::handle_response(state, hash, contact_id, data);
+        }
+        ChatPayload::DownloadCompareNote { reason } => {
+            crate::download_compare::handle_note(state, hash, contact_id, &reason);
+        }
+        ChatPayload::ChangeCompareRequest { url, data } => {
+            crate::page_integrity::handle_change_request(state, hash, contact_id, url, data);
+        }
+        ChatPayload::ChangeCompareResponse { data } => {
+            crate::page_integrity::handle_change_response(state, hash, contact_id, data);
+        }
+        ChatPayload::ChangeCompareNote { reason } => {
+            crate::page_integrity::handle_change_note(state, hash, contact_id, &reason);
         }
         ChatPayload::Status { away } => {
             // The AFK marker, and the ONLY writer of a peer's away flag:

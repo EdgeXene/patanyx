@@ -142,7 +142,16 @@ function mkSandbox(over) {
   sb.WebGL2RenderingContext = GL;
 
   vm.createContext(sb);
-  vm.runInContext(template.replace("__DIVERGENCE_TOKEN__", TOKEN), sb);
+  // BOTH placeholders, exactly as privacy.rs substitutes them. The
+  // overrides table defaults to "{}" in a real build; leaving it
+  // unreplaced makes it a bare identifier that throws, which kills the
+  // IIFE and silently disables every hook this gate measures.
+  vm.runInContext(
+    template
+      .replace("__DIVERGENCE_TOKEN__", TOKEN)
+      .replace("__DIVERGENCE_OVERRIDES__", "{}"),
+    sb,
+  );
   return sb;
 }
 

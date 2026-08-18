@@ -48,6 +48,10 @@ pub enum ScanKind {
     Recovery,
     /// Idea 2: report what is legible in an image before it is shared.
     Leaks,
+    /// The Premium region-read: plain text out of a dragged rectangle of an
+    /// in-memory page capture. Started by `ipc_region_scan`, never by
+    /// `ipc_scan` -- there is no file and no pick token on this path.
+    Region,
 }
 
 impl ScanKind {
@@ -55,6 +59,9 @@ impl ScanKind {
         match s {
             "recovery" => Some(Self::Recovery),
             "leaks" => Some(Self::Leaks),
+            // "region" is deliberately NOT parseable here: ipc_scan's kinds
+            // all redeem a file-pick token, and a region scan arriving there
+            // would be a caller trying to read a FILE with a region rect.
             _ => None,
         }
     }
@@ -80,6 +87,11 @@ fn error_code(e: &OcrError) -> &'static str {
     match e {
         OcrError::ModelsMissing(_) => "ocr_unavailable",
         OcrError::ImageDecode => "bad_image",
+        // The rect was validated against held dimensions before the worker
+        // started, so BadRegion surfacing here is a bug; it still gets an
+        // honest generic failure rather than a panic or a misleading
+        // "bad image".
+        OcrError::BadRegion => "ocr_failed",
         OcrError::ModelsInvalid(_) | OcrError::Inference(_) => "ocr_failed",
     }
 }
@@ -176,13 +188,12 @@ pub fn ipc_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static st
         _ => return Err("bad_image"),
     }
 
-    // The counter lives here rather than on AppState, matching how
+    // The counter lives in this module rather than on AppState, matching how
     // page_integrity keeps its own: nothing outside this module has any use
     // for it, and threading it through shared state would only widen the
-    // surface. Relaxed ordering is enough -- the token's only job is to let
-    // the UI ignore a result from a scan it already abandoned.
-    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // surface. Shared with the region flow so two in-flight scans can never
+    // carry the same token.
+    let token = next_result_token();
     let proxy: EventLoopProxy<UserEvent> = state.proxy();
     // A worker per scan rather than a pool: scans are user-initiated, one at a
     // time in practice, and a thread that exits when it is done cannot leak.
@@ -197,10 +208,110 @@ pub fn ipc_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static st
     Ok(json!({ "token": token }))
 }
 
-/// The actual work, on the worker thread. Returns codes, not errors, so the
-/// event arm has nothing left to decide.
-fn scan_blocking(path: &str) -> Result<Vec<TextRegion>, &'static str> {
-    let bytes = std::fs::read(path).map_err(|_| "bad_image")?;
+/// `ocr_region_scan` -- reads the text inside one rectangle of the pending
+/// region capture. Same async shape as `ipc_scan`: the reply carries a
+/// token, the text arrives later as an `ocr_result` event.
+///
+/// No file and no pick token on this path. The image is the in-memory
+/// capture stashed by the region flow, named by the capture token the
+/// `region_capture_ready` event handed the chrome. The rect is validated
+/// here, against dimensions Rust already holds, so a refusal the user
+/// caused comes back as a failed command rather than an event later.
+pub fn ipc_region_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
+    let capture = args
+        .get("capture")
+        .and_then(Value::as_u64)
+        .ok_or("bad_args")?;
+    let rect = ["x", "y", "w", "h"]
+        .map(|k| args.get(k).and_then(Value::as_u64));
+    let [Some(x), Some(y), Some(w), Some(h)] = rect else {
+        return Err("bad_args");
+    };
+    if !available() {
+        return Err("ocr_unavailable");
+    }
+    // A token that names nothing is a stale panel (the capture was replaced
+    // or the mode closed), its own code so the chrome can say "capture
+    // again" rather than "you did something wrong".
+    let (img_w, img_h) = crate::capture::region_dimensions(capture).ok_or("region_stale")?;
+    if w == 0 || h == 0 {
+        return Err("region_empty");
+    }
+    let fits = |a: u64, len: u64, max: u32| a.checked_add(len).is_some_and(|e| e <= u64::from(max));
+    if !fits(x, w, img_w) || !fits(y, h, img_h) {
+        return Err("region_out_of_bounds");
+    }
+    let png = crate::capture::region_png(capture).ok_or("region_stale")?;
+    let token = next_result_token();
+    let proxy: EventLoopProxy<UserEvent> = state.proxy();
+    // Truncations are safe: the bounds check above proved every value fits
+    // inside a u32 image dimension.
+    let (x, y, w, h) = (x as u32, y as u32, w as u32, h as u32);
+    std::thread::spawn(move || {
+        let result = with_engine(|engine| engine.recognize_region(&png, x, y, w, h));
+        let _ = proxy.send_event(UserEvent::Ocr(OcrEvent {
+            token,
+            kind: ScanKind::Region,
+            result,
+        }));
+    });
+    Ok(json!({ "token": token }))
+}
+
+/// Reads a page capture for Deep Recall, then hands the whole job back to
+/// `AppState::finish_archive`.
+///
+/// Unlike the other two flows this one does NOT emit an `ocr_result`: the
+/// text is not for the user to look at, it is what makes the archived page
+/// findable later. So the event that matters is `archive_saved`, and it is
+/// emitted once the picture and the text are both stored.
+///
+/// A read FAILURE is not an archive failure. A page of photographs with no
+/// legible words, or an engine that cannot load, still leaves a page worth
+/// keeping: the record is stored with empty text and stays findable by its
+/// title and address. Refusing to archive because OCR found nothing would
+/// throw away the capture over the least important half of it.
+pub fn read_for_archive(
+    state: &mut AppState,
+    png: Vec<u8>,
+    url: String,
+    title: String,
+    scope: &'static str,
+) {
+    let proxy: EventLoopProxy<UserEvent> = state.proxy();
+    std::thread::spawn(move || {
+        let text = with_engine(|engine| engine.recognize(&png))
+            .map(|regions| {
+                regions
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+            .unwrap_or_default();
+        let _ = proxy.send_event(UserEvent::ArchiveRead {
+            png,
+            url,
+            title,
+            scope,
+            text,
+        });
+    });
+}
+
+/// Result tokens for BOTH scan flows, one counter so no pair of in-flight
+/// scans can collide. Relaxed ordering is enough -- the token's only job is
+/// to let the UI ignore a result from a scan it already abandoned.
+fn next_result_token() -> u64 {
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Runs `f` against the cached engine, initialising it on first use. Returns
+/// codes, not errors, so the event arm has nothing left to decide.
+fn with_engine(
+    f: impl FnOnce(&OcrEngine) -> Result<Vec<TextRegion>, OcrError>,
+) -> Result<Vec<TextRegion>, &'static str> {
     match ENGINE.get_or_init(|| {
         match override_model_dir() {
             Some(dir) => OcrEngine::load(&dir),
@@ -213,9 +324,15 @@ fn scan_blocking(path: &str) -> Result<Vec<TextRegion>, &'static str> {
             // A poisoned lock means a previous scan panicked. Report a failure
             // rather than propagating the panic into the event loop.
             let guard = m.lock().map_err(|_| "ocr_failed")?;
-            guard.recognize(&bytes).map_err(|e| error_code(&e))
+            f(&guard).map_err(|e| error_code(&e))
         }
     }
+}
+
+/// The actual work, on the worker thread.
+fn scan_blocking(path: &str) -> Result<Vec<TextRegion>, &'static str> {
+    let bytes = std::fs::read(path).map_err(|_| "bad_image")?;
+    with_engine(|engine| engine.recognize(&bytes))
 }
 
 /// Called on the event loop when a worker finishes. Emits exactly one
@@ -239,6 +356,24 @@ pub fn handle_event(state: &mut AppState, event: OcrEvent) {
                     "ok": true,
                     "kind": "recovery",
                     "key": candidate.as_deref().map(patanyx_ocr::recovery::format_grouped),
+                })
+            }
+            ScanKind::Region => {
+                // Plain reading order, newline-joined: the regions arrive
+                // sorted by the engine, and a dragged rectangle's text is
+                // most useful as text, not as boxes. Zero regions is a
+                // RESULT ("nothing legible there"), not a failure.
+                let text = regions
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                json!({
+                    "token": event.token,
+                    "ok": true,
+                    "kind": "region",
+                    "text": text,
+                    "regions": regions.len(),
                 })
             }
             ScanKind::Leaks => {

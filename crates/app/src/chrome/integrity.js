@@ -261,6 +261,49 @@
   corrSection.appendChild(corrResult);
   panel.appendChild(corrSection);
 
+  // -- section 3: Change Cross-Check (chat builds only) --
+  //
+  // Deliberately a SEPARATE section from corroboration above, not a second
+  // button inside it. The two ask different questions: corroboration asks
+  // whether a contact is being served the same page RIGHT NOW, this asks
+  // whether a page changed for them since each of you saved it. Sharing one
+  // control would blur that, and the answers would arrive looking alike.
+  var xSection = el("div");
+  xSection.style.display = "none";
+  xSection.appendChild(sectionTitle("Did this page change for a contact too?"));
+  xSection.appendChild(
+    explainer(
+      "Compares what each of you saved with what each of you sees. A change you both got is an " +
+        "ordinary edit; a change only you got is worth a closer look, and has innocent causes too. " +
+        "Needs a page you have saved a copy of.",
+    ),
+  );
+  var xSelect = sty(el("select"), {
+    background: THEME.buttonBg,
+    color: THEME.text,
+    border: "1px solid " + THEME.border,
+    borderRadius: "4px",
+    padding: "4px 6px",
+    marginRight: "8px",
+    marginTop: "8px",
+    maxWidth: "220px",
+    fontSize: "12px",
+  });
+  var xButton = makeButton("Ask a contact");
+  var xRow = el("div");
+  xRow.appendChild(xSelect);
+  xRow.appendChild(xButton);
+  xSection.appendChild(xRow);
+  var xStatus = sty(el("div", ""), {
+    color: THEME.dim,
+    fontSize: "12px",
+    marginTop: "8px",
+  });
+  xSection.appendChild(xStatus);
+  var xResult = el("div");
+  xSection.appendChild(xResult);
+  panel.appendChild(xSection);
+
   // ---- state ----------------------------------------------------------------
 
   var supported = false;
@@ -291,20 +334,29 @@
       .request("chat_contacts", {})
       .then(function (data) {
         contacts = (data && data.items) || [];
-        clear(contactSelect);
-        if (contacts.length === 0) {
-          contactSelect.appendChild(
-            option("", "No contacts yet -- add one in Chat"),
-          );
-          return;
-        }
-        for (var i = 0; i < contacts.length; i++) {
-          contactSelect.appendChild(option(contacts[i].id, contacts[i].label));
+        // Both pickers are filled from ONE fetch: two sections asking the
+        // same question of the same list would be two chances for them to
+        // disagree about who your contacts are.
+        var pickers = [contactSelect, xSelect];
+        for (var p = 0; p < pickers.length; p++) {
+          clear(pickers[p]);
+          if (contacts.length === 0) {
+            pickers[p].appendChild(
+              option("", "No contacts yet -- add one in Chat"),
+            );
+            continue;
+          }
+          for (var i = 0; i < contacts.length; i++) {
+            pickers[p].appendChild(option(contacts[i].id, contacts[i].label));
+          }
         }
       })
       .catch(function (err) {
-        clear(contactSelect);
-        contactSelect.appendChild(option("", friendly(err)));
+        var pickers = [contactSelect, xSelect];
+        for (var p = 0; p < pickers.length; p++) {
+          clear(pickers[p]);
+          pickers[p].appendChild(option("", friendly(err)));
+        }
       });
   }
 
@@ -328,7 +380,9 @@
         setDisabled(saveButton, !supported);
         setDisabled(checkButton, !supported);
         setDisabled(askButton, !supported || !chatBuild);
+        setDisabled(xButton, !supported || !chatBuild);
         corrSection.style.display = chatBuild ? "block" : "none";
+        xSection.style.display = chatBuild ? "block" : "none";
         if (chatBuild) {
           loadContacts();
         }
@@ -482,6 +536,101 @@
       });
   });
 
+
+  function setXStatus(text) {
+    xStatus.textContent = text;
+  }
+
+  xButton.addEventListener("click", function () {
+    var contactId = xSelect.value;
+    if (!contactId) {
+      setXStatus("Add a contact in Chat first.");
+      return;
+    }
+    clear(xResult);
+    setXStatus("Reading this page's bytes...");
+    window.__rb
+      .request("change_compare_request", { contact_id: contactId })
+      .catch(function (err) {
+        setXStatus(friendly(err));
+      });
+  });
+
+  // The caveats for THIS comparison, which are not the corroboration ones.
+  // Corroboration is about being served differently right now; this is about
+  // change over time, so its innocent explanations are different and its
+  // strongest reading is weaker.
+  function xCaveatList() {
+    var items = [
+      "A change only you saw has innocent causes: caches, regional editions, an edit between the two visits.",
+      "It trusts your contact to report honestly what they saved and what they see.",
+      "Two copies saved at different times routinely differ for that reason alone.",
+      "Nothing here says a page was aimed at you. It says where to look.",
+    ];
+    var ul = sty(el("ul"), {
+      margin: "4px 0 0",
+      paddingLeft: "18px",
+      color: THEME.dim,
+      fontSize: "12px",
+    });
+    for (var i = 0; i < items.length; i++) {
+      ul.appendChild(el("li", items[i]));
+    }
+    return ul;
+  }
+
+  function gapText(seconds) {
+    if (seconds === null || seconds === undefined) {
+      return null;
+    }
+    if (seconds < 3600) {
+      return Math.round(seconds / 60) + " minutes apart";
+    }
+    if (seconds < 172800) {
+      return Math.round(seconds / 3600) + " hours apart";
+    }
+    return Math.round(seconds / 86400) + " days apart";
+  }
+
+  function renderXVerdict(data) {
+    clear(xResult);
+    setXStatus("");
+    // "changed for me, not for them" is the one worth colouring; everything
+    // else is ordinary. The colour never carries meaning on its own -- the
+    // sentence below says the same thing in words.
+    var pointed = data.my_change === "text_differs" && data.their_change === "same";
+    var wrap = box(pointed ? THEME.warn : THEME.goodBorder);
+    // Rust's headline, verbatim. This file places wording, never composes it.
+    wrap.appendChild(sty(el("div", data.text), { color: THEME.bright }));
+    var gap = gapText(data.baseline_gap_seconds);
+    if (gap) {
+      wrap.appendChild(
+        sty(el("div", "Your saved copies were made " + gap + "."), {
+          color: THEME.dim,
+          fontSize: "12px",
+          marginTop: "6px",
+        }),
+      );
+    }
+    wrap.appendChild(xCaveatList());
+    xResult.appendChild(wrap);
+  }
+
+  var X_NOTES = {
+    no_baseline:
+      "Your contact has nothing saved for this address, so there was nothing on their side to compare.",
+    no_page: "Your contact could not read the page just now.",
+    unsupported: "Your contact's build cannot answer this.",
+    bad_message: "Your contact's answer could not be read.",
+    unexpected:
+      "An answer arrived for a comparison this browser did not ask for. Nothing was compared.",
+  };
+
+  function renderXNote(data) {
+    clear(xResult);
+    setXStatus(X_NOTES[data.reason] || X_NOTES.bad_message);
+  }
+
   // The four standing caveats, rendered WITH every verdict (brief: surface
   // them there, not on a help page).
   function caveatList() {
@@ -633,6 +782,26 @@
         return true;
       case "corroborate_note":
         renderNote(data);
+        return true;
+      case "change_compare_verdict":
+        renderXVerdict(data);
+        return true;
+      case "change_compare_note":
+        renderXNote(data);
+        return true;
+      case "change_compare_status":
+        setXStatus("Asked. Waiting for their answer...");
+        return true;
+      case "change_compare_error":
+        setXStatus(friendly(data.code || "io"));
+        return true;
+      case "change_compare_request_received":
+        // The automatic answer, surfaced. Same rule the other two peer
+        // features follow: a reply the user cannot see is the shape of a
+        // backdoor even when it is not one.
+        setXStatus(
+          "A contact asked whether a page changed for you. Your saved copy was compared and the answer sent.",
+        );
         return true;
       default:
         return false;

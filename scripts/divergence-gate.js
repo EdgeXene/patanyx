@@ -49,6 +49,7 @@ const SRC = path.join(
 );
 
 const PLACEHOLDER = "__DIVERGENCE_TOKEN__";
+const OVERRIDES_PLACEHOLDER = "__DIVERGENCE_OVERRIDES__";
 const TOKEN_A = "a".repeat(64);
 const TOKEN_B = "b".repeat(64);
 
@@ -265,9 +266,16 @@ function mkSandbox(opts) {
 }
 
 function runDivergence(sandbox, token) {
-  vm.runInContext(template.replace(PLACEHOLDER, token), sandbox, {
-    filename: "fingerprint_divergence.js",
-  });
+  // Both placeholders, as privacy.rs does. The overrides table is "{}" in
+  // a default build; unreplaced it is a bare identifier that throws and
+  // takes every hook down with it.
+  vm.runInContext(
+    template
+      .replace(PLACEHOLDER, token)
+      .replace(OVERRIDES_PLACEHOLDER, "{}"),
+    sandbox,
+    { filename: "fingerprint_divergence.js" },
+  );
 }
 
 // Read a 16x16 image through the (patched) prototype and return the noise

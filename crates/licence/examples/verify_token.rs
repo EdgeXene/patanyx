@@ -47,6 +47,9 @@ fn main() -> ExitCode {
         patanyx_licence::LicenceState::Active { days_left } => {
             println!("VERIFIED: Active, {days_left} day(s) left");
         }
+        patanyx_licence::LicenceState::Perpetual => {
+            println!("VERIFIED: Perpetual, no expiry date");
+        }
         patanyx_licence::LicenceState::Lapsed { expires_day } => {
             println!("VERIFIED: Lapsed (expired on day {expires_day}); the token is real");
         }

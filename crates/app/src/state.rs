@@ -135,6 +135,17 @@ pub struct Tab {
     /// set-aside shelf must never remember one) need the per-tab fact, not
     /// the browser-wide policy of the moment.
     pub ephemeral: bool,
+    /// Whether a Fingerprint Divergence script was actually built for this
+    /// tab, recorded at construction.
+    ///
+    /// OBSERVED, not configured, and the difference is the whole point of
+    /// the proof panel: this is false when the pref was off, when the
+    /// randomness source failed (which yields no script rather than a fixed
+    /// token), and when the site is set to Off. Reading the pref at display
+    /// time would answer a different question and would be wrong for every
+    /// tab opened before the pref last changed, since neither engine can
+    /// re-register a live view's scripts.
+    pub divergence_registered: bool,
     history: Vec<String>,
     history_index: Option<usize>,
     /// Set when `load_url` originates from back/forward/reload so the
@@ -624,6 +635,9 @@ fn build_tab(
     // Response-policy workaround on unix, a no-op on Windows where wry's
     // download handlers are implemented natively.
     platform::fix_downloads(&webview);
+    // What the platform layer just did, captured from the same inputs it
+    // used rather than re-derived later.
+    let divergence_built = platform::privacy::divergence_script(policy.ephemeral).is_some();
 
     Ok(Tab {
         id,
@@ -632,6 +646,7 @@ fn build_tab(
         url: url.to_string(),
         title: String::new(),
         ephemeral: policy.ephemeral,
+        divergence_registered: divergence_built,
         history: Vec::new(),
         history_index: None,
         suppress_history: false,
@@ -877,6 +892,21 @@ pub struct AppState {
     /// never has to describe two tabs. The query lives only here and inside
     /// the engine; nothing is persisted, for any tab kind.
     pub find: crate::find::FindSession,
+    /// THE one source of find generations in the process (see find.rs):
+    /// find-in-page and the cross-tab scan both draw from it, so a number
+    /// can never describe two different searches of any kind.
+    pub find_gen: crate::find::GenSeq,
+    /// The live cross-tab search, if any: one row per scanned tab, in tab
+    /// strip order, filled as the engine's byte reads answer. Replaced
+    /// wholesale by each new find_tabs_search and dropped by lock_vault --
+    /// never cancelled row by row (TabScan's id, drawn from find_gen, is
+    /// what makes a dropped scan's late reads harmless).
+    pub tab_scan: Option<crate::tab_search::TabScan>,
+    /// Quarantine tabs skipped when the live scan was started. Snapshots
+    /// word this number long after start, so it is stored with the scan
+    /// rather than recomputed against tabs that may have opened or closed
+    /// since; meaningless, unread and reset while tab_scan is None.
+    tab_scan_skipped_quarantine: usize,
     /// Monotonically increasing; never reused even after tabs close.
     next_tab_id: u64,
     /// Platform host areas (chrome/content containers on unix, the parent
@@ -889,6 +919,38 @@ pub struct AppState {
     /// Current chrome strip height in logical pixels. Stored here (not only
     /// on the GTK widget) because Windows must re-apply it on every resize.
     chrome_height: i32,
+    /// Width the chrome is using down the LEFT edge, in logical pixels.
+    ///
+    /// Zero in the Top layout, which is every build before the sidebar
+    /// existed. A second number rather than a signed height because the two
+    /// axes are independent: a panel opening grows the top inset and must
+    /// not disturb the left one, and the sidebar is present whether or not a
+    /// panel is open.
+    chrome_left: i32,
+    /// The top inset of the CLOSED chrome, remembered across a panel.
+    ///
+    /// `chrome_height` holds whatever the chrome last asked for, which while
+    /// a panel is open is the panel's height. Coming back to a strip needs
+    /// the closed number, and it used to be read from `CHROME_HEIGHT_PX` --
+    /// correct only by luck, and only for one layout. The sidebar's closed
+    /// strip is ~88 and the constant is 120, so the frame between the
+    /// arrangement message and the height message would have shoved the page
+    /// down by 32px on every panel close. This is that constant, made honest.
+    closed_chrome_height: i32,
+    /// The chrome's resolved colours as last reported (or as persisted, until
+    /// the chrome speaks). Kept here because the Windows title bar FORGETS
+    /// them across a maximize/restore -- seen 2026-08-17: the caption went
+    /// back to the system colour on maximize while an outside call painted
+    /// it fine in that state -- so `relayout` re-applies them on every
+    /// layout pass. Reading prefs there would be a file read per resize.
+    chrome_palette: platform::ChromePalette,
+    /// Whether the window was maximized the last time `relayout` looked.
+    /// A change here is what triggers the full title-bar re-apply WITH the
+    /// frame refresh: DWM repaints the maximized frame in the system colour
+    /// and only a refresh brings ours back (writing the same value again is
+    /// a no-op to it -- seen 2026-08-17). A `Cell` because `relayout` is
+    /// `&self`; `None` until the first layout so boot counts as a change.
+    window_maximized_seen: std::cell::Cell<Option<bool>>,
     /// Whether the chrome is covering the window instead of sitting in a strip.
     ///
     /// SEPARATE FROM `chrome_height`, and deliberately not just a taller
@@ -942,6 +1004,11 @@ pub struct AppState {
     /// be replayed.
     pub picked_paths: std::collections::VecDeque<(u64, PathBuf)>,
     pub next_pick_token: u64,
+    /// What the capture currently in flight is FOR. Written by the IPC arm
+    /// that set `CAPTURE_IN_FLIGHT`, read once by `on_capture_done`. A single
+    /// value is enough because the in-flight flag admits one capture at a
+    /// time; see `capture::CaptureIntent`.
+    pub capture_intent: crate::capture::CaptureIntent,
     /// Smoke only: the second ping has been ASKED for. Distinguishes "the
     /// webview never came up" from "the reply is still in flight", which the
     /// single deadline used to conflate.
@@ -952,6 +1019,10 @@ pub struct AppState {
     pub smoke_vault_done: bool,
     /// In-flight page-byte reads and corroboration requests. Memory only.
     pub integrity: crate::page_integrity::IntegrityState,
+    /// Outstanding download comparisons we asked for. Memory only, like the
+    /// page-corroboration map beside it.
+    #[cfg(feature = "chat")]
+    pub download_compare: crate::download_compare::DownloadCompareState,
     /// A password a content tab just submitted, waiting on the user's Save/
     /// Never. NEVER PERSISTED: this field is the entire lifetime of that
     /// password outside the vault -- it exists here only from the moment the
@@ -1250,11 +1321,22 @@ impl AppState {
             tabs: Vec::new(),
             active: 0,
             find: crate::find::FindSession::default(),
+            find_gen: crate::find::GenSeq::default(),
+            tab_scan: None,
+            tab_scan_skipped_quarantine: 0,
             next_tab_id: 1,
             hosts,
             proxy,
             chrome,
             chrome_height: platform::CHROME_HEIGHT_PX,
+            closed_chrome_height: platform::CHROME_HEIGHT_PX,
+            chrome_palette: crate::prefs::load().chrome_palette,
+            window_maximized_seen: std::cell::Cell::new(None),
+            // Zero until the chrome reports otherwise, in BOTH layouts. The
+            // saved placement is a chrome-side fact; Rust learns the sidebar
+            // exists when the chrome measures it, one round trip after boot,
+            // the same way it learns the strip's height.
+            chrome_left: 0,
             chrome_arrangement: platform::ChromeLayout::Strip,
             privacy: platform::TabPolicy::default(),
             // Defaults to "opened on its own"; `main` sets it from the
@@ -1265,10 +1347,13 @@ impl AppState {
             ping_count: 0,
             picked_paths: std::collections::VecDeque::new(),
             next_pick_token: 1,
+            capture_intent: crate::capture::CaptureIntent::SaveFile,
             smoke_second_ping_requested: false,
             smoke_deadline_ticks: 0,
             smoke_vault_done: false,
             integrity: crate::page_integrity::IntegrityState::default(),
+            #[cfg(feature = "chat")]
+            download_compare: crate::download_compare::DownloadCompareState::default(),
             pending_save: None,
             pending_pdf: std::collections::HashMap::new(),
             #[cfg(feature = "chat")]
@@ -1442,22 +1527,69 @@ impl AppState {
     /// the UI thread, like every other picker flow. A cancelled picker is a
     /// changed mind, not an error: no file, no toast.
     pub fn on_capture_done(&mut self, ev: crate::capture::CaptureEvent) {
-        // Whatever happens below, the next capture may start.
+        // Whatever happens below, the next capture may start. The intent is
+        // read alongside and reset for the same reason the flag is cleared:
+        // a stale intent must not survive into an unrelated later capture.
         crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+        let intent = self.capture_intent;
+        self.capture_intent = crate::capture::CaptureIntent::SaveFile;
         let scope = crate::capture::current_scope();
         let bytes = match ev.png.and_then(|bytes| {
             crate::capture::validate_capture_bytes(&bytes).map(|()| bytes)
         }) {
             Ok(bytes) => bytes,
             Err(code) => {
-                let text = match code {
-                    "no_capture_page" => "Nothing to capture on this page.".to_string(),
-                    _ => "The capture failed; nothing was saved.".to_string(),
-                };
-                self.emit("toast", json!({ "text": text, "error": true }));
+                match intent {
+                    crate::capture::CaptureIntent::SaveFile => {
+                        let text = match code {
+                            "no_capture_page" => "Nothing to capture on this page.".to_string(),
+                            _ => "The capture failed; nothing was saved.".to_string(),
+                        };
+                        self.emit("toast", json!({ "text": text, "error": true }));
+                    }
+                    crate::capture::CaptureIntent::Region => {
+                        // The region panel is sitting in a "capturing" state
+                        // and needs a settled event, not a toast it may not
+                        // connect to the mode it opened.
+                        self.emit(
+                            "region_capture_ready",
+                            json!({ "ok": false, "error": code }),
+                        );
+                    }
+                    crate::capture::CaptureIntent::Archive => {
+                        self.emit("archive_saved", json!({ "ok": false, "error": code }));
+                    }
+                }
                 return;
             }
         };
+        if intent == crate::capture::CaptureIntent::Region {
+            match crate::capture::stash_region(bytes) {
+                Ok((token, width, height)) => {
+                    self.emit(
+                        "region_capture_ready",
+                        json!({
+                            "ok": true,
+                            "token": token,
+                            "w": width,
+                            "h": height,
+                            "scope": crate::capture::scope_label(scope),
+                        }),
+                    );
+                }
+                Err(code) => {
+                    self.emit(
+                        "region_capture_ready",
+                        json!({ "ok": false, "error": code }),
+                    );
+                }
+            }
+            return;
+        }
+        if intent == crate::capture::CaptureIntent::Archive {
+            self.archive_captured_page(bytes, crate::capture::scope_label(scope));
+            return;
+        }
         let title = format!(
             "Save capture ({})",
             crate::capture::scope_label(scope)
@@ -1494,12 +1626,20 @@ impl AppState {
     }
 
     /// Forward an engine find-count callback to the chrome, if it still
-    /// belongs to the tab the user is looking at. A callback already in
-    /// flight when a tab switch stopped the session must not paint counts
-    /// onto another tab's bar, which is why this checks the webview identity
-    /// rather than trusting delivery order.
+    /// belongs to the search the user is looking at. Two stale-event drops
+    /// protect that paint, neither trusting delivery order: the generation
+    /// must be the session's current one (a callback from an abandoned
+    /// query or a stopped session quotes a dead one), and the webview key
+    /// must be the active tab's (a callback already in flight across a tab
+    /// switch must not paint counts onto another tab's bar).
     pub fn on_find_event(&self, ev: crate::find::FindEvent) {
         if !self.find.is_active() {
+            return;
+        }
+        // The webview-key check below cannot catch a stale count from the
+        // SAME tab: a stop followed by a new start leaves the key intact
+        // while the old count is already meaningless.
+        if ev.generation != self.find.generation() {
             return;
         }
         let Some(webview) = self.active_webview() else {
@@ -1557,12 +1697,47 @@ impl AppState {
     /// needed after resize, scale-factor change, tab switch, and chrome
     /// height change. unix: no-op, GTK packing owns layout there.
     pub fn relayout(&self) {
+        // Before the geometry: the title bar comes back in the system colour
+        // after a maximize or a restore, and every such transition arrives
+        // here as a resize. Writing the same colours again does not repaint
+        // it; the frame refresh does. So: on a maximized-state CHANGE, the
+        // full apply with the refresh; on an ordinary resize, the bare
+        // re-write, which costs nothing and cannot flicker.
+        let maximized = platform::window_is_maximized(&self.hosts);
+        if self.window_maximized_seen.get() != Some(maximized) {
+            self.window_maximized_seen.set(Some(maximized));
+            let _ = platform::set_window_accent(&self.hosts, &self.chrome_palette);
+            // And once more AFTER the transition. The apply above runs inside
+            // the resize that announces the maximize, and Windows repaints
+            // the frame in the system colour after it -- a call from another
+            // process a moment later painted the maximized caption fine, so
+            // it is timing, not state. A short timer, then a loop event, so
+            // the re-apply lands when Windows is done; the loop event is
+            // where the window lives, and the timer thread only sends it.
+            // Twice: the maximize animation runs a few hundred milliseconds
+            // and Windows repaints the frame at its END, so a re-apply that
+            // lands inside the animation is repainted over (80 ms was, seen
+            // on hardware 2026-08-17). One after the animation, one more
+            // well after for a slow machine.
+            let proxy = self.proxy.clone();
+            std::thread::spawn(move || {
+                for delay_ms in [400u64, 1500] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                    if proxy.send_event(crate::UserEvent::WindowFrameSettled).is_err() {
+                        return;
+                    }
+                }
+            });
+        } else {
+            platform::reapply_window_accent(&self.hosts, &self.chrome_palette);
+        }
         let active = self.tabs.get(self.active).map(|tab| &tab.webview);
         platform::layout(
             &self.hosts,
             &self.chrome,
             active,
             self.chrome_height,
+            self.chrome_left,
             self.chrome_arrangement,
         );
     }
@@ -1600,8 +1775,15 @@ impl AppState {
         // a panel closes. The strip cannot be 500 tall, so the stale value is
         // dropped rather than laid out: the height message arriving directly
         // behind this one relayouts with the real number.
+        //
+        // The value restored is the CLOSED height this chrome last reported,
+        // not the build-time constant it used to be. The constant is 120 and
+        // the sidebar layout's closed strip is ~88, so on that layout the
+        // "fix" would itself have been a 32px jump -- the same defect, one
+        // third the size, and harder to see.
         if leaving_cover {
-            self.chrome_height = platform::CHROME_HEIGHT_PX.max(0);
+            self.chrome_height = self.closed_chrome_height.max(0);
+            platform::set_chrome_height(&self.hosts, self.chrome_height);
         }
         self.relayout();
     }
@@ -1611,12 +1793,70 @@ impl AppState {
         matches!(self.chrome_arrangement, platform::ChromeLayout::Split { .. })
     }
 
-    pub fn set_chrome_height(&mut self, px: i32) {
-        self.chrome_height = px;
-        // unix: updates the GTK size request (and GTK repacks by itself).
-        // Windows: no-op, the relayout() below applies the new height.
-        platform::set_chrome_height(&self.hosts, px);
+    /// What the chrome is currently using along the top, in logical pixels.
+    ///
+    /// For a caller that wants to change ONE axis and leave the other where
+    /// the chrome put it, rather than inventing a number for it.
+    pub fn chrome_height(&self) -> i32 {
+        self.chrome_height
+    }
+
+    /// Both axes at once: what the chrome is using along the top, and down
+    /// the left.
+    ///
+    /// One entry point rather than two setters, because the two numbers
+    /// describe one rectangle and applying them separately means laying out
+    /// twice -- once with a top that matches and a left that does not. That
+    /// intermediate frame is exactly the class of defect the stale-height
+    /// guard above exists to stop, and it would be back the first time
+    /// switching layout changed both numbers together.
+    pub fn set_chrome_insets(&mut self, top: i32, left: i32) {
+        self.chrome_height = top;
+        self.chrome_left = left;
+        // Only a STRIP reports the closed chrome. While a panel is open the
+        // top inset is the panel's height, and remembering that as "closed"
+        // is what would put the page back under a 700px card.
+        if matches!(self.chrome_arrangement, platform::ChromeLayout::Strip) {
+            self.closed_chrome_height = top;
+        }
+        // unix: moves the content overlay's insets (GTK repacks itself).
+        // Windows: no-op, the relayout() below applies both numbers.
+        platform::set_chrome_height(&self.hosts, top);
+        platform::set_chrome_left(&self.hosts, left);
         self.relayout();
+    }
+
+    /// The chrome's resolved colours, everywhere the chrome document itself
+    /// cannot paint: the OS title bar and border, and every open tab's page
+    /// scrollbar (live on Windows; installed but not honoured by WebKitGTK
+    /// -- see each backend's `set_page_scrollbar`). Persisted
+    /// first, so a tab created
+    /// before the chrome next speaks -- including the first tab of the next
+    /// launch -- reads the same colours from prefs.
+    /// Returns whether the OS caption tint is in effect (Windows 11 accepted
+    /// the attributes); the chrome keys its inner top line off it.
+    pub fn set_chrome_palette(&mut self, palette: platform::ChromePalette) -> bool {
+        let mut p = crate::prefs::load();
+        if p.chrome_palette != palette {
+            p.chrome_palette = palette;
+            // A prefs write that fails leaves the live window correct and
+            // only the NEXT launch on the old colours; not worth refusing
+            // the whole change over.
+            let _ = crate::prefs::save(&p);
+        }
+        self.chrome_palette = palette;
+        let caption_tinted = platform::set_window_accent(&self.hosts, &palette);
+        for tab in &self.tabs {
+            platform::set_page_scrollbar(&tab.webview, &tab.view, palette.scrollbar);
+        }
+        caption_tinted
+    }
+
+    /// The deferred half of the maximize/restore re-apply (see `relayout`):
+    /// nudge the colours to a value DWM will treat as a change, then the real
+    /// ones with the frame refresh. Windows only does anything with it.
+    pub fn refresh_window_accent(&self) {
+        platform::refresh_window_accent(&self.hosts, &self.chrome_palette);
     }
 
     // ---- tabs ---------------------------------------------------------------
@@ -1683,6 +1923,20 @@ impl AppState {
             .position(|tab| tab.id == id)
             .ok_or("not_found")?;
         let was_active = index == self.active;
+
+        // A live cross-tab scan keeps the closing tab's row: a still-pending
+        // row becomes "tab_closed", a done row keeps its result -- the text
+        // was read while the tab lived, and the UI shows the row as
+        // gone-but-counted. This runs BEFORE the last-tab branch below,
+        // which returns early after building a replacement; both exits
+        // close the same tab and the scan must hear about it either way.
+        let scan_changed = match self.tab_scan.as_mut() {
+            Some(scan) => scan.on_tab_closed(id),
+            None => false,
+        };
+        if scan_changed {
+            self.emit_tab_scan_state();
+        }
 
         // CLOSING THE LAST TAB: build the replacement BEFORE removing.
         //
@@ -1841,6 +2095,12 @@ impl AppState {
     /// both: a checkbox that silently does nothing is worse than one that
     /// says it is unavailable here.
     pub fn privacy_status(&self) -> Value {
+        // The browser-wide cookie control's static wording rides along here
+        // rather than living in the markup: the chrome writes what Rust says,
+        // and the sentence that keeps this feature honest ("cookies, not your
+        // saved passwords") is then pinned by cookie_control's own tests
+        // instead of by nobody. Assembled, not phrased -- see that module.
+        let copy = crate::cookie_control::forget_all_copy();
         json!({
             "block_ads": self.privacy.block_ads,
             "freeze_after_load": self.privacy.freeze_after_load,
@@ -1848,6 +2108,13 @@ impl AppState {
             "ephemeral": self.privacy.ephemeral,
             "network_blocking_supported": platform::network_blocking_supported(),
             "freeze_enforced": platform::freeze_enforced(),
+            "forget_all": {
+                "intro": copy.intro,
+                "warning": copy.warning,
+                "button": copy.button,
+                "confirm": copy.confirm,
+                "cancel": copy.cancel,
+            },
         })
     }
 
@@ -2099,6 +2366,47 @@ impl AppState {
             Ok(json!({ "origin": host }))
         } else {
             Err("cookie_delete_failed")
+        }
+    }
+
+    /// Deletes cookies for EVERY site -- and, exactly like the per-site call
+    /// above, only cookies.
+    ///
+    /// Takes no argument for the same reason `forget_active_tab_cookies`
+    /// takes none: there is nothing for a caller to name. The scope is all of
+    /// it, which is precisely why the chrome puts a confirmation in front of
+    /// it and words that confirmation from `cookie_control` rather than
+    /// inventing a sentence at the call site.
+    ///
+    /// COOKIES ALONE, and the UI copy must keep saying so. The reasoning is
+    /// unchanged from the per-site case: `ClearBrowsingData` would take a
+    /// data-kind mask and reach history, cache and site data the user did not
+    /// ask about. `DeleteAllCookies` is the whole of what this does.
+    ///
+    /// WHY IT PICKS A PERSISTENT TAB RATHER THAN THE ACTIVE ONE. The engine
+    /// call runs against the profile of whichever webview it is handed, and a
+    /// quarantine tab is in-private: its cookies are a separate, in-memory
+    /// store that dies with the tab anyway. Running this from a quarantine tab
+    /// would clear that store, leave every saved cookie untouched, and return
+    /// success -- a false claim on exactly the surface where a false claim
+    /// matters most. So it looks for a tab on the saved profile and refuses
+    /// with `no_persistent_tab` when every open tab is a quarantine one, which
+    /// is an honest "there is nothing saved here to clear".
+    pub fn forget_all_cookies(&self) -> Result<Value, &'static str> {
+        let tab = self
+            .tabs
+            .iter()
+            .find(|tab| !tab.ephemeral)
+            .ok_or("no_persistent_tab")?;
+        if platform::forget_all_cookies(&tab.webview) {
+            Ok(json!({ "message": crate::cookie_control::cleared_line() }))
+        } else {
+            // Its OWN code, not the per-site `cookie_delete_failed`. The two
+            // failures need different sentences ("for this site" is false
+            // here), and one code cannot carry two messages -- sharing it is
+            // how the chrome would end up telling a user the wrong thing
+            // about what was left untouched.
+            Err("cookie_delete_all_failed")
         }
     }
 
@@ -2390,10 +2698,23 @@ impl AppState {
         // user's addresses on the LAN.
         #[cfg(feature = "chat")]
         crate::chat_panel::on_vault_locked(self);
+        // Premium output must not outlive the licence session: the scan is
+        // dropped BEFORE the licence session is told, and the chrome hears
+        // it (locked: true) so an open panel clears. Byte reads already in
+        // flight die naturally -- their answers quote a dead scan id.
+        self.tab_scan = None;
+        self.tab_scan_skipped_quarantine = 0;
+        self.emit_tab_scan_state();
         // The licence session state derives from the vault the same way:
         // nothing licence-related survives a lock, and the next unlock
         // re-verifies from the stored record. Ungated, like the tunnel.
         crate::licence_control::on_vault_locked();
+        // The per-site divergence table dies with the vault for the same
+        // reason: it was read out of the encrypted store, and a tab opened
+        // after the lock must not carry choices this browser can no longer
+        // read. Cleared BEFORE the event, so nothing can observe the lock
+        // and still be handed the old table.
+        set_divergence_overrides_snapshot(String::new());
         self.emit("vault_locked", json!({}));
     }
 
@@ -2421,6 +2742,44 @@ impl AppState {
                 self.store_error = Some(crate::ipc::store_code(err));
             }
         }
+        // Per-site divergence choices live in the store, and the script that
+        // needs them is built by platform code with no AppState in reach, so
+        // the table is snapshotted into a process-level cache here.
+        self.refresh_divergence_snapshot();
+        // Sweep archive pictures no record names. Debris is possible
+        // whenever a write was interrupted between the two stores, and a
+        // picture with no way to see or delete it should not sit on disk.
+        if let Some(store) = self.store.as_ref() {
+            let _ = store.reconcile_archive();
+        }
+    }
+
+    /// Rebuilds the injected per-site table from the open store.
+    ///
+    /// Called at unlock and after every change. With no store open the table
+    /// is EMPTY, which is the honest pre-unlock answer: the choices are
+    /// encrypted with the vault, so before it opens this browser genuinely
+    /// does not know them, and every tab gets the global behaviour.
+    pub fn refresh_divergence_snapshot(&self) {
+        let entries: Vec<(String, bool)> = self
+            .store
+            .as_ref()
+            .map(|store| {
+                store
+                    .divergence_overrides()
+                    .iter()
+                    .map(|o| {
+                        (
+                            o.host.clone(),
+                            matches!(o.level, patanyx_store::DivergenceLevel::Off),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        set_divergence_overrides_snapshot(crate::platform::privacy::divergence_overrides_json(
+            &entries,
+        ));
     }
 
     pub fn store_status(&self) -> Value {
@@ -2526,7 +2885,7 @@ impl AppState {
         // the user is leaving, and a count arriving late must find nothing
         // to describe. The chrome closes its bar off the url_changed this
         // switch emits below.
-        if self.find.stop() {
+        if self.find.stop(&mut self.find_gen) {
             platform::find_stop(&self.tabs[self.active].webview);
         }
         platform::hide_tab(&self.tabs[self.active].view, &self.tabs[self.active].webview);
@@ -2559,6 +2918,129 @@ impl AppState {
     pub fn emit_tabs_changed(&self) {
         let list = self.tab_list();
         self.emit("tabs_changed", list);
+    }
+
+    /// The cross-tab scan's target list: every non-quarantine tab, in strip
+    /// order. Quarantine tabs are NEVER scanned -- their contract is that
+    /// nothing outlives them, and a search row is a memory -- so they are
+    /// skipped and counted, and the count is what the UI states.
+    pub fn tab_scan_candidates(&self) -> (Vec<u64>, usize) {
+        let mut ids = Vec::with_capacity(self.tabs.len());
+        let mut skipped = 0usize;
+        for tab in &self.tabs {
+            if tab.ephemeral {
+                skipped += 1;
+            } else {
+                ids.push(tab.id);
+            }
+        }
+        (ids, skipped)
+    }
+
+    /// Start (or wholesale replace) the cross-tab scan and remember how
+    /// many quarantine tabs were left out, so every later snapshot words
+    /// the same number the search reply did. A replaced scan needs no
+    /// per-row cancel: its in-flight reads quote its dead id and
+    /// TabScan::record refuses them.
+    pub fn start_tab_scan(&mut self, scan: crate::tab_search::TabScan, skipped_quarantine: usize) {
+        self.tab_scan = Some(scan);
+        self.tab_scan_skipped_quarantine = skipped_quarantine;
+    }
+
+    /// A tab's content webview by id, for per-tab engine asks that are not
+    /// about the active tab (the scan's byte reads).
+    pub fn tab_webview(&self, id: u64) -> Option<&WebView> {
+        self.tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| &tab.webview)
+    }
+
+    /// Whether a goto target is one the scan could have listed: it exists
+    /// and is not a quarantine tab.
+    pub fn tab_is_searchable(&self, id: u64) -> bool {
+        self.tabs.iter().any(|tab| tab.id == id && !tab.ephemeral)
+    }
+
+    /// The ONE place the find_tabs_state shape is built -- the search reply
+    /// and every later event share it, so the chrome renders one shape.
+    /// Rows join the scan with LIVE tab titles/urls; a tab that closed
+    /// mid-scan keeps its row but reads "Closed tab". Counts are worded by
+    /// find::format_count and reasons by reason_copy: the chrome renders
+    /// strings, it never words anything.
+    pub fn find_tabs_state(&self) -> Value {
+        use crate::tab_search::ScanRow;
+        let rows = match &self.tab_scan {
+            Some(scan) => scan
+                .rows()
+                .iter()
+                .map(|(id, row)| {
+                    let live = self.tabs.iter().find(|tab| tab.id == *id);
+                    let title = live.map(|tab| tab.title.as_str()).unwrap_or("Closed tab");
+                    let url = live.map(|tab| tab.url.as_str()).unwrap_or("");
+                    match row {
+                        ScanRow::Pending => json!({
+                            "id": id,
+                            "title": title,
+                            "url": url,
+                            "state": "pending",
+                            "reason": null,
+                        }),
+                        ScanRow::Done(set) => json!({
+                            "id": id,
+                            "title": title,
+                            "url": url,
+                            "state": "done",
+                            "reason": null,
+                            "count": set.total,
+                            "capped": set.capped,
+                            "text": crate::find::format_count(None, set.total, set.capped),
+                            "snippets": set
+                                .snippets
+                                .iter()
+                                .map(|s| json!({
+                                    "text": s.text,
+                                    "start": s.match_start,
+                                    "end": s.match_end,
+                                    "cut_start": s.cut_start,
+                                    "cut_end": s.cut_end,
+                                }))
+                                .collect::<Vec<Value>>(),
+                        }),
+                        ScanRow::Unsearchable(reason) => json!({
+                            "id": id,
+                            "title": title,
+                            "url": url,
+                            "state": "unsearchable",
+                            "reason": crate::tab_search::reason_copy(reason),
+                        }),
+                    }
+                })
+                .collect::<Vec<Value>>(),
+            None => Vec::new(),
+        };
+        json!({
+            "scanning": self
+                .tab_scan
+                .as_ref()
+                .map_or(false, |scan| !scan.is_complete()),
+            // An absence of information must never read as unlocked.
+            "locked": self.vault.is_none(),
+            "query": self.tab_scan.as_ref().map(|scan| scan.query()).unwrap_or(""),
+            "skipped_quarantine": if self.tab_scan.is_some() {
+                self.tab_scan_skipped_quarantine
+            } else {
+                0
+            },
+            "rows": rows,
+        })
+    }
+
+    /// Every scan state change funnels here: row answers (page_integrity),
+    /// tab closes, and the vault lock.
+    pub fn emit_tab_scan_state(&self) {
+        let state = self.find_tabs_state();
+        self.emit("find_tabs_state", state);
     }
 
     /// The active tab's webview, for engine reads that must go through the
@@ -2623,6 +3105,69 @@ impl AppState {
             .get(self.active)
             .map(|tab| tab.url.clone())
             .unwrap_or_default()
+    }
+
+    pub fn active_title(&self) -> String {
+        self.tabs
+            .get(self.active)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_default()
+    }
+
+    /// A capture on its way into Deep Recall: read it for text, then store
+    /// the record and the encrypted picture together.
+    ///
+    /// The READ happens on a worker, like every other scan, because it takes
+    /// about a second on a real page and this runs on the event loop. So
+    /// this method hands the bytes off and returns; `finish_archive` does
+    /// the storing when the text comes back.
+    ///
+    /// The url and title are captured NOW rather than when the text arrives.
+    /// A second is long enough for the user to navigate, and archiving a
+    /// picture of one page under the address of another would be a quiet
+    /// lie about where it came from.
+    fn archive_captured_page(&mut self, png: Vec<u8>, scope: &'static str) {
+        let url = self.active_url();
+        let title = self.active_title();
+        if self.store.is_none() {
+            self.emit(
+                "archive_saved",
+                json!({ "ok": false, "error": "not_unlocked" }),
+            );
+            return;
+        }
+        crate::ocr_support::read_for_archive(self, png, url, title, scope);
+    }
+
+    /// The text came back: write the record and the picture.
+    pub fn finish_archive(
+        &mut self,
+        png: Vec<u8>,
+        url: String,
+        title: String,
+        scope: &'static str,
+        text: String,
+    ) {
+        let Some(store) = self.store.as_mut() else {
+            self.emit(
+                "archive_saved",
+                json!({ "ok": false, "error": "not_unlocked" }),
+            );
+            return;
+        };
+        match store.add_archive(&url, &title, scope, &text, Some(&png)) {
+            Ok(id) => {
+                let words = text.split_whitespace().count();
+                self.emit(
+                    "archive_saved",
+                    json!({ "ok": true, "id": id, "words": words }),
+                );
+            }
+            Err(e) => {
+                let code = crate::ipc::store_code(e);
+                self.emit("archive_saved", json!({ "ok": false, "error": code }));
+            }
+        }
     }
 
     // ---- navigation (always the active tab) ----------------------------------
@@ -3020,5 +3565,47 @@ mod permission_book_tests {
             "an unreachable table must deny even a granted permission"
         );
         assert!(book.status_for(SITE).is_empty(), "and show nothing");
+    }
+}
+
+/// The per-site divergence table, as a JSON object literal ready to inject.
+///
+/// A process-level cache rather than a field, because the script is built in
+/// `platform::privacy::divergence_script` during tab construction, where no
+/// `AppState` is in scope. Starts EMPTY and returns to empty at vault lock:
+/// the choices are encrypted with the vault, so a locked browser does not
+/// know them, and pretending otherwise would apply a stale table to a tab
+/// opened after the vault closed.
+static DIVERGENCE_OVERRIDES_JSON: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+
+pub fn divergence_overrides_snapshot() -> String {
+    DIVERGENCE_OVERRIDES_JSON
+        .lock()
+        .map(|held| {
+            if held.is_empty() {
+                "{}".to_string()
+            } else {
+                held.clone()
+            }
+        })
+        // A poisoned lock means a panic happened while the table was being
+        // written. The safe answer is the global behaviour, never a
+        // half-written table.
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn set_divergence_overrides_snapshot(json: String) {
+    if let Ok(mut held) = DIVERGENCE_OVERRIDES_JSON.lock() {
+        *held = json;
+    }
+}
+
+impl AppState {
+    /// Whether the active tab actually got a divergence script.
+    pub fn active_divergence_registered(&self) -> bool {
+        self.tabs
+            .get(self.active)
+            .map(|tab| tab.divergence_registered)
+            .unwrap_or(false)
     }
 }

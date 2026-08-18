@@ -13,6 +13,77 @@ const ids = new Set(
       .matchAll(/id="([a-z0-9_-]+)"/g),
   ].map((m) => m[1]),
 );
+// Ids carrying a given attribute in the real markup, so a
+// `querySelectorAll("[data-premium]")` in chrome.js resolves to the elements
+// index.html actually marks. Attribute-only: this stub models ids, and a
+// general selector engine here would be a second, wrong browser. Elements
+// created at runtime are matched too, through their own attrs (see the
+// document-level implementation below).
+const attrIds = new Map();
+{
+  const html = require("fs").readFileSync(process.env.HTML_PATH, "utf8");
+  for (const tag of html.matchAll(/<[a-z]+\b[^>]*>/g)) {
+    const idMatch = tag[0].match(/id="([a-z0-9_-]+)"/);
+    if (!idMatch) continue;
+    for (const attr of tag[0].matchAll(/\s(data-[a-z0-9-]+)[=\s>]/g)) {
+      if (!attrIds.has(attr[1])) attrIds.set(attr[1], []);
+      attrIds.get(attr[1]).push(idMatch[1]);
+    }
+  }
+}
+
+// The document's tree, such as it is: parent links and child lists, kept
+// truthful by appendChild/insertBefore/removeChild below.
+function detach(node) {
+  const parent = node && node.parentNode;
+  if (!parent || !Array.isArray(parent.children)) return;
+  const at = parent.children.indexOf(node);
+  if (at >= 0) parent.children.splice(at, 1);
+}
+
+// MutationObserver, childList only, delivered synchronously.
+//
+// The real one batches into a microtask; this fires on the spot, which a
+// gate can assert against without awaiting. That is a deliberate difference
+// and it is the safe direction: code that works when records arrive
+// immediately also works when they arrive a tick later, and the chrome's
+// use of it -- sweeping a late-appended button into the sidebar -- is
+// idempotent either way.
+const observers = [];
+function notifyAdded(parent, node) {
+  for (const obs of observers) {
+    if (obs.target !== parent) continue;
+    obs.fn(
+      [
+        {
+          type: "childList",
+          target: parent,
+          addedNodes: [node],
+          removedNodes: [],
+        },
+      ],
+      obs,
+    );
+  }
+}
+class MutationObserverStub {
+  constructor(fn) {
+    this.fn = fn;
+    this.target = null;
+  }
+  observe(target) {
+    this.target = target;
+    observers.push(this);
+  }
+  disconnect() {
+    const at = observers.indexOf(this);
+    if (at >= 0) observers.splice(at, 1);
+  }
+  takeRecords() {
+    return [];
+  }
+}
+
 const allEls = [];
 function mkEl(id) {
   const listeners = {};
@@ -26,7 +97,29 @@ function mkEl(id) {
     className: "",
     disabled: false,
     checked: false,
-    style: {},
+    // A plain property bag that ALSO answers setProperty/getPropertyValue.
+    //
+    // Both shapes are used against it: integrity.js and update.js write
+    // `el.style.display` directly, and chrome.js publishes its measurements
+    // as CSS custom properties. The bag was untyped before, so the second
+    // shape threw "setProperty is not a function" -- from inside a deferred
+    // callback, which in node takes the whole gate process with it.
+    //
+    // Recorded rather than discarded, for the same reason the document
+    // listeners are: `--chrome-left-px` and `--chrome-closed-px` are how the
+    // chrome tells the stylesheet what it measured, and a gate that cannot
+    // read them cannot assert that a layout reported itself correctly.
+    style: {
+      setProperty(k, v) {
+        this[k] = String(v);
+      },
+      getPropertyValue(k) {
+        return typeof this[k] === "string" ? this[k] : "";
+      },
+      removeProperty(k) {
+        delete this[k];
+      },
+    },
     dataset: {},
     children: [],
     _listeners: listeners,
@@ -78,24 +171,64 @@ function mkEl(id) {
     hasAttribute(k) {
       return k in attrs;
     },
+    // MOVING A NODE DETACHES IT FIRST, the way a real DOM does.
+    //
+    // These used to push unconditionally, so a node appended to a second
+    // parent was a child of both -- which is not a state a browser can be
+    // in, and it made the one behaviour worth testing untestable: the
+    // toolbar-placement feature MOVES its buttons between two containers,
+    // and a gate asking "where is #btn-vault now" would have been told
+    // "both". Detaching also feeds the observer below a truthful record.
     appendChild(c) {
+      detach(c);
       this.children.push(c);
       c.parentNode = this;
+      notifyAdded(this, c);
       return c;
     },
-    insertBefore(c) {
-      this.children.push(c);
+    insertBefore(c, ref) {
+      detach(c);
+      const at = ref ? this.children.indexOf(ref) : -1;
+      if (at < 0) this.children.push(c);
+      else this.children.splice(at, 0, c);
       c.parentNode = this;
+      notifyAdded(this, c);
+      return c;
+    },
+    removeChild(c) {
+      detach(c);
       return c;
     },
     replaceChildren(...c) {
       this.children = c;
     },
     remove() {},
-    querySelector() {
-      return null;
+    // `.class` and `#id` against this element's own children, one level.
+    //
+    // Deliberately not a selector engine: it answers exactly the shape the
+    // chrome uses to find a landmark inside a container it owns -- the
+    // toolbar looking for its own `.toolbar-break` -- and returns null for
+    // anything more, so a gate is never quietly told "no match" when the
+    // truth is "not implemented".
+    querySelector(sel) {
+      return this.querySelectorAll(sel)[0] || null;
     },
-    querySelectorAll() {
+    querySelectorAll(sel) {
+      if (typeof sel !== "string") return [];
+      const kids = Array.isArray(this.children) ? this.children : [];
+      if (sel.startsWith(".")) {
+        const want = sel.slice(1);
+        return kids.filter(
+          (c) =>
+            (c.classList && c.classList.contains(want)) ||
+            (typeof c.className === "string" &&
+              c.className.split(/\s+/).includes(want)),
+        );
+      }
+      if (sel.startsWith("#")) {
+        const want = sel.slice(1);
+        return kids.filter((c) => c.id === want);
+      }
       return [];
     },
     closest() {
@@ -149,6 +282,58 @@ const registered = [];
 const els = new Map();
 for (const id of ids) els.set(id, mkEl(id));
 
+// #toolbar's children, seeded in SOURCE ORDER from the markup.
+//
+// Every element here existed already; what was missing was the fact that
+// they are in a container, in an order. The toolbar-placement feature moves
+// everything after `.toolbar-break` into the sidebar and back, and both
+// halves of that -- which buttons move, and what order they return in --
+// are only expressible against a real child list. Without this the gate can
+// see thirteen buttons and nothing about where any of them is.
+//
+// Parsed rather than listed: a button added to the row later joins this by
+// existing, exactly as it joins the real toolbar.
+{
+  const html = require("fs").readFileSync(process.env.HTML_PATH, "utf8");
+  const header = html.slice(
+    html.indexOf('<header id="toolbar"'),
+    html.indexOf("</header>"),
+  );
+  const bar = els.get("toolbar");
+  if (bar && header) {
+    // DIRECT children only, which needs the nesting tracked: `#vault-dot` is
+    // a span inside `#btn-vault`, and seeding it as a sibling would make the
+    // toolbar's own child list disagree with the markup -- and then the
+    // placement code, which moves whatever is after the row break, would
+    // move a button's insides out from under it.
+    let depth = 0;
+    const body = header.slice(header.indexOf(">") + 1);
+    for (const tag of body.matchAll(/<(\/?)([a-z]+)\b([^>]*)>/g)) {
+      const [, closing, name, attrs] = tag;
+      const selfClosing =
+        /\/$/.test(attrs) || name === "input" || name === "img";
+      if (closing) {
+        depth -= 1;
+        continue;
+      }
+      if (depth === 0) {
+        const id = (attrs.match(/id="([a-z0-9_-]+)"/) || [])[1];
+        const isBreak = /class="[^"]*\btoolbar-break\b/.test(attrs);
+        // The break carries no id in the markup; chrome.js and the gate both
+        // find it by class, so it needs an element that answers to that.
+        const el = isBreak ? mkEl("toolbar-break") : id ? els.get(id) : null;
+        if (el) {
+          if (isBreak) el.className = "toolbar-break";
+          bar.children.push(el);
+          el.parentNode = bar;
+        }
+      }
+      if (!selfClosing) depth += 1;
+    }
+  }
+}
+
+global.MutationObserver = MutationObserverStub;
 global.registered = registered;
 global.els = els;
 global.allEls = allEls;
@@ -174,8 +359,23 @@ global.document = {
     return n;
   },
   createElementNS: (ns, t) => mkEl("svg-" + t),
-  querySelector: () => null,
-  querySelectorAll: () => [],
+  querySelector: (sel) => global.document.querySelectorAll(sel)[0] || null,
+  // Attribute selectors only, resolved against the real markup plus anything
+  // the chrome has since set the attribute on itself. Anything else returns
+  // empty, exactly as before -- a gate that needs a richer selector should
+  // teach this deliberately rather than get a silently wrong answer.
+  querySelectorAll: (sel) => {
+    const attr = typeof sel === "string" && sel.match(/^\[([a-z0-9-]+)\]$/);
+    if (!attr) return [];
+    const seeded = (attrIds.get(attr[1]) || [])
+      .map((id) => els.get(id))
+      .filter(Boolean);
+    const dynamic = allEls.filter(
+      (el) =>
+        el.hasAttribute && el.hasAttribute(attr[1]) && !seeded.includes(el),
+    );
+    return seeded.concat(dynamic);
+  },
   body: mkEl("body"),
   head: mkEl("head"),
   documentElement: mkEl("html"),

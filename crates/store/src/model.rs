@@ -27,6 +27,29 @@ pub struct StoreData {
     /// delete, so ids and the stored creation order survive deletions.
     #[serde(default)]
     pub next_shelf_seq: u64,
+    /// Archived pages: the METADATA and the extracted text only. The page
+    /// picture itself is NOT here, and must never be: this whole document is
+    /// re-serialised, re-encrypted and rewritten on every mutation, so a
+    /// megabyte of PNG in this vector would be rewritten every time a
+    /// bookmark is added. Pictures live one-file-per-capture beside the
+    /// store (see the blob module); this record only names one.
+    ///
+    /// ADDITIVE ONLY, the same rule `shelves` documents: a store written
+    /// before this field existed reads it as an empty list, so `schema`
+    /// stays at SCHEMA_VERSION.
+    #[serde(default)]
+    pub archive: Vec<ArchiveRecord>,
+    /// Per-site Fingerprint Divergence choices.
+    ///
+    /// HERE RATHER THAN IN prefs.json, and that is a privacy decision, not a
+    /// filing one. This is a list of hostnames the user has visited and
+    /// cared about, which is browsing-history-adjacent; prefs.json is
+    /// plaintext on disk. The store is encrypted with the vault, so the list
+    /// is only readable while the user is.
+    ///
+    /// ADDITIVE ONLY, same rule as the fields above.
+    #[serde(default)]
+    pub divergence_overrides: Vec<DivergenceOverride>,
 }
 
 impl Default for StoreData {
@@ -38,6 +61,8 @@ impl Default for StoreData {
             downloads: Vec::new(),
             shelves: Vec::new(),
             next_shelf_seq: 0,
+            archive: Vec::new(),
+            divergence_overrides: Vec::new(),
         }
     }
 }
@@ -483,4 +508,74 @@ mod tests {
         assert!(normalize_folder_name(&"x".repeat(41)).is_err());
         assert!(normalize_folder_name(&"x".repeat(40)).is_ok());
     }
+}
+
+/// One archived page: what it was, and what could be read on it.
+///
+/// The picture is NOT in here. `has_picture` says whether a blob file with
+/// this record's `id` exists beside the store; the bytes are fetched from
+/// the blob module on demand. See `StoreData::archive` for why.
+///
+/// `text` is what OCR read off the capture, which is the whole point of the
+/// feature: it holds words that exist ONLY inside images and that no
+/// bookmark search could ever match. It is exactly as sensitive as the page
+/// it came from, which is why it lives in the encrypted store and nowhere
+/// else.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchiveRecord {
+    /// Also the blob filename, so it is constrained to the blob module's
+    /// safe-id alphabet at creation.
+    pub id: String,
+    pub url: String,
+    pub title: String,
+    /// Seconds since the unix epoch.
+    pub created_at: u64,
+    /// What part of the page the capture covers, in the capture module's
+    /// own words ("visible area" or "full page"). Stored rather than
+    /// recomputed: a record archived on one platform keeps the truth about
+    /// how it was made when it is read on another.
+    pub scope: String,
+    /// The text OCR read. Empty is a legitimate outcome (a page of
+    /// photographs with no legible words), not a failure.
+    #[serde(default)]
+    pub text: String,
+    /// Bytes of the encrypted picture on disk, for the size cap. Zero when
+    /// no picture was kept.
+    #[serde(default)]
+    pub picture_bytes: u64,
+    /// Whether a picture was kept at all. Distinct from `picture_bytes == 0`
+    /// so a future record with a genuinely empty picture is not confused
+    /// with one that never had one.
+    #[serde(default)]
+    pub has_picture: bool,
+}
+
+/// What divergence should do on one site.
+///
+/// Only two values, deliberately. A third ("stricter") would change the
+/// noise algorithm, and the set of techniques that can DETECT the noise is
+/// pinned by scripts/divergence-detect-gate.js in both directions: a
+/// technique that starts detecting fails the gate, and so does one that
+/// stops. Off and Default leave the algorithm byte-identical, so the pinned
+/// figure cannot drift behind anyone's back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DivergenceLevel {
+    /// No noise on this site. For sites that break under it.
+    Off,
+    /// Whatever the global setting says. Stored rather than implied so a
+    /// deliberate "leave this one alone" survives a change to the default.
+    Default,
+}
+
+/// One site's choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DivergenceOverride {
+    /// FULL lowercase hostname, matching how the injected script keys its
+    /// noise (top-frame hostname, not eTLD+1). `www.example.com` and
+    /// `example.com` are different entries because they are different keys
+    /// to the thing being overridden, and pretending otherwise would apply
+    /// a choice the user did not make.
+    pub host: String,
+    pub level: DivergenceLevel,
 }

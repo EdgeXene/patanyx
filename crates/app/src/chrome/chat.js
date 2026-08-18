@@ -193,11 +193,13 @@
   // rather than a hope. Maps iterate in insertion order, so the oldest goes.
   const OUTBOX_LIMIT = 500;
 
-  // The conversation view is the tallest panel. The Rust clamp in ipc.rs is
-  // this value PLUS banner allowance (720 = 640 + 80): the clamp ceiling
-  // sitting exactly at the tallest panel is what once discarded banner
-  // heights over an open chat in full, so if this number grows, that
-  // ceiling's comment is where the arithmetic lives.
+  // The conversation view was the tallest panel; the theme panel passed it
+  // when the toolbar section gained a placement row. The Rust clamp is the
+  // tallest panel PLUS banner allowance (CHROME_TOP_RANGE in
+  // platform/mod.rs, now 80..=800 for a 760 theme panel): a ceiling sitting
+  // exactly at the tallest panel is what once discarded banner heights over
+  // an open chat in full, so if this number grows past 720, that range is
+  // where the arithmetic lives.
   const CHAT_OPEN_PX = 640;
 
   // ---- panel registration ------------------------------------------------------

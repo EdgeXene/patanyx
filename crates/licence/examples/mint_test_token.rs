@@ -5,13 +5,20 @@
 //! license_id hex appear in NO captured output (design 4.3). The relay's
 //! auth tests also use it to (re)generate their pinned fixture.
 //!
-//! Only ever run with a THROWAWAY seed. It exists to make test tokens, and
-//! nothing here is a real signing key.
+//! SEED HANDLING, and this changed: the header used to say "only ever run
+//! with a THROWAWAY seed". That is still right for the gate's fixtures, and
+//! it is no longer the only use. This is also the publisher's minting path
+//! for a perpetual token (`expires-day` = `NEVER_EXPIRES`, which is
+//! 4294967295), and that one is signed with the REAL seed on purpose. What
+//! stays true either way: a token minted here is a bearer credential that
+//! cannot be revoked, so a real-seed token belongs on machines the key
+//! holder controls and nowhere else.
 //!
 //! Usage: mint_test_token <seed-hex-64> <key-id> <license-id-hex-32> <expires-day>
 //! stdout:
 //!   KEY_HEX=<64 lowercase hex>     verifying key, for RELAY_LICENCE_KEYS
 //!   WIRE_HEX=<180 lowercase hex>   token.to_wire_bytes(), for the Register frame
+//!   TOKEN_TEXT=ptx1-<126 chars>    the form a person pastes into the vault
 
 use ed25519_dalek::SigningKey;
 use patanyx_licence::Token;
@@ -75,4 +82,8 @@ fn main() {
         hex_lower(&signing_key.verifying_key().to_bytes())
     );
     println!("WIRE_HEX={}", hex_lower(&token.to_wire_bytes()));
+    // The PASTEABLE form. The wire hex above is what the relay handshake
+    // carries; it is not what a person types into the vault, and printing
+    // only the wire form meant the one output a human needs was missing.
+    println!("TOKEN_TEXT={}", token.to_text());
 }

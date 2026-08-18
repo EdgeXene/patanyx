@@ -70,6 +70,14 @@ pub const PROTECTED_SUFFIXES: &[&str] = &[
     "weeblysite.com",
     // cloud infrastructure
     "amazonaws.com",
+    // AWS's LEGACY global S3 endpoints. Every bucket is reachable through
+    // them, so an entry naming one blocks all of S3 rather than one tenant.
+    // The build screens bare public suffixes against the shipped PSL, but the
+    // PSL carries only the -1 form, and `amazonaws.com` above does not match
+    // either: this array is compared EXACTLY. Both are listed here so neither
+    // depends on the PSL happening to carry it.
+    "s3-external-1.amazonaws.com",
+    "s3-external-2.amazonaws.com",
     "azurewebsites.net",
     "cloudfront.net",
     "windows.net",

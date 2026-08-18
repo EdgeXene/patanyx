@@ -200,9 +200,9 @@ check(
     global.rbCalls.length = 0;
     global.$("btn-privacy")._fire("click");
     await flush();
-    const heights = global.rbCalls.filter((c) => c.cmd === "set_chrome_height");
-    assert(heights.length > 0, "closing the panel sent no set_chrome_height");
-    const last = heights[heights.length - 1].args.px;
+    const heights = global.rbCalls.filter((c) => c.cmd === "set_chrome_insets");
+    assert(heights.length > 0, "closing the panel sent no set_chrome_insets");
+    const last = heights[heights.length - 1].args.top;
     // 148 is closedChromePx()'s floor (domstub measures the rows at 0), and
     // 40 is the banner planted above. Exact, so a double-count fails too.
     assert(
@@ -211,6 +211,13 @@ check(
         "(want 188 = 148 floor + 40 banner, got " +
         last +
         "); anything less clips the banner outside the chrome window",
+    );
+    // The banner's allowance is on the TOP axis only. A sidebar takes width,
+    // not height, and a banner measured into the left inset would push the
+    // page sideways every time a warning appeared.
+    assert(
+      heights[heights.length - 1].args.left === 0,
+      "a banner must not change the left inset",
     );
     // Leave the banner hidden for the checks that follow.
     global.$("blocked-dismiss")._fire("click");
