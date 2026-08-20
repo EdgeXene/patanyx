@@ -56,15 +56,76 @@ const closePrivacy = async () => {
   await flush();
 };
 
-const state = (proof, sites) => {
+// `premium` defaults to true for the older checks, which is exactly how a
+// UI-side Premium gate on a FREE feature survived every run of this gate:
+// no check here had ever been a free user. Pass premium:false to be one.
+const state = (proof, sites, premium) => {
   global.rbResolve.divergence_proof_get = proof;
   global.rbResolve.divergence_sites_list = { items: sites || [] };
+  // The write arm needs an answer too, or the handler's catch reverts the
+  // checkbox and the test cannot tell a refusal from a missing stub.
+  global.rbResolve.divergence_site_set = {};
+  global.rbResolve.divergence_site_clear = {};
+  const isPremium = premium === undefined ? true : premium;
   global.rbResolve.premium_status = {
-    state: "perpetual",
-    premium: true,
+    state: isPremium ? "perpetual" : "free",
+    premium: isPremium,
     on_sale: false,
   };
 };
+
+check(
+  "a FREE user can actually turn divergence off for a site",
+  async () => {
+    // THE DEFECT THIS PINS. Fingerprint Divergence and its per-site
+    // exceptions became free permanently on 2026-08-19, and the four IPC
+    // arms in ipc.rs were un-gated to match. The chrome kept its own gate:
+    // the dv-off handler called premiumBlocked() first, reverted the
+    // checkbox, toasted "A Premium feature, arriving the day Premium
+    // launches", and never sent divergence_site_set. So the feature was
+    // free in Rust, published as free on four surfaces, and unusable.
+    //
+    // Neither guard caught it. licence-planted-defect-gate only reads
+    // ipc.rs and never opens chrome.js; every check in THIS file ran as a
+    // Premium user. A free user is the only one who can see it.
+    state(
+      {
+        host: "example.com",
+        enabled_globally: true,
+        off_for_this_site: false,
+        registered: true,
+        surfaces: ["canvas"],
+      },
+      [],
+      false,
+    );
+    await openPrivacy();
+    global.rbCalls.length = 0;
+
+    const box = global.$("dv-off");
+    box.checked = true;
+    box._fire("change");
+    await flush();
+
+    const sent = global.rbCalls.filter((c) => c.cmd === "divergence_site_set");
+    // REACHING RUST IS THE WHOLE ASSERTION. The checkbox's final state is
+    // not: the handler re-reads divergence_proof_get afterwards, and this
+    // stub keeps reporting off_for_this_site:false, so asserting on the box
+    // would test the harness rather than the gate.
+    const ok = sent.length === 1;
+    const args = ok ? JSON.stringify(sent[0].args) : "";
+    await closePrivacy();
+    assert(
+      ok,
+      "a free user's per-site choice never reached Rust; the chrome refused " +
+        "it. Commands sent: " + JSON.stringify(global.rbCalls.map((c) => c.cmd)),
+    );
+    assert(
+      args.includes("example.com"),
+      "the command went out without the host it was about: " + args,
+    );
+  },
+);
 
 check("a registered tab is described as installed, not as proven", async () => {
   state({
@@ -141,23 +202,24 @@ check("a Premium refusal explains rather than hides the section", async () => {
   await closePrivacy();
 });
 
-check("the per-site note does not call Fingerprint Divergence free", async () => {
+check("the per-site note states that choosing per site is free", async () => {
   const html = fs.readFileSync(process.env.HTML_PATH, "utf8");
   const premium = html.match(/id="dv-premium"[^>]*>([\s\S]*?)<\/p>/);
   assert(premium, "the premium note is missing");
   const text = premium[1].toLowerCase();
   assert(
     text.includes("per site"),
-    "the note must scope Premium to the per-site choice: " + text,
+    "the note must name the per-site choice: " + text,
   );
-  // Fingerprint Divergence is what Premium sells (design preamble
-  // 2026-08-06, reaffirmed 2026-08-16); a note that called the global
-  // toggle free would be the exact claim a buyer could hold against the
-  // page. Until launch it is simply switched on for everyone, which is
-  // not a promise and is not said here.
+  // REVERSED 2026-08-19. This assertion used to REQUIRE that the note never
+  // call Divergence free, because Divergence was what Premium sold. The
+  // it became free permanently, exceptions included, and the site now
+  // says so on three pages -- so the old assertion would have blocked the
+  // correct copy. It is inverted rather than deleted, because the thing worth
+  // pinning is still that this note and the published pages agree.
   assert(
-    !text.includes("stays free") && !text.includes("remains free"),
-    "Fingerprint Divergence is Premium; the note must not call it free: " + text,
+    text.includes("free"),
+    "choosing per site is free now; the note must say so: " + text,
   );
 });
 

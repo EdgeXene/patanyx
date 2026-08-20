@@ -616,6 +616,14 @@ fn status_json(u: &Updater) -> Value {
         "running": current_version().map(|v| v.to_string()),
         "platform": running_platform().map(|p| p.as_str()),
         "state": "idle",
+        // Something on the network terminated TLS and the fetch only
+        // succeeded once the OS trust store was accepted. Surfaced rather
+        // than swallowed: the user is entitled to know their traffic is
+        // being inspected, and to know the update was still verified
+        // against the publisher's signature despite it. False on every
+        // ordinary network, and on a build with no update networking.
+        "intercepted": net::LAST_FETCH_WAS_INTERCEPTED
+            .load(std::sync::atomic::Ordering::Relaxed),
     });
     match &u.phase {
         Phase::Idle => {}
@@ -891,9 +899,45 @@ fn payload_refusal_text(error: &UpdateError) -> String {
     }
 }
 
+/// Whether a transport error is a certificate refusal rather than a plain
+/// failure to connect. Matched on the text because that is all the transport
+/// gives us, and matched broadly on purpose: a false positive here says
+/// "something is inspecting your connection" about an ordinary outage, which
+/// is a worse answer than the generic one, so the phrases are the specific
+/// ones rustls produces for a chain it will not accept.
+fn is_certificate_refusal(detail: &str) -> bool {
+    let d = detail.to_ascii_lowercase();
+    d.contains("unknownissuer")
+        || d.contains("invalid peer certificate")
+        || d.contains("certificate")
+}
+
 fn fetch_detail(error: &FetchError) -> String {
     match error {
-        FetchError::Network(detail) => format!("could not reach the update server ({detail})"),
+        // NO RUST ERROR TEXT IN ANY OF THESE. What the user used to get was
+        // `{detail}` verbatim -- "tls connection init failed: invalid peer
+        // certificate: UnknownIssuer", or an os error number -- which names
+        // no cause a person can act on and reads as a fault in the browser.
+        //
+        // The certificate case is worth telling apart because it has a real
+        // explanation and a real remedy: something between this browser and
+        // us is terminating TLS, and downloading the installer from the
+        // website works because that download goes through a browser using
+        // the certificates this computer already trusts.
+        FetchError::Network(detail) if is_certificate_refusal(detail) => {
+            "PATANYX could not confirm it was talking to the update server. \
+             Something on this computer or its network is inspecting \
+             encrypted traffic and presenting its own certificate, which this \
+             browser does not recognize. Nothing was installed. You can still \
+             update by downloading the installer from the website."
+                .to_string()
+        }
+        FetchError::Network(_) => {
+            "could not reach the update server. It may be temporarily \
+             unavailable, or something on this network is blocking the \
+             connection."
+                .to_string()
+        }
         FetchError::Http(status) => format!("the update server answered with HTTP {status}"),
         FetchError::TooLarge => {
             "the update server sent more data than a valid answer can contain".to_string()
@@ -1088,6 +1132,13 @@ pub(crate) mod net {
     /// parking the worker thread forever.
     pub const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(600);
 
+    /// Whether the last fetch only succeeded once the OS trust store was
+    /// accepted -- i.e. something is terminating TLS between here and the
+    /// distribution host. Reported to the user rather than swallowed; see
+    /// `crate::net::Roots`.
+    pub static LAST_FETCH_WAS_INTERCEPTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
     pub fn get(url: &str, cap: u64, timeout: Duration) -> Result<Vec<u8>, FetchError> {
         // The agent comes from crate::net, the ONE place that knows the
         // tunnel rule (proxy when the engine says so, fail closed when it
@@ -1096,10 +1147,52 @@ pub(crate) mod net {
         // hole the tunnel design flagged cannot reopen as a second copy.
         let agent = crate::net::agent(timeout)
             .map_err(|e| FetchError::Network(e.to_string()))?;
-        let response = agent.get(url).call().map_err(|e| match e {
-            ureq::Error::Status(code, _) => FetchError::Http(code),
-            ureq::Error::Transport(t) => FetchError::Network(t.to_string()),
-        })?;
+        let first = agent.get(url).call();
+
+        // A TRANSPORT FAILURE MAY BE AN INTERCEPTING PROXY, AND THE RETRY IS
+        // THE TEST (security audit 2026-08-18, F21).
+        //
+        // On a corporate network every connection is terminated and re-signed
+        // by a CA in the OS store and in no public root list, so the strict
+        // agent above reports UnknownIssuer and the user receives no updates
+        // at all -- silently, while the rest of the browser works, because the
+        // engine consults the OS store and this does not.
+        //
+        // Rather than match on an error string, which is brittle across ureq
+        // and rustls versions, the retry IS the diagnosis: if the same request
+        // succeeds once the OS roots are accepted, then something the machine
+        // trusts and Mozilla does not is in the path. If it fails too, the
+        // original error is what the user sees, so a genuine outage still
+        // reads as an outage.
+        //
+        // Safe HERE and nowhere else: this function fetches manifests and
+        // payloads, whose integrity rests on the compiled-in Ed25519 key and
+        // a sha256 from the signed manifest, not on TLS. The activation call
+        // carries a licence token and keeps using `crate::net::agent` only.
+        let response = match first {
+            Ok(response) => {
+                LAST_FETCH_WAS_INTERCEPTED.store(false, std::sync::atomic::Ordering::Relaxed);
+                response
+            }
+            Err(ureq::Error::Status(code, _)) => return Err(FetchError::Http(code)),
+            Err(ureq::Error::Transport(strict_error)) => {
+                let relaxed = crate::net::agent_accepting_os_roots(timeout)
+                    .map_err(|e| FetchError::Network(e.to_string()))?;
+                match relaxed.get(url).call() {
+                    Ok(response) => {
+                        LAST_FETCH_WAS_INTERCEPTED
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                        response
+                    }
+                    Err(ureq::Error::Status(code, _)) => return Err(FetchError::Http(code)),
+                    // Report the STRICT error, not the retry's: the retry is a
+                    // diagnostic, and its failure says nothing the first did not.
+                    Err(ureq::Error::Transport(_)) => {
+                        return Err(FetchError::Network(strict_error.to_string()))
+                    }
+                }
+            }
+        };
         // Fail fast when the server announces more than the cap; the capped
         // read below stays the enforcement of record.
         if let Some(len) = response
@@ -1125,6 +1218,11 @@ pub(crate) mod net {
 
     pub const MANIFEST_TIMEOUT: Duration = Duration::from_secs(30);
     pub const PAYLOAD_TIMEOUT: Duration = Duration::from_secs(600);
+
+    /// Always false here: this build makes no TLS connection to intercept.
+    /// Present so `status_json` compiles one way in both builds.
+    pub static LAST_FETCH_WAS_INTERCEPTED: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 
     pub fn get(_url: &str, _cap: u64, _timeout: Duration) -> Result<Vec<u8>, FetchError> {
         Err(FetchError::Network(
@@ -1224,6 +1322,28 @@ pub mod installer {
     fn relaunch(path: &Path) -> std::io::Result<()> {
         std::process::Command::new(path).spawn()?;
         Ok(())
+    }
+
+    /// Start a replacement of THIS binary and let this process exit normally.
+    ///
+    /// Same three lines as `relaunch`, and deliberately the same ones: this
+    /// is a restart, not an update, so nothing is written to disk first. The
+    /// tunnel's "Apply and restart" needs a new process because WebView2
+    /// reads `--proxy-server` only when the environment is created, and there
+    /// was no way to restart the browser from anywhere outside this module.
+    ///
+    /// WHY THE SPAWN-THEN-QUIT ORDER IS SAFE HERE, and it is not obvious:
+    /// the vault holds an OS file lock (mandatory on Windows), so two live
+    /// processes could not both open it. They never do. The replacement
+    /// starts at the unlock screen and touches no vault until the user types
+    /// a passphrase, by which time this process has returned to the event
+    /// loop, exited, and had its lock released by the kernel. The updater
+    /// has relied on exactly this since 0.9.x.
+    ///
+    /// The caller sends `QuitForRelaunch` AFTER this returns Ok, never
+    /// before: a failed spawn must leave a working browser running.
+    pub(crate) fn relaunch_current_exe() -> std::io::Result<()> {
+        relaunch(&std::env::current_exe()?)
     }
 
     /// Remove the `.old` file a previous update left behind. Called at

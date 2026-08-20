@@ -619,6 +619,26 @@ button.danger:hover {
   background: color-mix(in srgb, var(--st-ok) 20%, transparent);
 }
 
+/* A GLOW for the three states a user needs to know they are still in after
+   walking away, asked for by name: the vault is unlocked, the tunnel is
+   carrying traffic, a saved password is available for this page.
+   
+   Same green as every other "this is on" signal, because the meaning is the
+   same and this row has exactly one colour rule. The glow is an ADDITION to
+   the outline above, not a replacement: it survives being looked at out of
+   the corner of an eye, which is the whole job. Not the accent -- that means
+   focus and hover, and confusing "you are tunnelled" with "your cursor is
+   here" is the one mistake this scheme exists to prevent.
+
+   Scoped to these three deliberately. Every protection pill glowing at once
+   would be a lit-up row that says nothing, and the status pills keep their
+   single-outline restraint. */
+#btn-vault.is-active,
+#btn-tunnel.is-active,
+#btn-fill.is-active {
+  box-shadow: 0 0 8px color-mix(in srgb, var(--st-ok) 55%, transparent);
+}
+
 /* The engine REFUSED something that was asked of it.
  *
  * This class was already being written -- chrome.js toggles it on the freeze
@@ -789,7 +809,12 @@ body.loading #url {
    A panel added later belongs HERE, not in a rule of its own. */
 #vault-panel,
 #privacy-panel,
-#recall-panel,
+/* The tools modal host. Joined this list on 2026-08-19, the DAY it was
+   created, because it shipped one hardware round without it and rendered
+   exactly the failure the comment above describes: a pale native-default
+   rectangle with integrity.js's own dark card floating inside it. The list
+   is the point; a panel added later belongs HERE. */
+#integrity-host,
 #dns-panel,
 #tunnel-panel,
 #tab-panel,
@@ -1088,6 +1113,100 @@ body.loading #url {
   user-select: none;
   -webkit-user-select: none;
   touch-action: none;
+}
+/* What the image check read. Monospace because alignment is meaning here --
+   a card number split across two OCR lines should look split -- and scrolled
+   rather than unbounded so a dense screenshot cannot push the findings off
+   the panel. pre-wrap: long lines wrap instead of forcing a sideways scroll
+   nobody expects in a text block. */
+#leakcheck-text {
+  margin: 0.4rem 0 0;
+  padding: 0.5rem 0.6rem;
+  max-height: 32vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--st-dim, #8f909a);
+  background: var(--sf-row, #1f2027);
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 6px;
+}
+
+/* Openers with no place in the layout. display:none rather than the hidden
+   ATTRIBUTE, deliberately: the palette's availability filter reads .hidden,
+   and these buttons are not unavailable -- they are the palette's own doors
+   to surfaces with no toolbar button. The hidden attribute on them is what
+   kept "Switch tab..." and "Select tabs..." out of the palette in every
+   build since 0.9.63. */
+.detached-opener {
+  display: none;
+}
+
+/* The tools modal: Page integrity, Deep Recall, and the image check under
+   one roof. The strip is buttons, not a reinvented tab widget; the active
+   one borrows the toolbar's aria-pressed convention so the state is visible
+   and readable by the same rules everywhere. Bodies are plain sections whose
+   [hidden] the tab logic drives -- #recall-panel used to be a top-level
+   panel and keeps its inner styling, minus the panel-list membership it left
+   above. */
+#tools-tabs {
+  display: flex;
+  gap: 0.4rem;
+  margin-bottom: 0.8rem;
+  border-bottom: 1px solid var(--line, #2a2f3a);
+  padding-bottom: 0.6rem;
+}
+#tools-tabs button[aria-pressed="true"] {
+  border-color: var(--accent, #4f8cff);
+  color: var(--accent-ink, #9ab8f0);
+}
+.tools-body {
+  padding: 0;
+}
+
+/* The Deep Recall preview. Same sizing as the region capture above, minus
+   the crosshair: this image is looked at, not dragged over. The border says
+   "this is a saved copy", separating it from the live page behind the
+   panel. */
+/* The stage scrolls, not the panel. A full-page capture is far taller than
+   any card, and at Actual size wider too, so both axes are live here and the
+   picture is the thing that moves -- panning it must not drag the panel's
+   own scroll with it. */
+#recall-preview-stage {
+  overflow: auto;
+  max-height: 60vh;
+  border: 1px solid var(--line, #2a2f3a);
+  border-radius: 6px;
+  background: var(--sf-panel, #1a1b20);
+}
+#recall-preview-img {
+  display: block;
+  width: 100%;
+  height: auto;
+  margin: 0;
+  user-select: none;
+  -webkit-user-select: none;
+}
+/* Zoomed: the picture stops shrinking to the card and the stage scrolls to
+   reach the rest of it. The WIDTH is set inline by the zoom control (a
+   percentage of the picture's natural width), so the rule's job is only to
+   stop anything else clamping it. */
+#recall-preview.zoomed #recall-preview-img {
+  max-width: none;
+  width: auto;
+}
+#recall-preview-level {
+  min-width: 3.5rem;
+  text-align: center;
+  font-size: 12px;
+  color: var(--st-dim, #8f909a);
+  align-self: center;
+}
+#recall-preview {
+  margin-top: 0.6rem;
 }
 #region-selbox {
   position: absolute;
@@ -1808,10 +1927,120 @@ textarea {
   background: var(--st-err-bg2);
 }
 
+/* Plain HTTP. AMBER, deliberately, not the danger red: this is the browser
+   saying "nothing here is encrypted", a fact about the connection, not a
+   claim that anyone means the user harm -- red is reserved for the blocklist
+   and interception banners, and spending it on every http:// site would
+   teach the eye to skim it. Continue is styled as the dangerous choice all
+   the same, using the same warn tokens the resolver banner uses. */
+#insecure-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-warn-bg2);
+  color: var(--st-warn);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#insecure-warning[hidden] {
+  display: none;
+}
+#insecure-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+#insecure-warning .banner-actions button.danger {
+  color: var(--st-warn-text);
+  border-color: var(--st-warn-border2);
+  background: var(--st-warn-bg);
+}
+
 /* A newer version is available. NEUTRAL palette: this is news, not a warning.
    Using the amber or red treatment would spend the user's alarm budget on
    "there is an update", and the day a real warning appears they would have
    learned to skim past that colour. */
+/* The tunnel banner had NO rule of its own -- every sibling in this band
+   has one, and without it this rendered as a bare block with no padding,
+   no background and an icon that did not line up. Found while reworking
+   the panel; the gate checked its copy and its BANNERS membership but
+   never that it was styled. Same error palette as #tls-warning: this
+   banner says traffic is NOT going where the user asked. */
+#tunnel-warning {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 14px;
+  background: var(--st-err-bg);
+  color: var(--st-err);
+  border-bottom: 1px solid var(--ln);
+}
+
+/* Numbered headings inside the tunnel panel. Small and quiet: they are
+   signposts through a five-minute setup, not section titles competing
+   with the panel's own h1. */
+/* The "what unlocking turns on" list on the unlock pane. Tight and quiet:
+   it is orientation for someone deciding whether to type a passphrase, not
+   a feature tour. */
+/* The line that introduces the chips. Needs air above it: without this it
+   runs straight into the auto-lock sentence and reads as one paragraph. */
+#vault-locked .vault-enables-intro {
+  margin-top: 12px;
+}
+.vault-enables {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 6px 0 10px;
+  padding: 0;
+  list-style: none;
+}
+/* Rounded, outlined chips rather than a bulleted column: the row reads in a
+   glance and costs three lines instead of ten on a panel that is already
+   long. The ACCENT border, deliberately not the state green -- green means
+   "this protection is ON", and every one of these is OFF while the reader is
+   looking at a locked vault. Saying otherwise in colour would be the same
+   class of lie the tunnel banner was telling. */
+/* The forced row break: not a chip, so it takes none of the chip styling
+   and none of the gap's visual weight. */
+.vault-enables li.vault-enables-break {
+  flex-basis: 100%;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: none;
+}
+.vault-enables li {
+  padding: 3px 10px;
+  border: 1px solid var(--accent-choice-border);
+  border-radius: 999px;
+  background: var(--accent-choice-bg);
+  color: var(--accent-choice-text);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+#tunnel-panel .tunnelp-step {
+  margin: 14px 0 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tx-max);
+}
+#tunnel-panel .tunnelp-paste-label {
+  display: block;
+  margin: 8px 0 4px;
+  color: var(--tx);
+}
+#tunnel-panel #tunnelp-paste {
+  width: 100%;
+  box-sizing: border-box;
+  font-family: monospace;
+  font-size: 12px;
+  resize: vertical;
+}
+
 #update-banner {
   display: flex;
   gap: 10px;
@@ -3901,6 +4130,7 @@ html {
 :root[data-toolbar-placement="left"] #save-password-banner,
 :root[data-toolbar-placement="left"] #lock-warning,
 :root[data-toolbar-placement="left"] #tunnel-warning,
+:root[data-toolbar-placement="left"] #insecure-warning,
 :root[data-toolbar-placement="left"] #findbar {
   margin-left: var(--chrome-left-px, 0px);
 }

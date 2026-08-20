@@ -387,11 +387,33 @@ pub fn handle_event(state: &mut AppState, event: OcrEvent) {
                         })
                     })
                     .collect();
+                // WHAT IT READ, not only what it matched. "Found nothing
+                // sensitive" is a verdict from SEVEN kinds -- count them off
+                // leaks::LeakKind, not off scan_text, which is the mistake
+                // that put "five" into published copy: six come from
+                // scan_text (an email, a 12-19 digit Luhn run, a longer digit
+                // run, an API token, a private-key header, an IPv4) and
+                // HiddenText comes from scan_regions. A reader cannot
+                // check a verdict they cannot see the evidence for -- the
+                // question that prompted this was exactly "how does it know
+                // what's sensitive?". The region scan has always returned its
+                // text; this one returned a count, so the panel could say
+                // "read 26 lines" and never show one.
+                //
+                // Local only, like everything else here: the picture is the
+                // user's own, the text is theirs, it goes to their screen and
+                // is never stored or sent.
+                let text = regions
+                    .iter()
+                    .map(|r| r.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join("\n");
                 json!({
                     "token": event.token,
                     "ok": true,
                     "kind": "leaks",
                     "findings": findings,
+                    "text": text,
                     // Distinguishes "nothing sensitive found" from "no text at
                     // all", which mean very different things to someone about
                     // to share a screenshot.

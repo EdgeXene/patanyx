@@ -33,6 +33,8 @@
 //! * No clock, no filesystem, no network, no RNG. `today_utc` is always a
 //!   parameter.
 
+#![forbid(unsafe_code)]
+
 mod base64url;
 mod crc32;
 mod days;

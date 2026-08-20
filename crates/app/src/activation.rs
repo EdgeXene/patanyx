@@ -153,8 +153,36 @@ pub fn decode_hex_16(hex: &str) -> Option<[u8; 16]> {
 fn licence_origin() -> String {
     std::env::var("PATANYX_LICENCE_ORIGIN")
         .ok()
-        .filter(|v| v.starts_with("http://127.0.0.1:") || v.starts_with("http://localhost:"))
+        .filter(|v| is_loopback_origin(v))
         .unwrap_or_else(|| crate::updater::base_url().to_string())
+}
+
+/// Is this override a real loopback origin, by the HOST rather than by how
+/// the string begins?
+///
+/// A prefix test reads `http://localhost:@evil.example/` as loopback: the
+/// userinfo runs up to the last `@`, so everything before it is a username
+/// and the actual host is `evil.example` (security audit 2026-08-18, F5).
+/// The override then aims the activation POST -- which carries the full
+/// licence token and this install's device id -- at whatever that resolves
+/// to. Reaching it needs control of the process environment, which is
+/// already a lost machine, but "you had to be compromised first" is a reason
+/// to fix a hole cheaply rather than a reason to keep it.
+///
+/// `host_of` is the same extraction the content allowlist uses, so the two
+/// agree about where a host ends and there is one place to correct if a
+/// browser ever normalizes differently. A port is required, as before: the
+/// override exists for the end-to-end gate, which always names one.
+fn is_loopback_origin(value: &str) -> bool {
+    let Some(host) = crate::state::host_of(value) else {
+        return false;
+    };
+    if !matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]") {
+        return false;
+    }
+    // http only, and a port must be present: this is a test hook, not a
+    // second production endpoint.
+    value.starts_with("http://") && value.rsplit(':').next().is_some_and(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
 }
 
 /// How one activation attempt ended.
@@ -535,7 +563,78 @@ mod tests {
     }
 
     #[test]
+    /// ACTIVATION MUST NEVER ACCEPT AN INTERCEPTED CONNECTION.
+    ///
+    /// The update and blocklist channels may fall back to the OS trust store,
+    /// because their integrity rests on the compiled-in Ed25519 key rather
+    /// than on TLS (see `net::Roots`, security audit 2026-08-18, F21). This
+    /// request is the opposite case: it SENDS the licence token and this
+    /// install's device id, so TLS confidentiality is the whole protection
+    /// and no signature can recover a secret already handed to a proxy.
+    ///
+    /// Reading the source is the only way to state "this function is not
+    /// called here" as a test. Same idiom as privacy.rs's zero-channels
+    /// check. If activation ever legitimately needs the relaxed agent, that
+    /// is a decision to argue for in a commit message, not a line to slip in.
+    #[test]
+    fn activation_never_reaches_for_the_relaxed_agent() {
+        // ONLY THE SHIPPED HALF. The test module below necessarily names the
+        // function it is asserting the absence of, which would match itself --
+        // the same self-match the export guard avoids by excluding its own
+        // file. Everything above `#[cfg(test)]` is what is compiled into the
+        // binary, and that is what this is about.
+        let source = include_str!("activation.rs");
+        let shipped = source
+            .split_once("#[cfg(test)]")
+            .map(|(before, _)| before)
+            .unwrap_or(source);
+        let needle = concat!("agent_accepting", "_os_roots");
+        let calls: Vec<&str> = shipped
+            .lines()
+            .filter(|l| l.contains(needle))
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect();
+        assert!(
+            calls.is_empty(),
+            "activation must use only the strict agent; found: {calls:?}"
+        );
+        // And it does still build one, or it would not be talking to anything.
+        assert!(
+            shipped.contains("crate::net::agent("),
+            "the activation call lost its agent entirely"
+        );
+    }
+
+    #[test]
     fn the_origin_override_only_accepts_loopback() {
+        // USERINFO IS NOT A HOST (security audit 2026-08-18, F5). The last
+        // `@` ends the userinfo, so each of these has a real host that is not
+        // loopback while BEGINNING with a loopback-looking string. A prefix
+        // test accepted every one and aimed the activation POST -- the full
+        // licence token and this install's device id -- at the attacker.
+        for spelling in [
+            "http://localhost:@evil.example/",
+            "http://127.0.0.1:@evil.example/",
+            "http://localhost:8788@evil.example/",
+            "http://127.0.0.1:1@evil.example/",
+            // A host that merely starts with the loopback name.
+            "http://localhost.evil.example:8788/",
+            "http://127.0.0.1.evil.example:8788/",
+            // https is not the shape this hook takes.
+            "https://127.0.0.1:8788/",
+        ] {
+            std::env::set_var("PATANYX_LICENCE_ORIGIN", spelling);
+            assert_ne!(
+                licence_origin(),
+                spelling,
+                "a non-loopback host reached the override: {spelling}"
+            );
+        }
+        // The genuine article still works, or the end-to-end gate cannot run.
+        for good in ["http://127.0.0.1:18788", "http://localhost:18788"] {
+            std::env::set_var("PATANYX_LICENCE_ORIGIN", good);
+            assert_eq!(licence_origin(), good, "loopback override refused: {good}");
+        }
         std::env::set_var("PATANYX_LICENCE_ORIGIN", "http://evil.example");
         assert_eq!(licence_origin(), crate::updater::base_url());
         std::env::set_var("PATANYX_LICENCE_ORIGIN", "http://127.0.0.1:18788");

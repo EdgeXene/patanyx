@@ -200,7 +200,18 @@ fn refresh_blocking() -> Result<(u64, usize), String> {
         16 * 1024,
         std::time::Duration::from_secs(20),
     )
-    .map_err(|e| format!("manifest fetch: {e:?}"))?;
+    // Same reasoning as the list fetch below, and this is the one that
+    // usually fails first: the manifest is the smaller, earlier request.
+    .map_err(|e| {
+        let detail = format!("{e:?}").to_ascii_lowercase();
+        if detail.contains("certificate") || detail.contains("unknownissuer") {
+            "could not confirm it was talking to the list server; something \
+             is inspecting encrypted traffic on this computer or its network"
+                .to_string()
+        } else {
+            "could not reach the list server".to_string()
+        }
+    })?;
 
     // Signature FIRST. Until this returns Ok the bytes are attacker-controlled
     // and nothing is parsed from them.
@@ -219,7 +230,22 @@ fn refresh_blocking() -> Result<(u64, usize), String> {
         MAX_BLOCKLIST_BYTES,
         std::time::Duration::from_secs(60),
     )
-    .map_err(|e| format!("list fetch: {e:?}"))?;
+    // NOT `{e:?}`. That put a Rust Debug string in front of a user --
+    // `Network("A connection attempt failed because the connected party did
+    // not properly respond ... (os error 10060)")` -- inside a row that
+    // already says REFRESH FAILED in red. Nobody can act on an os error
+    // number, and the row's real news is the reassuring half: the list
+    // already downloaded is still in force, which the caller states.
+    .map_err(|e| {
+        let detail = format!("{e:?}").to_ascii_lowercase();
+        if detail.contains("certificate") || detail.contains("unknownissuer") {
+            "could not confirm it was talking to the list server; something \
+             is inspecting encrypted traffic on this computer or its network"
+                .to_string()
+        } else {
+            "could not reach the list server".to_string()
+        }
+    })?;
 
     // Hash and length against the SIGNED manifest. This is what makes the
     // hosting untrusted: whoever serves the file cannot change it.

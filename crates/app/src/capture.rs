@@ -29,16 +29,14 @@ pub enum CaptureScope {
     FullPage,
 }
 
-/// The scope this build produces.
+/// What this build's capture path aims for, used only where no event is in
+/// hand (the Windows fallback reports its own scope on the event).
+///
+/// NOT the label for a finished capture: read `CaptureEvent::scope` for that.
+/// This said `VisibleArea` on Windows long after Windows started capturing
+/// whole pages, and every surface that trusted it lied in the same way.
 pub const fn current_scope() -> CaptureScope {
-    #[cfg(windows)]
-    {
-        CaptureScope::VisibleArea
-    }
-    #[cfg(not(windows))]
-    {
-        CaptureScope::FullPage
-    }
+    CaptureScope::FullPage
 }
 
 /// Label used in the saved toast; the honest half of the platform split.
@@ -92,6 +90,71 @@ pub fn validate_capture_bytes(bytes: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Ceiling on a base64-encoded capture, before it is decoded.
+///
+/// 96 MiB of base64 is about 72 MiB of PNG, which is a very tall page and
+/// far beyond anything a person saves on purpose. The viewport capture never
+/// needed a ceiling because the window bounded it; a whole-page capture of
+/// an endless feed is bounded by nothing, and the encoded string, its parsed
+/// copy and the decoded bytes are all resident at the same moment.
+pub const MAX_CAPTURE_BASE64: usize = 96 * 1024 * 1024;
+
+/// Decodes standard base64 (RFC 4648, with or without padding).
+///
+/// Hand-written because this tree takes NO new dependency for thirty lines
+/// of table lookup, and it is needed for exactly one thing: the DevTools
+/// protocol returns a full-page screenshot as a base64 string, and that is
+/// the path that finally made Deep Recall save a page rather than a
+/// viewport. Whitespace is tolerated because JSON transports sometimes wrap;
+/// any other character is a refusal rather than a guess, since a silently
+/// mis-decoded PNG would fail validation later with a far worse message.
+pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    const INVALID: u8 = 0xFF;
+    let value = |c: u8| -> u8 {
+        match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            _ => INVALID,
+        }
+    };
+    let mut out = Vec::with_capacity(input.len() / 4 * 3 + 3);
+    let mut acc: u32 = 0;
+    let mut bits: u32 = 0;
+    let mut padding = 0usize;
+    for c in input.bytes() {
+        if c.is_ascii_whitespace() {
+            continue;
+        }
+        if c == b'=' {
+            padding += 1;
+            continue;
+        }
+        // Data after padding is malformed, not merely odd.
+        if padding > 0 {
+            return None;
+        }
+        let v = value(c);
+        if v == INVALID {
+            return None;
+        }
+        acc = (acc << 6) | v as u32;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    // Leftover bits must be zero; anything else means truncated input.
+    if bits >= 6 || acc != 0 || padding > 2 {
+        return None;
+    }
+    Some(out)
+}
+
 /// One capture at a time. Set when a capture starts, cleared when its
 /// event is handled; a second request while one is pending is refused with
 /// "busy" instead of queueing a second picker behind the first.
@@ -121,6 +184,19 @@ pub enum CaptureIntent {
 /// the UI thread, exactly like the other pickers.
 pub struct CaptureEvent {
     pub png: Result<Vec<u8>, &'static str>,
+    /// What this capture ACTUALLY covered, set by the path that produced it
+    /// rather than by the platform it ran on.
+    ///
+    /// It used to be read from `current_scope()`, a compile-time constant
+    /// saying "visible area" on Windows -- which stopped being true the day
+    /// Windows learned to capture a whole page, and stayed wrong in the save
+    /// dialog, the toast, the region panel, and, worst, PERSISTED into every
+    /// saved Deep Recall record. A const cannot describe a decision made at
+    /// runtime, and there is one now: the full-page path can fall back to the
+    /// viewport on a runtime too old to answer the protocol call. Carrying it
+    /// on the event is what lets that fallback label itself honestly instead
+    /// of inheriting a promise the other path made.
+    pub scope: CaptureScope,
 }
 
 /// The one in-memory capture the region mode may currently be looking at.
@@ -202,6 +278,32 @@ pub fn clear_region() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn base64_round_trips_the_shapes_a_screenshot_arrives_in() {
+        // The three residue cases, which is where a hand-rolled decoder goes
+        // wrong: 3n bytes (no padding), 3n+1 (==), 3n+2 (=).
+        assert_eq!(decode_base64("TWFu").as_deref(), Some(&b"Man"[..]));
+        assert_eq!(decode_base64("TWE=").as_deref(), Some(&b"Ma"[..]));
+        assert_eq!(decode_base64("TQ==").as_deref(), Some(&b"M"[..]));
+        assert_eq!(decode_base64("").as_deref(), Some(&b""[..]));
+        // Unpadded is accepted: some transports strip it.
+        assert_eq!(decode_base64("TWE").as_deref(), Some(&b"Ma"[..]));
+        // A real PNG header, which is what this actually carries.
+        let png = decode_base64("iVBORw0KGgo=").expect("png header");
+        assert!(crate::capture::is_plausible_png(&[&png[..], &[0u8; 32][..]].concat()));
+    }
+
+    #[test]
+    fn base64_refuses_rather_than_guesses() {
+        // A mis-decode would surface later as "capture_failed" on a PNG that
+        // was never a PNG, which is a much worse message than refusing here.
+        assert_eq!(decode_base64("!!!!"), None, "invalid alphabet");
+        assert_eq!(decode_base64("TQ==TQ=="), None, "data after padding");
+        assert_eq!(decode_base64("T"), None, "a lone sextet is truncated");
+        // Whitespace is tolerated: JSON transports wrap long strings.
+        assert_eq!(decode_base64("TW Fu\n").as_deref(), Some(&b"Man"[..]));
+    }
+
     use super::*;
 
     #[test]

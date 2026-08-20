@@ -2083,7 +2083,11 @@ pub fn capture_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                     .save_to_bufferv("png", &[])
                     .map_err(|_| "capture_failed")
             })();
-            let _ = proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent { png }));
+            // WebKitGTK's SnapshotRegion::FullDocument, always the whole page.
+            let _ = proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent {
+                png,
+                scope: crate::capture::CaptureScope::FullPage,
+            }));
         },
     );
 }
@@ -2252,6 +2256,16 @@ pub fn engine_info() -> crate::platform::EngineInfo {
 /// detail of the engine.
 pub fn tick_auto_freeze(_view: &TabView, _now: Instant) -> (bool, Option<Instant>) {
     (false, None)
+}
+
+/// Strip the source address from a finished download's Mark-of-the-Web.
+///
+/// A no-op here: the `Zone.Identifier` stream is an NTFS feature and neither
+/// WebKitGTK nor any Linux filesystem writes one. Present so `platform`
+/// exposes one shape on both targets and the event loop stays free of
+/// `#[cfg]`. See `platform::motw` for what the Windows arm does and why.
+pub fn scrub_download_mark(_path: &std::path::Path) -> super::motw::Outcome {
+    super::motw::Outcome::NotApplicable
 }
 
 #[cfg(test)]

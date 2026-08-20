@@ -486,6 +486,39 @@
       detailText += "\n\nWhat is new in " + st.offered + ":\n" + st.notes;
     }
 
+    // YOUR NETWORK IS READING THIS CONNECTION, AND SAYING SO IS THE POINT.
+    //
+    // A corporate proxy terminates TLS and re-signs it with a CA the machine
+    // trusts and no public root list does. The check now retries against the
+    // OS trust store so such a user still RECEIVES updates -- before, they
+    // silently received none at all -- and this is the half that keeps the
+    // fallback honest: the fact is shown, not swallowed, along with what
+    // still protected the download when TLS did not.
+    //
+    // Deliberately not styled as an error. Nothing failed, and the update is
+    // exactly as trustworthy as any other: the manifest carries the
+    // publisher's signature and the bytes are checked against it.
+    //
+    // PRESENT TENSE, AND THAT IS LOAD-BEARING. The flag is set by the
+    // MANIFEST fetch, which is the check -- so this notice appears with no
+    // download in existence, and an earlier draft saying "the download was
+    // still verified" was simply false on screen in the ordinary
+    // up-to-date case. It states the standing property instead.
+    //
+    // The last sentence is the inconvenient half, and it belongs here: a
+    // proxy that terminates TLS sees the request. Scoped to what this
+    // request actually reveals -- that a check happened -- because the
+    // manifest URL is identical for every install and carries no version.
+    if (st.intercepted) {
+      detailText +=
+        "\n\nSomething on your network is inspecting encrypted traffic, so " +
+        "the last signed fetch from the update server was accepted against " +
+        "the certificates your computer trusts. Updates are verified against " +
+        "the publisher's signature, " +
+        "which does not depend on the connection. Whoever runs that equipment " +
+        "can see that this browser checked for an update.";
+    }
+
     els.status.textContent = stateText;
     els.detail.textContent = detailText;
     els.detail.style.color = detailColor;

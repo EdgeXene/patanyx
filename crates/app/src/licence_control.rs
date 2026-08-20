@@ -489,10 +489,13 @@ pub fn keys_available() -> bool {
 /// History: the machinery landed fully tested with NO enforcement on
 /// purpose -- flipping a feature switch was reserved as a later, deliberate
 /// act, and the cross-tab search is that act. Nothing else gates yet; the
-/// features shipped unlocked as Premium seeds (divergence, the photo check)
-/// still flip only at the actual Premium launch. Theme packs left that list
-/// on 2026-08-16 and are free permanently -- there is no switch here to flip
-/// for them, and adding one would break a published promise. The reasoning
+/// features shipped unlocked as Premium seeds (the photo check) still flip
+/// only at the actual Premium launch. Theme packs left that list on
+/// 2026-08-16 and are free permanently -- there is no switch here to flip
+/// for them, and adding one would break a published promise. FINGERPRINT
+/// DIVERGENCE LEFT IT ON 2026-08-19 the same way, and so did its per-site
+/// exceptions, whose three IPC arms did genuinely refuse without a licence
+/// until that day. The reasoning
 /// is in `about.rs::PREMIUM`.
 pub fn premium_active() -> bool {
     lock(&SESSION)

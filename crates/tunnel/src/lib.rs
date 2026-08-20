@@ -38,6 +38,8 @@
 //! across the handover with no window where the port is free for another
 //! process.
 
+#![forbid(unsafe_code)]
+
 mod config;
 mod session;
 mod socks;

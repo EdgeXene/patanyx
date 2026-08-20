@@ -569,6 +569,43 @@ impl Store {
         self.save()
     }
 
+    /// Empty the bookmark manager: every bookmark and every folder name.
+    ///
+    /// IRREVERSIBLE, AND THAT IS THE POINT OF THE NAME. There is no undo
+    /// buffer, no trash, and no bookmark export to fall back on -- the only
+    /// copy of this data lives in the vault this store is, so once saved it
+    /// is gone. The confirmation belongs in the UI; this function does what
+    /// it is told.
+    ///
+    /// WHAT GOES, and why it is both vectors rather than just the first:
+    ///   * every `Bookmark`, which OWNS its tags, its Quick Access pin and
+    ///     its provenance digest -- so those go with it and cannot be left
+    ///     behind pointing at nothing (see `Bookmark::digest`);
+    ///   * every folder NAME in `bookmark_folders`, which exists only to
+    ///     keep an empty folder visible. Leaving those would empty the
+    ///     manager and still show a sidebar of folders, which is not what
+    ///     "delete everything" looked like when it was asked for.
+    ///
+    /// WHAT STAYS, deliberately: downloads, shelves, archived pages and
+    /// divergence overrides. They share this store but they are not the
+    /// bookmark manager, and a bulk delete that quietly took them too would
+    /// be the worst kind of surprise.
+    ///
+    /// Returns what was removed, so the caller can report a number the user
+    /// can check against what they were just looking at.
+    pub fn delete_all_bookmarks(&mut self) -> Result<(usize, usize), StoreError> {
+        let bookmarks = self.data.bookmarks.len();
+        let folders = self.data.bookmark_folders.len();
+        if bookmarks == 0 && folders == 0 {
+            // Nothing to do, and no reason to rewrite the vault for it.
+            return Ok((0, 0));
+        }
+        self.data.bookmarks.clear();
+        self.data.bookmark_folders.clear();
+        self.save()?;
+        Ok((bookmarks, folders))
+    }
+
     /// Replace the whole bookmark set, for vault import. Returns how many
     /// were kept.
     ///
@@ -1240,6 +1277,73 @@ mod tests {
         fs::write(&path, &bytes).unwrap();
         let err = Store::unlock(&path, "pw").unwrap_err();
         assert!(matches!(err, StoreError::AuthFailed), "got {err:?}");
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn deleting_the_whole_manager_takes_bookmarks_folders_tags_pins_and_digests() {
+        let path = test_path("delete-all");
+        let mut store = make_store(&path, "pw");
+
+        let a = store.add_bookmark("https://a.example/", "A").unwrap();
+        let b = store.add_bookmark("https://b.example/", "B").unwrap();
+        store.mark_seen(&a, page_digest("page a content")).unwrap();
+        store.set_bookmark_tags(&b, vec!["work".into()]).unwrap();
+        store.set_quick_access(&a, true).unwrap();
+        store.create_folder("Reading").unwrap();
+
+        // A download record shares this store and must NOT be swept up: it
+        // is not the bookmark manager.
+        store
+            .record_download("https://a.example/f.bin", "f.bin", 10, [7u8; 32])
+            .unwrap();
+
+        assert_eq!(store.delete_all_bookmarks().unwrap(), (2, 1));
+
+        assert!(store.bookmarks().is_empty(), "bookmarks survived");
+        assert!(store.folders().is_empty(), "folder names survived");
+        // The digest went with the bookmark that owned it.
+        assert!(matches!(
+            store.check(&a, &page_digest("page a content")),
+            Err(StoreError::NotFound(_))
+        ));
+        assert_eq!(store.downloads().len(), 1, "downloads must not be swept up");
+
+        // Gone from the vault, not merely from memory.
+        let store = Store::unlock(&path, "pw").unwrap();
+        assert!(
+            store.bookmarks().is_empty(),
+            "bookmarks came back on unlock"
+        );
+        assert!(store.folders().is_empty(), "folders came back on unlock");
+        assert_eq!(store.downloads().len(), 1, "downloads lost on unlock");
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn deleting_an_already_empty_manager_is_a_no_op() {
+        // Reports nothing removed, and does not rewrite the vault for it.
+        let path = test_path("delete-all-empty");
+        let mut store = make_store(&path, "pw");
+        assert_eq!(store.delete_all_bookmarks().unwrap(), (0, 0));
+        assert!(store.bookmarks().is_empty());
+        // Twice in a row is still fine.
+        assert_eq!(store.delete_all_bookmarks().unwrap(), (0, 0));
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn an_empty_folder_alone_is_still_worth_deleting() {
+        // A manager with no bookmarks but folders the user made is not
+        // "already empty": the delete must still clear and report them.
+        let path = test_path("delete-all-folders");
+        let mut store = make_store(&path, "pw");
+        store.create_folder("Reading").unwrap();
+        store.create_folder("Work").unwrap();
+        assert_eq!(store.delete_all_bookmarks().unwrap(), (0, 2));
+        assert!(store.folders().is_empty());
+        let store = Store::unlock(&path, "pw").unwrap();
+        assert!(store.folders().is_empty(), "folders came back on unlock");
         let _ = fs::remove_dir_all(&path);
     }
 

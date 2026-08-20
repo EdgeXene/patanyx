@@ -1,0 +1,6 @@
+# libFuzzer's working state. Crash INPUTS under artifacts/ are deliberately
+# NOT ignored: a crashing input is evidence, and it belongs in the history
+# next to the test that was written for it.
+target/
+corpus/
+coverage/

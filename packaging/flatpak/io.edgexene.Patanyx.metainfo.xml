@@ -48,6 +48,27 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="0.9.65" date="2026-08-19">
+      <description>
+        <p>Fingerprint Divergence is free, permanently, and on by default. Turning its noise off for named sites is free with it; that used to ask for a Premium license and no longer does.</p>
+        <p>A page saved with Deep Recall can now be opened and looked at, not only searched, with zoom from a quarter size up to four times. Its picture stays encrypted on this device and is shown one at a time; locking the vault takes it off screen. On Windows the picture now covers the whole page rather than the part that was on screen.</p>
+        <p>Reading text out of pictures is far better at finding it. A saved page used to be squashed into one small square before the reader looked at it, which left ordinary body text too small to see, and each line it did find was crushed sideways to fit a fixed width. Pages are now read in overlapping pieces at their real size, and a long line is read in sections split at the spaces between words.</p>
+        <p>Page integrity, Deep Recall and the image check share one window with three tabs, and both of the last two can now be reached from the command palette with Ctrl+K. The image check says which seven things it looks for and can show you everything it read.</p>
+        <p>Private Tunnel is one click. Apply and restart closes the browser and brings it back at your vault; unlock it and the tunnel starts carrying traffic and your tabs reopen. If any cannot be set aside, the browser now says so before it restarts rather than after, and any it cannot reopen are waiting in the Bookmark Manager under "Before tunnel restart", which is no longer deleted once a restore finishes.</p>
+        <p>A locked vault says so instead of reporting a broken tunnel, and a tunnel that is genuinely carrying traffic no longer raises that warning when the vault locks behind it. The vault, tunnel and password buttons glow while each one is live. The unlock pane lists what unlocking turns back on.</p>
+        <p>A saved password now fills forms that used to refuse it and make you retype, and when a page offers to save one the browser names the sender it actually saw. Ctrl+F puts the cursor in the find bar. A new tab hands the cursor to the address bar. The Bookmark Manager can be emptied in one go and counts every folder it is about to remove. A pinned shortcut shows the logo.</p>
+        <p>Opening a page over plain HTTP asks first, the warning cannot be relabeled underneath you between reading it and answering, and a site reached on a port can now be continued past. A page that offers you a file cannot disguise what type it is by writing the name backwards. On a network that inspects traffic, updates keep working and the browser tells you the network is inspecting.</p>
+      </description>
+    </release>
+    <release version="0.9.64" date="2026-08-19">
+      <description>
+        <p>Private Tunnel is one click. Apply and restart closes the browser and brings it back at your vault; unlock it and the tunnel starts carrying traffic and your tabs reopen. If anything goes wrong they are waiting in the Bookmark Manager under "Before tunnel restart". The panel now walks through the setup a step at a time instead of describing it.</p>
+        <p>A locked vault says so. With the tunnel switched on and the vault still locked, the browser used to report the tunnel as down, which sent people looking for a broken connection; it now says the vault holds the configuration and offers to open it. The unlock pane lists what unlocking turns back on.</p>
+        <p>The vault, Private Tunnel and password buttons glow while each one is genuinely live, so a tunnel left running is visible at a glance.</p>
+        <p>A saved password now fills forms that used to refuse it and make you retype, and when a page offers to save one the browser names the sender it actually saw. Ctrl+F puts the cursor in the find bar, so you can type straight away. A new tab hands the cursor to the address bar. The Bookmark Manager can be emptied in one go, and says exactly what that removes before it does it. A pinned shortcut shows the logo, because the program finally carries one.</p>
+        <p>Opening a page over plain HTTP asks first, and the warning cannot be relabelled underneath you between reading it and answering. A page that offers you a file cannot disguise what type it is by writing the name backwards. On a network that inspects traffic, updates keep working and the browser tells you the network is inspecting.</p>
+      </description>
+    </release>
     <release version="0.9.63" date="2026-08-17">
       <description>
         <p>The tab pack: Multi-Tab Search finds a word across every open tab and shows a snippet from each; the Tab Switcher finds a tab by a few letters of its title or address; Batch Tab Actions select several tabs and close, bookmark, or shelve them together. These three ask for a Premium license from day one and unlock when Premium launches. Bookmark Search in the Library is free and ranks the closest match first, even with letters missing.</p>

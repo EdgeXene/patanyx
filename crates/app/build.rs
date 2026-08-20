@@ -22,7 +22,113 @@ use std::path::PathBuf;
 // header of hostrules.rs for why this is an include and not an import.
 include!("src/platform/hostrules.rs");
 
+/// Embeds the Windows icon and version resource into the executable.
+///
+/// WHY THIS EXISTS. The shipped 0.9.63 binary had NO resource directory at
+/// all -- no icon, no version block. The app looked right while RUNNING,
+/// because main.rs sets a window icon from raw pixels at startup, but a
+/// PINNED taskbar shortcut points at the file and Windows reads the icon out
+/// of the file, finds nothing, and draws the blank generic placeholder.
+/// Reported from hardware 2026-08-18. The runtime icon cannot fix it; only a
+/// resource in the PE can.
+///
+/// The .rc is GENERATED rather than committed so the version block cannot go
+/// stale: the numbers come from CARGO_PKG_VERSION, which is the same source
+/// check-version.sh already treats as authoritative.
+///
+/// Compiled with llvm-rc, which lives in the same LLVM bin directory that
+/// build-windows.sh already puts on PATH for llvm-lib. A Windows build that
+/// cannot find it FAILS rather than quietly producing another iconless
+/// binary -- shipping one of those is the defect this exists to prevent.
+fn embed_windows_resources() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return;
+    }
+    let manifest = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let ico = manifest.join("patanyx.ico");
+    assert!(ico.is_file(), "patanyx.ico is missing at {}", ico.display());
+    println!("cargo:rerun-if-changed={}", ico.display());
+
+    let version = std::env::var("CARGO_PKG_VERSION").unwrap();
+    let mut parts = version
+        .split('.')
+        .map(|p| p.parse::<u16>().unwrap_or(0))
+        .collect::<Vec<_>>();
+    parts.resize(4, 0);
+    let quad = format!("{},{},{},{}", parts[0], parts[1], parts[2], parts[3]);
+
+    // No #include: every constant is spelled numerically so the script needs
+    // no Windows SDK headers, which a cross-compile does not have.
+    // `1 ICON` is the lowest icon id, which is the one Explorer shows.
+    let rc = format!(
+        "1 ICON \"{icon}\"\n\
+         1 VERSIONINFO\n\
+         FILEVERSION {quad}\n\
+         PRODUCTVERSION {quad}\n\
+         FILEFLAGSMASK 0x3fL\n\
+         FILEFLAGS 0x0L\n\
+         FILEOS 0x40004L\n\
+         FILETYPE 0x1L\n\
+         FILESUBTYPE 0x0L\n\
+         BEGIN\n\
+         BLOCK \"StringFileInfo\"\n\
+         BEGIN\n\
+         BLOCK \"040904b0\"\n\
+         BEGIN\n\
+         VALUE \"CompanyName\", \"EdgeXene LLC\"\n\
+         VALUE \"FileDescription\", \"PATANYX\"\n\
+         VALUE \"FileVersion\", \"{version}\"\n\
+         VALUE \"InternalName\", \"PATANYX\"\n\
+         VALUE \"OriginalFilename\", \"PATANYX.exe\"\n\
+         VALUE \"ProductName\", \"PATANYX\"\n\
+         VALUE \"ProductVersion\", \"{version}\"\n\
+         END\n\
+         END\n\
+         BLOCK \"VarFileInfo\"\n\
+         BEGIN\n\
+         VALUE \"Translation\", 0x409, 1200\n\
+         END\n\
+         END\n",
+        icon = ico.display(),
+        quad = quad,
+        version = version,
+    );
+    let rc_path = out.join("patanyx.rc");
+    std::fs::write(&rc_path, rc).unwrap_or_else(|e| panic!("writing {}: {e}", rc_path.display()));
+
+    let res_path = out.join("patanyx.res");
+    let tool = ["llvm-rc", "llvm-rc-14", "rc.exe"]
+        .into_iter()
+        .map(String::from)
+        .find(|t| {
+            std::process::Command::new(t)
+                .arg("/?")
+                .output()
+                .map(|o| o.status.success() || !o.stdout.is_empty() || !o.stderr.is_empty())
+                .unwrap_or(false)
+        })
+        .or_else(|| std::env::var("RC").ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "no resource compiler found (tried llvm-rc, llvm-rc-14, rc.exe, $RC). \
+                 A Windows build without one produces a binary with NO ICON, which is \
+                 the exact defect this step exists to prevent. On Debian: \
+                 apt-get install llvm-14, then put /usr/lib/llvm-14/bin on PATH."
+            )
+        });
+    let status = std::process::Command::new(&tool)
+        .arg(format!("/fo{}", res_path.display()))
+        .arg(&rc_path)
+        .status()
+        .unwrap_or_else(|e| panic!("running {tool}: {e}"));
+    assert!(status.success(), "{tool} failed on {}", rc_path.display());
+    // -bins, not the blanket form: tests link too and do not need this.
+    println!("cargo:rustc-link-arg-bins={}", res_path.display());
+}
+
 fn main() {
+    embed_windows_resources();
     let src = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("src")
         .join("blocklist.txt");

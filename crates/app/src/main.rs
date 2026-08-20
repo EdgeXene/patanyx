@@ -145,6 +145,14 @@ enum UserEvent {
     /// The staged update was installed; this process must end so the
     /// relaunched one is the only browser left.
     QuitForUpdate,
+    /// A replacement of THIS binary is already running and this process must
+    /// end. Same exit as `QuitForUpdate` and deliberately a separate variant:
+    /// nothing was installed, so a reader of either arm can tell at a glance
+    /// whether the binary on disk changed.
+    ///
+    /// Raised by the tunnel's "Apply and restart", which needs a new process
+    /// because the engine reads the proxy setting only at startup.
+    QuitForRelaunch,
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
     AutoLockTick,
@@ -214,6 +222,14 @@ enum UserEvent {
         host: String,
         rule: String,
     },
+    /// A plain-HTTP navigation was held back by the navigation handler
+    /// pending the user's Continue. Carries the URL so the chrome can name
+    /// the site and Rust can re-issue the same load; see
+    /// `AppState::note_insecure_navigation`.
+    InsecureNavigation {
+        tab_id: u64,
+        url: String,
+    },
     /// A content tab's password form was submitted. Carries exactly what the
     /// save-password banner needs -- the PASSWORD IS HERE because the banner
     /// offers to save it on the strength of this one message, held only in
@@ -222,7 +238,12 @@ enum UserEvent {
     /// unwritten). See `note_login_submitted` in state.rs.
     LoginSubmitted {
         tab_id: u64,
-        origin: String,
+        /// The URI of the document that sent the message, as the ENGINE
+        /// reports it (`ICoreWebView2WebMessageReceivedEventArgs::Source`),
+        /// never the `origin` the page put in its own JSON. See
+        /// `note_login_submitted`, which refuses the offer outright when this
+        /// disagrees with the tab's tracked URL.
+        source_url: String,
         username: String,
         password: String,
     },
@@ -285,6 +306,31 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
                 .header("Content-Security-Policy", CSP)
                 .body(Cow::Owned(bytes))
                 .expect("region capture response"),
+            None => http::Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Security-Policy", CSP)
+                .body(Cow::Borrowed(&b"not found"[..]))
+                .expect("static 404 response"),
+        };
+    }
+    // The Deep Recall preview's image. Same contract as /region-capture/
+    // above -- token-addressed, chrome-origin only, stale token is a 404 --
+    // with one difference in what the bytes ARE: this is a decrypted page
+    // from the encrypted archive, staged one at a time by
+    // archive_picture_stage and wiped on preview close, panel close, and
+    // vault lock. See archive.rs::STAGED_PICTURE for the custody rules.
+    if let Some(name) = request.uri().path().strip_prefix("/archive-picture/") {
+        let png = name
+            .strip_suffix(".png")
+            .and_then(|t| t.parse::<u64>().ok())
+            .and_then(archive::staged_png);
+        return match png {
+            Some(bytes) => http::Response::builder()
+                .header("Content-Type", "image/png")
+                .header("Content-Security-Policy", CSP)
+                .body(Cow::Owned(bytes))
+                .expect("archive picture response"),
             None => http::Response::builder()
                 .status(404)
                 .header("Content-Type", "text/plain; charset=utf-8")
@@ -375,6 +421,20 @@ const PROBE_SETTLE: std::time::Duration = std::time::Duration::from_secs(6);
 /// could round-trip. The result was `SMOKE FAIL: pings=1 vault_done=true` on
 /// Windows every time, and a coin flip on Linux.
 const SMOKE_SECOND_PING_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The wire name for a `motw::Outcome`, for the `download_finished` event.
+/// Spelled here rather than with a serde derive so the strings the chrome
+/// matches on are visible in one place next to where they are emitted.
+fn mark_outcome_name(outcome: platform::motw::Outcome) -> &'static str {
+    use platform::motw::Outcome::*;
+    match outcome {
+        NotApplicable => "n/a",
+        Clean => "clean",
+        Scrubbed => "scrubbed",
+        Failed => "failed",
+        Unknown => "unknown",
+    }
+}
 
 #[cfg(test)]
 mod build_variant_tests {
@@ -757,6 +817,13 @@ fn main() {
                 // what produced two browsers per click.
                 *control_flow = ControlFlow::Exit;
             }
+            Event::UserEvent(UserEvent::QuitForRelaunch) => {
+                // Same reason, and the same exit: Exit unwinds the event loop,
+                // which drops AppState and with it the vault, so the key
+                // material is zeroized and the vault's file lock is released
+                // for the process already waiting at its unlock screen.
+                *control_flow = ControlFlow::Exit;
+            }
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
@@ -863,9 +930,28 @@ fn main() {
                 // finished download is recorded"); until this call existed,
                 // the re-check it offers could never run.
                 app.record_download_provenance(&url, path.as_deref(), success);
+                // Then the mark. On Windows the engine has just written a
+                // Zone.Identifier stream carrying the source URL next to the
+                // file (observed on a real install, 2026-08-18); this keeps
+                // the zone and drops the address. AFTER provenance on
+                // purpose: provenance hashes the file's main stream, which
+                // this does not touch, but ordering it second means a
+                // failure here can never cost the fingerprint. The outcome
+                // rides on the finished event so the downloads view can say
+                // what happened -- `Failed` in particular, because then the
+                // address is still on disk and the user should hear it.
+                let mark = match (success, path.as_deref()) {
+                    (true, Some(p)) => platform::scrub_download_mark(std::path::Path::new(p)),
+                    _ => platform::motw::Outcome::NotApplicable,
+                };
                 app.emit(
                     "download_finished",
-                    json!({ "url": url, "path": path, "success": success }),
+                    json!({
+                        "url": url,
+                        "path": path,
+                        "success": success,
+                        "mark": mark_outcome_name(mark),
+                    }),
                 );
             }
             // The async main-resource read (or its failure) returns here from
@@ -906,13 +992,20 @@ fn main() {
                     json!({ "tab_id": tab_id, "host": host, "rule": rule }),
                 );
             }
+            Event::UserEvent(UserEvent::InsecureNavigation { tab_id, url }) => {
+                // Same shape as NavigationBlocked: the refusal already
+                // happened; this records it on the tab and lets the chrome
+                // ask the user, or a held-back page is indistinguishable from
+                // a broken browser.
+                app.note_insecure_navigation(tab_id, url);
+            }
             Event::UserEvent(UserEvent::LoginSubmitted {
                 tab_id,
-                origin,
+                source_url,
                 username,
                 password,
             }) => {
-                app.note_login_submitted(tab_id, origin, username, password);
+                app.note_login_submitted(tab_id, source_url, username, password);
             }
             Event::UserEvent(UserEvent::BlocklistRefreshed(outcome)) => {
                 // Reported to the chrome either way. A refresh that keeps
@@ -980,8 +1073,10 @@ fn main() {
                     Shortcut::LockVault => app.lock_vault(),
                     Shortcut::OpenCommandPalette => app.open_command_palette(),
                     Shortcut::Print => app.print_active_tab(),
-                    // The chrome owns the bar; the key only asks it to open.
-                    Shortcut::OpenFind => app.emit("find_open", json!({})),
+                    // The chrome owns the bar; the key asks it to open AND
+                    // takes keyboard focus off the page first, or the bar
+                    // opens with a caret in it that receives nothing.
+                    Shortcut::OpenFind => app.open_find_bar(),
                     // Same shape as OpenFind: the chrome owns the panel, the
                     // key only asks it to open, and the premium gate lives
                     // in the find_tabs_search arm -- the key is never a way

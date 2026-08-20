@@ -42,7 +42,13 @@ N=$(parse "$ALLOW" | wc -l)
 # this pin moves with it -- that is the pin working. 48 as of 2026-08-15:
 # the two first-party hosts (patanyx.com, the launch page; patanyx.net).
 # 49 as of 2026-08-17: wa.me, the tripwire's catch at the 0.9.63 rebuild.
-check "shipped allowlist parses to 49 hosts" "49" "$N"
+# 64 as of 2026-08-19: the warn-band sweep at the 0.9.64 release, the first
+# time that band was adjudicated as a set. Fifteen single-source reports of
+# established apexes -- a regulated broker, a university, a package
+# repository, a national carrier -- plus four hosting apexes where the
+# abusive page is a subdomain and taking the apex takes every customer.
+# Nothing from the refuse band; none of these ever held a build.
+check "shipped allowlist parses to 64 hosts" "64" "$N"
 # googll.store was allowlisted for one draft on the strength of its Tranco rank
 # and then removed; see the note in the allowlist. Asserted explicitly because
 # the mistake is an easy one to make twice.

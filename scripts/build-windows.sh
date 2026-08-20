@@ -22,6 +22,14 @@ for dir in $(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -V -r); do
   fi
 done
 
+if ! command -v llvm-rc >/dev/null 2>&1 && ! command -v llvm-rc-14 >/dev/null 2>&1; then
+  echo "BUILD FAIL: llvm-rc not found." >&2
+  echo "  build.rs needs it to compile the icon and version resource into the" >&2
+  echo "  exe. Without a resource the binary has NO ICON and a pinned taskbar" >&2
+  echo "  shortcut shows the blank placeholder (reported from hardware," >&2
+  echo "  2026-08-18). It ships beside llvm-lib in the same LLVM bin dir." >&2
+  exit 1
+fi
 if ! command -v llvm-lib >/dev/null 2>&1; then
   echo "BUILD FAIL: llvm-lib not found." >&2
   echo "  cc-rs needs it to archive ring's objects for the MSVC target." >&2

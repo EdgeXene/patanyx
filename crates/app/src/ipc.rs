@@ -829,37 +829,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // entry; the reply says how many opened.
         "shelf_restore" => {
             let id = arg_str(args, "id")?;
-            // Cloned out of the store first: the open calls below borrow
-            // state mutably, and a shelf is small.
-            let entries = {
-                store_open(state)?
-                    .shelves()
-                    .iter()
-                    .find(|shelf| shelf.id == id)
-                    .ok_or("not_found")?
-                    .tabs
-                    .clone()
-            };
-            let total = entries.len();
-            let mut opened = 0usize;
-            for entry in &entries {
-                if state.tabs.len() >= crate::state::MAX_TABS {
-                    break;
-                }
-                // Re-validated on the way back in, like tab_new does: this
-                // string came out of a file, not a live tab.
-                if !crate::state::is_allowed_content_url(&entry.url) {
-                    continue;
-                }
-                // First restored tab in the foreground, the rest behind it:
-                // one focus change per restore, not one per tab.
-                match state.new_tab(&entry.url, opened == 0) {
-                    Ok(_) => opened += 1,
-                    // A refused build stops the loop. The shelf is still
-                    // there, so nothing unopened is lost.
-                    Err(_) => break,
-                }
-            }
+            let (opened, total) = restore_shelf_tabs(state, id)?;
             Ok(json!({ "opened": opened, "total": total }))
         }
         // The chrome asks nothing before sending this (a shelf is small and
@@ -966,6 +936,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // recorded inside licence_control, never propagated into the
             // unlock.
             crate::licence_control::on_vault_unlocked(state);
+            // Last, and only after the tunnel is up: see the fn's own doc.
+            restore_after_tunnel_restart(state);
             Ok(json!({ "recovery_key": migrated }))
         }
         // The recovery key exists to be USED. `vault_create` mints one, shows
@@ -991,6 +963,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::tunnel_control::on_vault_unlocked(state);
             // Same as vault_unlock: ungated, recorded, never fatal.
             crate::licence_control::on_vault_unlocked(state);
+            // Same as vault_unlock: a recovery-key unlock owes the restore too.
+            restore_after_tunnel_restart(state);
             Ok(json!({}))
         }
         "vault_lock" => {
@@ -2049,9 +2023,18 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
 
         // Per-site Fingerprint Divergence. The GLOBAL toggle above stays
         // free: it ships today, and taking it away would break the promise
-        // that free features remain free. Only choosing per site is Premium.
+        // that free features remain free. Choosing per site is free too,
+        // as of 2026-08-19.
+        // NO PREMIUM GATE ON THESE FOUR, and it is not an oversight.
+        // Fingerprint Divergence and its per-site exceptions are FREE
+        // PERMANENTLY as of 2026-08-19, the same treatment
+        // theme packs got on 2026-08-16. The site says so in plain words on
+        // the landing page, the About page and the Fingerprint Divergence
+        // page, so re-adding a gate here would break a published promise --
+        // which is the one direction the free-tier rule does not allow.
+        // Divergence left the Premium-seed list in licence_control.rs with
+        // this change.
         "divergence_site_set" => {
-            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
             let host = arg_str(args, "host")?;
             let off = args.get("off").and_then(Value::as_bool).unwrap_or(false);
             let level = if off {
@@ -2065,7 +2048,6 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
         "divergence_site_clear" => {
-            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
             let host = arg_str(args, "host")?;
             let store = store_open(state)?;
             store.clear_divergence_override(host).map_err(store_code)?;
@@ -2073,7 +2055,6 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
         "divergence_sites_list" => {
-            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
             let store = store_open(state)?;
             let items: Vec<Value> = store
                 .divergence_overrides()
@@ -2094,7 +2075,6 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // with a given profile; it does not prove a site was fooled, which
         // only the live test page can show.
         "divergence_proof_get" => {
-            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
             let url = state.active_url();
             let host = crate::state::host_of(&url).unwrap_or_default();
             let overrides = crate::state::divergence_overrides_snapshot();
@@ -2280,6 +2260,37 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let id = arg_str(args, "id")?;
             let store = store_open(state)?;
             store.delete_archive(id).map_err(store_code)?;
+            // The staged preview may be showing exactly the record that was
+            // deleted; a picture the user removed must not stay on screen or
+            // servable. Cheap when it is someone else's: one slot either way.
+            crate::archive::clear_staged();
+            Ok(json!({}))
+        }
+        // The other half of "as a picture": archive_save has stored an
+        // encrypted screenshot since the feature landed, and until 0.9.65
+        // nothing could read it back -- the panel listed has_picture:true and
+        // offered only Delete. Reported from the panel itself: "Where am I
+        // supposed to find the screenshots?"
+        //
+        // Gated like archive_list and archive_search: viewing is the half
+        // that does the remembering. The ungated exception stays exactly one
+        // arm wide (archive_delete), because removing your own data must
+        // never depend on a licence -- seeing it again is the feature.
+        "archive_picture_stage" => {
+            crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+            let id = arg_str(args, "id")?;
+            let store = store_open(state)?;
+            let png = store.archive_picture(id).map_err(store_code)?;
+            let token = crate::archive::stash_picture(png)?;
+            // The chrome builds the URL itself; only the token crosses IPC.
+            // The bytes travel over the rbchrome protocol, where the 1 MiB
+            // frame cap does not apply and img-src 'self' already allows it.
+            Ok(json!({ "token": token }))
+        }
+        // Ungated, like ocr_region_close: closing a preview must always
+        // work, licence or no licence, and it destroys rather than reveals.
+        "archive_picture_clear" => {
+            crate::archive::clear_staged();
             Ok(json!({}))
         }
 
@@ -2518,6 +2529,22 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 None => Err("not_found"),
                 Some(removed) => Ok(json!({ "id": id, "folder": folder, "removed": removed })),
             }
+        }
+        // IRREVERSIBLE, AND THE ONLY GUARD IS THE CHROME'S CONFIRMATION.
+        // That is enough here and nowhere near enough on the open web: this
+        // command is reachable only from the chrome webview, because content
+        // webviews have no IPC at all, so the thing being defended against
+        // is a stray click rather than a hostile page. The chrome names the
+        // count and says the word "permanently" before it ever gets here.
+        //
+        // There is no bookmark export in this build, so nothing on this path
+        // can suggest "back them up first" without inventing a feature. The
+        // vault export is a whole-vault operation and is not that.
+        "bookmarks_delete_all" => {
+            let (bookmarks, folders) = store_open(state)?
+                .delete_all_bookmarks()
+                .map_err(store_code)?;
+            Ok(json!({ "bookmarks": bookmarks, "folders": folders }))
         }
         "bookmark_delete" => {
             let id = arg_str(args, "id")?;
@@ -2768,7 +2795,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 return Ok(json!({ "imported": false }));
             };
             use std::io::Read as _;
-            use zeroize::Zeroize as _;
+            // No Zeroize here any more: the wipe moved into
+            // store_tunnel_config with the parse it belongs to, so both
+            // import paths cannot drift apart on it.
             let mut text = String::new();
             std::fs::File::open(&path)
                 .map_err(|_| "io")?
@@ -2779,66 +2808,159 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 .take((patanyx_tunnel::MAX_CONFIG_BYTES + 1) as u64)
                 .read_to_string(&mut text)
                 .map_err(|_| "io")?;
-            // The dispatch error channel is &'static str codes, so the
-            // DYNAMIC refusal text rides the SUCCESS payload instead --
-            // the same shape relay URL errors took when they got their own
-            // code. ConfigError's Display is the ENTIRE import-error
-            // vocabulary: named variants, none carrying key material, an
-            // endpoint, or a path.
-            let parsed = patanyx_tunnel::parse(&text);
-            // The raw file text holds the private key; wipe it the moment
-            // the parser is done with it, on BOTH outcomes (the independent
-            // review caught this buffer surviving un-wiped). The parsed
-            // copies below move into the vault, whose own drop wipes them.
-            text.zeroize();
-            let config = match parsed {
-                Ok(config) => config,
-                Err(refusal) => {
-                    return Ok(json!({ "imported": false, "error": refusal.to_string() }))
+            store_tunnel_config(state, &mut text)
+        }
+        // The clipboard path. Providers increasingly generate a configuration
+        // in a web page rather than serving a .conf file, and then the
+        // clipboard is the only handoff the user has.
+        //
+        // ONE PRIVACY DIFFERENCE FROM THE FILE PATH, and it is inherent
+        // rather than an oversight: this text reaches Rust through the IPC
+        // frame, so a copy of the private key exists inside the parsed JSON
+        // value for as long as that value lives. The file path never crosses
+        // that boundary at all. The owned copy this arm makes is wiped in
+        // store_tunnel_config; the frame's own buffer is dropped, not
+        // scrubbed. Anyone who prefers the narrower path still has it, one
+        // button to the left.
+        "tunnel_import_text" => {
+            unlocked(state)?;
+            let mut text = arg_str(args, "text")?.to_string();
+            // The same bound the file path applies, and for the same reason:
+            // MAX_CONFIG_BYTES + 1 so an oversized configuration is REFUSED
+            // by the parser's TooLarge rather than silently truncated into
+            // something that parses as valid.
+            let cap = patanyx_tunnel::MAX_CONFIG_BYTES + 1;
+            if text.len() > cap {
+                let mut end = cap;
+                while end > 0 && !text.is_char_boundary(end) {
+                    end -= 1;
                 }
+                text.truncate(end);
+            }
+            if text.trim().is_empty() {
+                // Nothing pasted. Not a refusal to report, the same as
+                // closing the file picker.
+                return Ok(json!({ "imported": false }));
+            }
+            store_tunnel_config(state, &mut text)
+        }
+
+        // WHAT THE RESTART WILL COST, asked BEFORE it is paid.
+        //
+        // plan_create drops every ephemeral tab and every non-storable URL,
+        // and that exclusion is a privacy promise rather than a filter
+        // preference -- an ephemeral tab must never be written to the store,
+        // restart or no restart. The defect was not the dropping; it was
+        // saying nothing about it. "Open new tabs without a saved profile"
+        // is a BROWSER-WIDE setting, so with it on every tab is ephemeral,
+        // the plan comes out empty, and the old code restarted anyway on the
+        // strength of a note promising "your tabs are set aside and reopen
+        // after you unlock". One unconfirmed click, whole session gone, copy
+        // asserting the opposite.
+        //
+        // So the counts go to the panel first and the panel asks. Same
+        // candidates and the same plan_create as the arm below, deliberately:
+        // a preview computed a second way is a preview that can disagree
+        // with what actually happens.
+        "tunnel_restart_preview" => {
+            let candidates: Vec<crate::shelf::Candidate> = state
+                .tabs
+                .iter()
+                .map(|tab| crate::shelf::Candidate {
+                    id: tab.id,
+                    ephemeral: tab.ephemeral,
+                    title: &tab.title,
+                    url: &tab.url,
+                })
+                .collect();
+            let plan = crate::shelf::plan_create(&candidates, None);
+            Ok(json!({
+                "kept": plan.entries.len(),
+                "left_out": plan.left_out,
+            }))
+        }
+
+        // ONE CLICK FOR THE RESTART THE ENGINE FORCES.
+        //
+        // WebView2 reads --proxy-server only when the environment is created
+        // (platform/windows.rs), so a tunnel switched on mid-session cannot
+        // take effect in this process. That restart is not going away; what
+        // was going away was the user doing it by hand, losing their tabs,
+        // and being told about it only AFTER the switch.
+        //
+        // ORDER IS THE WHOLE CORRECTNESS ARGUMENT, and it is the updater's:
+        // shelve, then spawn, then quit -- each step only after the previous
+        // one succeeded. A failed shelve must not cost the session; a failed
+        // spawn must leave a working browser running and no marker pointing
+        // at a shelf nobody will restore.
+        //
+        // The vault's file lock (mandatory on Windows) is why spawn-then-quit
+        // is safe: the replacement starts at its unlock screen and opens no
+        // vault until the user types a passphrase, by which time this process
+        // has exited and the kernel has released the lock.
+        "tunnel_apply_restart" => {
+            // Store first, exactly as shelf_create does: a session must never
+            // be set aside on the strength of a write that cannot happen.
+            store_open(state)?;
+
+            let plan = {
+                let candidates: Vec<crate::shelf::Candidate> = state
+                    .tabs
+                    .iter()
+                    .map(|tab| crate::shelf::Candidate {
+                        id: tab.id,
+                        ephemeral: tab.ephemeral,
+                        title: &tab.title,
+                        url: &tab.url,
+                    })
+                    .collect();
+                let plan = crate::shelf::plan_create(&candidates, None);
+                plan.entries
+                    .iter()
+                    .map(|entry| patanyx_store::ShelfTab {
+                        title: entry.title.to_owned(),
+                        url: entry.url.to_owned(),
+                    })
+                    .collect::<Vec<_>>()
             };
-            let mut settings = patanyx_vault::TunnelSettings {
-                enabled: true,
-                // MOVE the secrets out of the parsed config rather than
-                // cloning: one fewer copy of key material to zeroize.
-                private_key_b64: config.private_key_b64,
-                peer_public_key_b64: config.peer_public_key_b64,
-                endpoint: config.endpoint,
-                preshared_key_b64: config.preshared_key_b64,
-                keepalive_secs: config.keepalive_secs,
-                allowed_ips: config.allowed_ips,
-                dns: config.dns,
-                address: config.address,
+
+            // A NAME A PERSON WOULD RECOGNISE, not shelf_name's count form:
+            // if the restore ever fails, this is what they will be scanning
+            // the manager for.
+            let shelved = if plan.is_empty() {
+                // Nothing storable -- every tab is ephemeral or internal.
+                // Restart anyway; there is simply nothing to bring back.
+                None
+            } else {
+                let stored = store_open(state)?
+                    .add_shelf("Before tunnel restart".to_string(), plan)
+                    .map_err(store_code)?;
+                let mut prefs = crate::prefs::load();
+                prefs.tunnel_restore_shelf = Some(stored.id.clone());
+                crate::prefs::save(&prefs).map_err(|_| "io")?;
+                Some(stored.id)
             };
-            // The vault can auto-lock while the file dialog is open. On that
-            // path `settings` would drop as a plain struct -- no vault around
-            // it to wipe on drop -- so wipe its secrets by hand first.
-            let vault = match unlocked(state) {
-                Ok(vault) => vault,
-                Err(code) => {
-                    settings.private_key_b64.zeroize();
-                    if let Some(psk) = settings.preshared_key_b64.as_mut() {
-                        psk.zeroize();
+
+            if let Err(_error) = crate::updater::installer::relaunch_current_exe() {
+                // NOTHING HAPPENED, and the browser must look like it. Undo
+                // in reverse: clear the marker before removing the shelf, so
+                // a crash between the two leaves a harmless orphan shelf
+                // rather than a marker pointing at a shelf that is gone.
+                if let Some(id) = shelved {
+                    let mut prefs = crate::prefs::load();
+                    prefs.tunnel_restore_shelf = None;
+                    let _ = crate::prefs::save(&prefs);
+                    if let Ok(store) = store_open(state) {
+                        let _ = store.remove_shelf(&id);
                     }
-                    return Err(code);
                 }
-            };
-            vault
-                .set_tunnel_settings(Some(settings))
-                .map_err(|_| "io")?;
-            // DECIDED: importing does NOT flip the prefs mode. Importing a
-            // configuration and switching the tunnel on are separate acts,
-            // and the panel copy says so.
-            //
-            // It DOES try to start the tunnel, though. The normal first-run
-            // order is: choose Imported, restart, unlock, import -- and the
-            // unlock hook already ran, found no configuration, and returned.
-            // Without this call the port stays parked and refusing, so the
-            // browser is dead until the NEXT unlock, with nothing on screen
-            // saying why. Idempotent: the guards inside return immediately
-            // when a tunnel is already running or the mode is not Imported.
-            crate::tunnel_control::on_vault_unlocked(state);
-            Ok(json!({ "imported": true }))
+                return Err("relaunch_failed");
+            }
+
+            // Only now. Tabs are deliberately NOT closed: this process is
+            // exiting, and closing them would race the shutdown for no gain.
+            let _ = state.proxy().send_event(crate::UserEvent::QuitForRelaunch);
+            Ok(json!({ "relaunching": true }))
         }
         "tunnel_set_mode" => {
             let mode = crate::prefs::TunnelMode::parse(arg_str(args, "mode")?)
@@ -3060,6 +3182,20 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             tab.webview.load_url(&format!("https://{host}/")).ok();
             Ok(json!({ "allowed": host }))
         }
+
+        // The plain-HTTP warning's two buttons. Both act on the ACTIVE tab's
+        // held-back URL and take no arguments: the URL is whatever the
+        // navigation handler recorded, never something the chrome names, so
+        // this cannot be used to open an arbitrary address. Per tab, next
+        // navigation, gone with the tab -- see `blocklist_allow`.
+        // The host the chrome DISPLAYED, echoed back so Rust can confirm the
+        // user's click landed on the banner they read. 253 is the DNS limit,
+        // the same bound blocklist_allow applies.
+        "insecure_allow" => {
+            let shown = arg_str_capped(args, "host", 253)?;
+            state.insecure_allow(shown)
+        }
+        "insecure_dismiss" => state.insecure_dismiss(),
 
         // The resolver-unreachable banner. `resolver_retry` re-probes on
         // demand; `resolver_dismiss` closes the banner for this episode only.
@@ -3891,6 +4027,182 @@ fn parse_credential_origin(site: &str) -> Option<String> {
     is_valid_host(host_only).then(|| host_only.to_ascii_lowercase())
 }
 
+/// Parse a WireGuard configuration and store it in the vault.
+///
+/// Shared by both import paths -- the file picker and the pasted text -- so
+/// the handling of key material cannot drift between them. `text` is wiped
+/// here, on BOTH outcomes, the moment the parser is done with it.
+///
+/// The dispatch error channel is `&'static str` codes, so the DYNAMIC
+/// refusal text rides the SUCCESS payload instead. `ConfigError`'s Display
+/// is the entire import-error vocabulary: named variants, none carrying key
+/// material, an endpoint, or a path.
+fn store_tunnel_config(state: &mut AppState, text: &mut String) -> Result<Value, &'static str> {
+    use zeroize::Zeroize as _;
+    let parsed = patanyx_tunnel::parse(text);
+    // The raw text holds the private key; wipe it the moment the parser is
+    // done with it, on BOTH outcomes (the independent review caught this
+    // buffer surviving un-wiped). The parsed copies below move into the
+    // vault, whose own drop wipes them.
+    text.zeroize();
+    let config = match parsed {
+        Ok(config) => config,
+        Err(refusal) => return Ok(json!({ "imported": false, "error": refusal.to_string() })),
+    };
+    let mut settings = patanyx_vault::TunnelSettings {
+        enabled: true,
+        // MOVE the secrets out of the parsed config rather than
+        // cloning: one fewer copy of key material to zeroize.
+        private_key_b64: config.private_key_b64,
+        peer_public_key_b64: config.peer_public_key_b64,
+        endpoint: config.endpoint,
+        preshared_key_b64: config.preshared_key_b64,
+        keepalive_secs: config.keepalive_secs,
+        allowed_ips: config.allowed_ips,
+        dns: config.dns,
+        address: config.address,
+    };
+    // The vault can auto-lock while the file dialog is open. On that
+    // path `settings` would drop as a plain struct -- no vault around
+    // it to wipe on drop -- so wipe its secrets by hand first.
+    let vault = match unlocked(state) {
+        Ok(vault) => vault,
+        Err(code) => {
+            settings.private_key_b64.zeroize();
+            if let Some(psk) = settings.preshared_key_b64.as_mut() {
+                psk.zeroize();
+            }
+            return Err(code);
+        }
+    };
+    vault
+        .set_tunnel_settings(Some(settings))
+        .map_err(|_| "io")?;
+    // DECIDED: importing does NOT flip the prefs mode. Importing a
+    // configuration and switching the tunnel on are separate acts,
+    // and the panel copy says so.
+    //
+    // It DOES try to start the tunnel, though. The normal first-run
+    // order is: choose Imported, restart, unlock, import -- and the
+    // unlock hook already ran, found no configuration, and returned.
+    // Without this call the port stays parked and refusing, so the
+    // browser is dead until the NEXT unlock, with nothing on screen
+    // saying why. Idempotent: the guards inside return immediately
+    // when a tunnel is already running or the mode is not Imported.
+    crate::tunnel_control::on_vault_unlocked(state);
+    Ok(json!({ "imported": true }))
+}
+
+/// Reopen the session "Apply and restart" set aside, if this boot is the one
+/// that owes it. Called from both unlock arms, immediately after the tunnel
+/// is brought up.
+///
+/// WHY HERE AND NOT EARLIER: the tabs live in the vault-backed store, which
+/// is locked until this moment, and the tunnel comes up on this same call.
+/// Restoring any sooner would reopen pages into a browser that is still
+/// fail-closed, and every one of them would fail to load.
+///
+/// THE MARKER IS CLEARED FIRST, before a single tab opens. If the restore
+/// crashes halfway, the next boot must not try again and stack a second copy
+/// of the session on top of the first. One attempt is the promise.
+///
+/// THE SHELF IS NEVER DELETED HERE. It used to be, when every tab "came
+/// back" -- but new_tab returns Err only when the engine cannot build a
+/// webview, so a tab that opened and then failed to LOAD still counted, and
+/// the one scenario this feature exists for (the tunnel comes up
+/// fail-closed, every restored tab lands on an error page) deleted the
+/// shelf at the moment it was needed. It stays in the Bookmark Manager
+/// under "Before tunnel restart" until the user removes it, which is what
+/// shelf_delete is for.
+fn restore_after_tunnel_restart(state: &mut AppState) {
+    let mut prefs = crate::prefs::load();
+    let Some(id) = prefs.tunnel_restore_shelf.clone() else {
+        return;
+    };
+
+    // THE STORE HAS TO BE OPEN BEFORE THE MARKER IS SPENT. This is called
+    // from the recovery-key unlock as well, and that path cannot read the
+    // store at all: bookmarks and downloads are encrypted under the
+    // PASSPHRASE, so vault_unlock_recovery calls mark_store_unavailable and
+    // every store_open after it returns "store_needs_passphrase".
+    //
+    // The marker used to be taken and PERSISTED CLEARED right here, before
+    // anything was attempted, and the restore's error was discarded. So a
+    // user who mistyped their passphrase and fell back to the recovery key
+    // got: no tabs, no explanation, and a marker already burned -- unlocking
+    // properly later restored nothing, because there was no longer anything
+    // saying a restore was owed. The dialog had told them a number of tabs
+    // would come back.
+    //
+    // Checking first costs one extra unlock's worth of patience and keeps
+    // the promise. The same guard covers a corrupt store on the ordinary
+    // passphrase path.
+    if store_open(state).is_err() {
+        return;
+    }
+
+    prefs.tunnel_restore_shelf = None;
+    if crate::prefs::save(&prefs).is_err() {
+        // The marker could not be cleared, so restoring now risks doing it
+        // again on the next boot. Leaving the shelf untouched costs the user
+        // one manual restore; a duplicated session costs them trust.
+        return;
+    }
+    // RESTORING NEVER DESTROYS. The shelf used to be deleted when every tab
+    // came back, which sounded tidy and was measuring the wrong thing:
+    // new_tab returns Err only when the engine cannot build a webview, so a
+    // tab that opens and then fails to LOAD still counts as opened. The
+    // scenario that breaks is the one this whole feature exists for -- the
+    // tunnel comes up fail-closed, every restored tab lands on an error
+    // page, opened == total, and the safety net was deleted at the exact
+    // moment the user needed it.
+    //
+    // So it is left in the Bookmark Manager under "Before tunnel restart"
+    // and the user removes it themselves, which is what shelf_delete is
+    // for and what every other shelf in the browser already does. The cost
+    // is one shelf someone has to tidy up; the cost of the old behaviour
+    // was a session that could not be got back.
+    let _ = restore_shelf_tabs(state, &id);
+}
+
+/// Reopen every tab a shelf holds. Returns `(opened, total)`.
+///
+/// Shared by `shelf_restore` and the post-unlock restore that "Apply and
+/// restart" leaves behind, so both obey the same rules: every URL is
+/// RE-VALIDATED on the way back in (these strings came out of a file, not a
+/// live tab), MAX_TABS still caps the window, the first tab lands in the
+/// foreground and the rest behind it, and a refused build stops the loop
+/// rather than hammering on. NEITHER caller deletes the shelf here --
+/// restoring never destroys.
+fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize), &'static str> {
+    // Cloned out of the store first: the open calls below borrow state
+    // mutably, and a shelf is small.
+    let entries = {
+        store_open(state)?
+            .shelves()
+            .iter()
+            .find(|shelf| shelf.id == id)
+            .ok_or("not_found")?
+            .tabs
+            .clone()
+    };
+    let total = entries.len();
+    let mut opened = 0usize;
+    for entry in &entries {
+        if state.tabs.len() >= crate::state::MAX_TABS {
+            break;
+        }
+        if !crate::state::is_allowed_content_url(&entry.url) {
+            continue;
+        }
+        match state.new_tab(&entry.url, opened == 0) {
+            Ok(_) => opened += 1,
+            Err(_) => break,
+        }
+    }
+    Ok((opened, total))
+}
+
 fn store_open(state: &mut AppState) -> Result<&mut Store, &'static str> {
     // Resolved BEFORE the mutable borrow below: reading it inside the `None`
     // arm would borrow `state` immutably while `as_mut` still holds it.
@@ -4203,6 +4515,12 @@ mod tests {
             // tunnel_status) are exempted in counts_as_presence itself: a
             // passive panel refresh must not re-arm the idle deadline.
             "tunnel_import",
+            // The pasted-text twin of tunnel_import, and as deliberate an
+            // act as it is: both store a configuration in the vault.
+            "tunnel_import_text",
+            // Ending the process to apply a setting is about as deliberate
+            // as a click gets.
+            "tunnel_apply_restart",
             "tunnel_set_mode",
             "tunnel_remove",
             // Mutating licence acts, as deliberate as it gets; the read arm
@@ -4365,6 +4683,19 @@ mod tests {
             "http://rbchrome.loca\rlhost/",
             // https as well: the host is reserved regardless of scheme.
             "https://rbchrome.localhost/",
+            // SPELLINGS THE HOST COMPONENT ITSELF CARRIES (security audit
+            // 2026-08-18, F19). Every entry above is a trick in the URL
+            // AROUND the host; these are inside it, and `host_of` compares
+            // literally, so all five passed until `is_allowed_content_url`
+            // gained a second opinion from a WHATWG parser. Confirmed with
+            // that parser: each resolves to origin http://rbchrome.localhost.
+            "http://%72bchrome.localhost/",
+            "http://rbchrome%2elocalhost/",
+            "http://%72bchrome%2elocalhost/",
+            // U+3002 IDEOGRAPHIC FULL STOP, which IDNA maps to '.'.
+            "http://rbchrome\u{3002}localhost/",
+            // U+FF52 FULLWIDTH LATIN SMALL LETTER R, which IDNA maps to 'r'.
+            "http://\u{ff52}bchrome.localhost/",
         ] {
             assert!(
                 !is_allowed_content_url(url),
@@ -4399,6 +4730,63 @@ mod tests {
         ] {
             assert!(!is_allowed_content_url(url), "wrongly allowed: {url:?}");
         }
+    }
+
+    /// A credential-save offer is bound to the document the ENGINE says sent
+    /// it, and refused when that disagrees with the tab.
+    ///
+    /// TWO DEFECTS IN ONE (security audit 2026-08-18, F20). The banner used to
+    /// name the `origin` the PAGE put in its own JSON, so a hostile page could
+    /// make the trusted chrome vouch for a site the user was not on -- a
+    /// phishing primitive built out of our own UI. And nothing compared the
+    /// sender to the tab, so a submission posted just before a navigation
+    /// could arrive after it and bind to the new site, which
+    /// `cred_save_confirm` would then file the password under.
+    #[test]
+    fn a_save_offer_needs_the_sender_and_the_tab_to_agree() {
+        use crate::state::login_offer_origin;
+
+        // The ordinary case: same site, offer allowed, banner names it.
+        assert_eq!(
+            login_offer_origin("https://example.com/login", Some("https://example.com/login")),
+            Some("example.com".to_string())
+        );
+        // A fragment or query moved, the site did not. Still one honest offer:
+        // refusing here would throw away real submissions on ordinary sites.
+        assert_eq!(
+            login_offer_origin("https://example.com/login#a", Some("https://example.com/login?b=1")),
+            Some("example.com".to_string())
+        );
+        // THE RACE: posted from one site, the tab has already moved to another.
+        assert_eq!(
+            login_offer_origin("https://example.com/login", Some("https://evil.example/")),
+            None,
+            "a submission must never bind to a site the tab moved on to"
+        );
+        // A subdomain is a different host, and this comparison is exact.
+        assert_eq!(
+            login_offer_origin("https://accounts.example.com/", Some("https://example.com/")),
+            None
+        );
+        // No tab, no placeable offer.
+        assert_eq!(login_offer_origin("https://example.com/", None), None);
+        // A sender the host parser cannot read is not shown at all, rather
+        // than shown under a guess.
+        assert_eq!(login_offer_origin("", Some("https://example.com/")), None);
+        assert_eq!(
+            login_offer_origin("about:blank", Some("https://example.com/")),
+            None
+        );
+        // And the reserved chrome host cannot be laundered into a banner.
+        assert_eq!(
+            login_offer_origin(
+                "http://rbchrome.localhost/",
+                Some("http://rbchrome.localhost/")
+            ),
+            Some("rbchrome.localhost".to_string()),
+            "host_of reports it; is_allowed_content_url is what keeps a content \
+             tab from ever being on it"
+        );
     }
 
     /// Non-ASCII hosts must not panic a byte-oriented parser. They are

@@ -79,6 +79,65 @@
     return offScreen;
   }
 
+  // The <input> prototype's own value setter, captured once.
+  //
+  // WHY THIS IS NEEDED, and it was not a guess: a plain `el.value = x` fills
+  // the box and the site still refuses it. React-class frameworks install a
+  // per-ELEMENT value tracker -- an own accessor that shadows the prototype's
+  // -- and remember the last value they saw written through it. When our
+  // synthetic `input` event arrives, the framework asks the tracker whether
+  // anything changed, the tracker says "no, I recorded that write myself",
+  // and the event is DISCARDED. The DOM shows the password; the framework's
+  // own state stays empty; the submit button stays disabled. Reported on
+  // Crunchyroll's login, where the credential appeared in the field and the
+  // form would not take it until it was retyped by hand.
+  //
+  // Calling the PROTOTYPE setter writes the real value while leaving the
+  // tracker's remembered value stale, so the event that follows reads as a
+  // genuine change and the framework picks it up.
+  //
+  // An earlier comment here recorded that this workaround was deliberately
+  // "not added on suspicion" after a plain assignment proved enough on
+  // Google's page. That was the right call then and the evidence has now
+  // arrived; do not simplify it back.
+  var nativeValueSetter = (function () {
+    try {
+      var proto = window.HTMLInputElement && window.HTMLInputElement.prototype;
+      var d = proto && Object.getOwnPropertyDescriptor(proto, "value");
+      return d && typeof d.set === "function" ? d.set : null;
+    } catch (e) {
+      return null;
+    }
+  })();
+
+  // Fills one field the way a person would: focus it, put the value in
+  // through the native setter, then let the page hear about it.
+  //
+  // The fallback is exactly the old behaviour, never worse: a document with
+  // no HTMLInputElement, or a page that has deleted the descriptor, still
+  // gets a plain assignment rather than nothing.
+  function setFieldValue(el, value) {
+    if (typeof el.focus === "function") {
+      // Some forms only run their validation once a field has been
+      // focused, and a fill that never touches focus never triggers it.
+      try {
+        el.focus();
+      } catch (e) {
+        // A detached or disabled field: the write below still stands.
+      }
+    }
+    if (nativeValueSetter) {
+      try {
+        nativeValueSetter.call(el, value);
+      } catch (e) {
+        el.value = value;
+      }
+    } else {
+      el.value = value;
+    }
+    fireInputEvents(el);
+  }
+
   function fireInputEvents(el) {
     el.dispatchEvent(new Event("input", { bubbles: true }));
     el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -130,9 +189,10 @@
       // when there is genuinely no form, and a missing password field no
       // longer aborts the username fill.
       //
-      // Not fixed by guessing: `.value = x` plus an input event was checked
-      // against that same live page and the value sticks, so no native-setter
-      // workaround is warranted. It is not added on suspicion.
+      // A THIRD failure, found later and fixed in setFieldValue above:
+      // `.value = x` plus an input event sticks on that Google page but is
+      // silently rejected by React-class forms, which track writes per
+      // element. See the comment on nativeValueSetter.
       var pwFields = document.querySelectorAll('input[type="password"]');
       var pwField = null;
       for (var i = 0; i < pwFields.length; i += 1) {
@@ -153,12 +213,10 @@
         usernameField(form) || (form ? null : usernameField(document));
 
       if (userField && typeof msg.username === "string") {
-        userField.value = msg.username;
-        fireInputEvents(userField);
+        setFieldValue(userField, msg.username);
       }
       if (pwField && typeof msg.password === "string") {
-        pwField.value = msg.password;
-        fireInputEvents(pwField);
+        setFieldValue(pwField, msg.password);
       }
     });
   } catch (e) {

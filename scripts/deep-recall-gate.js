@@ -58,15 +58,122 @@ const licensed = (premium) => {
   };
 };
 
-// Opening and closing the panel makes chrome.js re-read the licence.
+// Deep Recall lives in the tools modal now (2026-08-19): its toolbar button
+// is gone, and the way in is the modal's recall TAB -- which opens the modal
+// itself when it is closed, because every tab button is a complete door (the
+// palette clicks them directly). STATE-AWARE rather than toggles: the old
+// btn-recall helpers were pure toggles, and checks that assumed "open"
+// while a previous check left the panel open flipped it shut and read stale
+// rows. Selecting the tab re-runs the licence read, which is what the old
+// panel-open did.
 const openPanel = async () => {
-  $("btn-recall").click();
+  $("btn-tab-recall").click();
   await flush();
 };
 const closePanel = async () => {
-  $("btn-recall").click();
-  await flush();
+  if (!$("integrity-host").hidden) {
+    $("btn-integrity").click();
+    await flush();
+  }
 };
+
+check("locking the vault takes the picture off the screen", async () => {
+  // THE LEAK THIS PINS. Rust clears the staged slot on lock, so the token
+  // 404s -- but an image ALREADY LOADED stays rendered, and a full-page
+  // screenshot would sit there through an idle auto-lock. The shipped
+  // release notes say locking the vault takes it off screen, so this is a
+  // published claim, not a preference.
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "a5",
+        url: "https://example.com/kept",
+        title: "Kept page",
+        created_at: 1700000000,
+        has_picture: true,
+        words: 8,
+      },
+    ],
+    count: 1,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 5 };
+  await ensureOpen();
+  findButton($("recall-list"), "View")._fire("click");
+  await flush();
+  assert(!$("recall-preview").hidden, "precondition: the picture is showing");
+
+  global.window.__rb_event({ event: "vault_locked", data: {} });
+  await flush();
+
+  assert(
+    $("recall-preview").hidden,
+    "the decrypted page is still on screen after the vault locked",
+  );
+  assert(
+    !$("recall-preview-img").getAttribute("src"),
+    "the img kept its src, so the picture is still rendered",
+  );
+  await ensureClosed();
+});
+
+check("the tools host is in the every-panel style rule", () => {
+  // THE GRAY RECTANGLE, reported from hardware the same day the host was
+  // created. chrome.css paints every panel through ONE id-list rule
+  // (background, padding, scroll), whose own comment says a new panel
+  // belongs in the list -- and #integrity-host shipped a hardware round
+  // without joining it, rendering as a pale native-default rectangle with
+  // integrity.js's dark card floating inside. Nothing in the suite compares
+  // computed styles, so this checks the one thing that IS checkable: the
+  // selector list names the host.
+  const css = fs.readFileSync(
+    path.join(chromeDir, "chrome.css"),
+    "utf8",
+  );
+  const rule = css.match(/#vault-panel,[\s\S]*?\{/);
+  assert(rule, "the every-panel rule is gone entirely");
+  assert(
+    rule[0].includes("#integrity-host"),
+    "#integrity-host is missing from the every-panel rule; the tools modal " +
+      "renders as an unpainted rectangle",
+  );
+});
+
+check("the tools modal is one home with three doors", async () => {
+  // THE RESTRUCTURE THIS PINS, 2026-08-19: Page
+  // integrity, Deep Recall and the image check share one modal, and each
+  // tab button is a complete door -- clicking it OPENS the modal when it is
+  // closed, because the palette clicks these buttons directly and a palette
+  // row that lands on a closed modal is a dead end. Deep Recall's own
+  // toolbar button is gone; a stale #btn-recall reference anywhere would
+  // resurrect a second door to a panel that no longer exists.
+  licensed(true);
+  assert(!$("btn-recall"), "the old Deep Recall toolbar button is back");
+  assert($("integrity-host").hidden, "the modal must start closed");
+
+  $("btn-tab-recall").click();
+  await flush();
+  assert(!$("integrity-host").hidden, "the recall tab did not open the modal");
+  assert(!$("recall-panel").hidden, "the recall body is not showing");
+  assert(
+    $("tools-integrity-slot").hidden,
+    "two tab bodies are showing at once",
+  );
+  assert(
+    $("btn-tab-recall").getAttribute("aria-pressed") === "true",
+    "the active tab does not say so",
+  );
+
+  // The toolbar button itself lands on Page integrity, as it always has.
+  $("btn-integrity").click();
+  await flush();
+  $("btn-integrity").click();
+  await flush();
+  assert(!$("tools-integrity-slot").hidden, "the toolbar door lands on integrity");
+  assert($("recall-panel").hidden, "recall stayed up under the integrity tab");
+  await closePanel();
+});
 
 check("a locked Deep Recall never asks Rust to save", async () => {
   licensed(false);
@@ -160,21 +267,342 @@ check("a page with no readable text says so on its row", async () => {
 });
 
 check("saving reports what was actually read", async () => {
+  // Both events carry the full shape Rust sends. They used to omit scope and
+  // truncated, which is an event the app can no longer produce -- a stub that
+  // drifts from the real payload tests a code path nobody runs.
   licensed(true);
   await closePanel();
   await openPanel();
-  fire("archive_saved", { ok: true, id: "a3", words: 137 });
+  fire("archive_saved", {
+    ok: true,
+    id: "a3",
+    words: 137,
+    truncated: false,
+    scope: "full page",
+  });
   await flush();
   const status = $("recall-status").textContent;
   assert(/137/.test(status), "the word count must reach the user: " + status);
 
-  fire("archive_saved", { ok: true, id: "a4", words: 0 });
+  fire("archive_saved", {
+    ok: true,
+    id: "a4",
+    words: 0,
+    truncated: false,
+    scope: "full page",
+  });
   await flush();
   const empty = $("recall-status").textContent;
   assert(
     /No text was read/.test(empty),
     "a read that found nothing must say so, not just 'Saved': " + empty,
   );
+});
+
+// THE CLAIM HAS TO TRACK THE CAPTURE. A compliance pass caught this message
+// telling every user "the picture is complete" while the Windows fallback
+// path -- an engine too old for the full-page protocol call -- had saved the
+// viewport. The scope rides on the event; these four checks are the whole
+// truth table, because three of them were true before the fix and only the
+// fourth was wrong, which is how it survived.
+check("a truncated read on a full-page capture says the picture is whole", async () => {
+  licensed(true);
+  await closePanel();
+  await openPanel();
+  fire("archive_saved", {
+    ok: true,
+    id: "s1",
+    words: 900,
+    truncated: true,
+    scope: "full page",
+  });
+  await flush();
+  const status = $("recall-status").textContent;
+  assert(
+    /stops partway down/.test(status),
+    "a truncated read must admit the text stops: " + status,
+  );
+  assert(
+    /picture is complete/.test(status),
+    "a full-page capture may say the picture is whole: " + status,
+  );
+});
+
+check("a truncated read on a viewport capture must NOT claim a whole picture", async () => {
+  licensed(true);
+  await closePanel();
+  await openPanel();
+  fire("archive_saved", {
+    ok: true,
+    id: "s2",
+    words: 900,
+    truncated: true,
+    scope: "visible area",
+  });
+  await flush();
+  const status = $("recall-status").textContent;
+  assert(
+    !/picture is complete/.test(status),
+    "the viewport fallback must not claim a complete picture: " + status,
+  );
+  assert(
+    /on screen/.test(status),
+    "the viewport fallback must say what the picture actually covers: " + status,
+  );
+});
+
+check("an untruncated viewport capture still says what the picture covers", async () => {
+  licensed(true);
+  await closePanel();
+  await openPanel();
+  fire("archive_saved", {
+    ok: true,
+    id: "s3",
+    words: 40,
+    truncated: false,
+    scope: "visible area",
+  });
+  await flush();
+  const status = $("recall-status").textContent;
+  assert(
+    /on screen/.test(status),
+    "a viewport capture is worth saying even when the read was whole: " +
+      status,
+  );
+  assert(
+    !/stops partway down/.test(status),
+    "an untruncated read must not claim truncation: " + status,
+  );
+});
+
+check("the empty state does not out-claim the save message", async () => {
+  // Found by a real browser, not by this file: the empty state sat directly
+  // above a save message saying the picture was only the visible area, and
+  // flatly contradicted it. A static string shown before any capture exists
+  // cannot know the scope, so it defers instead of asserting.
+  // Read from the markup, not the stub: this is a static string and the dom
+  // stub does not carry text out of index.html.
+  const text = fs
+    .readFileSync(path.join(chromeDir, "index.html"), "utf8")
+    .replace(/\s+/g, " ");
+  const empty = (text.match(/id="recall-empty"[\s\S]{0,1500}?<\/p>/) || [
+    "(#recall-empty is gone)",
+  ])[0].replace(/<!--[\s\S]*?-->/g, "");
+  assert(
+    /each save says how much of the page it captured/.test(empty),
+    "the empty state must hand the scope claim to the save message: " + empty,
+  );
+});
+
+check("a truncated read that found no text must not talk about text", async () => {
+  // Reachable through the tile-budget half of the truncation flag: an
+  // image-dense page can exhaust detection while every line reads empty.
+  // "No text was read" and "the text stops partway down" cannot both be
+  // true, and the two clauses were assembled independently, which is how
+  // the pair got past the four-way table above.
+  licensed(true);
+  await closePanel();
+  await openPanel();
+  fire("archive_saved", {
+    ok: true,
+    id: "s5",
+    words: 0,
+    truncated: true,
+    scope: "visible area",
+  });
+  await flush();
+  const status = $("recall-status").textContent;
+  assert(
+    /No text was read/.test(status),
+    "an empty read must still say so: " + status,
+  );
+  assert(
+    !/stops partway down/.test(status),
+    "there is no text to stop: " + status,
+  );
+  assert(
+    /on screen/.test(status),
+    "the viewport scope is still worth saying: " + status,
+  );
+
+  fire("archive_saved", {
+    ok: true,
+    id: "s6",
+    words: 0,
+    truncated: true,
+    scope: "full page",
+  });
+  await flush();
+  const whole = $("recall-status").textContent;
+  assert(
+    whole === "Saved. No text was read from this picture.",
+    "a whole-page capture with nothing in it needs no clause at all: " + whole,
+  );
+});
+
+check("the ordinary case stays one plain sentence", async () => {
+  licensed(true);
+  await closePanel();
+  await openPanel();
+  fire("archive_saved", {
+    ok: true,
+    id: "s4",
+    words: 40,
+    truncated: false,
+    scope: "full page",
+  });
+  await flush();
+  const status = $("recall-status").textContent;
+  assert(
+    status === "Saved. 40 words read from this page.",
+    "no shortfall means no extra clause: " + status,
+  );
+});
+
+// The dom stub's querySelectorAll matches direct children by class or id
+// only, so a tag search two levels deep needs its own walk.
+// Both helpers above are state-aware now, so these are plain aliases kept
+// so the newer checks read as they were written.
+const ensureOpen = openPanel;
+const ensureClosed = closePanel;
+
+// The stub carries no tagName; a runtime-created button's id is
+// "new-button" (domstub.js createElement), and its label is textContent.
+const findButton = (node, label) => {
+  const kids = (node && node.children) || [];
+  for (const kid of kids) {
+    if (
+      String(kid.id || "").startsWith("new-button") &&
+      kid.textContent === label
+    ) {
+      return kid;
+    }
+    const hit = findButton(kid, label);
+    if (hit) return hit;
+  }
+  return null;
+};
+
+check("a saved picture can actually be looked at", async () => {
+  // THE DEFECT THIS PINS, reported from the panel itself: "Where am I
+  // supposed to find the screenshots?" archive_save stored the picture,
+  // encrypted and tested, and the panel listed has_picture:true while
+  // offering only Delete. No IPC arm exposed the bytes and nothing here
+  // asked. The row now carries View: it stages the ONE decrypted picture
+  // and points the preview img at the token URL the chrome protocol serves.
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "a7",
+        url: "https://example.com/kept",
+        title: "Kept page",
+        created_at: 1700000000,
+        has_picture: true,
+        words: 12,
+      },
+    ],
+    count: 1,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 7 };
+  await ensureOpen();
+
+  const view = findButton($("recall-list"), "View");
+  assert(view, "a row with a picture has no View button");
+  view._fire("click");
+  await flush();
+
+  const staged = global.rbCalls.filter((c) => c.cmd === "archive_picture_stage");
+  assert(staged.length === 1, "View never asked Rust to stage the picture");
+  assert(staged[0].args.id === "a7", "staged the wrong record: " + JSON.stringify(staged[0].args));
+  assert(
+    $("recall-preview-img").getAttribute("src") === "/archive-picture/7.png",
+    "the preview does not point at the staged token: " +
+      $("recall-preview-img").getAttribute("src"),
+  );
+  assert(!$("recall-preview").hidden, "the preview stayed hidden");
+  await ensureClosed();
+});
+
+check("a save with no picture offers no View", async () => {
+  // has_picture:false is a real state (a degraded save keeps text only) and
+  // a View button on it would stage a NotFound and toast an error at the
+  // user for clicking the button we drew.
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "a8",
+        url: "https://example.com/textonly",
+        title: "Text only",
+        created_at: 1700000000,
+        has_picture: false,
+        words: 3,
+      },
+    ],
+    count: 1,
+    max: 200,
+  };
+  await ensureOpen();
+  assert(
+    !findButton($("recall-list"), "View"),
+    "a row with no picture grew a View button",
+  );
+  await ensureClosed();
+});
+
+check("closing the preview, and the panel, both release the picture", async () => {
+  // The staged slot holds a DECRYPTED page. Close must wipe it (Rust side)
+  // and drop the chrome's reference (src removed), and closing the whole
+  // panel must do the same -- a decrypted page must not sit staged behind a
+  // closed panel where nothing on screen says it exists.
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "a9",
+        url: "https://example.com/kept",
+        title: "Kept page",
+        created_at: 1700000000,
+        has_picture: true,
+        words: 5,
+      },
+    ],
+    count: 1,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 9 };
+  await ensureOpen();
+  findButton($("recall-list"), "View")._fire("click");
+  await flush();
+  global.rbCalls.length = 0;
+
+  $("recall-preview-close")._fire("click");
+  await flush();
+  assert(
+    global.rbCalls.some((c) => c.cmd === "archive_picture_clear"),
+    "closing the preview never told Rust to wipe the staged bytes",
+  );
+  assert(
+    !$("recall-preview-img").getAttribute("src"),
+    "the img kept its src after close",
+  );
+  assert($("recall-preview").hidden, "the preview stayed visible");
+
+  // And via the panel: stage again, close the whole panel.
+  findButton($("recall-list"), "View")._fire("click");
+  await flush();
+  global.rbCalls.length = 0;
+  await ensureClosed();
+  assert(
+    global.rbCalls.some((c) => c.cmd === "archive_picture_clear"),
+    "closing the panel left the decrypted picture staged",
+  );
+  // The checks below this one predate ensureOpen/ensureClosed and use the
+  // raw toggles, counting on the panel being OPEN when they start. Restore
+  // that so inserting these checks does not change what they test.
+  await ensureOpen();
 });
 
 check("a full archive is reported as a thing the user can fix", async () => {

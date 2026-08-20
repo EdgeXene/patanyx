@@ -35,6 +35,13 @@ case "$mode" in
     git apply --check "$patch" || {
       echo "premium-launch-flip: the launch patch no longer applies to this branch." >&2
       echo "  Re-derive it: apply by hand, verify, 'git diff > $patch', revert." >&2
+      echo "" >&2
+      echo "  READ docs/premium-launch/README.md FIRST. As of 2026-08-19 this" >&2
+      echo "  patch still GATES FINGERPRINT DIVERGENCE, which is now free" >&2
+      echo "  permanently and published as such on three website pages." >&2
+      echo "  Re-deriving it by applying it as written reinstates the gate and" >&2
+      echo "  takes a free feature away from everyone. Strip every Divergence" >&2
+      echo "  hunk before re-deriving." >&2
       exit 1; }
     echo "premium-launch-flip OK: branch not on sale, patch applies cleanly"
     ;;

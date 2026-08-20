@@ -516,6 +516,24 @@ else
 fi
 
 echo
+echo "=== gate 1n2: the plain-HTTP warning, and the find bar's strip height ==="
+# Two things in the band under the toolbar. The warning is driven from
+# tab_status and its buttons carry no URL of their own; the find bar was never
+# in BANNERS and rendered under the page with the left toolbar (Ctrl+F "did
+# nothing"). Same guard shape as the gates above.
+if [ -f scripts/http-warning-gate.js ]; then
+  if ! grep -q 'id="insecure-allow"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/http-warning-gate.js exists but index.html has" >&2
+    echo "  no #insecure-allow; the warning was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/http-warning-gate.js
+else
+  echo "  (no http-warning gate in this tree)"
+fi
+
+echo
 echo "=== gate 1o: the find-across-tabs panel ==="
 # The first premium surface. Proven against three planted defects when it
 # landed: always-goto-row-0, clearing the locked notice, and naive UTF-16

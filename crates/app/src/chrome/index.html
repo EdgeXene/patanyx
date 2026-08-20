@@ -497,23 +497,34 @@
         <span class="feature-label">Read text</span>
       </button>
 
-      <!-- Deep Recall. The label is NOT "Save Page": this button opens a
-           panel, and a control that says it saves while it opens is lying
-           about what it does. The saving lives on the button inside. -->
+      <!-- The tools modal's one door (was Deep Recall's own button; the
+           the three content tools were collapsed into one modal and one
+           toolbar slot, 2026-08-19). In MARKUP now rather than built by
+           integrity.js, so chrome.js can register the combined panel against
+           it and the gate harness can click it; integrity.js detects it and
+           skips building its own. Shield-with-tick icon and title kept
+           verbatim from the runtime button users already know. -->
       <button
-        id="btn-recall"
+        id="btn-integrity"
         class="feature-btn"
-        data-premium="1"
         type="button"
         aria-pressed="false"
-        aria-label="Deep Recall: saved pages"
-        title="Save pages and find them again by any word"
+        title="Page integrity: has this page changed since you saved it?"
       >
-        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-          <path d="M3.5 2.5 H12.5 V13.5 L8 10.5 L3.5 13.5 Z" />
-          <path d="M6 6 H10" />
+        <svg
+          class="ico"
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 3l7 4v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V7z" />
+          <path d="M9 12l2 2 4-4" />
         </svg>
-        <span class="feature-label">Recall</span>
+        <span class="feature-label">Integrity</span>
       </button>
 
       <!-- LAST, and kept there by `order` rather than by position.
@@ -670,6 +681,31 @@
           Open anyway
         </button>
         <button id="blocked-dismiss" type="button" class="small">
+          Dismiss
+        </button>
+      </div>
+    </div>
+
+    <!-- Plain-HTTP warning. Rendered from tab_status's `insecure_pending`
+         (the URL the navigation handler is holding for the ACTIVE tab), so
+         it follows tab switches like every other per-tab fact and never a
+         stale event. Continue and Dismiss take no arguments: Rust already
+         knows the URL, and the chrome must not be able to name a different
+         one. Local and private addresses never raise it. -->
+    <div id="insecure-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1.5 L15 14 H1 Z" />
+        <path d="M8 6 V9.5 M8 11.8 V12.4" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title">This site is not encrypted</span>
+        <span id="insecure-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="insecure-allow" type="button" class="small danger">
+          Continue anyway
+        </button>
+        <button id="insecure-dismiss" type="button" class="small">
           Dismiss
         </button>
       </div>
@@ -872,15 +908,22 @@
 
     <!-- Detached openers for surfaces with no toolbar button of their own.
          The palette actions "Switch tab..." and "Select tabs..." click
-         these by id -- the palette gate requires the id to resolve -- and
-         registerPanel wires the switcher one to its panel. `hidden` keeps
-         them out of the layout while the ids stay literal in this file,
-         which the id scrape requires. -->
+         these by id, and registerPanel wires the switcher one to its panel.
+
+         class="detached-opener", NOT the hidden attribute, and the
+         difference was a shipped defect: the palette filters out any action
+         whose button carries `hidden`, because for real toolbar buttons
+         hidden means UNAVAILABLE (chat until chat.js reveals it). These two
+         were hidden merely to stay out of the layout, the filter could not
+         tell the difference, and both palette rows -- the tab pack's ONLY
+         doors -- never appeared in any build since 0.9.63. Found by a user
+         asking where "Select tabs" was. display:none keeps them out of the
+         layout exactly as before; the ids stay literal for the id scrape. -->
     <button
       id="btn-switcher"
       type="button"
+      class="detached-opener"
       data-premium="1"
-      hidden
       aria-pressed="false"
     >
       Switch tab
@@ -888,8 +931,8 @@
     <button
       id="btn-tabselect"
       type="button"
+      class="detached-opener"
       data-premium="1"
-      hidden
       aria-pressed="false"
     >
       Select tabs
@@ -1180,6 +1223,12 @@
             />
             <button id="bmm-new-folder-add" type="button" class="small">
               New folder
+            </button>
+            <!-- Last in the row and styled as a danger action: it empties the
+               whole manager and there is no undo. The confirmation, not this
+               button, is what stands between a stray click and the data. -->
+            <button id="bmm-delete-all" type="button" class="small danger">
+              Delete all bookmarks
             </button>
           </div>
           <p class="panel-note" id="bmm-folder-error" hidden></p>
@@ -1558,7 +1607,45 @@
     <!-- DEEP RECALL. Save a page as a picture plus the text read off it,
          then find it again by a word. Every string here is static frame;
          every failure sentence comes from ERROR_TEXT. -->
-    <section id="recall-panel" hidden>
+    <!-- THE TOOLS MODAL: Page integrity, Deep Recall, and the image check
+         under one roof, 2026-08-19. Three tools that
+         all answer "what did I keep, and is it still what I kept?", and
+         until now three different doors: a runtime-injected panel, a toolbar
+         button, and a section buried in Privacy that the palette could not
+         reach. One modal, three tabs; chrome.js registers it against the
+         markup #btn-integrity below, and integrity.js fills the first slot
+         with the panel it already builds. The tab strip is markup so the
+         gate harness (which loads chrome.js alone) can drive it. -->
+    <section id="integrity-host" hidden>
+      <div id="tools-tabs" role="tablist" aria-label="Page tools">
+        <button id="btn-tab-integrity" type="button" class="small" aria-pressed="true">
+          Page integrity
+        </button>
+        <!-- data-premium came across with the feature. The toolbar button
+             that used to carry it is gone, and without it applyPremiumState
+             never marks this tab locked -- so Deep Recall looked ordinary and
+             refused after the click, which is the exact thing the premium
+             marking exists to prevent. Page integrity's tab has none because
+             Page integrity is free. -->
+        <button
+          id="btn-tab-recall"
+          type="button"
+          class="small"
+          data-premium="1"
+          aria-pressed="false"
+        >
+          Deep Recall
+        </button>
+        <!-- Hidden until the OCR models are confirmed installed, exactly like
+             the section it reveals: a tab that cannot work is worse than no
+             tab. Unhidden beside #leakcheck in chrome.js's ocr_status probe. -->
+        <button id="btn-tab-imagecheck" type="button" class="small" aria-pressed="false" hidden>
+          Image check
+        </button>
+      </div>
+      <!-- integrity.js appends its self-built panel content here. -->
+      <div id="tools-integrity-slot" class="tools-body"></div>
+      <section id="recall-panel" class="tools-body" hidden>
       <h1>Deep Recall</h1>
       <p class="panel-intro">
         Save a page as a picture plus the text read off it, stored encrypted on
@@ -1575,6 +1662,38 @@
         </button>
       </div>
       <p id="recall-status" aria-live="polite"></p>
+      <!-- The preview. Hidden until a row's View button stages a picture;
+           the img src is a token URL the rbchrome protocol serves from the
+           one staged slot (archive.rs), so img-src 'self' already covers it
+           and no bytes ever ride the IPC channel. Closing here, closing the
+           panel, deleting the record, and locking the vault all clear the
+           slot -- the token in a stale src then 404s, which is the design. -->
+      <div id="recall-preview" hidden>
+        <div class="form-buttons">
+          <!-- A saved page is a FULL-PAGE screenshot: squeezed to the width
+               of a 600px card it is unreadable, and the panel's own scroll
+               moves the whole panel rather than the picture. So the picture
+               gets its own scrolling stage and a size the reader chooses.
+               Fit is the default because it answers "which page is this?"
+               at a glance; Actual size answers "what did it say?" -->
+          <button id="recall-preview-out" type="button" class="small" aria-label="Zoom out">
+            &minus;
+          </button>
+          <span id="recall-preview-level" aria-live="polite">Fit</span>
+          <button id="recall-preview-in" type="button" class="small" aria-label="Zoom in">
+            +
+          </button>
+          <button id="recall-preview-fit" type="button" class="small">
+            Fit
+          </button>
+          <button id="recall-preview-close" type="button" class="small">
+            Close picture
+          </button>
+        </div>
+        <div id="recall-preview-stage">
+          <img id="recall-preview-img" alt="Saved picture of the page" draggable="false" />
+        </div>
+      </div>
       <!-- aria-label rather than a visually-hidden <label>: this chrome has
            no sr-only class, and inventing one here would put an untested
            positioning rule in the stylesheet for a single field. -->
@@ -1586,14 +1705,67 @@
         autocomplete="off"
       />
       <p class="panel-foot" id="recall-empty" hidden>
-        Nothing saved yet. On Windows the picture covers the visible area. On
-        Linux it covers the full page.
+        <!-- The Windows half of this sentence stopped being true on
+             2026-08-19: capture_page now asks the DevTools protocol for a
+             full-page screenshot and only falls back to the viewport on a
+             runtime too old to answer. Reported as "It's supposed to capture
+             the entire page, right? Why can't I scroll down?"
+             It then had to be qualified the same day. This is a STATIC
+             string shown before any capture exists, so it cannot know which
+             path a save will take -- and a browser check caught it sitting
+             directly above a save message that said the opposite. It now
+             describes the normal case and hands the last word to the save
+             message, which knows the real scope. -->
+        Nothing saved yet. Saving keeps a picture of the page and the text
+        read off it; each save says how much of the page it captured.
       </p>
       <p class="panel-foot" id="recall-none" hidden>
         No saved page has that word. Try another one.
       </p>
       <ul id="recall-list" class="items" role="list"></ul>
     </section>
+      <section id="leakcheck" class="tools-body" hidden>
+        <h3 class="section-head">Check an image before you share it</h3>
+        <p class="panel-foot">
+          <!-- What it looks for is NAMED, because "found nothing sensitive"
+               reads as a judgment the browser is not making. The list must
+               match LeakKind in crates/ocr/src/leaks.rs, which has SEVEN
+               variants -- an earlier version of this copy said five and
+               silently dropped the private-key header and the faint-text
+               finding, both of which are live and ungated. A counted
+               enumeration is a promise; count it against the enum, not
+               against scan_text alone (HiddenText comes from scan_regions). -->
+          Reads the text in a picture and looks for seven things that give you
+          away: an email address, a card number, a long number, an API key or
+          token, a private key header, an IP address, and text too faint for a
+          person to see. It can also show you everything it read, so its
+          answer can be checked. It runs on this computer, and the picture is
+          never uploaded or saved.
+        </p>
+        <div class="form-buttons">
+          <button id="leakcheck-pick" type="button" class="small">
+            Choose an image
+          </button>
+        </div>
+        <p class="error" id="leakcheck-error"></p>
+        <p class="ok" id="leakcheck-status"></p>
+        <ul id="leakcheck-list" class="entry-list"></ul>
+        <!-- The evidence behind the verdict. Hidden until a scan has read
+             something, and behind a toggle rather than always open: the
+             common case is a clean answer the reader accepts, and a wall of
+             OCR text under it buries the finding list that matters. -->
+        <div id="leakcheck-readwrap" hidden>
+          <div class="form-buttons">
+            <button id="leakcheck-showtext" type="button" class="small">
+              Show what it read
+            </button>
+          </div>
+          <pre id="leakcheck-text" hidden></pre>
+        </div>
+      </section>
+    </section>
+
+    
 
     <section id="privacy-panel" hidden>
       <h1>Privacy protections</h1>
@@ -1668,9 +1840,10 @@
         <h3 class="section-head">Fingerprint Divergence on this site</h3>
         <p class="panel-foot" id="dv-host"></p>
         <p class="panel-note" id="dv-premium" hidden>
-          Choosing per site is a Premium feature, arriving the day Premium
-          launches. Find it in the Premium row of the Vault panel.
-        </p>
+        Choosing per site is free, like Fingerprint Divergence itself.
+        Name a full hostname to turn the noise off there and leave it on
+        everywhere else.
+      </p>
         <label class="toggle-row" for="dv-off">
           <input id="dv-off" type="checkbox" />
           <span class="toggle-text">
@@ -1792,22 +1965,11 @@
         <p class="ok" id="forget-all-result" hidden></p>
       </section>
 
-      <section id="leakcheck" hidden>
-        <h3 class="section-head">Check an image before you share it</h3>
-        <p class="panel-foot">
-          Reads the text in a picture so you can see what it gives away, like an
-          address, a card number or a key. It runs on this computer. The picture
-          is never uploaded or saved.
-        </p>
-        <div class="form-buttons">
-          <button id="leakcheck-pick" type="button" class="small">
-            Choose an image
-          </button>
-        </div>
-        <p class="error" id="leakcheck-error"></p>
-        <p class="ok" id="leakcheck-status"></p>
-        <ul id="leakcheck-list" class="entry-list"></ul>
-      </section>
+      <!-- "Check an image before you share it" MOVED OUT of this panel
+           2026-08-19, whole, into the combined tools modal beside Page
+           integrity and Deep Recall: one home for the
+           three content tools, reachable from the palette). Nothing else in
+           this panel changed. -->
     </section>
 
     <!-- The resolver choice, reachable straight from the toolbar. It is a
@@ -1911,34 +2073,107 @@
     </section>
 
     <section id="tunnel-panel" hidden>
-      <h1>Tunnel</h1>
+      <h1>Private Tunnel</h1>
       <!-- Every word here about what the tunnel DOES arrives from Rust
            (TunnelMode::describe, as describe_off / describe_imported in
            tunnel_get). This markup carries mechanical labels only, so this
            panel can never word a choice differently from another surface. -->
       <p class="panel-foot" id="tunnelp-status"></p>
+
+      <!-- THE PREREQUISITE, BEFORE THE CONTROLS IT GATES. This used to be a
+           refusal AFTER the click: the import button was live with a locked
+           vault, the picker opened, a file was chosen, and only then did it
+           fail. Saying it first costs a line and saves that whole walk. -->
+      <p class="panel-note" id="tunnelp-vault-first" hidden>
+        Private Tunnel keeps its configuration in the vault. Create or unlock
+        the vault first.
+      </p>
+
+      <!-- Numbered because the order is not guessable: a configuration has
+           to exist before the switch means anything, and the switch does
+           nothing until the engine restarts. Step LABELS are mechanical and
+           live here; every sentence about what the tunnel DOES still comes
+           from Rust. -->
+      <!-- STANDING, not conditional. The prerequisite note above appears
+           only while the vault is shut; this says the dependency exists at
+           all, so someone reading the panel with an open vault still learns
+           that closing it will take the tunnel down with it. -->
+      <p class="panel-note" id="tunnelp-vault-link">
+        Private Tunnel needs your vault. Its configuration is stored there, so
+        it carries traffic only while the vault is unlocked, and while it is
+        switched on with the vault locked, pages will not load at all.
+      </p>
+
+      <h2 class="tunnelp-step">1. Get a configuration</h2>
+      <p class="panel-note" id="tunnelp-provider">
+        You supply the server: PATANYX does not run one and does not resell
+        anyone else's. Any WireGuard provider that hands you a configuration
+        file will do, as will your own server.
+      </p>
+
+      <h2 class="tunnelp-step">2. Import it</h2>
       <p class="panel-foot" id="tunnelp-config"></p>
+      <div class="form-buttons">
+        <button id="tunnelp-import" type="button" class="small">
+          Import from a file
+        </button>
+        <button id="tunnelp-remove" type="button" class="small">Remove</button>
+      </div>
+      <!-- The paste path exists because providers increasingly generate a
+           configuration in a web page rather than serving a .conf, and the
+           clipboard is then the only handoff the user has. Same parser, same
+           size cap, same wipe as the file path. -->
+      <label class="tunnelp-paste-label" for="tunnelp-paste">
+        Or paste the configuration text:
+      </label>
+      <textarea
+        id="tunnelp-paste"
+        rows="4"
+        spellcheck="false"
+        autocomplete="off"
+        placeholder="[Interface] ..."
+      ></textarea>
+      <div class="form-buttons">
+        <button id="tunnelp-paste-import" type="button" class="small">
+          Import pasted configuration
+        </button>
+      </div>
+
+      <h2 class="tunnelp-step">3. Switch it on</h2>
       <div class="form-buttons">
         <button id="tunnelp-off" type="button" class="small">Off</button>
         <button id="tunnelp-imported" type="button" class="small">
           Imported
         </button>
       </div>
+      <!-- The engine's own words for each choice, immediately under the
+           choice they describe. The Imported text ends with the restart
+           caveat, so the cost of switching is on screen BEFORE the click
+           rather than only in the note that appears after it. Never retyped
+           here; both strings arrive from TunnelMode::describe. -->
+      <p class="panel-foot" id="tunnelp-describe-off"></p>
+      <p class="panel-foot" id="tunnelp-describe-imported"></p>
+      <p class="panel-note">
+        Importing a configuration does not switch the tunnel on. Use the
+        buttons above for that.
+      </p>
+
+      <h2 class="tunnelp-step">4. Apply it</h2>
       <!-- Directly under the choice that causes it. It sat below both
            describe paragraphs, which are long enough that the note landed
            off the bottom of a 500px panel -- shown, and never seen. -->
       <p class="ok" id="tunnelp-restart" hidden></p>
-      <p class="panel-foot" id="tunnelp-describe-off"></p>
-      <p class="panel-foot" id="tunnelp-describe-imported"></p>
-      <div class="form-buttons">
-        <button id="tunnelp-import" type="button" class="small">
-          Import configuration
+      <!-- Sits with the note, not in the button row above: it is the answer
+           to that note, and it must not read as a third mode choice. Hidden
+           and shown together with it. -->
+      <div id="tunnelp-restart-actions" hidden>
+        <button id="tunnelp-apply-restart" type="button" class="small">
+          Apply and restart now
         </button>
-        <button id="tunnelp-remove" type="button" class="small">Remove</button>
       </div>
-      <p class="panel-note">
-        Importing a configuration does not switch the tunnel on. Use the buttons
-        above for that.
+      <p class="panel-note" id="tunnelp-applied-note">
+        Nothing to apply: the browser is already running with the setting
+        shown above.
       </p>
       <p class="panel-note" id="tunnelp-error" hidden></p>
     </section>
@@ -2051,6 +2286,7 @@
           <p class="error" id="unlock-error"></p>
         </form>
 
+
         <!-- AUTO-LOCK, moved here from the Backup pane (decided 2026-08-05)
              so it is seen at the moment the passphrase is keyed rather than
              only by someone who already went looking for it.
@@ -2080,6 +2316,76 @@
         </p>
         <div class="form-buttons" id="autolock-choices"></div>
         <p class="panel-note" id="autolock-note"></p>
+
+        <!-- WHAT UNLOCKING IS FOR, on the screen where the question arises,
+             and directly under the sentence about how long it lasts.
+             
+             THE LIST IS EXHAUSTIVE AND WAS CHECKED AGAINST THE HANDLER, not
+             written from memory: every arm in ipc.rs guarded by
+             unlocked(state) or store_open(state), mapped to the name its own
+             surface already uses. An earlier draft of this list named five
+             of them and quietly omitted Sets of tabs, Downloads, Deep Recall
+             and the per-site divergence choice. If a feature is added behind
+             either guard, it belongs here; if something here starts working
+             while locked, it must come out.
+             
+             NOTHING PREMIUM IS NAMED HERE. Only features a passphrase alone
+             turns on, because that is what this list claims. The arms behind
+             the Premium gate, verified against every cross_tab_gate call in
+             ipc.rs, are: archive_save/list/search (Deep Recall),
+             change_compare_request and download_compare_request (the compare
+             features), divergence_* (Divergence Exceptions), find_tabs_*
+             (Multi-Tab Search), ocr_region_* (Text Capture), and
+             tabs_switcher_list / tabs_batch_enter (Tab Switcher, Batch Tab
+             Actions). None of those belong in this list; unlocking does not
+             turn them on.
+             
+             Set-aside tabs are deliberately not named: owner's call, on the
+             grounds that the distinction between setting tabs aside and the
+             Premium batch actions beside it confuses more than it explains.
+             Do not add it back.
+             
+             Chat is absent for a different reason: it exists only in chat
+             builds, and the paragraph above already says the vault holds the
+             chat identity.
+             "Premium features" stays, and is the reason those two omissions
+             are not a contradiction: the licence itself is stored and
+             verified in the vault (licence_paste, licence_activate), so a
+             locked vault cannot check an entitlement at all and NOTHING
+             Premium works. Unlocking is what makes the licence readable;
+             owning one is what makes any particular feature appear. Naming
+             the category rather than individual features is what keeps that
+             true without listing a menu nobody may be entitled to.
+             
+             Chips rather than a bulleted column: six short names read in a
+             glance where six sentences do not, and they fit one or two rows
+             instead of costing twenty lines on a panel that is already
+             long. -->
+        <p class="panel-note vault-enables-intro">
+          Unlocking the vault turns these on:
+        </p>
+        <ul class="vault-enables">
+          <li>Private Tunnel</li>
+          <li>Saved passwords</li>
+          <li>Bookmarks</li>
+          <li>Downloads</li>
+          <li>Notes</li>
+          <!-- Caps the first row at five. Six short names fit a wide panel on
+               one line, which is a wall rather than a list; flex-wrap alone
+               cannot express "at most five" because it only breaks when the
+               row runs out of width. A zero-height full-width item forces the
+               break where it is wanted and disappears on a narrow panel,
+               where wrapping already happens sooner. -->
+          <li class="vault-enables-break" aria-hidden="true"></li>
+          <li>Premium features</li>
+        </ul>
+        <!-- The one that does not merely go missing. With the tunnel on and
+             the vault shut, nothing loads at all, which reads as a broken
+             browser rather than a feature waiting to be switched on. -->
+        <p class="panel-note" id="vault-enables-tunnel">
+          Private Tunnel is the one to watch: while it is switched on and the
+          vault is locked, no page will load at all.
+        </p>
 
         <p class="panel-foot">
           Forgotten your passphrase? Use the recovery key from when you set up

@@ -606,11 +606,23 @@ check("runtime-built panels do not inline-override panel-modal", () => {
 // measurement one.
 //
 // Keyed on role=alert/status because that is what every banner in this file
-// already carries, and a new one will carry it too.
+// already carries, and a new one will carry it too -- plus role=search, which
+// is the find bar. It sits in the same band under the toolbar and is clipped
+// by the same rule, and it was NOT in BANNERS: with the toolbar across the top
+// the 148px floor happened to leave enough slack for it, and with the toolbar
+// down the left edge (strip measured tightly) it rendered under the page and
+// Ctrl+F "did nothing". The `hidden` attribute is optional in the pattern
+// only because the find bar carries it before the role.
 check("every banner in the chrome is measured by syncChromeHeight", () => {
   const declared = [
-    ...html.matchAll(/<div id="([a-z-]+)" role="(?:alert|status)"/g),
+    ...html.matchAll(
+      /<div id="([a-z-]+)"(?: hidden)? role="(?:alert|status|search)"/g,
+    ),
   ].map((m) => m[1]);
+  assert(
+    declared.includes("findbar"),
+    "the find bar (#findbar, role=search) is no longer found by the sweep",
+  );
   assert(
     declared.length >= 6,
     "found only " + declared.length + " banners; the pattern stopped matching",

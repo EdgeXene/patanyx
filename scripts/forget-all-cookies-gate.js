@@ -105,7 +105,13 @@ const sectionStart = html.lastIndexOf(
   "<section",
   html.indexOf('id="forget-all-choice"'),
 );
-const sectionEnd = html.lastIndexOf("<section", html.indexOf('id="leakcheck"'));
+// The next <section> AFTER this one, whichever it is. This used to be
+// found by looking for #leakcheck, which happened to be the neighbour --
+// until 2026-08-19, when the image check moved out of the Privacy panel
+// into the tools modal and the landmark walked off with it, leaving
+// sectionEnd BEFORE sectionStart and every check below reading a negative
+// slice. A boundary should not be another feature's address.
+const sectionEnd = html.indexOf("<section", sectionStart + 1);
 const SECTION = html.slice(sectionStart, sectionEnd);
 
 check("the section exists inside the privacy panel", () => {
@@ -113,7 +119,7 @@ check("the section exists inside the privacy panel", () => {
     html.indexOf('id="forget-all-choice"') !== -1,
     "#forget-all-choice is missing from index.html",
   );
-  assert(sectionEnd !== -1, "the leak-check section it precedes is missing");
+  assert(sectionEnd !== -1, "no section follows it; the panel ends abruptly");
   assert(sectionStart < sectionEnd, "the section is out of order");
   const panelStart = html.indexOf('id="privacy-panel"');
   const panelEnd = html.indexOf('id="dns-panel"');

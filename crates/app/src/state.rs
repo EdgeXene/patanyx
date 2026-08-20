@@ -68,6 +68,33 @@ pub fn is_allowed_content_url(url: &str) -> bool {
     if url == "about:blank" {
         return true;
     }
+    // TWO PARSERS, AND EITHER ONE MAY VETO (security audit 2026-08-18, F19).
+    //
+    // `host_of` compares the host it extracts LITERALLY. That is correct for
+    // the normalizations it was written for -- stripped tabs, a backslash
+    // authority, userinfo, case -- and blind to the ones that happen INSIDE
+    // the host component: percent-decoding and IDNA mapping. So
+    // `http://%72bchrome%2elocalhost/` and `http://rbchrome\u{3002}localhost/`
+    // read as unrelated names here and resolve to the chrome origin in the
+    // engine. Five such spellings passed before this arm existed; they are
+    // pinned in `ipc.rs`'s bypass table.
+    //
+    // The fix is not to teach `host_of` percent-decoding and a Unicode
+    // mapping table by hand -- that is the same class of work that produced
+    // the gap, and a mapping table is never finished. It is to ask the
+    // question a second time with the parser the engines actually implement,
+    // and let EITHER answer deny. A bypass now has to be a host that this
+    // parser resolves somewhere harmless AND `host_of` reads as harmless,
+    // while the engine reads it as chrome.
+    //
+    // Deliberately additive: `host_of` still decides everything else,
+    // including which non-http schemes are refused, so nothing that was
+    // denied before becomes allowed now.
+    if let Ok(parsed) = url::Url::parse(url) {
+        if parsed.host_str() == Some(platform::CHROME_RESERVED_HOST) {
+            return false;
+        }
+    }
     match host_of(url) {
         // Compared case-insensitively; `host_of` has already lowercased.
         Some(host) => host != platform::CHROME_RESERVED_HOST,
@@ -119,6 +146,39 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
     }
 }
 
+/// Whether a credential-save offer may be shown for a submission, and the
+/// site name the banner is allowed to use.
+///
+/// Pure, and separated from `note_login_submitted` for the reason the rest of
+/// this file separates decisions from I/O: the interesting cases are about two
+/// URLs disagreeing, and an `AppState` full of live webviews is not needed to
+/// state them.
+///
+/// `sender` is the engine's answer to "which document sent this"
+/// (`ICoreWebView2WebMessageReceivedEventArgs::Source`), NEVER the `origin`
+/// field the page puts in its own JSON. The page's field used to reach the
+/// save banner, which let a hostile page make the trusted chrome name a site
+/// the user was not on (security audit 2026-08-18, F20).
+///
+/// `tab` is what this side believes the tab is showing. The two disagree in
+/// exactly the case worth refusing: a page posts a submission and then
+/// navigates. Web messages and navigation events are not ordered against each
+/// other, so the message can arrive after the move, and the offer would
+/// otherwise bind to whichever site is loaded by then -- with
+/// `cred_save_confirm` dutifully re-deriving the host from THAT url and filing
+/// the password under it.
+///
+/// Hosts are compared, not whole URLs: an in-page fragment or a query change
+/// is not a different site and must not throw an honest offer away.
+pub(crate) fn login_offer_origin(sender: &str, tab: Option<&str>) -> Option<String> {
+    let sender_host = host_of(sender)?;
+    let tab_host = host_of(tab?)?;
+    if sender_host != tab_host {
+        return None;
+    }
+    Some(sender_host)
+}
+
 pub struct Tab {
     pub id: u64,
     /// Platform handle for the tab's view: the GTK container on unix, a
@@ -161,6 +221,22 @@ pub struct Tab {
     /// the point -- an override that outlived its tab would be a hole nobody
     /// remembers opening.
     malicious_override: Rc<RefCell<BTreeSet<String>>>,
+    /// Hosts the user chose to reach over plain HTTP after being warned.
+    /// Same shape and the same lifetime rule as `malicious_override`: per
+    /// tab, shared with the navigation handler's closure, gone with the tab.
+    /// Kept as a SEPARATE set on purpose -- "I accept this site is
+    /// unencrypted" and "I accept this site is on a phishing list" are two
+    /// decisions, and one set for both would let either answer the other.
+    insecure_override: Rc<RefCell<BTreeSet<String>>>,
+    /// The plain-HTTP URL the navigation handler held back, waiting on the
+    /// user's answer. `tab_status` carries it so the chrome shows the
+    /// warning for THIS tab and only while it is the active one; cleared by
+    /// Continue, Dismiss, and any navigation that does go through.
+    insecure_pending: Option<String>,
+    /// When `insecure_pending` was last set. The banner's subject may not be
+    /// rewritten faster than a person can read it -- see
+    /// `INSECURE_BANNER_STABILITY` and `note_insecure_navigation`.
+    insecure_pending_at: Option<Instant>,
 }
 
 impl Tab {
@@ -440,6 +516,97 @@ impl Tab {
             .borrow_mut()
             .insert(host.to_ascii_lowercase());
     }
+
+    /// Let this tab reach `host` over plain HTTP. Same contract as
+    /// `allow_malicious_host`: next navigation, this tab only, no permanent
+    /// form.
+    pub fn allow_insecure_host(&self, host: &str) {
+        self.insecure_override
+            .borrow_mut()
+            .insert(host.to_ascii_lowercase());
+    }
+}
+
+/// How long a plain-HTTP banner's subject is held still before a different
+/// held-back URL may replace it.
+///
+/// A PAGE CHOOSES WHEN THIS FIRES AND WHAT IT NAMES. `location.href` in a
+/// loop raises a fresh held navigation every few milliseconds, each one
+/// rewriting the banner, so the host a person reads need not be the host
+/// that was pending when their click landed: the browser's own trusted UI
+/// becomes the delivery mechanism. The click is separately protected --
+/// Continue names the host it displayed and Rust refuses a mismatch -- but a
+/// banner flickering through attacker-chosen names is its own defect, and
+/// rewriting it at 20 Hz also drives a dozen COM round-trips per frame
+/// through `emit_tab_status` on the event-loop thread.
+///
+/// So a replacement is ignored while the current subject is younger than
+/// this. The navigation is still held back either way; only the banner's
+/// text is steadied. 750ms is long enough to defeat a tight loop and short
+/// enough that a real second navigation is not left describing a stale one.
+const INSECURE_BANNER_STABILITY: Duration = Duration::from_millis(750);
+
+/// What a newly held-back plain-HTTP URL does to the banner already on
+/// screen. Pure so `cargo test` can prove the rule without an engine.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BannerUpdate {
+    /// Nothing changed; emit nothing. A page retrying the same URL must not
+    /// drive a status sweep per attempt.
+    Unchanged,
+    /// The current subject is younger than the stability window, so it keeps
+    /// the banner. The navigation is still held back; only the relabel is
+    /// refused.
+    HoldSteady,
+    /// Show the new subject.
+    Replace,
+}
+
+pub fn banner_subject_update(
+    current: Option<&str>,
+    current_at: Option<Instant>,
+    incoming: &str,
+    now: Instant,
+) -> BannerUpdate {
+    match current {
+        Some(pending) if pending == incoming => BannerUpdate::Unchanged,
+        Some(_)
+            if current_at.is_some_and(|at| now.duration_since(at) < INSECURE_BANNER_STABILITY) =>
+        {
+            BannerUpdate::HoldSteady
+        }
+        _ => BannerUpdate::Replace,
+    }
+}
+
+/// Whether a Continue click belongs to the banner the user actually read.
+///
+/// The chrome echoes the host it DISPLAYED. If the held-back URL moved on
+/// between the paint and the click -- the window above bounds how often that
+/// can happen, it does not make it impossible -- the two disagree and the
+/// click is refused. A confirmation, never a selection: this can only ever
+/// agree or disagree with a URL that is already pending, so no value passed
+/// here can name a destination of its own.
+pub fn continue_matches_shown_banner(pending_url: &str, shown_host: &str) -> bool {
+    host_of(pending_url).is_some_and(|host| shown_host.eq_ignore_ascii_case(&host))
+}
+
+/// Whether a navigation to `url` must be held back for the plain-HTTP
+/// warning. `http:` only, and NOT for the user's own network: loopback,
+/// `localhost`, RFC1918, link-local and CGNAT literals are exempt, the way
+/// every shipping HTTPS-only mode exempts local addresses -- a router's admin page
+/// or a device on the LAN is plain HTTP by construction, and a warning that
+/// fires on every one of those teaches the user to click through it. Every
+/// other http:// destination is warned about once per tab per host.
+pub fn needs_insecure_warning(url: &str) -> bool {
+    if !platform::privacy::is_insecure_page_url(url) {
+        return false;
+    }
+    match host_of(url) {
+        Some(host) => !platform::privacy::is_private_host(&host),
+        // No parseable authority: not something the warning can name, and
+        // `is_allowed_content_url` has already refused it upstream.
+        None => false,
+    }
 }
 
 impl Drop for Tab {
@@ -479,6 +646,8 @@ fn build_tab(
     // security decisions is how one of them ends up wrong.
     let malicious_override: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
     let nav_allowed = malicious_override.clone();
+    let insecure_override: Rc<RefCell<BTreeSet<String>>> = Rc::new(RefCell::new(BTreeSet::new()));
+    let nav_insecure_allowed = insecure_override.clone();
     let load_proxy = proxy.clone();
     let title_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
@@ -556,6 +725,22 @@ fn build_tab(
                         });
                         return false;
                     }
+                }
+            }
+            // PLAIN HTTP, after the blocklist: a listed host gets the
+            // stronger warning, not this one. Held back rather than loaded,
+            // and the chrome asks; Continue puts the host in the per-tab
+            // override and re-issues the SAME url, which passes here. Local
+            // and private addresses never reach this arm (see
+            // `needs_insecure_warning`). Same subframe caveat as the block
+            // above on WebKitGTK; on WebView2 NavigationStarting is top-level
+            // only.
+            if needs_insecure_warning(&url) {
+                let held = host_of(&url)
+                    .is_some_and(|host| !nav_insecure_allowed.borrow().contains(&host));
+                if held {
+                    let _ = nav_proxy.send_event(UserEvent::InsecureNavigation { tab_id: id, url });
+                    return false;
                 }
             }
             true
@@ -652,6 +837,9 @@ fn build_tab(
         suppress_history: false,
         zoom: 1.0,
         malicious_override,
+        insecure_override,
+        insecure_pending: None,
+        insecure_pending_at: None,
     })
 }
 
@@ -748,7 +936,18 @@ fn unique_download_path(url: &str, suggested: &Path) -> PathBuf {
 
 #[cfg(unix)]
 fn sanitize_filename(name: &str) -> String {
-    let stripped: String = name.chars().filter(|c| *c != '/' && *c != '\\').collect();
+    // Direction overrides and zero-width characters go FIRST, on both
+    // platforms (security audit 2026-08-18, Phase 6). A file name is a
+    // display surface: `invoice\u{202E}gpj.exe` renders in a file manager as
+    // `invoiceexe.jpg`, so a user who has been taught to check the extension
+    // checks it and is told the wrong answer. The predicate is the same one
+    // `hover.rs` uses to stop a link text lying about its target -- one
+    // definition, because the two problems are the same problem.
+    let stripped: String = name
+        .chars()
+        .filter(|c| !crate::hover::is_deceptive(*c))
+        .filter(|c| *c != '/' && *c != '\\')
+        .collect();
     let stripped = stripped.trim_start_matches('.');
     if stripped.is_empty() {
         "download".to_string()
@@ -764,6 +963,11 @@ fn sanitize_filename(name: &str) -> String {
     // collapse into a traversal like ".." or an alternate-data-stream ":").
     let mapped: String = name
         .chars()
+        // Direction overrides and zero-width characters first: see the unix
+        // arm above. `invoice\u{202E}gpj.exe` displays as `invoiceexe.jpg`,
+        // and Explorer is exactly where a user checks an extension before
+        // double-clicking. Same predicate as the hover readout uses.
+        .filter(|c| !crate::hover::is_deceptive(*c))
         .map(|c| match c {
             '<' | '>' | ':' | '"' | '/' | '\\' | '|' | '?' | '*' => '_',
             c if (c as u32) < 0x20 => '_',
@@ -1533,7 +1737,10 @@ impl AppState {
         crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
         let intent = self.capture_intent;
         self.capture_intent = crate::capture::CaptureIntent::SaveFile;
-        let scope = crate::capture::current_scope();
+        // The scope the capture ACTUALLY had, from the path that produced
+        // it -- not a compile-time guess about the platform. On Windows those
+        // differ whenever the full-page call could not be issued.
+        let scope = ev.scope;
         let bytes = match ev.png.and_then(|bytes| {
             crate::capture::validate_capture_bytes(&bytes).map(|()| bytes)
         }) {
@@ -1913,6 +2120,7 @@ impl AppState {
             self.set_active(index);
         }
         self.emit_tabs_changed();
+        self.focus_url_bar_for_blank_tab(switch, url);
         Ok(id)
     }
 
@@ -1968,6 +2176,7 @@ impl AppState {
             let url = self.tabs[0].url.clone();
             self.emit("url_changed", json!({ "url": url }));
             self.emit_tab_status();
+            self.focus_url_bar_for_blank_tab(true, "about:blank");
             return Ok(());
         }
 
@@ -2048,7 +2257,51 @@ impl AppState {
     /// Evaluated on the chrome webview only, which is the one surface where
     /// script evaluation is permitted.
     pub fn focus_url_bar(&self) {
+        // Two focuses, and both are needed. The chrome webview is one widget
+        // (GTK) / one HWND (WebView2) among several: `element.focus()` inside
+        // it places the caret, but does not by itself take keyboard focus
+        // away from a content webview that holds it -- so first the WIDGET is
+        // focused (grab_focus / MoveFocus), then the script places the caret.
+        // Best-effort: a refused widget focus is not worth more than the
+        // script that follows it.
+        let _ = self.chrome.focus();
         self.emit("focus_url_bar", json!({}));
+    }
+
+    /// Ctrl+F: open the find bar with the cursor already in it.
+    ///
+    /// TWO FOCUSES, for exactly the reason `focus_url_bar` documents above.
+    /// The chrome already called `findInput.focus()` when it opened the bar,
+    /// and that was not enough: the shortcut is resolved in Rust precisely
+    /// BECAUSE a content webview has keyboard focus, and `element.focus()`
+    /// inside the chrome document places a caret without taking that focus
+    /// away from the page. So the bar opened, looked ready, and swallowed
+    /// nothing -- every keystroke still went to the page behind it. The
+    /// widget is focused first, then the chrome opens the bar and puts the
+    /// caret in it.
+    ///
+    /// Same best-effort rule: a refused widget focus is not worth more than
+    /// the event that follows it.
+    pub fn open_find_bar(&self) {
+        let _ = self.chrome.focus();
+        self.emit("find_open", json!({}));
+    }
+
+    /// A BLANK tab the user is now looking at has nothing to focus but the
+    /// address bar, so the cursor lands there: Ctrl+T, the "+" button, and
+    /// the fresh tab left behind when the last one closes.
+    ///
+    /// Called AFTER `show_tab`, which on Windows moves keyboard focus to the
+    /// content webview (each WebView2 child is its own HWND, focused
+    /// explicitly when shown). The chrome's "+" click handler used to focus
+    /// the bar BEFORE its `tab_new` round trip and lost to exactly that; the
+    /// Ctrl+T path never focused it at all. A tab opened on a real URL keeps
+    /// focus on the page, as every browser does; a background tab changes
+    /// nothing.
+    fn focus_url_bar_for_blank_tab(&self, switch: bool, url: &str) {
+        if switch && url == "about:blank" {
+            self.focus_url_bar();
+        }
     }
 
     /// Ctrl+K. Pushed to the chrome rather than acted on here: which actions
@@ -2157,6 +2410,7 @@ impl AppState {
                 "tunnel": "not_attempted",
                 "content_script_registered": "not_attempted",
                 "pending_save": Value::Null,
+                "insecure_pending": Value::Null,
             });
         };
         let engine_settings = platform::engine_settings(&tab.view);
@@ -2244,6 +2498,34 @@ impl AppState {
                 (self.tabs.get(self.active).map(|t| t.id) == Some(p.tab_id))
                     .then(|| json!({ "origin": p.origin, "username": p.username }))
             }),
+            // The plain-HTTP URL the navigation handler is holding for THIS
+            // tab, or null. The chrome renders the warning from this field
+            // alone, so it follows the active tab and never a stale event.
+            "insecure_pending": tab.insecure_pending.as_deref(),
+            // THE HOST, COMPUTED HERE, because the chrome computing its own
+            // put two parsers on the same string and they disagreed. The
+            // chrome's regex kept the whole authority; host_of strips the
+            // port and the userinfo. continue_matches_shown_banner demands
+            // the two agree, so Continue was refused for every URL carrying
+            // a port -- http://example.com:8080/ warned normally, then said
+            // "That does not look right" whichever way the user answered,
+            // with no path forward at all.
+            //
+            // Worse for a banner whose whole job is naming the right site:
+            // the authority includes userinfo, so
+            // http://www.paypal.com@attacker.example/ RENDERED as
+            // "www.paypal.com@attacker.example". An attacker-chosen string
+            // in the subject line of the warning about that attacker. This
+            // is the relabelling class the banner was rewritten to prevent,
+            // arriving through the parser rather than through a race.
+            //
+            // The blocklist banner one screen away already did it this way.
+            "insecure_pending_host": tab
+                .insecure_pending
+                .as_deref()
+                .and_then(host_of)
+                .map(Value::from)
+                .unwrap_or(Value::Null),
         })
     }
 
@@ -2419,13 +2701,23 @@ impl AppState {
     /// Silently drops the submission if the vault is locked: offering to
     /// save into a vault the user has not opened is not this feature's job,
     /// and there is no "unlock, then continue" flow here to build.
-    pub fn note_login_submitted(&mut self, tab_id: u64, origin: String, username: String, password: String) {
+    pub fn note_login_submitted(
+        &mut self,
+        tab_id: u64,
+        source_url: String,
+        username: String,
+        password: String,
+    ) {
         if self.tabs.get(self.active).map(|t| t.id) != Some(tab_id) {
             return;
         }
         if self.vault.is_none() {
             return;
         }
+        let tab_url = self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.url.clone());
+        let Some(origin) = login_offer_origin(&source_url, tab_url.as_deref()) else {
+            return;
+        };
         self.pending_save = Some(PendingSave {
             tab_id,
             origin: origin.clone(),
@@ -2709,6 +3001,14 @@ impl AppState {
         // nothing licence-related survives a lock, and the next unlock
         // re-verifies from the stored record. Ungated, like the tunnel.
         crate::licence_control::on_vault_locked();
+        // The staged Deep Recall picture dies with the vault too. The STORE
+        // stays open (above), so the archive's ciphertext remains readable --
+        // but the staged slot holds a DECRYPTED page screenshot, servable
+        // over the chrome protocol, and the panel's published copy says the
+        // feature "requires an unlocked vault". A locked browser with a
+        // decrypted page still on offer would make that sentence false, so
+        // the promise wins over the loophole.
+        crate::archive::clear_staged();
         // The per-site divergence table dies with the vault for the same
         // reason: it was read out of the encrypted store, and a tab opened
         // after the lock must not carry choices this browser can no longer
@@ -2896,6 +3196,14 @@ impl AppState {
         self.relayout();
         let url = self.tabs[index].url.clone();
         self.emit("url_changed", json!({ "url": url }));
+        // The status is PER TAB and `emit_tab_status`'s own doc has always
+        // listed "tab switch" among the transitions that push it -- but no
+        // switch path did. Everything rendered from tab_status (freeze chip,
+        // TLS banner, save-password offer, the plain-HTTP warning) described
+        // the tab the user just LEFT until something else happened to
+        // re-emit it. Found when the HTTP warning stayed up on a tab that had
+        // already continued.
+        self.emit_tab_status();
     }
 
     pub fn tab_list(&self) -> Value {
@@ -3097,6 +3405,7 @@ impl AppState {
             self.set_active(index);
         }
         self.emit_tabs_changed();
+        self.focus_url_bar_for_blank_tab(switch, url);
         Ok(id)
     }
 
@@ -3157,10 +3466,24 @@ impl AppState {
         };
         match store.add_archive(&url, &title, scope, &text, Some(&png)) {
             Ok(id) => {
-                let words = text.split_whitespace().count();
+                // The reader stops at MAX_BOXES and says so with a marker
+                // region. Deep Recall is the surface that actually reaches
+                // that cap -- a long page is exactly what it saves -- and
+                // reporting a word count as if it were the whole page is the
+                // "read 2 lines" failure in a politer costume. The marker is
+                // not a word the user wrote, so it comes out of the count as
+                // well as being announced.
+                let truncated = text.contains(patanyx_ocr::TRUNCATED_MARKER);
+                let words = text
+                    .replace(patanyx_ocr::TRUNCATED_MARKER, " ")
+                    .split_whitespace()
+                    .count();
+                // The scope travels with the event because the picture can
+                // be a viewport on the Windows fallback path, and the save
+                // message is the only place the user is told which they got.
                 self.emit(
                     "archive_saved",
-                    json!({ "ok": true, "id": id, "words": words }),
+                    json!({ "ok": true, "id": id, "words": words, "truncated": truncated, "scope": scope }),
                 );
             }
             Err(e) => {
@@ -3210,6 +3533,10 @@ impl AppState {
         };
         self.tabs[index].url = url.clone();
         self.tabs[index].record_history(url.clone());
+        // A navigation that went THROUGH answers any held-back one: the user
+        // went somewhere else, or clicked Continue and this is that load.
+        self.tabs[index].insecure_pending = None;
+        self.tabs[index].insecure_pending_at = None;
         // The DOM state that produced any pending save offer for THIS tab is
         // gone the moment it navigates -- confirming it now would save under
         // whatever origin the tab happens to show next.
@@ -3220,9 +3547,85 @@ impl AppState {
             self.emit("url_changed", json!({ "url": url }));
         }
         self.emit_tabs_changed();
-            if is_active {
+        if is_active {
             self.emit_tab_status();
         }
+    }
+
+    /// The navigation handler held back a plain-HTTP load on tab `id`.
+    /// Recorded on the tab, so a background tab's warning is waiting when the
+    /// user switches to it, and pushed to the chrome now if the tab is the
+    /// active one. Nothing loaded; the refusal already happened.
+    pub fn note_insecure_navigation(&mut self, id: u64, url: String) {
+        self.note_insecure_navigation_at(id, url, Instant::now())
+    }
+
+    /// The clock is a parameter so the stability rule is testable without
+    /// sleeping.
+    pub fn note_insecure_navigation_at(&mut self, id: u64, url: String, now: Instant) {
+        let is_active = self.tabs.get(self.active).map(|t| t.id) == Some(id);
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return; // late event from a closed tab
+        };
+        if banner_subject_update(
+            tab.insecure_pending.as_deref(),
+            tab.insecure_pending_at,
+            &url,
+            now,
+        ) != BannerUpdate::Replace
+        {
+            return;
+        }
+        tab.insecure_pending = Some(url);
+        tab.insecure_pending_at = Some(now);
+        if is_active {
+            self.emit_tab_status();
+        }
+    }
+
+    /// "Continue" on the plain-HTTP warning: the held-back URL's host joins
+    /// the active tab's override and the SAME URL is loaded again, this time
+    /// passing the navigation handler. Refuses when nothing is pending, so a
+    /// compromised chrome cannot use this to seed an override for a host the
+    /// user was never asked about.
+    pub fn insecure_allow(&mut self, shown_host: &str) -> Result<Value, &'static str> {
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        // BORROWED, NOT TAKEN, until every check has passed. Taking first
+        // meant a rejected request still cleared the pending, so the banner
+        // vanished and the user could not retry.
+        let url = tab.insecure_pending.clone().ok_or("bad_args")?;
+        // Re-checked at the point of use, not trusted from when it was
+        // recorded: only a URL this warning would hold back may be allowed
+        // through it.
+        if !needs_insecure_warning(&url) || !is_allowed_content_url(&url) {
+            return Err("bad_args");
+        }
+        let host = host_of(&url).ok_or("bad_args")?;
+        // THE HOST THE USER READ MUST BE THE HOST THAT LOADS. The chrome
+        // sends back the host it displayed; if the pending URL changed
+        // between the render and the click, these differ and the click is
+        // refused rather than loading something the user never agreed to.
+        // This is a CONFIRMATION, not a selection: a mismatch refuses, and
+        // no value here can ever name a URL that was not already pending, so
+        // it cannot become an open-anything primitive.
+        if !continue_matches_shown_banner(&url, shown_host) {
+            return Err("bad_args");
+        }
+        tab.insecure_pending = None;
+        tab.insecure_pending_at = None;
+        tab.allow_insecure_host(&host);
+        tab.webview.load_url(&url).ok();
+        let status = self.active_tab_status();
+        Ok(json!({ "allowed": host, "status": status }))
+    }
+
+    /// "Dismiss" on the plain-HTTP warning: the held-back URL is dropped and
+    /// nothing is allowed. The tab stays where it was.
+    pub fn insecure_dismiss(&mut self) -> Result<Value, &'static str> {
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        tab.insecure_pending = None;
+        tab.insecure_pending_at = None;
+        Ok(self.active_tab_status())
     }
 
     pub fn on_title_changed(&mut self, id: u64, title: String) {
@@ -3258,6 +3661,47 @@ mod tests {
         assert_eq!(sanitize_filename("..\\..\\evil.exe"), "evil.exe");
         assert_eq!(sanitize_filename(".hidden"), "hidden");
         assert_eq!(sanitize_filename(""), "download");
+    }
+
+    /// A FILE NAME IS A DISPLAY SURFACE, and the same characters that let a
+    /// link text lie about its target let a name lie about its type.
+    ///
+    /// `invoice\u{202E}gpj.exe` renders in a file manager as `invoiceexe.jpg`,
+    /// because the override reverses everything after it. A user who has been
+    /// taught to check the extension before opening something checks it, and
+    /// is told the wrong answer. Zero-width characters are the quieter half:
+    /// they let two downloads look identical while being different files.
+    ///
+    /// Runs on both platforms because both file managers honour the override.
+    #[test]
+    fn deceptive_characters_never_survive_into_a_file_name() {
+        // The classic: reads as ".jpg", actually ".exe".
+        let disguised = sanitize_filename("invoice\u{202E}gpj.exe");
+        assert!(
+            !disguised.contains('\u{202E}'),
+            "a direction override survived into a file name: {disguised:?}"
+        );
+        assert!(
+            disguised.ends_with(".exe"),
+            "the real extension must remain visible: {disguised:?}"
+        );
+        // Every character the hover readout refuses, refused here too.
+        for c in [
+            '\u{202A}', '\u{202B}', '\u{202C}', '\u{202D}', '\u{202E}', '\u{2066}',
+            '\u{2067}', '\u{2068}', '\u{2069}', '\u{200B}', '\u{200E}', '\u{200F}',
+            '\u{00AD}', '\u{FEFF}',
+        ] {
+            let name = format!("a{c}b.txt");
+            let out = sanitize_filename(&name);
+            assert!(
+                !out.chars().any(crate::hover::is_deceptive),
+                "{c:?} survived sanitizing: {out:?}"
+            );
+        }
+        // A name made only of them is not a name.
+        assert_eq!(sanitize_filename("\u{202E}\u{200B}"), "download");
+        // And ordinary names are untouched.
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
     }
 
     #[cfg(windows)]
@@ -3404,6 +3848,167 @@ mod tests {
                  vault content",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod insecure_warning_tests {
+    use super::{
+        banner_subject_update, continue_matches_shown_banner, needs_insecure_warning, BannerUpdate,
+        INSECURE_BANNER_STABILITY,
+    };
+    use std::time::Instant;
+
+    /// THE ATTACK THIS BOUNDS. A page already continued-through runs
+    /// `location.href = "http://" + rand() + ".attacker.example/"` every
+    /// 50ms. Each attempt is held back and would have relabelled the banner,
+    /// so the host a person reads need not be the host that is pending when
+    /// their click lands. The subject is now frozen for the stability
+    /// window, which makes a tight loop unable to move it at all.
+    #[test]
+    fn a_redirect_loop_cannot_relabel_the_banner_under_the_reader() {
+        let t0 = Instant::now();
+        let shown = "http://first.example/";
+        for i in 0..20 {
+            let attempt = format!("http://a{i}.attacker.example/");
+            let step = t0 + INSECURE_BANNER_STABILITY / 40 * (i as u32 + 1);
+            assert_eq!(
+                banner_subject_update(Some(shown), Some(t0), &attempt, step),
+                BannerUpdate::HoldSteady,
+                "attempt {i} moved the banner inside the stability window"
+            );
+        }
+    }
+
+    #[test]
+    fn the_same_url_again_changes_nothing_and_emits_nothing() {
+        // A page retrying one URL must not drive a status sweep per attempt:
+        // active_tab_status is a dozen COM round-trips on the event loop.
+        let t0 = Instant::now();
+        assert_eq!(
+            banner_subject_update(Some("http://x.example/"), Some(t0), "http://x.example/", t0),
+            BannerUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn a_genuinely_later_navigation_does_replace_the_subject() {
+        // The window steadies the banner; it must not freeze it forever, or
+        // a real second navigation would be described by a stale one.
+        let t0 = Instant::now();
+        let later = t0 + INSECURE_BANNER_STABILITY + std::time::Duration::from_millis(1);
+        assert_eq!(
+            banner_subject_update(
+                Some("http://a.example/"),
+                Some(t0),
+                "http://b.example/",
+                later
+            ),
+            BannerUpdate::Replace
+        );
+        // And the first banner of all is never held back.
+        assert_eq!(
+            banner_subject_update(None, None, "http://a.example/", t0),
+            BannerUpdate::Replace
+        );
+    }
+
+    /// The second half of the defence: the window bounds how often the
+    /// subject can move, and this catches the remaining race where it moved
+    /// after the chrome painted but before the click was processed.
+    #[test]
+    fn continue_is_refused_when_the_pending_url_moved_after_the_paint() {
+        // The user read "good.example" and clicked it.
+        assert!(continue_matches_shown_banner(
+            "http://good.example/path?q=1",
+            "good.example"
+        ));
+        assert!(continue_matches_shown_banner(
+            "http://GOOD.example/",
+            "good.example"
+        ));
+        // Pending has since become the attacker's. The click names what was
+        // on screen, the two disagree, and it is refused rather than loading
+        // a full attacker-chosen URL as the top-level document.
+        assert!(!continue_matches_shown_banner(
+            "http://attacker.example/deep/path",
+            "good.example"
+        ));
+        // A host that cannot be parsed can never match.
+        assert!(!continue_matches_shown_banner("not a url", ""));
+        assert!(!continue_matches_shown_banner("http://good.example/", ""));
+    }
+
+    #[test]
+    fn the_echoed_host_cannot_name_a_destination_of_its_own() {
+        // The property that keeps this a confirmation rather than a
+        // selection: agreement is only ever possible with the URL already
+        // pending, so no value passed in can introduce a new one.
+        for attempt in [
+            "evil.example",
+            "good.example.evil.example",
+            "good.example:80",
+            "good.example/",
+            "",
+        ] {
+            let allowed = continue_matches_shown_banner("http://good.example/", attempt);
+            assert_eq!(
+                allowed,
+                attempt == "good.example",
+                "{attempt:?} must not be accepted for good.example"
+            );
+        }
+    }
+
+    /// The case the feature exists for: a public site over plain HTTP is
+    /// held back; the same site over HTTPS is not.
+    #[test]
+    fn public_http_is_warned_https_is_not() {
+        assert!(needs_insecure_warning("http://example.com/"));
+        assert!(needs_insecure_warning("HTTP://Example.COM/path?q=1"));
+        assert!(needs_insecure_warning("http://user@example.com:8080/"));
+        assert!(!needs_insecure_warning("https://example.com/"));
+        assert!(!needs_insecure_warning("about:blank"));
+    }
+
+    /// The user's own network is exempt: routers, printers and LAN devices
+    /// are plain HTTP by construction, and a warning that fires on every one
+    /// of them teaches the user to click through it.
+    #[test]
+    fn local_and_private_addresses_are_exempt() {
+        for url in [
+            "http://localhost/",
+            "http://localhost:8080/admin",
+            "http://router.localhost/",
+            "http://127.0.0.1/",
+            "http://[::1]/",
+            "http://192.168.1.1/",
+            "http://10.0.0.5:9000/",
+            "http://172.16.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            assert!(!needs_insecure_warning(url), "{url} must not be warned about");
+        }
+    }
+
+    /// A public address that merely LOOKS local is not exempt: only literal
+    /// private ranges and the localhost name are, never a hostname that might
+    /// resolve there.
+    #[test]
+    fn a_public_name_is_not_exempt_for_sounding_local() {
+        assert!(needs_insecure_warning("http://router.example.com/"));
+        assert!(needs_insecure_warning("http://8.8.8.8/"));
+        assert!(needs_insecure_warning("http://192.168.1.1.example.com/"));
+    }
+
+    /// Anything the allowlist upstream would already refuse is not this
+    /// warning's business: no authority, no warning.
+    #[test]
+    fn unparseable_urls_are_not_warned() {
+        assert!(!needs_insecure_warning("http://"));
+        assert!(!needs_insecure_warning("http:///path"));
+        assert!(!needs_insecure_warning("file:///etc/passwd"));
+        assert!(!needs_insecure_warning("javascript:alert(1)"));
     }
 }
 

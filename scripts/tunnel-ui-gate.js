@@ -63,6 +63,11 @@ function stubTunnel(overrides) {
       tunnel_status: { mode: "off", report: "not_attempted" },
       tunnel_import: { imported: true },
       tunnel_remove: {},
+      // The banner has TWO causes now, and they must be tested apart. A
+      // shut vault is a cause on its own (the configuration lives there, so
+      // nothing can be built before the first unlock); these checks are
+      // about the measured-failure path, so they run with it open.
+      vault_status: { unlocked: true },
     },
     overrides || {},
   );
@@ -649,6 +654,390 @@ check("the command palette can open the tunnel panel", () => {
   assert(
     /label:\s*"Open Tunnel",\s*buttonId:\s*"btn-tunnel"/.test(src),
     'PALETTE_ACTIONS needs { label: "Open Tunnel", buttonId: "btn-tunnel" }',
+  );
+});
+
+check(
+  "a locked vault is reported as a locked vault, not as a broken tunnel",
+  async () => {
+    // THE DEFECT THIS PINS, reported from hardware. With the tunnel on and
+    // the vault shut, the configuration cannot be read, the listener is
+    // parked refusing, and every page fails. The browser said "the tunnel
+    // is down. PATANYX will NOT fall back to a direct connection." True,
+    // and useless: it describes the symptom and hides the fix, so a healthy
+    // setup reads as a broken internet connection.
+    stubTunnel({
+      tunnel_get: {
+        mode: "imported",
+        describe_off: OFF_COPY,
+        describe_imported: IMPORTED_COPY,
+        has_config: null,
+        report: "failed",
+        start_error: null,
+      },
+    });
+    // The REAL path the engine uses when the vault shuts: vault_status is
+    // read once at boot, so a later stub would change nothing. This drives
+    // showState("locked") exactly as an auto-lock does.
+    global.window.__rb_event({ event: "vault_locked", data: {} });
+    await flush();
+    await openTunnelPanel();
+    await flush();
+
+    const banner = global.$("tunnel-warning");
+    assert(
+      banner.hidden === false,
+      "no banner at all while the tunnel is on and the vault is shut",
+    );
+    // Immediately: this cause needs no measurement, so it must not wait out
+    // the failure grace period. Fifteen seconds of blank window before any
+    // explanation is most of the confusion.
+    const title = String(global.$("tunnel-warning-title").textContent || "");
+    const body = String(global.$("tunnel-warning-body").textContent || "");
+    assert(
+      /vault/i.test(title) || /vault/i.test(body),
+      "the banner never mentions the vault: " + title + " / " + body,
+    );
+    assert(
+      !/tunnel is down/i.test(body),
+      "the banner still blames the tunnel: " + body,
+    );
+    // And it offers the thing that fixes it.
+    assert(
+      /vault/i.test(String(global.$("tunnel-warning-open").textContent || "")),
+      "the banner's button does not offer the vault",
+    );
+  },
+);
+
+check(
+  "a vault that locks over a WORKING tunnel raises no banner at all",
+  async () => {
+    // THE OVERCORRECTION THIS PINS. The test above proves the boot case:
+    // vault never unlocked, tunnel never came up, banner owed. The fix for
+    // it keyed on mode + vault alone, which reads a locked vault as a dead
+    // tunnel -- and tunnel_control has deliberately NO on_vault_locked,
+    // because the session already holds its keys. So the real sequence is:
+    // unlock at boot, tunnel reaches "applied" and carries traffic, the
+    // vault auto-locks a few minutes later, and the browser raised a red
+    // alert saying "pages will not load until you unlock it" and advising
+    // the user to switch off the tunnel that was working. Pages loaded
+    // fine. Worse, the toolbar button reads the MEASURED value, so it sat
+    // green at the same instant the banner said the opposite.
+    //
+    // The banner is owed when the vault is shut AND the probe does not
+    // report a working tunnel. Never on the mode alone.
+    stubTunnel({
+      tunnel_get: {
+        mode: "imported",
+        describe_off: OFF_COPY,
+        describe_imported: IMPORTED_COPY,
+        has_config: null,
+        report: "applied",
+        start_error: null,
+      },
+    });
+    // Order matters and mirrors the real one: the tunnel is measured
+    // carrying FIRST, then the vault locks behind it.
+    sendTabStatus("applied");
+    await flush();
+    global.window.__rb_event({ event: "vault_locked", data: {} });
+    await flush();
+    await openTunnelPanel();
+    await flush();
+
+    const banner = global.$("tunnel-warning");
+    assert(
+      banner.hidden === true,
+      "a banner claiming pages will not load, while the probe reports the " +
+        "tunnel applied and the toolbar shows it green",
+    );
+  },
+);
+
+check(
+  "a restart that would lose every tab asks first, and Cancel means no restart",
+  async () => {
+    // THE DEFECT THIS PINS. plan_create never sets aside an ephemeral tab --
+    // a privacy promise, not a preference -- and "Open new tabs without a
+    // saved profile" is BROWSER-WIDE. With it on, every tab is dropped, the
+    // plan comes out empty, and the old code restarted anyway underneath a
+    // note promising "your tabs are set aside and reopen after you unlock".
+    // One click, whole session gone, no confirmation, no count, and the copy
+    // said the opposite.
+    stubTunnel({
+      tunnel_get: {
+        mode: "imported",
+        describe_off: OFF_COPY,
+        describe_imported: IMPORTED_COPY,
+        has_config: true,
+        report: "not_attempted",
+        start_error: null,
+      },
+      tunnel_restart_preview: { kept: 0, left_out: 7 },
+    });
+    await openTunnelPanel();
+    await flush();
+    global.rbCalls.length = 0;
+
+    global.$("tunnelp-apply-restart")._fire("click");
+    await flush();
+
+    // Nothing may have restarted while the question is on screen.
+    assert(
+      global.rbCalls.filter((c) => c.cmd === "tunnel_apply_restart").length === 0,
+      "the browser restarted before the user answered",
+    );
+    const msg = String(global.$("confirm-text").textContent || "");
+    assert(/7/.test(msg), "the question never says how many tabs: " + msg);
+
+    // Cancel: the session must survive answering no.
+    global.$("confirm-cancel")._fire("click");
+    await flush();
+    assert(
+      global.rbCalls.filter((c) => c.cmd === "tunnel_apply_restart").length === 0,
+      "Cancel still restarted the browser and took the tabs with it",
+    );
+  },
+);
+
+check("a restart that loses nothing keeps its single click", async () => {
+  // The confirmation is owed to a LOSS, not to the feature. Asking every
+  // time trains the answer, and the ordinary case -- every tab storable --
+  // must stay one unglamorous click.
+  stubTunnel({
+    tunnel_get: {
+      mode: "imported",
+      describe_off: OFF_COPY,
+      describe_imported: IMPORTED_COPY,
+      has_config: true,
+      report: "not_attempted",
+      start_error: null,
+    },
+    tunnel_restart_preview: { kept: 4, left_out: 0 },
+  });
+  await openTunnelPanel();
+  await flush();
+  global.rbCalls.length = 0;
+
+  global.$("tunnelp-apply-restart")._fire("click");
+  await flush();
+
+  assert(
+    global.rbCalls.filter((c) => c.cmd === "tunnel_apply_restart").length === 1,
+    "a lossless restart stopped to ask a question nobody needed",
+  );
+});
+
+check("both panels state that Private Tunnel depends on the vault", () => {
+  // Asked for by name: the dependency must be visible in the vault panel
+  // and the tunnel panel, not only in a banner someone sees once.
+  const html = fs.readFileSync(path.join(chromeDir, "index.html"), "utf8");
+
+  const tunnelPanel = html.slice(
+    html.indexOf('id="tunnel-panel"'),
+    html.indexOf("</section>", html.indexOf('id="tunnel-panel"')),
+  );
+  assert(
+    /vault/i.test(tunnelPanel),
+    "the tunnel panel never mentions the vault",
+  );
+
+  const vaultLocked = html.slice(
+    html.indexOf('id="vault-locked"'),
+    html.indexOf("</div>", html.indexOf('class="vault-enables"')),
+  );
+  assert(
+    /vault-enables/.test(vaultLocked),
+    "the unlock pane has no list of what unlocking turns on",
+  );
+  for (const feature of ["Private Tunnel", "Saved passwords", "Bookmarks"]) {
+    assert(
+      vaultLocked.includes(feature),
+      "the unlock list does not name " + feature,
+    );
+  }
+});
+
+check("the status line never shows a wire word", async () => {
+  // tunnel_control::report() returns exactly three machine words. They were
+  // being printed raw, so the one surface a user opens to find out whether
+  // they are protected said "Status: not_attempted".
+  for (const wire of ["not_attempted", "applied", "failed"]) {
+    stubTunnel({
+      tunnel_get: {
+        mode: "off",
+        describe_off: OFF_COPY,
+        describe_imported: IMPORTED_COPY,
+        has_config: false,
+        report: wire,
+        start_error: null,
+      },
+    });
+    await openTunnelPanel();
+    const line = String(global.$("tunnelp-status").textContent || "");
+    assert(
+      !line.includes(wire),
+      "the raw wire word " + wire + " reached the user: " + line,
+    );
+    assert(line.length > "Status: ".length, "the status line said nothing");
+  }
+  stubTunnel();
+});
+
+check("a locked vault is a prerequisite stated BEFORE the controls", async () => {
+  // has_config null means the vault is locked. This used to be a refusal
+  // AFTER the click: the picker opened, a file was chosen, and only then
+  // did it fail.
+  stubTunnel({
+    tunnel_get: {
+      mode: "off",
+      describe_off: OFF_COPY,
+      describe_imported: IMPORTED_COPY,
+      has_config: null,
+      report: "not_attempted",
+      start_error: null,
+    },
+  });
+  await openTunnelPanel();
+  const note = global.$("tunnelp-vault-first");
+  assert(note && note.hidden === false, "the vault prerequisite is not shown");
+  // The wording is static markup, so it is checked against the file the
+  // way this gate checks every other fixed string.
+  const html = fs.readFileSync(path.join(chromeDir, "index.html"), "utf8");
+  const noteMarkup = html.slice(
+    html.indexOf('id="tunnelp-vault-first"'),
+    html.indexOf("</p>", html.indexOf('id="tunnelp-vault-first"')),
+  );
+  assert(
+    /vault/i.test(noteMarkup),
+    "the prerequisite does not mention the vault: " + noteMarkup,
+  );
+  for (const id of ["tunnelp-import", "tunnelp-paste-import"]) {
+    assert(
+      global.$(id).disabled === true,
+      id + " is still live with a locked vault",
+    );
+  }
+  // And it goes away once the vault is open.
+  stubTunnel();
+  await openTunnelPanel();
+  assert(
+    global.$("tunnelp-vault-first").hidden === true,
+    "the prerequisite stayed up with an unlocked vault",
+  );
+  assert(
+    global.$("tunnelp-import").disabled === false,
+    "import stayed disabled with an unlocked vault",
+  );
+});
+
+check("pasted text imports through its own arm and shows refusals", async () => {
+  await openTunnelPanel();
+  global.rbCalls.length = 0;
+  // Nothing pasted: refuse locally, never round-trip.
+  global.$("tunnelp-paste").value = "   ";
+  global.$("tunnelp-paste-import")._fire("click");
+  await flush();
+  assert(
+    !global.rbCalls.some((c) => c.cmd === "tunnel_import_text"),
+    "an empty paste still called the engine",
+  );
+
+  // A real paste reaches the engine with its text.
+  global.rbCalls.length = 0;
+  global.rbResolve.tunnel_import_text = { imported: true };
+  global.$("tunnelp-paste").value = "[Interface]\nPrivateKey = x";
+  global.$("tunnelp-paste-import")._fire("click");
+  await flush();
+  const calls = global.rbCalls.filter((c) => c.cmd === "tunnel_import_text");
+  assert(calls.length === 1, "expected one paste import, got " + calls.length);
+  assert(
+    calls[0].args && calls[0].args.text.includes("[Interface]"),
+    "the pasted text did not reach the engine",
+  );
+  assert(
+    global.$("tunnelp-paste").value === "",
+    "a successful paste should clear the box",
+  );
+
+  // A refusal shows the engine's own words and KEEPS the text.
+  global.rbResolve.tunnel_import_text = { imported: false, error: "no [Interface] section" };
+  global.$("tunnelp-paste").value = "nonsense";
+  global.$("tunnelp-paste-import")._fire("click");
+  await flush();
+  const err = global.$("tunnelp-error");
+  assert(err.hidden === false, "a refused paste showed no error");
+  assert(
+    String(err.textContent).includes("no [Interface] section"),
+    "the refusal text was not shown verbatim: " + err.textContent,
+  );
+  assert(
+    global.$("tunnelp-paste").value === "nonsense",
+    "a refused paste threw away what the user pasted",
+  );
+  delete global.rbResolve.tunnel_import_text;
+});
+
+check("the tunnel banner is styled like its siblings", () => {
+  // It had no rule at all: a bare block with no padding or background,
+  // while every other banner in that band has one.
+  const css = fs.readFileSync(path.join(chromeDir, "chrome.css"), "utf8");
+  const rule = css.match(/#tunnel-warning\s*\{[^}]*\}/);
+  assert(rule, "#tunnel-warning has no CSS rule of its own");
+  for (const prop of ["padding", "background", "display"]) {
+    assert(
+      rule[0].includes(prop),
+      "#tunnel-warning is missing " + prop + "; got " + rule[0],
+    );
+  }
+});
+
+check(
+  "the toolbar button glows only while the tunnel is MEASURED as carrying",
+  async () => {
+    // The distinction this pins: mode "imported" is only what the user
+    // ASKED for. A button that lit on the asking would be green while
+    // traffic went direct, which is the one thing the colour must never say.
+    const btn = global.$("btn-tunnel");
+    sendTabStatus("applied");
+    await flush();
+    assert(
+      btn.classList.contains("is-active"),
+      "an applied tunnel must light the toolbar button",
+    );
+    sendTabStatus("failed");
+    await flush();
+    assert(
+      !btn.classList.contains("is-active"),
+      "a failed tunnel must NOT keep the button lit",
+    );
+    sendTabStatus("not_attempted");
+    await flush();
+    assert(
+      !btn.classList.contains("is-active"),
+      "a tunnel that was never attempted must not light the button",
+    );
+  },
+);
+
+check("the glow rule covers the vault, tunnel and password buttons", () => {
+  const css = fs.readFileSync(path.join(chromeDir, "chrome.css"), "utf8");
+  // Asked for by name so a returning user can see, at a glance, what they
+  // are still in the middle of. All three or none: a partial rule would
+  // teach that a dark button means off.
+  const rule = css.match(/#btn-vault\.is-active[^{]*\{[^}]*\}/);
+  assert(rule, "no glow rule naming #btn-vault.is-active");
+  const selector = rule[0].slice(0, rule[0].indexOf("{"));
+  for (const id of ["#btn-vault", "#btn-tunnel", "#btn-fill"]) {
+    assert(
+      selector.includes(id + ".is-active"),
+      "the glow rule must name " + id + ".is-active; got " + selector,
+    );
+  }
+  assert(
+    /box-shadow/.test(rule[0]) && /--st-ok/.test(rule[0]),
+    "the glow must be a box-shadow in the shared green, not a new colour",
   );
 });
 

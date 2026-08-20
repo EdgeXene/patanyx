@@ -44,7 +44,12 @@ function mkInput(spec, formEl) {
   const el = {
     _attrs: { type: spec.type || "text" },
     name: spec.name || "",
-    value: spec.value || "",
+    // The value lives in ONE backing field, reached through an accessor,
+    // exactly as a real element's does. That is what lets the prototype
+    // setter below write a field whose own accessor a framework has
+    // replaced -- with a plain data property here, a prototype write would
+    // be shadowed and this gate would measure nothing.
+    _raw: spec.value || "",
     _w: spec.hidden ? 0 : 200,
     _h: spec.hidden ? 0 : 30,
     form: formEl || null,
@@ -64,7 +69,43 @@ function mkInput(spec, formEl) {
       this.events.push(e.type);
       return true;
     },
+    focus() {
+      this.focused = true;
+    },
   };
+  Object.defineProperty(el, "value", {
+    configurable: true,
+    get() {
+      return el._raw;
+    },
+    set(v) {
+      el._raw = v;
+    },
+  });
+  return el;
+}
+
+// A field belonging to a React-class form.
+//
+// The framework installs a per-ELEMENT `value` accessor that shadows the
+// prototype's and remembers every write it sees. That memory is the bug:
+// when a synthetic `input` event arrives, the framework compares what the
+// tracker last recorded against the current value, concludes nothing
+// changed, and throws the event away -- so the box shows the password and
+// the form still refuses it. Writing through the PROTOTYPE setter leaves
+// `trackerSaw` untouched, which is exactly what this fixture measures.
+function withTracker(el) {
+  el.trackerSaw = null;
+  Object.defineProperty(el, "value", {
+    configurable: true,
+    get() {
+      return el._raw;
+    },
+    set(v) {
+      el.trackerSaw = v;
+      el._raw = v;
+    },
+  });
   return el;
 }
 
@@ -105,6 +146,23 @@ function load(fixture) {
       this.type = type;
     },
   };
+  // The real page's HTMLInputElement.prototype value setter, which writes
+  // the field WITHOUT going through any per-element tracker a framework
+  // installed on top of it. autofill.js reaches this through
+  // window.HTMLInputElement, the same way it would in a document.
+  function HTMLInputElement() {}
+  Object.defineProperty(HTMLInputElement.prototype, "value", {
+    configurable: true,
+    get() {
+      return this._raw;
+    },
+    set(v) {
+      this._raw = v;
+    },
+  });
+  if (!fixture.noInputPrototype) {
+    sandbox.window.HTMLInputElement = HTMLInputElement;
+  }
   sandbox.window.top = sandbox.window;
 
   const src = fs.readFileSync(SRC, "utf8");
@@ -204,6 +262,55 @@ check("a visible password field is preferred over a staged one", () => {
     real.value === "hunter2" && staged.value === "",
     "the password went into the invisible staged field while a real one was " +
       "on screen",
+  );
+});
+
+check(
+  "a React-tracked form receives the fill as a real change (Crunchyroll)",
+  () => {
+    // THE BUG THIS PINS. Reported from Crunchyroll's login: the fill put
+    // the credential in the boxes, and the form would not accept it -- the
+    // submit stayed dead until it was retyped by hand. Plain `.value = x`
+    // goes through the framework's per-element tracker, which then
+    // recognises its own write and discards the input event, so the page's
+    // state never learns anything was typed.
+    const user = withTracker(mkInput({ name: "email" }));
+    const pass = withTracker(mkInput({ name: "password", type: "password" }));
+    const fill = load({ inputs: [user, pass] });
+    fill("alice@example.com", "hunter2");
+
+    // The value really is in the field.
+    assert(
+      user.value === "alice@example.com" && pass.value === "hunter2",
+      "the tracked fields did not receive the credential",
+    );
+    // And it did NOT go through the tracker, which is what makes the event
+    // that follows read as a genuine change.
+    assert(
+      user.trackerSaw === null && pass.trackerSaw === null,
+      "the fill went through the page's own value tracker, so the framework " +
+        "will discard the input event and the form will refuse the value",
+    );
+    // The page is still told, in the order a person would produce.
+    assert(
+      pass.events.join(",") === "input,change",
+      "expected input then change, got: " + pass.events.join(","),
+    );
+    assert(user.focused === true, "the field was filled without being focused");
+  },
+);
+
+check("a document with no HTMLInputElement still fills", () => {
+  // The fallback must be exactly the old behaviour, never nothing: a page
+  // that has deleted the descriptor, or an engine that does not expose it,
+  // gets a plain assignment.
+  const user = mkInput({ name: "email" });
+  const pass = mkInput({ name: "password", type: "password" });
+  const fill = load({ inputs: [user, pass], noInputPrototype: true });
+  fill("alice", "hunter2");
+  assert(
+    user.value === "alice" && pass.value === "hunter2",
+    "the fallback path did not fill the fields",
   );
 });
 

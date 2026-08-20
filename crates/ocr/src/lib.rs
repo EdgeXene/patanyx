@@ -4,6 +4,8 @@
 //! none may be added: the product's market position is that user data does
 //! not leave the machine.
 
+#![forbid(unsafe_code)]
+
 pub mod color;
 pub mod leaks;
 pub mod recovery;
@@ -44,6 +46,23 @@ const MIN_COMPONENT_PX: usize = 8;
 /// Hard cap on recognized boxes per image so a pathological mask cannot
 /// turn one IPC call into minutes of recognition work.
 const MAX_BOXES: usize = 200;
+/// Overlap between detection tiles, in source pixels.
+///
+/// A line that straddles a seam must appear WHOLE in at least one tile, or be
+/// rejoinable from its halves. 96px is comfortably taller than any text line
+/// these features meet (page captures at 100% zoom run 14-40px) and wide
+/// enough that a short word is never split in both directions at once.
+const DET_TILE_OVERLAP: u32 = 96;
+/// Cap on the pieces one detected line is split into for recognition. Each
+/// piece is a recognizer pass; a line needing more than this is pathological
+/// (a whole paragraph detected as one box) and is squeezed as before rather
+/// than spending the budget on it.
+const MAX_LINE_PARTS: usize = 12;
+/// Cap on detection tiles for one image. Each tile is a full detector pass,
+/// so this is the CPU bound: 24 passes is a few seconds, not minutes. An
+/// image needing more is downscaled until it fits, which is the old
+/// whole-image behaviour applied only where it is genuinely unavoidable.
+const MAX_DET_TILES: usize = 24;
 /// Rec input is FIXED at 48x320. The height is fixed by the architecture; the
 /// width is fixed by the conversion.
 ///
@@ -99,6 +118,10 @@ impl std::fmt::Display for OcrError {
 }
 
 impl std::error::Error for OcrError {}
+
+/// Marks a result that stopped at `MAX_BOXES` rather than reaching the end
+/// of the page. Callers surface it; nobody parses it for meaning.
+pub const TRUNCATED_MARKER: &str = "\u{2026}[more text on this page than could be read]";
 
 #[derive(Debug, Clone)]
 pub struct TextRegion {
@@ -243,8 +266,13 @@ impl OcrEngine {
         let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
         let mut regions = self.recognize_pixels(&crop)?;
         for r in &mut regions {
-            r.x += x;
-            r.y += y;
+            // Saturating because the truncation marker carries y: u32::MAX to
+            // sort last, and a plain add would overflow it -- a panic in
+            // debug and in tests, a wrapped coordinate in release. The marker
+            // has no position worth preserving; every real box is far from
+            // the ceiling.
+            r.x = r.x.saturating_add(x);
+            r.y = r.y.saturating_add(y);
         }
         Ok(regions)
     }
@@ -252,7 +280,17 @@ impl OcrEngine {
     /// The shared pipeline behind both entry points: detect, then recognize
     /// each detected line, on pixels that are already decoded.
     fn recognize_pixels(&self, img: &RgbImage) -> Result<Vec<TextRegion>, OcrError> {
-        let boxes = self.detect(img)?;
+        let (boxes, gave_up) = self.detect_tiled(img)?;
+        // SILENT TRUNCATION IS THE ONE THING THIS MUST NOT DO. The cap keeps
+        // a pathological mask from turning one call into minutes of work, and
+        // it never bound before -- the whole image was squashed to 960px and
+        // yielded a handful of boxes. A full-page capture reaches it easily,
+        // and dropping everything past line 200 while reporting a word count
+        // as if that were the page is exactly the "read 2 lines" failure in a
+        // politer costume. The caller is told; see TextRegion::TRUNCATED.
+        // Either way of running out counts: more lines than the cap, or
+        // tiles abandoned before the page was even looked at.
+        let truncated = boxes.len() > MAX_BOXES || gave_up;
         let mut regions = Vec::new();
         for (x, y, w, h) in boxes.into_iter().take(MAX_BOXES) {
             if w < 2 || h < 2 {
@@ -275,7 +313,108 @@ impl OcrEngine {
                 });
             }
         }
+        if truncated {
+            // A marker region rather than a new return type: every caller
+            // already renders regions, and a caller that ignores this one is
+            // no worse off than before. Placed last so reading order holds.
+            regions.push(TextRegion {
+                text: TRUNCATED_MARKER.to_string(),
+                x: 0,
+                y: u32::MAX,
+                w: 0,
+                h: 0,
+                color: None,
+            });
+        }
         Ok(regions)
+    }
+
+    /// Detection over the whole image, in tiles that each fit the canvas at
+    /// native scale. See `tile_plan` for why the old single-pass squash could
+    /// not read a page capture.
+    ///
+    /// Boxes come back in ORIGINAL-image pixels, matching what `detect`
+    /// returned and what `recognize_region` already promises, so nothing
+    /// downstream learns a second coordinate space.
+    /// Detections plus WHETHER THE TILE LOOP GAVE UP EARLY. The flag is not
+    /// decoration: `recognize_pixels` decides truncation from the box count
+    /// after merging, and a run that abandoned whole tiles can still come out
+    /// of the merge under the cap. That held only by arithmetic -- the break
+    /// is at four times the cap and merging rejoins a handful of pairs -- and
+    /// a guarantee that depends on a merge rate is not a guarantee. Reported
+    /// rather than inferred.
+    fn detect_tiled(&self, img: &RgbImage) -> Result<(Vec<(u32, u32, u32, u32)>, bool), OcrError> {
+        let (ow, oh) = img.dimensions();
+        let (scale, tiles) = tile_plan(ow, oh);
+
+        // One tile at native scale IS the old path; skip the resize and the
+        // merge entirely so the common small-image case costs nothing new.
+        if scale >= 1.0 && tiles.len() <= 1 {
+            return self.detect(img).map(|boxes| (boxes, false));
+        }
+
+        // Resized ONCE if the tile budget demanded it, not per tile.
+        let source;
+        let work: &RgbImage = if scale < 1.0 {
+            let sw = ((ow as f64 * scale).round() as u32).max(1);
+            let sh = ((oh as f64 * scale).round() as u32).max(1);
+            source = image::imageops::resize(img, sw, sh, FilterType::Triangle);
+            &source
+        } else {
+            img
+        };
+
+        // The seam positions, in ORIGINAL-image space, so the merge can tell a
+        // line the tiling cut from two lines that merely sit close together.
+        let inv_scale = if scale > 0.0 { 1.0 / scale } else { 1.0 };
+        let mut seams_x: Vec<u32> = Vec::new();
+        let mut seams_y: Vec<u32> = Vec::new();
+        for (tx, ty, _, _) in &tiles {
+            if *tx > 0 {
+                seams_x.push(((*tx as f64) * inv_scale).round() as u32);
+            }
+            if *ty > 0 {
+                seams_y.push(((*ty as f64) * inv_scale).round() as u32);
+            }
+        }
+        seams_x.sort_unstable();
+        seams_x.dedup();
+        seams_y.sort_unstable();
+        seams_y.dedup();
+
+        let mut all: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut gave_up = false;
+        for (tx, ty, tw, th) in tiles {
+            if tw < 2 || th < 2 {
+                continue;
+            }
+            let tile = image::imageops::crop_imm(work, tx, ty, tw, th).to_image();
+            for (bx, by, bw, bh) in self.detect(&tile)? {
+                // Tile space -> working space -> original space. The second
+                // step is a no-op at scale 1.0, which is the usual case.
+                let inv = if scale > 0.0 { 1.0 / scale } else { 1.0 };
+                let x = (((bx + tx) as f64) * inv).round() as u32;
+                let y = (((by + ty) as f64) * inv).round() as u32;
+                let w = ((bw as f64) * inv).round() as u32;
+                let h = ((bh as f64) * inv).round() as u32;
+                // Clip to the source: a box in a tile's padding can map just
+                // outside after rounding.
+                let x = x.min(ow.saturating_sub(1));
+                let y = y.min(oh.saturating_sub(1));
+                let w = w.min(ow - x);
+                let h = h.min(oh - y);
+                if w > 0 && h > 0 {
+                    all.push((x, y, w, h));
+                }
+            }
+            // The cap counts DETECTIONS, not tiles: a pathological mask in an
+            // early tile must not buy itself the whole budget of later ones.
+            if all.len() > MAX_BOXES * 4 {
+                gave_up = true;
+                break;
+            }
+        }
+        Ok((merge_split_boxes(all, &seams_x, &seams_y), gave_up))
     }
 
     fn detect(&self, img: &RgbImage) -> Result<Vec<(u32, u32, u32, u32)>, OcrError> {
@@ -362,7 +501,65 @@ impl OcrEngine {
         Ok(boxes)
     }
 
+    /// Reads one detected line, splitting it first if it is too wide for the
+    /// recognizer to see honestly.
+    ///
+    /// THE SQUEEZE THIS REPLACES. The recognizer's input is baked at 48x320
+    /// by the graph conversion, and a crop was scaled to height 48 and then
+    /// CLAMPED to 320 wide. A full-width page line is about 1200x30, whose
+    /// honest width at height 48 is 1920 -- so it was squashed 6x
+    /// horizontally and every glyph became a 1-2px smear. The old comment
+    /// called that "degrades gracefully"; on a real page capture it does not,
+    /// and it is the second half of why saved pages read back as almost
+    /// nothing.
+    ///
+    /// So a line that would need more than REC_WIDTH is cut into pieces that
+    /// each fit at their true aspect, read separately, and joined. The cuts
+    /// land at the quietest column near each division -- the gap between two
+    /// words -- because a blind cut bisects a glyph at every boundary.
     fn recognize_line(&self, crop: &RgbImage) -> Result<String, OcrError> {
+        let (cw, ch) = crop.dimensions();
+        let parts = line_parts(cw, ch);
+        if parts > 1 {
+            let profile = ink_profile(crop);
+            let cuts = choose_cuts(&profile, parts, ch);
+            if !cuts.is_empty() {
+                let mut text = String::new();
+                let mut start = 0u32;
+                for (idx, (cut, _)) in cuts
+                    .iter()
+                    .map(|(c, g)| (*c as u32, *g))
+                    .chain(std::iter::once((cw, false)))
+                    .enumerate()
+                {
+                    let piece_w = cut.saturating_sub(start);
+                    if piece_w < 2 {
+                        start = cut;
+                        continue;
+                    }
+                    let piece = image::imageops::crop_imm(crop, start, 0, piece_w, ch).to_image();
+                    let part_text = self.recognize_one(&piece)?;
+                    // A space ONLY across a cut that fell in a real word gap.
+                    // A mid-word cut joins with nothing: inserting a space
+                    // there is what produced "som ething" and "CA RRIAGE" at
+                    // every chunk boundary.
+                    if idx > 0 && !text.is_empty() && !part_text.is_empty() {
+                        let (_, prev_was_gap) = cuts[idx - 1];
+                        if prev_was_gap && !text.ends_with(' ') && !part_text.starts_with(' ') {
+                            text.push(' ');
+                        }
+                    }
+                    text.push_str(&part_text);
+                    start = cut;
+                }
+                return Ok(text.trim().to_string());
+            }
+        }
+        self.recognize_one(crop)
+    }
+
+    /// One crop, one pass through the recognizer, at whatever aspect it has.
+    fn recognize_one(&self, crop: &RgbImage) -> Result<String, OcrError> {
         let (w, h) = crop.dimensions();
         // Scale to the model's height, then pad to its EXACT width. The width
         // is not negotiable -- the simplified graph is planned for REC_WIDTH
@@ -503,6 +700,362 @@ fn decode_image(bytes: &[u8]) -> Result<RgbImage, OcrError> {
 /// Capped at 1.0 on purpose: upscaling a small image to fill the canvas does
 /// not add information, it adds interpolation artefacts that the detector reads
 /// as texture. A small image is better as a small image in the corner.
+/// How many pieces a detected line must be read in.
+///
+/// 1 means the crop already fits the recognizer at its true aspect and takes
+/// the single-pass path unchanged. More than 1 means reading it whole would
+/// require squeezing it horizontally -- 6x for an ordinary full-width page
+/// line -- and the pieces are what avoids that.
+fn line_parts(w: u32, h: u32) -> usize {
+    if w < 4 || h == 0 {
+        return 1;
+    }
+    let honest = ((w as f32) * REC_HEIGHT as f32 / h as f32).round() as u32;
+    if honest <= REC_WIDTH {
+        return 1;
+    }
+    (((honest + REC_WIDTH - 1) / REC_WIDTH) as usize).min(MAX_LINE_PARTS)
+}
+
+/// Per-column "how much ink is here", used to split a long line at a gap
+/// between words rather than through a letter.
+///
+/// Measured as mean absolute deviation from the crop's MEDIAN luminance, so
+/// it works for dark-on-light and light-on-dark alike: a background column
+/// sits near the median whichever way round the page is, and a column with
+/// glyphs in it does not. Nothing here assumes text is dark.
+fn ink_profile(crop: &RgbImage) -> Vec<f32> {
+    let (w, h) = crop.dimensions();
+    if w == 0 || h == 0 {
+        return Vec::new();
+    }
+    let lum = |px: &image::Rgb<u8>| -> f32 {
+        0.299 * px[0] as f32 + 0.587 * px[1] as f32 + 0.114 * px[2] as f32
+    };
+    let mut all: Vec<f32> = crop.pixels().map(lum).collect();
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = all[all.len() / 2];
+    (0..w)
+        .map(|x| {
+            let mut acc = 0f32;
+            for y in 0..h {
+                acc += (lum(crop.get_pixel(x, y)) - median).abs();
+            }
+            acc / h as f32
+        })
+        .collect()
+}
+
+/// Where to cut a line into `parts` pieces, and whether each cut fell in a
+/// real word gap.
+///
+/// THE SPURIOUS SPACES THIS FIXES. The first version slid each cut to the
+/// quietest single column and added a space wherever that column was below a
+/// fraction of peak ink. In anti-aliased text the gap BETWEEN LETTERS is also
+/// quiet, so cuts landed mid-word and the join inserted a space there:
+/// "som ething", "CA RRIAGE", "Unauth orized" -- every 6-10 characters, which
+/// is exactly the chunk width. Reported from hardware with the whole readout
+/// visible.
+///
+/// A word gap is not a dip, it is a RUN: several consecutive quiet columns.
+/// So gaps are found as runs, the cut goes to the middle of the widest run
+/// near the division, and a space is added ONLY there. Where no run qualifies
+/// the cut still happens -- the piece must fit the recognizer -- but it is
+/// marked as mid-word and the pieces are joined with nothing between them.
+///
+/// Landing in a run has a second benefit: the hard edge of the crop falls in
+/// whitespace instead of through a glyph, so the recognizer stops reading the
+/// cut itself as a stroke (the stray leading "-" and "I" in the same report).
+fn choose_cuts(profile: &[f32], parts: usize, line_height: u32) -> Vec<(usize, bool)> {
+    let w = profile.len();
+    if parts <= 1 || w < parts * 2 {
+        return Vec::new();
+    }
+    // Quiet is relative to this line's own ink, so a faint line and a bold
+    // one are judged on their own terms.
+    let peak = profile.iter().copied().fold(0f32, f32::max);
+    if peak <= 0.0 {
+        return Vec::new();
+    }
+    let quiet_at = peak * 0.10;
+    // A word gap is about a quarter of the text height wide; letter spacing
+    // is far narrower. Three columns is the floor for very small text.
+    let min_gap = ((line_height / 4) as usize).max(3);
+
+    // Every run of quiet columns, as (start, end_exclusive).
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut run_start: Option<usize> = None;
+    for (x, v) in profile.iter().enumerate() {
+        if *v <= quiet_at {
+            run_start.get_or_insert(x);
+        } else if let Some(st) = run_start.take() {
+            if x - st >= min_gap {
+                runs.push((st, x));
+            }
+        }
+    }
+    if let Some(st) = run_start {
+        if w - st >= min_gap {
+            runs.push((st, w));
+        }
+    }
+
+    let part = w / parts;
+    let window = (part / 2).max(8);
+    let mut cuts: Vec<(usize, bool)> = Vec::with_capacity(parts - 1);
+    let mut prev = 0usize;
+    for i in 1..parts {
+        let target = i * part;
+        let lo = target.saturating_sub(window).max(prev + 1);
+        let hi = (target + window).min(w.saturating_sub(1));
+        if lo >= hi {
+            continue;
+        }
+        // Prefer the WIDEST qualifying run overlapping the window; a wider
+        // run is more certainly a space between words rather than a quirk of
+        // one glyph.
+        let mut best_run: Option<(usize, usize)> = None;
+        for (rs, re) in &runs {
+            let mid = (rs + re) / 2;
+            if mid <= prev || mid < lo || mid > hi {
+                continue;
+            }
+            if best_run.is_none_or(|(bs, be)| (re - rs) > (be - bs)) {
+                best_run = Some((*rs, *re));
+            }
+        }
+        if let Some((rs, re)) = best_run {
+            cuts.push(((rs + re) / 2, true));
+            prev = (rs + re) / 2;
+            continue;
+        }
+        // No gap to use: cut at the quietest column and say so, so the join
+        // does not invent a space in the middle of a word.
+        let mut best = lo;
+        let mut best_ink = f32::MAX;
+        for x in lo..hi {
+            if profile[x] < best_ink {
+                best_ink = profile[x];
+                best = x;
+            }
+        }
+        if best > prev {
+            cuts.push((best, false));
+            prev = best;
+        }
+    }
+    cuts
+}
+
+/// Where the detector should look, and at what scale.
+///
+/// THE DEFECT THIS REPLACES. `det_scale` fits the LONGEST side into the 960
+/// canvas, which is right for a photo and ruinous for a page capture: a
+/// 1600x4000 saved page became 384x960, turning 14px body text into 3.4px.
+/// Below roughly 8px the detector finds nothing, so most lines were never
+/// detected and never reached the recognizer -- reported as "Read 2 line(s)"
+/// on a screenshot full of text, from the feature whose entire purpose is
+/// finding words inside images.
+///
+/// Raising DET_SIDE is not available: tract cannot optimize the detection
+/// graph with symbolic H/W (it fails analysing a Concat), so the input shape
+/// is pinned at load time and re-planning per image would cost seconds.
+///
+/// So the image is cut into overlapping windows that each fit the canvas at
+/// NATIVE scale, and the detector runs once per window. Returns the scale to
+/// apply to the source first (1.0 in the common case) and the tile rects in
+/// that scaled space.
+///
+/// Small images are unchanged: anything already inside the canvas yields
+/// exactly one full-image tile at scale 1.0, which is byte-for-byte the old
+/// path.
+fn tile_plan(w: u32, h: u32) -> (f64, Vec<(u32, u32, u32, u32)>) {
+    if w == 0 || h == 0 {
+        return (1.0, Vec::new());
+    }
+    // Step between tile origins. Overlap is subtracted so consecutive tiles
+    // share a band; a line landing in that band is whole in one of them.
+    let step = DET_SIDE.saturating_sub(DET_TILE_OVERLAP).max(1);
+    let count = |extent: u32| -> usize {
+        if extent <= DET_SIDE {
+            1
+        } else {
+            // Ceiling division over the stepped extent.
+            (((extent - DET_SIDE) + step - 1) / step) as usize + 1
+        }
+    };
+
+    // Shrink only as far as the tile budget demands, rather than as far as one
+    // canvas demands. A page that needs 10 tiles keeps native scale; one that
+    // would need 200 is reduced until it needs 24.
+    let mut scale = 1.0f64;
+    loop {
+        let sw = ((w as f64 * scale).round() as u32).max(1);
+        let sh = ((h as f64 * scale).round() as u32).max(1);
+        if count(sw) * count(sh) <= MAX_DET_TILES || scale < 0.05 {
+            let mut tiles = Vec::new();
+            let mut y = 0u32;
+            loop {
+                let th = DET_SIDE.min(sh - y);
+                let mut x = 0u32;
+                loop {
+                    let tw = DET_SIDE.min(sw - x);
+                    tiles.push((x, y, tw, th));
+                    if x + tw >= sw {
+                        break;
+                    }
+                    x = (x + step).min(sw.saturating_sub(1));
+                }
+                if y + th >= sh {
+                    break;
+                }
+                y = (y + step).min(sh.saturating_sub(1));
+            }
+            return (scale, tiles);
+        }
+        scale *= 0.8;
+    }
+}
+
+/// Joins boxes that the tiling split apart -- and ONLY those.
+///
+/// THE RUNAWAY THIS FIXES. The first version applied its "are these one
+/// line?" test to every pair of boxes in the image, with no requirement that
+/// a seam lie between them. Simulated against the real predicate: sixty
+/// stacked lines whose boxes overlap by two pixels collapsed into a SINGLE
+/// box 1202px tall, because the union grows in place and each merge makes
+/// the next one easier. That box then goes to the recognizer as one line and
+/// is read as garbage. A two-column layout with a 50px gutter merged left
+/// and right row by row, interleaving two columns into one crop. Ordinary
+/// prose was untouched, which is exactly why the tests missed it: the
+/// failure needs tight leading (code blocks, tables, dense headings) or
+/// columns, and those are common in the page captures this release exists
+/// to read.
+///
+/// So a merge now requires the pair to straddle a SEAM: a box that lies
+/// wholly inside one tile's interior cannot have been split by tiling, and
+/// is left alone whatever it overlaps. The chain is capped as well, since a
+/// line split by one seam yields two pieces, not sixty.
+fn merge_split_boxes(
+    mut boxes: Vec<(u32, u32, u32, u32)>,
+    seams_x: &[u32],
+    seams_y: &[u32],
+) -> Vec<(u32, u32, u32, u32)> {
+    // No seams means one tile, which means nothing was split.
+    if seams_x.is_empty() && seams_y.is_empty() {
+        boxes.sort_by_key(|b| (b.1, b.0));
+        return boxes;
+    }
+    boxes.sort_by_key(|b| (b.1, b.0));
+    let mut out: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut heights: Vec<u32> = Vec::new();
+    for b in boxes {
+        let mut merged = false;
+        for (i, a) in out.iter_mut().enumerate() {
+            if !split_by_a_seam(*a, b, seams_x, seams_y) {
+                continue;
+            }
+            let x0 = a.0.min(b.0);
+            let y0 = a.1.min(b.1);
+            let x1 = (a.0 + a.2).max(b.0 + b.2);
+            let y1 = (a.1 + a.3).max(b.1 + b.3);
+            // A seam split makes two pieces of one line. Anything that would
+            // grow the box past twice the taller original's height is a chain
+            // forming, not a line rejoining.
+            let cap = heights[i].max(b.3).saturating_mul(2).max(4);
+            if y1 - y0 > cap {
+                continue;
+            }
+            *a = (x0, y0, x1 - x0, y1 - y0);
+            heights[i] = heights[i].max(b.3);
+            merged = true;
+            break;
+        }
+        if !merged {
+            out.push(b);
+            heights.push(b.3);
+        }
+    }
+    out.sort_by_key(|b| (b.1, b.0));
+    out
+}
+
+/// Whether these two boxes are ONE line that a seam on the MATCHING AXIS
+/// cut in half.
+///
+/// THE AXIS HOLE THIS CLOSES. The first seam gate asked only whether both
+/// boxes came within the overlap band of SOME seam, either axis. On any page
+/// wider than the canvas every full-width line crosses the vertical seam --
+/// so every pair of full-width lines passed the gate on X, which re-armed
+/// the VERTICAL merge across the whole page. The height cap stopped the
+/// runaway but not the damage: sixty dense lines still glued into thirty
+/// boxes of two lines each, and each of those went to a single-line
+/// recognizer as one crop.
+///
+/// My tests passed only because they supplied an empty `seams_x`, which no
+/// real 1600px capture has. Same shape of mistake as the runaway itself: the
+/// test did not reproduce the condition.
+///
+/// So the axis has to match the join. A side-by-side pair can only have been
+/// split by a VERTICAL seam, a stacked pair only by a HORIZONTAL one.
+fn split_by_a_seam(
+    a: (u32, u32, u32, u32),
+    b: (u32, u32, u32, u32),
+    seams_x: &[u32],
+    seams_y: &[u32],
+) -> bool {
+    let (ax0, ay0, ax1, ay1) = (a.0, a.1, a.0 + a.2, a.1 + a.3);
+    let (bx0, by0, bx1, by1) = (b.0, b.1, b.0 + b.2, b.1 + b.3);
+    let y_overlap = ay1.min(by1).saturating_sub(ay0.max(by0));
+    let x_overlap = ax1.min(bx1).saturating_sub(ax0.max(bx0));
+    let short_h = a.3.min(b.3).max(1);
+    let short_w = a.2.min(b.2).max(1);
+
+    // THE FACING EDGES, not merely "both near a seam". A line the tiling cut
+    // has one piece ENDING at the seam and the other STARTING there; two
+    // adjacent lines that happen to sit within a hundred pixels of it do not.
+    // Checking proximity alone still merged ten pairs out of a sixty-line
+    // dense block, because at 20px pitch ten lines fall inside the band.
+    let near_seam = |edge_a: u32, edge_b: u32, seams: &[u32]| -> bool {
+        // Tighter than the tile overlap: the overlap is how much the tiles
+        // SHARE, while a cut edge lands essentially on the seam. Slack here
+        // buys nothing and costs exactly the false merges above.
+        const EDGE_SLACK: u32 = 32;
+        seams.iter().any(|s| {
+            let da = edge_a.abs_diff(*s);
+            let db = edge_b.abs_diff(*s);
+            da <= EDGE_SLACK && db <= EDGE_SLACK
+        })
+    };
+
+    // SIDE BY SIDE on one text row: only a vertical seam explains it, and
+    // only if the pieces meet AT that seam.
+    let same_row = y_overlap * 2 >= short_h;
+    let x_gap = ax0.max(bx0).saturating_sub(ax1.min(bx1));
+    if same_row && (x_overlap > 0 || x_gap <= DET_TILE_OVERLAP) {
+        let (left_end, right_start) = if ax0 <= bx0 { (ax1, bx0) } else { (bx1, ax0) };
+        if near_seam(left_end, right_start, seams_x) {
+            return true;
+        }
+    }
+
+    // STACKED in one column: only a horizontal seam, and the union must be
+    // about ONE line tall. A cut line's halves overlap heavily, so their
+    // union barely exceeds the taller piece; two stacked LINES are nearly
+    // twice it. That ratio is what tells them apart once both are near a
+    // seam.
+    let same_col = x_overlap * 2 >= short_w;
+    if same_col && y_overlap > 0 {
+        let (top_end, bottom_start) = if ay0 <= by0 { (ay1, by0) } else { (by1, ay0) };
+        let union_h = ay1.max(by1) - ay0.min(by0);
+        let taller = a.3.max(b.3).max(1);
+        if near_seam(top_end, bottom_start, seams_y) && union_h <= taller * 2 {
+            return true;
+        }
+    }
+    false
+}
+
 fn det_scale(w: u32, h: u32) -> f64 {
     let longest = w.max(h).max(1) as f64;
     (DET_SIDE as f64 / longest).min(1.0)
@@ -614,6 +1167,378 @@ mod tests {
         assert_eq!(d, vec!["a".to_string(), " ".to_string(), "b".to_string()]);
         let d2 = parse_dict("a\nb");
         assert_eq!(d2, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn a_full_width_line_is_split_rather_than_squeezed() {
+        // THE DEFECT THIS PINS. A 1200x30 page line's honest width at the
+        // recognizer's 48px height is 1920, so it used to be squashed into
+        // 320 -- a 6x horizontal crush that turns glyphs into smears.
+        assert_eq!(line_parts(1200, 30), 6, "six pieces is what un-squeezed costs");
+        assert_eq!(line_parts(900, 26), 6);
+        // The common case is untouched: one pass, no cuts, no joins.
+        assert_eq!(line_parts(320, 48), 1);
+        assert_eq!(line_parts(200, 30), 1);
+        // Pathological input is squeezed as before rather than spending the
+        // whole recognizer budget on one detection.
+        assert_eq!(line_parts(100_000, 20), MAX_LINE_PARTS);
+        assert_eq!(line_parts(0, 0), 1, "degenerate input must not divide by zero");
+    }
+
+    #[test]
+    fn recognize_line_actually_uses_the_split_decision() {
+        // WITHOUT THIS, THE TEST ABOVE PASSES ON A DISABLED FEATURE. Planting
+        // `if false` over the split branch left every arithmetic assertion
+        // green, because none of them reached recognize_line -- which cannot
+        // be called here at all, since it needs the ONNX models. So the
+        // wiring is asserted against the source, the way the licence gate
+        // asserts its arms: recognize_line must ASK line_parts, and must not
+        // reintroduce a literal clamp to REC_WIDTH as its only width policy.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("fn recognize_line(")
+            .expect("recognize_line is gone");
+        let end = src[start..]
+            .find("fn recognize_one(")
+            .expect("recognize_one is gone")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("line_parts("),
+            "recognize_line no longer consults line_parts, so a wide line is \
+             squeezed again and every assertion about splitting is vacuous"
+        );
+        assert!(
+            body.contains("choose_cuts("),
+            "recognize_line no longer cuts at word gaps"
+        );
+    }
+
+    #[test]
+    fn abandoning_tiles_counts_as_truncation() {
+        // Same reason as the test above: this path needs the ONNX models and
+        // cannot be called here, so the wiring is asserted against the
+        // source. The rule it guards: `detect_tiled` stops early when the
+        // detections pass four times the cap, and `recognize_pixels` decides
+        // truncation from the box count AFTER merging. Those two numbers are
+        // not the same number. A run that gave up on whole tiles and then
+        // merged its way back under the cap would report a clean read of a
+        // page it never finished looking at -- the exact failure the marker
+        // exists to prevent, arriving by a different door.
+        let src = include_str!("lib.rs");
+        let start = src
+            .find("fn recognize_pixels(")
+            .expect("recognize_pixels is gone");
+        let end = src[start..]
+            .find("fn detect_tiled(")
+            .expect("detect_tiled is gone")
+            + start;
+        let body = &src[start..end];
+        assert!(
+            body.contains("gave_up"),
+            "recognize_pixels no longer reads whether detection gave up, so \
+             an abandoned page can report itself as fully read"
+        );
+        assert!(
+            body.contains("|| gave_up"),
+            "the early-exit flag must widen the truncation decision, not \
+             narrow it"
+        );
+
+        let dstart = src.find("fn detect_tiled(").unwrap();
+        let dend = src[dstart..].find("fn detect(").unwrap() + dstart;
+        let detect_body = &src[dstart..dend];
+        assert!(
+            detect_body.contains("gave_up = true;"),
+            "detect_tiled no longer records that it broke out of the tile \
+             loop, so the flag it returns is always false"
+        );
+    }
+
+    #[test]
+    fn cuts_land_in_the_gaps_between_words() {
+        // A blind cut bisects a glyph at every boundary and the recognizer
+        // reads the halves as two wrong characters. A real word gap is a RUN
+        // of quiet columns, and the cut must land in the middle of one.
+        let mut profile = vec![9.0f32; 600];
+        for gap in 190usize..210 {
+            profile[gap] = 0.0;
+        }
+        for gap in 390usize..410 {
+            profile[gap] = 0.0;
+        }
+        let cuts = choose_cuts(&profile, 3, 24);
+        assert_eq!(cuts.len(), 2, "two interior cuts for three parts");
+        for (c, is_gap) in &cuts {
+            assert!(profile[*c] == 0.0, "cut at {c} landed on ink");
+            assert!(*is_gap, "a run of 20 quiet columns is a word gap");
+        }
+    }
+
+    #[test]
+    fn a_dip_between_two_letters_is_not_a_word_gap() {
+        // THE SPURIOUS SPACES THIS PINS. Anti-aliased text is quiet between
+        // letters too. Treating those dips as gaps put a space at every chunk
+        // boundary -- "som ething", "CA RRIAGE", "Unauth orized" -- reported
+        // from hardware. A one- or two-column dip must NOT be called a gap,
+        // so the join adds nothing across it.
+        let mut profile = vec![9.0f32; 600];
+        for dip in [199usize, 200, 399, 400] {
+            profile[dip] = 0.0;
+        }
+        let cuts = choose_cuts(&profile, 3, 40);
+        assert_eq!(cuts.len(), 2, "the line must still be cut to fit");
+        for (_, is_gap) in &cuts {
+            assert!(
+                !*is_gap,
+                "a two-column dip between letters was mistaken for a word gap, \
+                 which is what inserts a space in the middle of a word"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_gap_is_preferred_over_a_narrow_one_nearby() {
+        // Both qualify; the wider run is the likelier word boundary.
+        let mut profile = vec![9.0f32; 400];
+        for x in 180usize..186 {
+            profile[x] = 0.0; // narrow
+        }
+        for x in 195usize..215 {
+            profile[x] = 0.0; // wide
+        }
+        let cuts = choose_cuts(&profile, 2, 24);
+        assert_eq!(cuts.len(), 1);
+        let (at, is_gap) = cuts[0];
+        assert!(*&is_gap);
+        assert!((195..215).contains(&at), "cut at {at} took the narrow gap");
+    }
+
+    #[test]
+    fn cuts_stay_ordered_and_inside_the_line() {
+        let profile = vec![1.0f32; 500];
+        let cuts = choose_cuts(&profile, 4, 30);
+        assert!(
+            cuts.windows(2).all(|p| p[0].0 < p[1].0),
+            "cuts must ascend"
+        );
+        assert!(
+            cuts.iter().all(|(c, _)| *c > 0 && *c < 500),
+            "cuts must be interior"
+        );
+    }
+
+    #[test]
+    fn a_short_line_is_never_split() {
+        // The common case must be untouched: one pass, no cuts, no joins.
+        assert!(choose_cuts(&vec![1.0f32; 200], 1, 30).is_empty());
+        // And a line too narrow to divide safely refuses rather than
+        // producing degenerate one-pixel pieces.
+        assert!(choose_cuts(&vec![1.0f32; 5], 4, 30).is_empty());
+    }
+
+    #[test]
+    fn the_ink_profile_finds_text_whichever_way_round_the_page_is() {
+        // Light-on-dark must profile the same as dark-on-light: the measure
+        // is deviation from the median, not darkness.
+        let mut dark_bg = RgbImage::new(20, 10);
+        for p in dark_bg.pixels_mut() {
+            *p = image::Rgb([10, 10, 10]);
+        }
+        let mut light_bg = RgbImage::new(20, 10);
+        for p in light_bg.pixels_mut() {
+            *p = image::Rgb([240, 240, 240]);
+        }
+        // One bright stripe on dark, one dark stripe on light, same column.
+        for y in 0..10 {
+            dark_bg.put_pixel(5, y, image::Rgb([240, 240, 240]));
+            light_bg.put_pixel(5, y, image::Rgb([10, 10, 10]));
+        }
+        let a = ink_profile(&dark_bg);
+        let b = ink_profile(&light_bg);
+        assert!(a[5] > a[0] * 5.0 + 1.0, "stripe not found on a dark page");
+        assert!(b[5] > b[0] * 5.0 + 1.0, "stripe not found on a light page");
+    }
+
+    #[test]
+    fn a_small_image_still_takes_the_single_pass_path() {
+        // The old behaviour must be untouched for anything already inside the
+        // canvas: one tile, native scale, no merge step.
+        let (scale, tiles) = tile_plan(800, 600);
+        assert_eq!(scale, 1.0);
+        assert_eq!(tiles, vec![(0, 0, 800, 600)]);
+    }
+
+    #[test]
+    fn a_tall_page_capture_is_read_at_native_scale() {
+        // THE DEFECT THIS PINS. 1600x4000 used to become 384x960, turning
+        // 14px text into 3.4px and reading almost nothing. Native scale is
+        // the whole point: at 1.0 a 14px line is still 14px.
+        let (scale, tiles) = tile_plan(1600, 4000);
+        assert_eq!(scale, 1.0, "a page capture must not be downscaled");
+        assert!(tiles.len() > 1, "it must be tiled, not squashed");
+        assert!(
+            tiles.len() <= MAX_DET_TILES,
+            "{} tiles exceeds the budget",
+            tiles.len()
+        );
+        for (_, _, w, h) in &tiles {
+            assert!(*w <= DET_SIDE && *h <= DET_SIDE, "a tile exceeds the canvas");
+        }
+    }
+
+    #[test]
+    fn tiles_cover_every_row_and_column_with_the_overlap() {
+        // Nothing may fall between tiles: every pixel of the source is inside
+        // at least one, and consecutive tiles share the overlap band so a
+        // line on a seam is whole somewhere.
+        let (w, h) = (1600u32, 4000u32);
+        let (scale, tiles) = tile_plan(w, h);
+        assert_eq!(scale, 1.0);
+        let mut rows: Vec<(u32, u32)> = tiles.iter().map(|t| (t.1, t.1 + t.3)).collect();
+        rows.sort_unstable();
+        rows.dedup();
+        assert_eq!(rows[0].0, 0, "the first tile must start at the top");
+        assert_eq!(rows[rows.len() - 1].1, h, "the last tile must reach the bottom");
+        for pair in rows.windows(2) {
+            let (prev_end, next_start) = (pair[0].1, pair[1].0);
+            assert!(next_start < prev_end, "a gap between tile rows");
+            assert!(
+                prev_end - next_start >= DET_TILE_OVERLAP.min(prev_end),
+                "rows overlap by less than the band"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enormous_image_is_reduced_rather_than_tiled_forever() {
+        // The budget is the CPU bound: each tile is a detector pass. A poster
+        // scan must degrade to the old squash rather than take minutes.
+        let (scale, tiles) = tile_plan(20000, 20000);
+        assert!(scale < 1.0, "it must shrink to fit the tile budget");
+        assert!(
+            tiles.len() <= MAX_DET_TILES,
+            "{} tiles exceeds the budget",
+            tiles.len()
+        );
+    }
+
+    #[test]
+    fn a_line_split_by_a_vertical_seam_becomes_one_box() {
+        // The failure this prevents: two half-lines recognized separately,
+        // each reading as gibberish, instead of one line read correctly.
+        let left = (100, 500, 400, 30);
+        let right = (500, 502, 380, 28);
+        // A vertical seam at 500 is what split this line.
+        let merged = merge_split_boxes(vec![left, right], &[500], &[]);
+        assert_eq!(merged.len(), 1, "the halves did not rejoin: {merged:?}");
+        let (x, y, w, h) = merged[0];
+        assert_eq!(x, 100);
+        assert!(y <= 500);
+        assert!(x + w >= 880, "the union must span both halves");
+        assert!(h >= 30);
+    }
+
+    #[test]
+    fn a_line_split_by_a_horizontal_seam_becomes_one_box() {
+        let top = (100, 480, 400, 20);
+        let bottom = (102, 494, 396, 18);
+        // A horizontal seam at 494 is what split this line.
+        let merged = merge_split_boxes(vec![top, bottom], &[], &[494]);
+        assert_eq!(merged.len(), 1, "the halves did not rejoin: {merged:?}");
+    }
+
+    #[test]
+    fn a_dense_block_far_from_any_seam_never_collapses() {
+        // THE RUNAWAY THIS PINS, and it is the shape my first tests missed:
+        // ordinary prose was fine, so nothing failed, while tight leading
+        // chained. Sixty stacked lines overlapping by 2px collapsed into ONE
+        // box 1202px tall, which the recognizer then read as garbage. Code
+        // blocks, tables and dense headings all produce this.
+        let stacked: Vec<(u32, u32, u32, u32)> =
+            (0..60).map(|i| (100, 100 + i * 20, 1200, 22)).collect();
+        // THE SEAMS A REAL 1600x4000 CAPTURE PRODUCES. Passing an empty
+        // seams_x here is what let the axis hole through the first time: no
+        // page wider than the canvas has one, and a full-width line always
+        // crosses the vertical seam.
+        let (_, tiles) = tile_plan(1600, 4000);
+        let mut sx: Vec<u32> = tiles.iter().filter(|t| t.0 > 0).map(|t| t.0).collect();
+        let mut sy: Vec<u32> = tiles.iter().filter(|t| t.1 > 0).map(|t| t.1).collect();
+        sx.sort_unstable();
+        sx.dedup();
+        sy.sort_unstable();
+        sy.dedup();
+        assert!(!sx.is_empty(), "a 1600px page must have a vertical seam");
+        let merged = merge_split_boxes(stacked.clone(), &sx, &sy);
+        // A pair whose facing edges land ON a seam is a legitimate rejoin --
+        // in a synthetic block one pair does, and refusing it would break the
+        // real case. What must NOT happen is the block collapsing: before
+        // the axis fix this was 30 boxes of two lines each, and before the
+        // seam gate it was ONE box.
+        assert!(
+            merged.len() >= stacked.len() - 2,
+            "a dense block collapsed: {} boxes became {}",
+            stacked.len(),
+            merged.len()
+        );
+        assert!(
+            merged.iter().all(|b| b.3 < 46),
+            "a merged box grew past about one line's height: tallest {}px",
+            merged.iter().map(|b| b.3).max().unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn two_columns_are_not_merged_across_the_gutter() {
+        // A 50px gutter is narrower than the overlap band, so the old rule
+        // joined left and right row by row and fed the recognizer one crop
+        // holding two columns of unrelated text.
+        let mut cols = Vec::new();
+        for i in 0..30u32 {
+            cols.push((100, 100 + i * 40, 400, 24));
+            cols.push((550, 100 + i * 40, 400, 24));
+        }
+        let (_, tiles) = tile_plan(1600, 4000);
+        let mut sx: Vec<u32> = tiles.iter().filter(|t| t.0 > 0).map(|t| t.0).collect();
+        let mut sy: Vec<u32> = tiles.iter().filter(|t| t.1 > 0).map(|t| t.1).collect();
+        sx.sort_unstable();
+        sx.dedup();
+        sy.sort_unstable();
+        sy.dedup();
+        let merged = merge_split_boxes(cols.clone(), &sx, &sy);
+        assert_eq!(merged.len(), cols.len(), "columns merged across the gutter");
+    }
+
+    #[test]
+    fn the_chain_is_capped_even_when_a_seam_is_present() {
+        // Belt and braces: at a real seam, a run of boxes must still not
+        // accumulate into one tall block. A split line is two pieces.
+        let stacked: Vec<(u32, u32, u32, u32)> =
+            (0..40).map(|i| (100, 900 + i * 20, 1200, 22)).collect();
+        let merged = merge_split_boxes(stacked, &[864], &[864, 1728]);
+        assert!(
+            merged.iter().all(|b| b.3 <= 88),
+            "a chain formed at the seam: tallest is {}px",
+            merged.iter().map(|b| b.3).max().unwrap_or(0)
+        );
+    }
+
+    #[test]
+    fn separate_lines_are_never_glued_together() {
+        // Over-merging is worse than a duplicate: one crop holding two lines
+        // recognizes as gibberish. Ordinary stacked lines with a gap, and
+        // side-by-side columns far apart, must survive as separate boxes.
+        let line_a = (100, 100, 400, 20);
+        let line_b = (100, 140, 400, 20); // 20px gap below a
+        let far_col = (900, 100, 300, 20); // same row, far to the right
+        let merged = merge_split_boxes(vec![line_a, line_b, far_col], &[500], &[500]);
+        assert_eq!(merged.len(), 3, "distinct lines were merged: {merged:?}");
+    }
+
+    #[test]
+    fn tile_plan_survives_degenerate_input() {
+        assert!(tile_plan(0, 0).1.is_empty());
+        assert_eq!(tile_plan(1, 1).1, vec![(0, 0, 1, 1)]);
     }
 
     #[test]

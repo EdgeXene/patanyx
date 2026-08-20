@@ -155,6 +155,36 @@ check("Ctrl+K opens the palette and renders the visible actions", async () => {
   );
 });
 
+check("the tab pack's only doors are not hidden out of the palette", () => {
+  // THE DEFECT THIS PINS, found by a user asking where "Select tabs" was.
+  // Switch tab and Select tabs have NO toolbar button by design -- the
+  // palette is their only way in. Their opener buttons carried the hidden
+  // ATTRIBUTE, purely to stay out of the layout, and paletteVisibleActions
+  // reads exactly that attribute to mean "unavailable" (chat, until chat.js
+  // reveals it). It could not tell the two meanings apart, so both rows were
+  // filtered out of every build since the tab pack shipped: two Premium
+  // features with no reachable door at all.
+  //
+  // Asserted against the MARKUP, not the live stub: every element in the dom
+  // stub starts hidden regardless of index.html, so only the file can answer
+  // this. They stay out of the layout via .detached-opener (display:none).
+  const html = require("fs").readFileSync(process.env.HTML_PATH, "utf8");
+  for (const id of ["btn-switcher", "btn-tabselect"]) {
+    const tag = html.match(new RegExp("<button[^>]*id=\"" + id + "\"[^>]*>", "s"));
+    assert(tag, "#" + id + " is missing from index.html entirely");
+    assert(
+      !/\bhidden\b/.test(tag[0]),
+      "#" + id + " carries the hidden attribute, which removes its palette " +
+        "row -- and the palette is this feature's only door. Use " +
+        "class=\"detached-opener\" to keep it out of the layout instead.",
+    );
+    assert(
+      /detached-opener/.test(tag[0]),
+      "#" + id + " must carry .detached-opener so it stays out of the layout",
+    );
+  }
+});
+
 check("typing filters the list to matching actions only", async () => {
   ensurePaletteOpen();
   await flush();

@@ -1,0 +1,82 @@
+# Coverage-guided fuzzing for the parsers that eat bytes this project did not
+# write. Its own `[workspace]`, deliberately: joining the main workspace would
+# put libfuzzer-sys and a nightly-only build into the same Cargo.lock the
+# reproducible release build depends on. Nothing here affects a shipped binary,
+# and `cargo build` at the repo root never sees it.
+#
+# Requires a nightly toolchain (libFuzzer needs -Z flags). The repo's pinned
+# 1.96.0 still governs every real build; nightly is only ever used here:
+#
+#     cargo +nightly fuzz run <target> -- -max_total_time=300
+#
+# WHAT IS AND IS NOT COVERED. Targets can only reach LIBRARY crates. The app
+# crate is a binary with no lib target, so its own parsers -- the hover
+# readout, the capture PNG header, the blocklist binary format, page
+# integrity, download compare -- are unreachable from here. Covering those
+# needs a lib target on crates/app, which is a structural decision, not a
+# fuzzing one. Until then this covers the crates a REMOTE party can reach:
+# the chat wire, the update and blocklist manifests, the delta decoder, and
+# the licence token and receipt parsers.
+#
+# `envelope::SessionEnvelope::decode` belongs on that list by reachability -- a
+# peer's inner message -- but `mod envelope` is private and it is not
+# re-exported, so it cannot be reached from here. Widening a crate's public API
+# to suit a fuzzer is the wrong trade; it is listed as a known gap instead.
+[package]
+name = "patanyx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+patanyx-chat = { path = "../crates/chat" }
+patanyx-update = { path = "../crates/update" }
+patanyx-licence = { path = "../crates/licence" }
+
+[[bin]]
+name = "chat_wire_decode"
+path = "fuzz_targets/chat_wire_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "chat_wire_read_frame"
+path = "fuzz_targets/chat_wire_read_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "update_manifest"
+path = "fuzz_targets/update_manifest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "blocklist_manifest"
+path = "fuzz_targets/blocklist_manifest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "update_delta"
+path = "fuzz_targets/update_delta.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "licence_token_parse"
+path = "fuzz_targets/licence_token_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "licence_receipt_parse"
+path = "fuzz_targets/licence_receipt_parse.rs"
+test = false
+doc = false
+
+[workspace]

@@ -209,9 +209,18 @@
   panel.appendChild(sectionTitle("Has this page changed?"));
   panel.appendChild(
     explainer(
+      // "not Deep Recall" is named EXPLICITLY, and it earns its words. These
+      // three tools moved into one modal on 2026-08-19, and the moment they
+      // shared a card the timestamp under this section started reading as
+      // Deep Recall's -- reported within the hour. The tools have separate
+      // stores (this one is the bookmark store; Deep Recall has its own
+      // encrypted archive) and the old layout conveyed that for free by
+      // keeping them in different places. Sharing a modal spent that, so the
+      // sentence has to pay it back.
       "Save a snapshot of this page as it was served to you. Later, compare: PATANYX tells you " +
         "how much of the visible text still matches. Snapshots live in your bookmark store, next " +
-        "to the bookmark -- nowhere else.",
+        "to the bookmark -- not in Deep Recall, and nowhere else. A page has to be bookmarked " +
+        "before it can be snapshotted.",
     ),
   );
   var saveButton = makeButton("Save snapshot now");
@@ -821,6 +830,33 @@
   };
 
   // ---- registration ---------------------------------------------------------------
+
+  // THE MARKUP-BUTTON HANDOVER, 2026-08-19. index.html now carries
+  // #btn-integrity itself and chrome.js registers the combined tools modal
+  // (Page integrity / Deep Recall / Image check) against it; this file's job
+  // shrank to providing the integrity tab's content. When the markup button
+  // and the slot exist, append the panel there, expose the refresh, and stop
+  // -- building a second button or registering a second panel would give the
+  // modal two competing doors. The old path below is kept whole as the
+  // fallback the button-creation comment always promised: if the markup is
+  // ever renamed, integrity stays REACHABLE rather than silently vanishing.
+  var markupButton = document.getElementById("btn-integrity");
+  var toolsSlot = document.getElementById("tools-integrity-slot");
+  if (markupButton && toolsSlot && window.__rb && window.__rb.registerPanel) {
+    panel.hidden = false;
+    // The HOST paints the panel now -- background, padding and scrolling all
+    // come from chrome.css's every-panel rule on #integrity-host. This inner
+    // div keeping its own inline background and padding is what rendered as
+    // a dark card floating in a pale rectangle on hardware: inline styles
+    // beat the class rule, which is the exact specificity trap this file's
+    // own width comment already documents. As a tab body it owns nothing but
+    // its content.
+    sty(panel, { background: "transparent", padding: "0", overflowY: "visible" });
+    toolsSlot.appendChild(panel);
+    window.__rbIntegrityRefresh = refreshCapability;
+    refreshCapability();
+    return;
+  }
 
   var button = el("button");
   button.id = "btn-integrity";

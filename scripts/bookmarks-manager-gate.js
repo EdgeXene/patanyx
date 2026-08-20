@@ -149,6 +149,13 @@ function handle(cmd, args) {
       if (!store.folders.includes(name)) store.folders.push(name);
       return { ok: true, data: { name } };
     }
+    case "bookmarks_delete_all": {
+      const bookmarks = store.bookmarks.length;
+      const folders = store.folders.length;
+      store.bookmarks = [];
+      store.folders = [];
+      return { ok: true, data: { bookmarks, folders } };
+    }
     case "bookmark_folder_delete": {
       const name = norm(args.name);
       store.folders = store.folders.filter((f) => f !== name);
@@ -538,6 +545,67 @@ check("deleting a folder keeps its bookmarks", async () => {
   assert(
     store.bookmarks.length === before,
     "a folder delete destroyed bookmarks; it must only unfile them",
+  );
+});
+
+check("Delete all bookmarks ASKS FIRST and cancelling changes nothing", async () => {
+  // The whole feature is the question. Cancel must leave the store alone --
+  // there is no undo and no bookmark export to restore from.
+  posted.length = 0;
+  const before = store.bookmarks.length;
+  const beforeFolders = store.folders.length;
+  assert(before > 0 && beforeFolders > 0, "fixture has nothing to delete");
+  global.$("bmm-delete-all")._fire("click");
+  await flush();
+  const text = String(global.$("confirm-text").textContent || "");
+  assert(
+    /permanently/i.test(text),
+    "the confirmation must say the word permanently; got: " + text,
+  );
+  assert(
+    /cannot be undone/i.test(text),
+    "the confirmation must say it cannot be undone; got: " + text,
+  );
+  assert(
+    text.includes(String(before)) && text.includes(String(beforeFolders)),
+    "the confirmation must name what is about to be lost; got: " + text,
+  );
+  // Cancel.
+  global.$("confirm-cancel")._fire("click");
+  await flush();
+  assert(
+    !posted.some((p) => p.cmd === "bookmarks_delete_all"),
+    "cancelling still sent the delete",
+  );
+  assert(
+    store.bookmarks.length === before && store.folders.length === beforeFolders,
+    "cancelling destroyed data",
+  );
+});
+
+check("Delete all bookmarks empties the manager once confirmed", async () => {
+  posted.length = 0;
+  assert(store.bookmarks.length > 0, "fixture has nothing to delete");
+  global.$("bmm-delete-all")._fire("click");
+  await flush();
+  global.$("confirm-yes")._fire("click");
+  await flush();
+  const calls = posted.filter((p) => p.cmd === "bookmarks_delete_all");
+  assert(calls.length === 1, "expected one delete call, got " + calls.length);
+  assert(
+    !calls[0].args || Object.keys(calls[0].args).length === 0,
+    "bookmarks_delete_all takes no arguments; got " +
+      JSON.stringify(calls[0].args),
+  );
+  assert(store.bookmarks.length === 0, "bookmarks survived the delete");
+  assert(store.folders.length === 0, "folders survived the delete");
+  // It empties the manager and nothing else: this command must never be the
+  // one that touches set-aside tabs or download records.
+  assert(
+    !posted.some(
+      (p) => /shelf|download|archive/i.test(p.cmd) && p.cmd !== "bookmark_list",
+    ),
+    "deleting bookmarks reached another feature's data",
   );
 });
 

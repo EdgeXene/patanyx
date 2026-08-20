@@ -22,7 +22,10 @@ const MAX_DISPLAY_CHARS: usize = 110;
 /// user reading the readout would see a domain that is not where they are
 /// going. Zero-width and line separators are here for the same reason at
 /// lower stakes -- they let a name be split or padded invisibly.
-fn is_deceptive(c: char) -> bool {
+/// Shared with `state::sanitize_filename`: a downloaded file's NAME is a
+/// display surface too, and the same characters that let a link text lie
+/// about where it points let a file name lie about what it is.
+pub(crate) fn is_deceptive(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO

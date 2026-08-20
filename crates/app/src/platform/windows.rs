@@ -1684,7 +1684,34 @@ fn connect_content_messages(webview: &WebView, proxy: &EventLoopProxy<UserEvent>
                 if msg.get("kind").and_then(|v| v.as_str()) != Some("login_submit") {
                     return Ok(());
                 }
-                let origin = msg.get("origin").and_then(|v| v.as_str()).unwrap_or("");
+                // WHERE THE MESSAGE CAME FROM IS THE ENGINE'S ANSWER, NOT
+                // THE PAGE'S (security audit 2026-08-18, F20).
+                //
+                // The script posts an `origin` field and this used to forward
+                // it. The SAVE path never trusted it -- `cred_save_confirm`
+                // re-derives the host from Rust's own tracked Tab.url -- so a
+                // credential could not be filed under a spoofed site. What the
+                // field did reach was the save BANNER, which a hostile page
+                // could therefore make name a site the user was not on: a
+                // phishing primitive built out of our own trusted chrome.
+                //
+                // `Source` is the URI of the document that actually sent the
+                // message, per the engine. It also carries the value the
+                // navigation race needs: `note_login_submitted` compares it
+                // against the tab's tracked URL, so a message that arrives
+                // after the tab has moved on is dropped rather than bound to
+                // whatever site is loaded by then.
+                //
+                // A Source we cannot read is a message we cannot place, and an
+                // unplaceable credential offer is not shown at all.
+                let mut source_raw = PWSTR::null();
+                if args.Source(&mut source_raw).is_err() {
+                    return Ok(());
+                }
+                let source = take_pwstr(source_raw);
+                if source.is_empty() {
+                    return Ok(());
+                }
                 let username = msg.get("username").and_then(|v| v.as_str()).unwrap_or("");
                 let password = msg.get("password").and_then(|v| v.as_str()).unwrap_or("");
                 if password.is_empty() {
@@ -1692,7 +1719,7 @@ fn connect_content_messages(webview: &WebView, proxy: &EventLoopProxy<UserEvent>
                 }
                 let _ = proxy.send_event(UserEvent::LoginSubmitted {
                     tab_id: id,
-                    origin: origin.to_string(),
+                    source_url: source,
                     username: username.to_string(),
                     password: password.to_string(),
                 });
@@ -4886,9 +4913,18 @@ pub fn find_start(
 
     let mut wide: Vec<u16> = query.encode_utf16().collect();
     wide.push(0);
-    // SAFETY: `wide` outlives the call and the setter copies the term (input
-    // LPCWSTR by SDK contract). If the copy assumption were ever wrong the
-    // symptom would be a stale term, not memory the engine still owns.
+    // SAFETY: `wide` is a named local, so it outlives the call, and the setter
+    // COPIES the term -- an input LPCWSTR is caller-owned and must be copied
+    // by anything that retains it, per the WebView2 Win32 API conventions.
+    //
+    // An earlier version of this comment said that if the copy assumption were
+    // ever wrong the symptom would be "a stale term, not memory the engine
+    // still owns". That understated it, and a SAFETY comment that
+    // understates its own failure mode is worse than none: `wide` is dropped
+    // at the end of this function, so an engine that RETAINED the pointer
+    // instead of copying would read freed memory on the next Start. That is a
+    // use after free, not stale text. The call is sound because the contract
+    // says copy, and this comment now names what the contract is holding up.
     if let Err(error) = unsafe { session.options.SetFindTerm(PCWSTR(wide.as_ptr())) } {
         diag(&format!("find: SetFindTerm FAILED: {error}"));
         find_destroy_session(session);
@@ -5027,12 +5063,113 @@ pub fn apply_page_theme(webview: &WebView, theme: crate::prefs::PageTheme) -> bo
 
 // ---- page capture ----
 
-/// Ask WebView2 for a PNG of the VISIBLE VIEWPORT and deliver the bytes (or
-/// an honest failure) as a UserEvent. CapturePreview is all the engine
-/// offers; faking a full page by resizing the real webview would repaint
-/// the user's window and lie about what was on screen, so the smaller
-/// honest scope ships and the labels say so.
+/// Ask WebView2 for a PNG of the WHOLE PAGE and deliver the bytes (or an
+/// honest failure) as a UserEvent.
+///
+/// "CapturePreview is all the engine offers" is what this comment used to
+/// say, and it was wrong -- which is why Deep Recall saved a viewport for
+/// months while its own panel promised a page. WebView2 exposes
+/// `CallDevToolsProtocolMethod`, and `Page.captureScreenshot` with
+/// `captureBeyondViewport: true` renders past the visible area WITHOUT
+/// resizing the real webview. The old objection (that faking a full page by
+/// resizing would repaint the user's window and lie about what was on
+/// screen) was right about resizing and wrong about the conclusion: the
+/// engine will do it properly if asked properly.
+///
+/// CapturePreview stays as the fallback, so a runtime too old for the
+/// protocol call still saves something rather than failing. The user is told
+/// which they got by the picture itself; nothing here claims a full page it
+/// did not take.
 pub fn capture_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+    if capture_full_page(webview, proxy) {
+        return;
+    }
+    diag("capture: full-page path unavailable, falling back to the viewport");
+    capture_viewport(webview, proxy);
+}
+
+/// Full-page capture over the DevTools protocol. Returns false if the call
+/// could not even be issued, so the caller can fall back.
+fn capture_full_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) -> bool {
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use windows::core::HSTRING;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let done_proxy = proxy.clone();
+    // captureBeyondViewport is the whole point. format png to match what the
+    // store and the OCR already expect; no quality key, since png ignores it.
+    let params = r#"{"format":"png","captureBeyondViewport":true}"#;
+
+    // SAFETY: COM interop; every result checked and every failure reported.
+    unsafe {
+        let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+            move |error_code, result| {
+                let png: Result<Vec<u8>, &'static str> = (|| {
+                    if let Err(error) = &error_code {
+                        diag(&format!("capture: captureScreenshot FAILED: {error}"));
+                        return Err("capture_failed");
+                    }
+                    // {"data":"<base64 png>"} -- parsed with the JSON already
+                    // in the tree rather than by hand.
+                    let raw = result;
+                    let value: serde_json::Value =
+                        serde_json::from_str(&raw).map_err(|_| "capture_failed")?;
+                    let b64 = value
+                        .get("data")
+                        .and_then(|d| d.as_str())
+                        .ok_or("capture_failed")?;
+                    // A CEILING THE VIEWPORT PATH NEVER NEEDED. CapturePreview
+                    // was bounded by the window (about 2 MP); a full-page
+                    // capture of an infinite-scroll page has no such bound,
+                    // and the base64 string, its JSON copy, and the decoded
+                    // bytes are all live at once. Refuse before decoding
+                    // rather than after.
+                    if b64.len() > crate::capture::MAX_CAPTURE_BASE64 {
+                        diag("capture: full-page PNG is too large to hold");
+                        return Err("capture_too_large");
+                    }
+                    let bytes = crate::capture::decode_base64(b64).ok_or("capture_failed")?;
+                    // The same validator the viewport path's bytes go
+                    // through, so a full-page capture cannot skip a check the
+                    // smaller one passes.
+                    crate::capture::validate_capture_bytes(&bytes)?;
+                    Ok(bytes)
+                })();
+                // No viewport retry from in here: the WebView cannot be
+                // carried into this handler, and a capture that the engine
+                // ACCEPTED and then failed is a real failure worth reporting
+                // rather than papering over with a smaller picture. The
+                // fallback that matters -- a runtime with no protocol
+                // support at all -- is handled where the call is issued.
+                let _ = done_proxy.send_event(UserEvent::Capture(
+                    // The protocol path renders past the viewport, so this
+                    // one genuinely is the whole page.
+                    crate::capture::CaptureEvent {
+                        png,
+                        scope: crate::capture::CaptureScope::FullPage,
+                    },
+                ));
+                Ok(())
+            },
+        ));
+        match core.CallDevToolsProtocolMethod(
+            &HSTRING::from("Page.captureScreenshot"),
+            &HSTRING::from(params),
+            &handler,
+        ) {
+            Ok(()) => true,
+            Err(error) => {
+                diag(&format!("capture: CallDevToolsProtocolMethod FAILED: {error}"));
+                false
+            }
+        }
+    }
+}
+
+/// The visible viewport, via CapturePreview. The fallback, and what every
+/// build did unconditionally before the full-page path existed.
+fn capture_viewport(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
     use webview2_com::CapturePreviewCompletedHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
     use windows::Win32::System::Com::{STREAM_SEEK_SET};
@@ -5043,6 +5180,9 @@ pub fn capture_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
     let fail = |proxy: &EventLoopProxy<UserEvent>| {
         let _ = proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent {
             png: Err("capture_failed"),
+            // Nothing was captured; the scope is immaterial but must be
+            // something, and claiming the smaller one cannot mislead.
+            scope: crate::capture::CaptureScope::VisibleArea,
         }));
     };
     // SAFETY: COM interop; every result checked, failures reported as an
@@ -5069,7 +5209,13 @@ pub fn capture_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                 }
                 read_stream_capped(&done_stream).map_err(|_| "capture_failed")
             })();
-            let _ = done_proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent { png }));
+            // CapturePreview is the viewport, and says so -- this is the
+            // fallback path, and it must not inherit the full-page path's
+            // promise.
+            let _ = done_proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent {
+                png,
+                scope: crate::capture::CaptureScope::VisibleArea,
+            }));
             Ok(())
         }));
         if let Err(error) = core.CapturePreview(
@@ -5675,4 +5821,114 @@ pub fn tick_auto_freeze(view: &TabView, now: Instant) -> (bool, Option<Instant>)
         return (true, None);
     }
     (false, st.freeze.auto_freeze_deadline())
+}
+
+/// Strip the source address from a finished download's Mark-of-the-Web,
+/// keeping the zone. See `platform::motw` for the why; this is the how.
+///
+/// The `Zone.Identifier` stream is opened with ordinary `std::fs` on the
+/// path `file:Zone.Identifier`, which NTFS resolves without any COM. Three
+/// outcomes, none of them a panic:
+///   * no stream, or one that already carries no address -> `Clean`, and
+///     NOTHING is written. Writing a stream where there was none would be
+///     inventing provenance; rewriting an identical one would bump the
+///     file's modified time for no reason.
+///   * an address is present and the rewrite succeeds -> `Scrubbed`.
+///   * an address is present and the rewrite fails -> `Failed`, and the
+///     caller is told, because the address is STILL ON DISK and a user who
+///     was promised otherwise should hear that from the browser rather than
+///     find it in Explorer.
+///
+/// THE WRITE NEVER TRUNCATES FIRST, and the earlier version of this comment
+/// was wrong about why. It claimed truncate-and-write "is one open call";
+/// `truncate(true)` lands at `open`, so it is two operations with the
+/// DESTRUCTIVE one first. A write that then failed -- a full disk (very
+/// plausible: the download just filled it), an I/O error, an AV filter that
+/// permits the open and blocks the write -- left a zero-length stream, which
+/// has no `ZoneId`, which means Windows stops warning about the file
+/// entirely. The one case that matters would have removed the safety half
+/// and told the user only that the address survived. A pre-commit audit
+/// caught it before release.
+///
+/// So: write the replacement over the stream WITHOUT truncating, then set
+/// the length to what was written, then `sync_all`. The replacement can be
+/// longer than the original (kept lines are re-emitted with CRLF), so the
+/// order has to be write-then-shorten, never shorten-then-write.
+///
+/// Then READ IT BACK. Nothing else here verifies that the bytes on disk are
+/// the bytes intended, and a report that contradicts the disk is worse than
+/// no report: `Scrubbed` is claimed only after re-reading the stream and
+/// confirming it still names a zone and no longer names an address.
+pub fn scrub_download_mark(path: &Path) -> super::motw::Outcome {
+    use super::motw::{Outcome, Verdict, STREAM_NAME};
+    use std::io::Write;
+
+    let mut stream_path = path.as_os_str().to_owned();
+    stream_path.push(":");
+    stream_path.push(STREAM_NAME);
+
+    // Bounded before it is read. A stream Windows wrote is tens of bytes;
+    // one this large was written by something else, and this runs on the
+    // event-loop thread, so it is not read at all.
+    const MAX_STREAM_BYTES: u64 = 64 * 1024;
+    match std::fs::metadata(&stream_path) {
+        Ok(m) if m.len() > MAX_STREAM_BYTES => return Outcome::Unknown,
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Outcome::Clean,
+        Err(_) => return Outcome::Unknown,
+    }
+    let existing = match std::fs::read(&stream_path) {
+        Ok(bytes) => bytes,
+        // NOT-FOUND IS THE ONLY ERROR THAT MEANS CLEAN. The engine simply
+        // did not mark this file, so there is nothing to remove and nothing
+        // to say. Every other error -- a sharing violation while an AV scans
+        // the file, a permission, a filesystem only pretending to be NTFS --
+        // means the stream could not be READ, which is not the same as it
+        // being absent: an address may be sitting there right now. Reporting
+        // that as Clean would show the user a plain "Saved" over exactly the
+        // record this module exists to remove, so it is its own outcome.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Outcome::Clean,
+        Err(_) => return Outcome::Unknown,
+    };
+    let text = String::from_utf8_lossy(&existing);
+    let replacement = match super::motw::rewrite(&text) {
+        Verdict::Keep => return Outcome::Clean,
+        Verdict::Replace(r) => r,
+    };
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(false)
+        .open(&stream_path)
+        .and_then(|mut f| {
+            f.write_all(replacement.as_bytes())?;
+            // Only now is it safe to shorten: every byte of the replacement
+            // is already down, so this can only remove leftovers from a
+            // longer original.
+            f.set_len(replacement.len() as u64)?;
+            f.sync_all()
+        });
+    if written.is_err() {
+        return Outcome::Failed;
+    }
+    // Verified, not assumed. If the stream now fails to read, or lost its
+    // zone, or still names an address, the write did not do what this
+    // function claims and the user is told so rather than reassured.
+    match std::fs::read(&stream_path) {
+        Ok(after) => {
+            let after = String::from_utf8_lossy(&after);
+            let has_zone = after
+                .lines()
+                .any(|l| l.trim().to_ascii_lowercase().starts_with("zoneid"));
+            let had_zone = text
+                .lines()
+                .any(|l| l.trim().to_ascii_lowercase().starts_with("zoneid"));
+            let still_has_address = matches!(super::motw::rewrite(&after), Verdict::Replace(_));
+            if still_has_address || (had_zone && !has_zone) {
+                Outcome::Failed
+            } else {
+                Outcome::Scrubbed
+            }
+        }
+        Err(_) => Outcome::Unknown,
+    }
 }

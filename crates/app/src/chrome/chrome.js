@@ -291,10 +291,35 @@
       case "download_finished": {
         const data = msg.data || {};
         if (data.success) {
-          toast(
-            "Saved " +
-              (fileNameFromPath(data.path) || fileNameFromUrl(data.url)),
-          );
+          const name = fileNameFromPath(data.path) || fileNameFromUrl(data.url);
+          // data.mark is what happened to the file's Mark-of-the-Web (see
+          // platform/motw.rs). Only "failed" is worth a word: "scrubbed"
+          // is the normal case on Windows and "clean" or "n/a" mean there
+          // was nothing to do. A failure means the source address is still
+          // written next to the file, and that is said plainly rather than
+          // hidden behind an ordinary "Saved".
+          if (data.mark === "failed") {
+            toast(
+              "Saved " +
+                name +
+                ", but Windows kept the download's source " +
+                "address next to the file and it could not be removed.",
+              true,
+            );
+          } else if (data.mark === "unknown") {
+            // NOT the same sentence as "failed". That one asserts the
+            // address is there; this one says only that it could not be
+            // checked, which is the honest limit of what the browser knows.
+            toast(
+              "Saved " +
+                name +
+                ". PATANYX could not check whether Windows wrote the " +
+                "download's source address next to it.",
+              true,
+            );
+          } else {
+            toast("Saved " + name);
+          }
         } else {
           toast("Download failed", true);
         }
@@ -436,9 +461,21 @@
     too_large: "That file is too big to be a bookmarks export",
     no_capture_page: "Nothing to capture on this page",
     capture_failed: "The capture failed; nothing was saved",
+    // Whole-page capture has no size bound of its own, so a very long page
+    // can exceed what this browser will hold at once. Named separately from
+    // capture_failed because the remedy differs: this one has a cause the
+    // user can act on.
+    capture_too_large:
+      "That page is too long to capture in one picture. Try saving a shorter page.",
     busy: "A capture is already in progress",
     no_storable_tabs:
       "Nothing to set aside: every tab here is ephemeral or an internal page",
+    // The restart did not happen and nothing was lost: the session was put
+    // back exactly as it was, so the honest thing to offer is the old
+    // manual route rather than a retry that would fail the same way.
+    relaunch_failed:
+      "PATANYX could not start a replacement, so nothing was changed. " +
+      "Close the browser and open it again to apply the tunnel setting.",
     bad_args: "That does not look right",
     // Find across tabs is the first premium-gated feature. The panel ALSO
     // un-hides a standing note on this code -- a toast alone would vanish
@@ -695,8 +732,12 @@
 
   // ---- tab strip -----------------------------------------------------------------
   $("btn-newtab").addEventListener("click", () => {
+    // No urlInput.focus() here. It used to be, and it ran BEFORE Rust built
+    // the tab and (on Windows) focused the new content webview, so the
+    // cursor never landed in the bar. Rust now emits focus_url_bar itself
+    // once the blank tab is showing -- one path for the button, Ctrl+T and
+    // the last-tab-closed fresh tab alike.
     rb("tab_new").catch(() => {});
-    urlInput.focus();
   });
 
   function hostOf(url) {
@@ -2257,6 +2298,12 @@
     // failed when the palette predated them. `paletteVisibleActions` resolves
     // ids live at open time, so runtime injection needs no special casing.
     { label: "Open Integrity", buttonId: "btn-integrity" },
+    // The other two tabs of the tools modal. Their buttons are the tab strip
+    // itself, so choosing one opens the modal AND lands on the right tool --
+    // this is what put all three in one modal in the first place: neither
+    // Deep Recall nor the image check was findable from here before.
+    { label: "Open Deep Recall", buttonId: "btn-tab-recall" },
+    { label: "Check an image before you share it", buttonId: "btn-tab-imagecheck" },
     { label: "Open Updates", buttonId: "btn-update" },
     { label: "About this site", buttonId: "btn-site-info" },
     { label: "Save page as PDF", buttonId: "btn-save-pdf" },
@@ -2608,6 +2655,11 @@
   // failure must persist longer than one probe cycle (10s in
   // tunnel_control) before the user is told the tunnel is down.
   let tunnelFailSince = 0;
+  // The last state the PROBE reported, kept because the warning banner needs
+  // to tell two different situations apart that the mode alone cannot:
+  // "the vault was never unlocked, so the tunnel never came up" and "the
+  // tunnel is carrying traffic and the vault locked itself behind it".
+  let tunnelMeasured = "not_attempted";
   const TUNNEL_FAIL_GRACE_MS = 15000;
 
   registerPanel("tunnel", {
@@ -2623,13 +2675,22 @@
       // Says what is true NOW ("not in effect yet") before what to do
       // about it: the user has already changed the setting and the browser
       // is still behaving the old way, which is the surprising half.
+      // "Tabs that can be" rather than "your tabs": ephemeral tabs and
+      // internal pages are never set aside, and the unqualified promise was
+      // simply false for anyone browsing without a saved profile. The exact
+      // count is not known until the button is pressed, and that is where
+      // it is now stated.
       note.textContent =
-        "Not in effect yet. Close PATANYX and open it again to apply this " +
-        "change. The engine takes the tunnel setting only at startup.";
+        "Not in effect yet. The engine takes the tunnel setting only at " +
+        "startup. Apply and restart does it for you: the tabs that can be " +
+        "set aside reopen after you unlock.";
       note.hidden = false;
     } else {
       note.hidden = true;
     }
+    // The button lives or dies with the note it answers.
+    const actions = $("tunnelp-restart-actions");
+    if (actions) actions.hidden = !pending;
   }
 
   function markTunnelChoice(mode) {
@@ -2641,10 +2702,29 @@
     $("tunnelp-imported").classList.toggle("active", mode === "imported");
   }
 
+  // The three words the engine speaks, in words a person does. The wire
+  // vocabulary is a contract (tunnel_control::report returns exactly these
+  // three), and it was being printed raw -- "Status: not_attempted" -- on
+  // the one surface a user opens to find out whether they are protected.
+  //
+  // Same phrasing as the engine-confirmed row elsewhere in this file, so
+  // two surfaces cannot describe one state differently.
+  const TUNNEL_REPORT_TEXT = {
+    not_attempted: "off (no tunnel chosen)",
+    applied: "carrying this browser's traffic",
+    failed: "not carrying traffic",
+  };
+
   function tunnelReportLine(report, startError) {
+    // An unknown value from a future engine falls back to the raw word
+    // rather than to silence: a status this build cannot name is still
+    // better shown than hidden.
+    const known = report == null ? null : TUNNEL_REPORT_TEXT[String(report)];
     let line =
-      "Status: " + (report == null ? "no measurement yet" : String(report));
+      "Status: " +
+      (report == null ? "no measurement yet" : known || String(report));
     if (startError) {
+      // Verbatim: the engine's error text is key-free by contract.
       line += ". Could not start: " + startError;
     }
     return line;
@@ -2675,9 +2755,21 @@
     // saying so.
     renderTunnelRestart(!!st.restart_pending);
     const configLine = $("tunnelp-config");
-    if (st.has_config === null || st.has_config === undefined) {
-      // Locked vault: Rust cannot say whether a configuration exists, and
-      // this line must not render "null" or guess.
+    // A null has_config means the vault is locked, so Rust cannot say
+    // whether a configuration exists. That is a PREREQUISITE, not a
+    // failure, and it is now said before the controls it gates rather than
+    // after a click that walks the user through a file picker to nowhere.
+    const vaultLocked = st.has_config === null || st.has_config === undefined;
+    const prereq = $("tunnelp-vault-first");
+    if (prereq) prereq.hidden = !vaultLocked;
+    for (const id of ["tunnelp-import", "tunnelp-paste-import", "tunnelp-remove"]) {
+      const btn = $(id);
+      if (btn) btn.disabled = vaultLocked;
+    }
+    const paste = $("tunnelp-paste");
+    if (paste) paste.disabled = vaultLocked;
+
+    if (vaultLocked) {
       configLine.textContent =
         "Unlock the vault to see whether a configuration is stored.";
     } else if (st.has_config) {
@@ -2685,6 +2777,11 @@
     } else {
       configLine.textContent = "No configuration imported yet.";
     }
+    // Step 4 always says something: with nothing pending, the honest answer
+    // is that there is nothing to apply, not an empty space that reads as a
+    // control that failed to load.
+    const appliedNote = $("tunnelp-applied-note");
+    if (appliedNote) appliedNote.hidden = !!st.restart_pending;
     syncTunnelWarning();
   }
 
@@ -2709,10 +2806,66 @@
   }
 
   function syncTunnelWarning() {
-    const show =
+    // A LOCKED VAULT IS NOT A BROKEN TUNNEL, and saying so was the whole
+    // defect. The configuration lives in the vault, so before the first
+    // unlock there is nothing to build a tunnel from; the listener is
+    // parked and refusing, every page fails, and the browser reported "the
+    // tunnel is down. PATANYX will NOT fall back to a direct connection."
+    // True, and useless: it describes the symptom the user can already see
+    // and hides the one thing that would fix it. Someone with an entirely
+    // healthy configuration reads that their internet is broken.
+    //
+    // Known instantly -- no measurement is needed to see that the vault is
+    // shut -- so this skips the grace period the failure path needs. Fifteen
+    // seconds of a blank window before any explanation is most of the
+    // confusion.
+    //
+    // BUT A LOCKED VAULT DOES NOT MEAN A DEAD TUNNEL, and reading it that way
+    // was worse than the bug it fixed. tunnel_control has deliberately no
+    // on_vault_locked: the session already holds its keys, so locking the
+    // password store does not stop a running tunnel. Unlock at boot, browse,
+    // let the vault auto-lock, and the mode-only test raised a red alert
+    // saying "pages will not load" and advising the user to switch off a
+    // tunnel that was carrying their traffic -- while the toolbar button,
+    // which reads the measured value, sat green two inches away. Two trusted
+    // surfaces disagreeing on screen is worse than either being wrong alone.
+    //
+    // So the banner is owed only when the vault is shut AND the probe does
+    // not report a working tunnel. The boot case still fires immediately,
+    // because a tunnel that never came up is never "applied".
+    const vaultShut =
+      tunnelMode === "imported" && !vaultUnlocked && tunnelMeasured !== "applied";
+    const measuredFailure =
       tunnelMode === "imported" &&
       tunnelFailSince !== 0 &&
       Date.now() - tunnelFailSince >= TUNNEL_FAIL_GRACE_MS;
+    const show = vaultShut || measuredFailure;
+
+    if (show) {
+      const title = $("tunnel-warning-title");
+      const body = $("tunnel-warning-body");
+      const open = $("tunnel-warning-open");
+      if (vaultShut) {
+        title.textContent = "Unlock your vault to use Private Tunnel";
+        body.textContent =
+          "Private Tunnel keeps its configuration in the vault, so pages " +
+          "will not load until you unlock it. PATANYX will NOT fall back " +
+          "to a direct connection. Unlock the vault, or switch the tunnel " +
+          "off in its panel.";
+        // Point at the thing that fixes it, not at the panel that explains
+        // it. One button, retargeted, so the banner never grows a second.
+        open.textContent = "Open vault";
+        open.dataset.target = "vault";
+      } else {
+        title.textContent = "The tunnel is not carrying traffic";
+        body.textContent =
+          "Pages are not loading because the tunnel is down. PATANYX will " +
+          "NOT fall back to a direct connection. Open the tunnel panel.";
+        open.textContent = "Open Tunnel panel";
+        open.dataset.target = "tunnel";
+      }
+    }
+
     const banner = $("tunnel-warning");
     if (banner.hidden !== !show) {
       banner.hidden = !show;
@@ -2723,6 +2876,7 @@
   }
 
   function noteTunnelMeasured(state) {
+    tunnelMeasured = state;
     if (tunnelMode !== "imported") {
       // Off means failing-to-carry-tunnel-traffic is not a failure at all.
       tunnelFailSince = 0;
@@ -2736,6 +2890,18 @@
       // value this build does not know -- ends the run.
       tunnelFailSince = 0;
     }
+    // THE TOOLBAR SAYS SO WHILE IT IS TRUE. Driven by the MEASURED report,
+    // never by the mode: "imported" only means the user asked for a tunnel,
+    // and a button that lit up on the asking would be green while traffic
+    // went direct. "applied" is the engine's own answer and requires both a
+    // live tunnel and a real SOCKS5 round trip (tunnel_control::classify),
+    // so this cannot claim protection that is not there.
+    //
+    // It is also the answer to "I quit days ago, am I still on the VPN?" --
+    // the state survives restarts in prefs, so the only honest place to
+    // answer that is somewhere always visible.
+    const tunnelBtn = $("btn-tunnel");
+    if (tunnelBtn) tunnelBtn.classList.toggle("is-active", state === "applied");
     syncTunnelWarning();
   }
 
@@ -2773,6 +2939,37 @@
     }
   });
 
+  // The pasted-text import. Same reply shape as the file path, so the
+  // refusal text lands in the same place and reads the same way.
+  if ($("tunnelp-paste-import")) {
+    $("tunnelp-paste-import").addEventListener("click", async () => {
+      const box = $("tunnelp-paste");
+      const err = $("tunnelp-error");
+      err.hidden = true;
+      const text = box ? box.value : "";
+      if (!text.trim()) {
+        err.textContent = "Paste a configuration first.";
+        err.hidden = false;
+        return;
+      }
+      try {
+        const r = await rb("tunnel_import_text", { text });
+        if (r && r.imported) {
+          // Cleared on success only: a refused paste stays on screen so the
+          // user can see what was wrong with it rather than re-copying.
+          if (box) box.value = "";
+          await refreshTunnel();
+        } else if (r && r.error) {
+          err.textContent = r.error;
+          err.hidden = false;
+        }
+      } catch (e) {
+        err.textContent = friendly(e);
+        err.hidden = false;
+      }
+    });
+  }
+
   $("tunnelp-remove").addEventListener("click", async () => {
     try {
       await rb("tunnel_remove");
@@ -2787,10 +2984,82 @@
     }
   });
 
+  // Apply and restart. This is the only button in the browser that ends the
+  // process on purpose, so it is deliberately unglamorous: one send, no
+  // confirmation dialog (the user has already chosen the mode and read the
+  // note above it), and the button disables itself so a second click cannot
+  // shelve the session twice while the first restart is under way.
+  if ($("tunnelp-apply-restart")) {
+    $("tunnelp-apply-restart").addEventListener("click", async () => {
+      const btn = $("tunnelp-apply-restart");
+      const err = $("tunnelp-error");
+      err.hidden = true;
+
+      // ASK BEFORE SPENDING SOMETHING THAT CANNOT BE GOT BACK. The engine
+      // never shelves an ephemeral tab -- that is a privacy promise, not a
+      // preference -- and "Open new tabs without a saved profile" is a
+      // BROWSER-WIDE setting, so a user who has it on loses every tab here
+      // with no way to retrieve them. This button used to restart anyway,
+      // under a note promising the tabs would come back.
+      //
+      // The question is asked ONLY when something will actually be lost, so
+      // the ordinary case keeps its one unglamorous click.
+      let preview = null;
+      try {
+        preview = await rb("tunnel_restart_preview");
+      } catch (e) {
+        // A preview that cannot be taken is not a reason to block the
+        // restart; it is a reason not to claim anything about the tabs.
+      }
+      if (preview && preview.left_out > 0) {
+        const lost = preview.left_out;
+        const kept = preview.kept;
+        const ok = await askConfirm(
+          kept === 0
+            ? "None of your " +
+                lost +
+                (lost === 1 ? " open tab" : " open tabs") +
+                " can be set aside, because tabs opened without a saved " +
+                "profile are never written to the vault. Restarting now " +
+                "closes them for good."
+            : lost +
+                (lost === 1 ? " tab" : " tabs") +
+                " cannot be set aside and will close for good; " +
+                kept +
+                (kept === 1 ? " will" : " will") +
+                " reopen after you unlock. Tabs opened without a saved " +
+                "profile are never written to the vault.",
+          "Restart anyway",
+        );
+        if (!ok) return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = "Restarting…";
+      try {
+        await rb("tunnel_apply_restart");
+        // No success path to render: the reply means the replacement is
+        // already running and this process is on its way out.
+      } catch (e) {
+        // It did NOT happen. Nothing was shelved that is not also cleaned
+        // up, so the honest thing is to put the button back.
+        btn.disabled = false;
+        btn.textContent = "Apply and restart now";
+        err.textContent = friendly(e);
+        err.hidden = false;
+      }
+    });
+  }
+
   // The REAL toolbar button's click, so the panel opens with exactly its
   // normal wiring rather than a copy of it.
   $("tunnel-warning-open").addEventListener("click", () => {
-    $("btn-tunnel").click();
+    // Whichever panel actually helps: the vault when that is what is
+    // missing, the tunnel panel otherwise. Both go through the REAL toolbar
+    // button, so each panel opens with its own registered wiring rather
+    // than a copy of it.
+    const target = $("tunnel-warning-open").dataset.target;
+    $(target === "vault" ? "btn-vault" : "btn-tunnel").click();
   });
 
   // Learn the mode at boot, so the banner logic has it before any panel
@@ -2906,12 +3175,19 @@
 
   $("dv-off").addEventListener("change", async () => {
     if (!divergenceHost) return;
-    await refreshPremium();
-    if (premiumBlocked()) {
-      $("dv-off").checked = !$("dv-off").checked;
-      $("dv-premium").hidden = false;
-      return;
-    }
+    // NO PREMIUM CHECK HERE, and its removal is the whole point of the
+    // 2026-08-19 decision. The four divergence IPC arms were un-gated in
+    // Rust, but this handler still called premiumBlocked() first: it
+    // reverted the checkbox, toasted "A Premium feature, arriving the day
+    // Premium launches", and returned without ever sending
+    // divergence_site_set. So a free user saw the switch flip back, under a
+    // note that had just been rewritten to say choosing per site is free.
+    // Two surfaces contradicting each other one line apart.
+    //
+    // Un-gating Rust is not enough on its own; the chrome gates
+    // independently, and neither licence-planted-defect-gate nor
+    // divergence-site-gate caught this -- the first only reads ipc.rs, and
+    // the second ran every check with premium: true.
     try {
       await rb("divergence_site_set", {
         host: divergenceHost,
@@ -3464,6 +3740,10 @@
     if (unlocked !== vaultUnlocked) {
       vaultUnlocked = unlocked;
       refreshAutofillOffer();
+      // The tunnel banner's whole point is that a shut vault is why nothing
+      // loads. Unlocking must take it down at that moment, not at whatever
+      // the next status event happens to be.
+      syncTunnelWarning();
     }
     const btn = $("btn-vault");
     const dot = $("vault-dot");
@@ -3791,11 +4071,31 @@
     $("create-pass1").value = "";
     $("create-pass2").value = "";
     $("unlock-pass").value = "";
+    // THE TUNNEL PASTE BOX HOLDS A WIREGUARD PRIVATE KEY, and it is cleared
+    // on success only -- a REFUSED paste deliberately stays on screen so the
+    // user can see what was wrong with it rather than re-copying. That is
+    // right while they are looking at it, and wrong the moment the vault
+    // locks: a rejected configuration would otherwise sit in the DOM of a
+    // locked browser, through an auto-lock, with its key in it. The Rust
+    // half zeroizes on both outcomes (store_tunnel_config), and the panel
+    // claims "same parser, same size cap, same wipe as the file path", so
+    // this is the line that makes that sentence true.
+    const paste = $("tunnelp-paste");
+    if (paste) paste.value = "";
     renderCreds();
     renderNotes();
   }
 
   function onLocked() {
+    // THE DECRYPTED PAGE COMES OFF THE SCREEN WITH THE VAULT. Rust clears
+    // the staged slot on lock, so the token 404s and nothing can be
+    // re-fetched -- but an image already loaded stays rendered, and a
+    // full-page screenshot of whatever the user saved would sit there
+    // through an idle auto-lock. The release notes say locking the vault
+    // takes it off screen, and archive.rs's own doc says a locked browser
+    // with a decrypted page on offer makes that sentence false. This is the
+    // line that keeps it true on the chrome side.
+    if (typeof recallPreviewClose === "function") recallPreviewClose();
     clearSecrets();
     credItems = [];
     noteItems = [];
@@ -4560,6 +4860,19 @@
     // The fail-closed tunnel banner. A banner absent from this list renders
     // OUTSIDE the clipped strip and is invisible -- the lock-warning defect.
     "tunnel-warning",
+    // The plain-HTTP warning: same band, same clipping rule.
+    "insecure-warning",
+    // The find bar. NOT a banner by role (role="search"), which is exactly how
+    // it escaped the toolbar gate's role=alert|status sweep and this list.
+    // With the toolbar across the top the closed strip is measured against a
+    // 148px floor, and the ~40px of slack under the two rows happened to be
+    // enough for the bar -- so Ctrl+F looked fine on every top-toolbar test.
+    // With the toolbar down the LEFT edge the strip is only the tab row and
+    // is measured tightly (floor 88), the slack is gone, and the bar rendered
+    // under the page: Ctrl+F "did nothing". Its own comment in index.html
+    // says it "goes through the same height sync the banners use"; now it
+    // does.
+    "findbar",
   ];
 
   function syncChromeInsets() {
@@ -4786,6 +5099,14 @@
     // password is worth surfacing whether or not Tab Activity is open, unlike
     // the Passwords section below.
     applyPendingSave(st.pending_save || null);
+
+    // Plain-HTTP warning: `insecure_pending` is the URL the navigation
+    // handler is holding for the ACTIVE tab, or null. Rendered from status,
+    // like the save offer, so a tab switch shows or hides it correctly.
+    applyInsecurePending(
+      st.insecure_pending || null,
+      st.insecure_pending_host || null,
+    );
 
     // Passwords used to be refreshed HERE, and only while Tab Activity was
     // open -- the round trip was not worth making for a panel nobody had
@@ -6330,17 +6651,43 @@
   });
 
   // Idea 2: say what is legible in an image before it is shared.
+  // Collapsed again for every new scan: text left over from the previous
+  // image, under a fresh verdict, is the worst thing this panel could show.
+  function leakTextReset() {
+    $("leakcheck-readwrap").hidden = true;
+    $("leakcheck-text").hidden = true;
+    $("leakcheck-text").textContent = "";
+    $("leakcheck-showtext").textContent = "Show what it read";
+  }
+
+  $("leakcheck-showtext").addEventListener("click", () => {
+    const pre = $("leakcheck-text");
+    pre.hidden = !pre.hidden;
+    $("leakcheck-showtext").textContent = pre.hidden
+      ? "Show what it read"
+      : "Hide what it read";
+    syncChromeInsets();
+  });
+
   $("leakcheck-pick").addEventListener("click", () => {
     const err = $("leakcheck-error");
     const status = $("leakcheck-status");
     const list = $("leakcheck-list");
     err.textContent = "";
     list.replaceChildren();
+    leakTextReset();
     status.textContent = "Reading the image...";
     startScan(
       "leaks",
       (data) => {
         const findings = data.findings || [];
+        // THE EVIDENCE, whatever the verdict. Offered on a clean result too
+        // -- that is the case where "how does it know?" gets asked, and the
+        // only honest answer is to show the reader what it had to work with.
+        if (data.text) {
+          $("leakcheck-text").textContent = data.text;
+          $("leakcheck-readwrap").hidden = false;
+        }
         if (!findings.length) {
           // "Nothing found" and "no text at all" are different answers and
           // the difference matters to someone about to post a screenshot.
@@ -6630,6 +6977,31 @@
     }
 
     const row = el("div", "item-row");
+    if (item.has_picture) {
+      // The saved screenshot, finally reachable. archive_save had stored it
+      // encrypted since the feature landed, and the panel listed it with
+      // has_picture:true while offering no way to look -- reported from the
+      // panel itself: "Where am I supposed to find the screenshots?" The
+      // stage arm decrypts ONE record into a single slot; the token URL is
+      // served by the chrome protocol, so no image bytes ride the IPC.
+      const view = el("button", "small", "View");
+      view.type = "button";
+      view.addEventListener("click", async () => {
+        try {
+          const r = await rb("archive_picture_stage", { id: item.id });
+          const img = $("recall-preview-img");
+          // As an ATTRIBUTE, like the region panel: setting and removing
+          // are then the same vocabulary (removeAttribute in the close).
+          img.setAttribute("src", "/archive-picture/" + r.token + ".png");
+          $("recall-preview").hidden = false;
+          $("recall-status").textContent = "";
+          syncChromeInsets();
+        } catch (e) {
+          $("recall-status").textContent = friendly(e);
+        }
+      });
+      row.appendChild(view);
+    }
     const del = el("button", "small", "Delete");
     del.type = "button";
     del.addEventListener("click", async () => {
@@ -6642,6 +7014,9 @@
       }
       try {
         await rb("archive_delete", { id: item.id });
+        // The record just deleted may be the one on screen. Rust cleared
+        // the slot with the delete; drop the chrome's reference too.
+        recallPreviewClose();
         await recallRefresh();
       } catch (e) {
         $("recall-status").textContent = friendly(e);
@@ -6651,6 +7026,129 @@
     li.appendChild(row);
     return li;
   }
+
+  // Closes the preview and releases the decrypted bytes on the Rust side.
+  // Blanking src first drops the chrome's reference; the clear wipes the
+  // slot, after which the old token URL is a 404 by design. fire-and-forget
+  // on the IPC: closing a picture must never be able to fail on screen.
+  function recallPreviewClose() {
+    const img = $("recall-preview-img");
+    img.removeAttribute("src");
+    // Back to Fit for the next picture: a reader who left one zoomed in
+    // should not have the next one open mid-page at some arbitrary level.
+    recallZoomSet(0);
+    $("recall-preview").hidden = true;
+    rb("archive_picture_clear").catch(() => {});
+  }
+
+  // REAL ZOOM, replacing the two-state Fit/Actual toggle that shipped first.
+  // "Actual size" is a developer's word for it and gives the reader exactly
+  // two choices, neither of which is "a bit bigger" -- which is what someone
+  // reading a saved page actually wants.
+  //
+  // 0 means FIT: the picture is width:100% of the stage and follows it on
+  // resize. Any other value is a multiplier on the picture's NATURAL width,
+  // so 1 is genuinely one image pixel per CSS pixel and the reader can go
+  // either side of it. The stage scrolls both axes at every level.
+  const RECALL_ZOOM_STEPS = [0.25, 0.4, 0.55, 0.75, 1, 1.5, 2, 3, 4];
+  let recallZoom = 0;
+
+  function recallZoomSet(level) {
+    recallZoom = level;
+    const wrap = $("recall-preview");
+    const img = $("recall-preview-img");
+    if (!level) {
+      wrap.classList.remove("zoomed");
+      img.style.width = "";
+      $("recall-preview-level").textContent = "Fit";
+      return;
+    }
+    // NOT YET LOADED IS NOT ZOOMABLE, and it must not LOOK zoomed either.
+    // naturalWidth is 0 until the picture arrives, so the width below would
+    // resolve to "" and leave the image at fit size while the readout said
+    // 200% -- a control that reports a change it did not make. The level is
+    // remembered and applied by the load handler instead.
+    const natural = img.naturalWidth || 0;
+    if (!natural) {
+      wrap.classList.remove("zoomed");
+      img.style.width = "";
+      $("recall-preview-level").textContent = "Fit";
+      return;
+    }
+    wrap.classList.add("zoomed");
+    // Against NATURAL width, not the stage's: the number then means what it
+    // says whatever size the panel happens to be.
+    img.style.width = Math.round(natural * level) + "px";
+    $("recall-preview-level").textContent = Math.round(level * 100) + "%";
+  }
+
+  // Keeps the point under the viewport's centre under it after a zoom.
+  // Without this every step throws the reader back to a different part of the
+  // page and they have to find their place again.
+  function recallZoomStep(dir) {
+    const stage = $("recall-preview-stage");
+    const img = $("recall-preview-img");
+    const before = img.clientWidth || 1;
+    // Where the centre of the viewport sits within the picture, 0..1.
+    const fx = (stage.scrollLeft + stage.clientWidth / 2) / Math.max(before, 1);
+    const fy =
+      (stage.scrollTop + stage.clientHeight / 2) /
+      Math.max(img.clientHeight || 1, 1);
+
+    // Fit is the entry point: stepping up from it starts at whichever ladder
+    // rung is closest to what the reader is already seeing.
+    let idx;
+    if (!recallZoom) {
+      const natural = img.naturalWidth || before;
+      const current = before / Math.max(natural, 1);
+      idx = 0;
+      for (let i = 0; i < RECALL_ZOOM_STEPS.length; i += 1) {
+        if (RECALL_ZOOM_STEPS[i] <= current) idx = i;
+      }
+    } else {
+      idx = RECALL_ZOOM_STEPS.indexOf(recallZoom);
+      if (idx < 0) idx = 0;
+    }
+    const next = idx + dir;
+    // Stepping below the first rung returns to Fit rather than stopping: Fit
+    // is the smallest useful view and the reader gets back to it by zooming
+    // out, not by hunting for a separate button.
+    if (next < 0) {
+      recallZoomSet(0);
+      return;
+    }
+    recallZoomSet(RECALL_ZOOM_STEPS[Math.min(next, RECALL_ZOOM_STEPS.length - 1)]);
+
+    const after = img.clientWidth || 1;
+    stage.scrollLeft = fx * after - stage.clientWidth / 2;
+    stage.scrollTop = fy * (img.clientHeight || 1) - stage.clientHeight / 2;
+  }
+
+  // Re-apply once the picture has dimensions: a click that arrived early is
+  // honoured rather than dropped, and a fresh picture always opens at Fit.
+  $("recall-preview-img").addEventListener("load", () => {
+    recallZoomSet(recallZoom);
+  });
+
+  $("recall-preview-in").addEventListener("click", () => recallZoomStep(1));
+  $("recall-preview-out").addEventListener("click", () => recallZoomStep(-1));
+  $("recall-preview-fit").addEventListener("click", () => recallZoomSet(0));
+
+  // Ctrl+wheel over the picture. The KEYBOARD equivalents are deliberately
+  // absent: connect_shortcuts resolves Ctrl+= / Ctrl+- / Ctrl+0 as global
+  // accelerators and marks them handled, so those keydowns never arrive in
+  // this document on Windows and a listener for them would work on Linux
+  // only -- a control that exists on one platform is worse than one that
+  // exists nowhere. The buttons are the answer on both.
+  $("recall-preview-stage").addEventListener(
+    "wheel",
+    (ev) => {
+      if (!ev.ctrlKey) return;
+      ev.preventDefault();
+      recallZoomStep(ev.deltaY < 0 ? 1 : -1);
+    },
+    { passive: false },
+  );
 
   function recallRender(items, searching) {
     const list = $("recall-list");
@@ -6704,35 +7202,144 @@
   });
 
   function onArchiveSaved(data) {
-    if (openPanelName !== "recall") return;
+    // The panel is "tools" now and Deep Recall is one tab of it; the saved
+    // event belongs on screen only while that tab is the one showing.
+    if (openPanelName !== "tools" || $("recall-panel").hidden) return;
     if (!data.ok) {
       $("recall-status").textContent =
         ERROR_TEXT[data.error] || "The page could not be saved.";
       return;
     }
+    // Two things can fall short of the whole page, and they are independent:
+    // the reader stops at its box cap, and on a WebView2 too old for the
+    // full-page protocol call the capture falls back to the viewport. The
+    // scope comes off the capture event itself rather than being assumed --
+    // saying "the picture is complete" on the fallback path is exactly the
+    // claim the capture code refuses to make about itself.
+    const wholePage = data.scope === "full page";
+    // "The text stops partway down" only means something if there was text.
+    // An image-dense page -- a photo wall, a map -- can pass the detector's
+    // tile budget while every line comes back empty, and that combination
+    // used to render "No text was read from this picture. The page was long,
+    // so the text stops partway down", which cannot both be true. Widening
+    // the truncation flag to cover abandoned tiles is what made it reachable.
+    const readShort = data.truncated && data.words > 0;
+    let shortfall = "";
+    if (readShort && wholePage) {
+      shortfall =
+        " The page was long, so the text stops partway down; the picture is complete.";
+    } else if (readShort) {
+      shortfall =
+        " The page was long, so the text stops partway down, and the picture is the part that was on screen.";
+    } else if (!wholePage) {
+      shortfall = " The picture is the part that was on screen.";
+    }
     // Says what was actually read, since "saved" alone hides the difference
     // between a page full of words and one the reader found nothing in.
     $("recall-status").textContent =
       data.words > 0
-        ? "Saved. " + data.words + " words read from this page."
-        : "Saved. No text was read from this picture.";
+        ? "Saved. " + data.words + " words read from this page." + shortfall
+        : "Saved. No text was read from this picture." + shortfall;
     recallRefresh();
   }
 
-  registerPanel("recall", {
-    el: $("recall-panel"),
-    button: $("btn-recall"),
-    heightPx: 560,
-    onOpen: async () => {
-      $("recall-status").textContent = "";
-      $("recall-premium").hidden = true;
-      await refreshPremium();
-      if (!premiumState.premium) {
-        $("recall-premium").hidden = false;
-        syncChromeInsets();
+  $("recall-preview-close").addEventListener("click", recallPreviewClose);
+
+  // ---- the tools modal ----------------------------------------------------
+  //
+  // Page integrity, Deep Recall, and the image check, one modal, three tabs
+  // one modal, 2026-08-19. Deep Recall's own panel and toolbar
+  // button are gone; the image check moved here OUT of the Privacy panel,
+  // whole. chrome.js owns the registration -- against the markup
+  // #btn-integrity -- so the gate harness, which loads this file alone, can
+  // open it; integrity.js detects the markup button, fills
+  // #tools-integrity-slot with the panel it already builds, and hands over
+  // its refresh as window.__rbIntegrityRefresh.
+
+  const TOOLS_TABS = [
+    { tab: "btn-tab-integrity", body: "tools-integrity-slot" },
+    { tab: "btn-tab-recall", body: "recall-panel" },
+    { tab: "btn-tab-imagecheck", body: "leakcheck" },
+  ];
+
+  // Deep Recall's old panel-open behavior, now the tab-show hook: same
+  // premium note, same refresh, unchanged wording.
+  async function recallTabShow() {
+    $("recall-status").textContent = "";
+    $("recall-premium").hidden = true;
+    await refreshPremium();
+    if (!premiumState.premium) {
+      $("recall-premium").hidden = false;
+      syncChromeInsets();
+      return;
+    }
+    recallRefresh();
+  }
+
+  function selectToolsTab(tabId) {
+    for (const { tab, body } of TOOLS_TABS) {
+      const active = tab === tabId;
+      $(tab).setAttribute("aria-pressed", active ? "true" : "false");
+      // Leaving the recall tab releases the staged picture, exactly as
+      // closing the old panel did: a decrypted page must not sit behind a
+      // body nothing on screen shows.
+      if (body === "recall-panel" && !active) recallPreviewClose();
+      $(body).hidden = !active;
+    }
+    if (tabId === "btn-tab-recall") recallTabShow();
+  }
+
+  // NO syncChromeInsets INSIDE selectToolsTab, and its absence is the fix for
+  // the gray rectangle reported from Windows.
+  //
+  // selectToolsTab is called from this panel's onOpen, and onOpen runs INSIDE
+  // togglePanelNamed BEFORE that function sends the arrangement
+  // (syncChromeCoverage -> chrome_overlay) and then the height
+  // (syncChromeInsets). Syncing from in here therefore sent a 640px chrome
+  // height while the arrangement was still Strip. In Strip the page sits
+  // BELOW the chrome, so Rust moved the page down to 640 -- and the region it
+  // vacated showed the native window background, which under
+  // translucent-backdrop (body transparent, scrim 0.62 alpha) reads as a flat
+  // gray slab with the page pushed beneath it. Exactly what the screenshot
+  // showed. No other panel does this: none of the fourteen calls
+  // syncChromeInsets from its onOpen, and this one was the only one that did.
+  //
+  // The open path needs nothing here -- togglePanelNamed sends arrangement
+  // then height, in that order, immediately after onOpen returns. Only a tab
+  // switch while the panel is ALREADY open needs its own sync, and the click
+  // handler below does that, by which time the arrangement is long since set.
+  function selectToolsTabAndFit(tabId) {
+    selectToolsTab(tabId);
+    syncChromeInsets();
+  }
+
+  for (const { tab } of TOOLS_TABS) {
+    $(tab).addEventListener("click", () => {
+      // From the palette the panel may still be closed; opening it first
+      // makes every tab button a complete door of its own.
+      if ($("integrity-host").hidden) {
+        // togglePanelNamed runs onOpen (which selects the integrity tab) and
+        // then sends arrangement + height itself; re-selecting after it is
+        // what lands the palette on the tab the user actually chose.
+        togglePanelNamed("tools");
+        selectToolsTabAndFit(tab);
         return;
       }
-      recallRefresh();
+      selectToolsTabAndFit(tab);
+    });
+  }
+
+  registerPanel("tools", {
+    el: $("integrity-host"),
+    button: $("btn-integrity"),
+    heightPx: 640,
+    // The preview dies with the modal, whichever tab is up.
+    onClose: recallPreviewClose,
+    onOpen: () => {
+      // The toolbar button means "Page integrity", as it always has; the
+      // other tabs are reached by their own palette entries or by hand.
+      selectToolsTab("btn-tab-integrity");
+      if (window.__rbIntegrityRefresh) window.__rbIntegrityRefresh();
     },
   });
 
@@ -7471,6 +8078,91 @@
   });
   $("blocked-dismiss").addEventListener("click", hideBlocked);
 
+  // ---- plain-HTTP warning ----
+  // Driven by tab_status (`insecure_pending`), never by an event of its own:
+  // the URL is a per-tab fact and the banner has to follow the active tab.
+  // Both buttons are argument-less on purpose -- Rust holds the URL, and
+  // the chrome cannot substitute another. Same height contract as every
+  // banner (it is in BANNERS).
+  function hideInsecure() {
+    const banner = $("insecure-warning");
+    if (!banner.hidden) {
+      banner.hidden = true;
+      syncChromeInsets();
+    }
+  }
+
+  // The URL the banner is currently describing. Continue echoes its host
+  // back to Rust, which refuses if the pending URL has moved on.
+  let shownUrl = null;
+  // The host as state.rs computed it. Never derived here; see below.
+  let shownHost = "";
+
+  function applyInsecurePending(url, host) {
+    const banner = $("insecure-warning");
+    shownUrl = url;
+    shownHost = host || "";
+    if (!url || !shownHost) {
+      // No host means Rust could not name the subject, and a warning that
+      // cannot say what it is about must not be shown at all.
+      hideInsecure();
+      return;
+    }
+    // THE HOST RUST COMPUTED, never one parsed here. Two parsers on the same
+    // string disagreed: this file's regex keeps the whole authority, while
+    // state.rs strips the port and the userinfo, and the Continue click is
+    // refused unless the two agree. So every http://host:port/ URL warned
+    // and then could not be continued past, and a userinfo URL rendered an
+    // attacker-chosen string as the name of the site being warned about.
+    // One value, computed once, on the side that decides.
+    $("insecure-body").textContent =
+      "PATANYX did not open " +
+      shownHost +
+      " because the connection is plain HTTP, not encrypted. Anything you " +
+      "send or receive on this site, including passwords, can be read or " +
+      "changed by anyone on the path. You can continue anyway; that applies " +
+      "to this site in this tab only and ends when you close the tab.";
+    if (banner.hidden) {
+      banner.hidden = false;
+      syncChromeInsets();
+    }
+  }
+
+  $("insecure-allow").addEventListener("click", async () => {
+    const allow = $("insecure-allow");
+    const dismiss = $("insecure-dismiss");
+    allow.disabled = true;
+    dismiss.disabled = true;
+    try {
+      // Send back the host this banner is DISPLAYING. Rust refuses if the
+      // pending URL has changed since it was rendered, so a page that
+      // rewrites the banner between the render and the click cannot borrow
+      // the click. It confirms; it cannot choose.
+      // The value that was SHOWN, so the confirmation is about the
+      // sentence the user actually read.
+      const res = await rb("insecure_allow", { host: shownHost });
+      // The reply carries the refreshed status, whose insecure_pending is
+      // now null -- and the load that follows re-emits it anyway.
+      if (res && res.status) applyTabStatus(res.status);
+      else hideInsecure();
+    } catch (e) {
+      toast(friendly(e), true);
+    } finally {
+      allow.disabled = false;
+      dismiss.disabled = false;
+    }
+  });
+  $("insecure-dismiss").addEventListener("click", async () => {
+    try {
+      const st = await rb("insecure_dismiss");
+      if (st) applyTabStatus(st);
+      else hideInsecure();
+    } catch (e) {
+      // Nothing to allow and nothing to keep: hide it either way.
+      hideInsecure();
+    }
+  });
+
   $("resolver-retry").addEventListener("click", async () => {
     const button = $("resolver-retry");
     button.disabled = true;
@@ -7636,7 +8328,12 @@
       ocrAvailable = false;
     }
     $("recovery-scan").hidden = !ocrAvailable;
+    // Availability reveals the section AND its tab: the section alone would
+    // leave a tab that opens onto nothing, the tab alone a tool with no door.
+    // (While the imagecheck tab is the active one, leaving this hidden state
+    // to the tab logic -- selectToolsTab re-runs on every switch.)
     $("leakcheck").hidden = !ocrAvailable;
+    if ($("btn-tab-imagecheck")) $("btn-tab-imagecheck").hidden = !ocrAvailable;
   })();
 
   // Whether the chosen resolver is reachable, asked once at startup.
@@ -8988,6 +9685,65 @@
       await refreshOrganizerAfterWrite();
     };
     $("bmm-new-folder-add").addEventListener("click", addFolder);
+    // Delete the whole manager. The confirmation is the feature: it names
+    // the exact counts the user is about to lose, says "permanently", and
+    // says there is no undo -- because there is not one, and there is no
+    // bookmark export to fall back on either.
+    //
+    // askConfirm focuses Cancel and answers false on Escape, so a stray
+    // keypress lands on the safe answer. The confirm button says what it
+    // does rather than "OK".
+    if ($("bmm-delete-all")) {
+      $("bmm-delete-all").addEventListener("click", async () => {
+        const errline = $("bmm-folder-error");
+        if (errline) errline.hidden = true;
+        // Counted from what is loaded, so the question names what the user
+        // is looking at rather than a number from somewhere else.
+        const marks = Array.isArray(bookmarkItems) ? bookmarkItems.length : 0;
+        // allFolders(), not bookmarkFolderNames: the grid renders the UNION
+        // of named folders and tag-only folders (created through
+        // bookmark_tags_set), so counting only the former asked about two
+        // while the user was looking at five. A destructive confirmation
+        // that understates what it destroys is the defect this whole dialog
+        // exists to prevent.
+        const folderList = allFolders();
+        const folders = Array.isArray(folderList) ? folderList.length : 0;
+        if (!marks && !folders) {
+          toast("There are no bookmarks or folders to delete.");
+          return;
+        }
+        const what = [
+          marks === 1 ? "1 bookmark" : `${marks} bookmarks`,
+          folders === 1 ? "1 folder" : `${folders} folders`,
+        ].join(" and ");
+        const ok = await askConfirm(
+          `Permanently delete ${what}? This also removes their tags, their ` +
+            `Quick Access pins, and the page snapshots kept for change ` +
+            `checks. It cannot be undone, and PATANYX has no bookmark ` +
+            `export to restore from. Your set-aside tabs, downloads and ` +
+            `archived pages are not affected.`,
+          "Delete everything",
+        );
+        if (!ok) return;
+        let removed;
+        try {
+          removed = await rb("bookmarks_delete_all");
+        } catch (e) {
+          if (errline) {
+            errline.textContent = friendly(e);
+            errline.hidden = false;
+          }
+          return;
+        }
+        await refreshOrganizerAfterWrite();
+        const n = (removed && removed.bookmarks) || 0;
+        const f = (removed && removed.folders) || 0;
+        toast(
+          `Deleted ${n === 1 ? "1 bookmark" : n + " bookmarks"} and ` +
+            `${f === 1 ? "1 folder" : f + " folders"}.`,
+        );
+      });
+    }
     $("bmm-new-folder").addEventListener("keydown", (ev) => {
       if (ev.key !== "Enter") return;
       ev.preventDefault();

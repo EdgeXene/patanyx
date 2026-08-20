@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "0.9.63"
+version = "0.9.65"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -50,7 +50,7 @@ relay-client = ["chat", "patanyx-chat/relay-client"]
 # patanyx-update declares no features of its own — the verification half is
 # unconditional there and has no network code to gate — so this forwards
 # only to the HTTP client.
-updater-net = ["dep:ureq"]
+updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
 
 [dependencies]
 wry = "0.55"
@@ -77,6 +77,17 @@ patanyx-tunnel = { path = "../tunnel" }
 patanyx-licence = { path = "../licence" }
 # Download provenance hashes the finished file before recording it.
 sha2 = "0.10"
+# A SECOND, INDEPENDENT OPINION ON WHERE A HOST ENDS (security audit
+# 2026-08-18, F19). `state::host_of` is hand-rolled on purpose -- it mirrors
+# two engine normalizations a naive split misses -- but it compares the host
+# it extracts LITERALLY, so a spelling the engine canonicalizes and it does
+# not (percent-encoding, IDNA) reads as an unrelated name to it and as the
+# chrome origin to the engine. This is the WHATWG parser the engines
+# implement, used ONLY to ask the reserved-host question a second way. Not a
+# replacement: a URL is denied if EITHER parser calls it the chrome host, so
+# a bypass has to fool both. Already in the lock via wry, so no new crate
+# enters the reproducible build.
+url = "2"
 # The tunnel_import IPC arm reads a WireGuard config -- private key included
 # -- into a String it must wipe before dropping; same major the vault pins.
 zeroize = "1"
@@ -93,6 +104,17 @@ patanyx-chat = { path = "../chat", optional = true }
 # when one is imported (fail closed on its dead port), so background update
 # traffic can never leave outside a tunnel the user chose. Pure Rust.
 ureq = { version = "2.12", default-features = false, features = ["tls", "socks-proxy"], optional = true }
+# TWO ROOT STORES, CHOSEN PER REQUEST (security audit 2026-08-18, F21).
+# ureq's own `native-certs` feature REPLACES the bundled roots globally, which
+# is the wrong shape: the update channel can safely accept an intercepting
+# proxy because its trust root is the compiled-in Ed25519 key, while the
+# activation call carries a licence token and must not. So the root store is
+# built here, per agent, via AgentBuilder::tls_config. rustls and webpki-roots
+# are already in the lock through ureq; rustls-native-certs is new and is what
+# reads the OS store (schannel on Windows).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"], optional = true }
+rustls-native-certs = { version = "0.8", optional = true }
+webpki-roots = { version = "0.26", optional = true }
 
 # Same versions wry 0.55 itself resolves, so there is one COM binding in the
 # tree. Needed to reach ICoreWebView2Settings8 and turn SmartScreen off; see

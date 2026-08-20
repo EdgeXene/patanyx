@@ -82,6 +82,47 @@ check(
   },
 );
 
+check("Ctrl+F takes keyboard focus off the page, not just the caret", () => {
+  // The bar always called findInput.focus() and that was never enough. This
+  // shortcut is resolved in Rust PRECISELY BECAUSE a content webview holds
+  // keyboard focus, and element.focus() inside the chrome document places a
+  // caret without taking that focus away -- so the bar opened looking ready
+  // and every keystroke still went to the page behind it.
+  //
+  // A DOM stub cannot see a widget focus, so what is pinned here is the
+  // wiring: the shortcut must go through the state method that focuses the
+  // chrome widget first, never a bare emit.
+  const main = fs.readFileSync(
+    path.join(__dirname, "..", "crates/app/src/main.rs"),
+    "utf8",
+  );
+  const arm = main.slice(
+    main.indexOf("Shortcut::OpenFind"),
+    main.indexOf("Shortcut::OpenFind") + 200,
+  );
+  assert(
+    /Shortcut::OpenFind\s*=>\s*app\.open_find_bar\(\)/.test(arm),
+    "Ctrl+F must route through open_find_bar; got: " + arm.split("\n")[0],
+  );
+  assert(
+    !/Shortcut::OpenFind\s*=>\s*app\.emit/.test(arm),
+    "Ctrl+F emits find_open directly, so the page keeps keyboard focus",
+  );
+
+  const state = fs.readFileSync(
+    path.join(__dirname, "..", "crates/app/src/state.rs"),
+    "utf8",
+  );
+  const fn = state.slice(
+    state.indexOf("pub fn open_find_bar"),
+    state.indexOf("pub fn open_find_bar") + 400,
+  );
+  assert(
+    /self\.chrome\.focus\(\)/.test(fn),
+    "open_find_bar does not focus the chrome widget",
+  );
+});
+
 (async () => {
   for (const [name, fn] of checks) {
     try {

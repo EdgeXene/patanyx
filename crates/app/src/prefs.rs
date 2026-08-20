@@ -528,7 +528,9 @@ impl TunnelMode {
                  traffic, so this is not an anonymity feature. If the tunnel \
                  goes down, pages fail to load. PATANYX never falls back to a \
                  direct connection. Switching this on or off takes effect the \
-                 next time you start the browser."
+                 next time you start the browser; Apply and restart, in the \
+                 Private Tunnel panel, does that for you and reopens your \
+                 tabs."
             }
         }
     }
@@ -597,6 +599,28 @@ pub struct Prefs {
     /// wrong-default trap here, so no field-level override function is
     /// needed.
     pub tunnel: TunnelMode,
+    /// A shelf id set aside by "Apply and restart", to be reopened once the
+    /// vault is unlocked in the replacement process.
+    ///
+    /// THE ID, NOT THE NAME: shelf names repeat (every "Set aside 3 tabs"
+    /// looks alike), and restoring the wrong one would reopen a session the
+    /// user shelved deliberately weeks ago. `Shelf::id` is unique.
+    ///
+    /// A MARKER IN PREFS RATHER THAN THE STORE, because it must be readable
+    /// BEFORE the vault is open: the reader is the boot that has not been
+    /// unlocked yet, and it needs to know whether to expect a restore at all.
+    /// The tabs themselves are in the vault-backed store, where they belong;
+    /// this is only a pointer, and a pointer to a shelf is not a browsing
+    /// record. Nothing here ever holds a URL -- process arguments and plain
+    /// prefs.json are both readable by anything on the machine.
+    ///
+    /// Absent field reads `None`, which is the correct meaning for every
+    /// prefs.json written before this existed: no restore is owed. That
+    /// comes from the STRUCT-level `#[serde(default)]` above, the same way
+    /// `tunnel` and `page_theme` get theirs -- no field-level attribute is
+    /// needed, and adding one would imply a wrong-default trap that is not
+    /// there.
+    pub tunnel_restore_shelf: Option<String>,
     /// Page color-scheme preference. `#[serde(default)]` at the struct
     /// level gives an old prefs.json `Auto`, which IS the correct
     /// absent-field meaning: a user who never touched this follows the OS.
@@ -680,6 +704,7 @@ impl Default for Prefs {
             vault_autolock_secs: AUTOLOCK_DEFAULT_SECS,
             update_channel: UpdateChannel::default(),
             tunnel: TunnelMode::default(),
+            tunnel_restore_shelf: None,
             page_theme: PageTheme::default(),
             chrome_theme: ChromeTheme::default(),
             chrome_scheme: ChromeScheme::default(),
@@ -872,6 +897,41 @@ pub fn save(prefs: &Prefs) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The marker "Apply and restart" leaves for the next boot. It is the
+    /// only thing that tells the replacement process a session is waiting,
+    /// so its absent-field meaning has to be "no restore owed" -- every
+    /// prefs.json ever written before this field existed says that by
+    /// saying nothing.
+    #[test]
+    fn the_restart_marker_is_absent_by_default_and_survives_a_round_trip() {
+        assert_eq!(Prefs::default().tunnel_restore_shelf, None);
+
+        // A prefs file from any earlier build: the key is simply not there.
+        let old: Prefs = serde_json::from_str(r#"{"tunnel":"imported"}"#)
+            .expect("an older prefs.json must still load");
+        assert_eq!(old.tunnel, TunnelMode::Imported);
+        // Guaranteed by the struct-level #[serde(default)], which is why
+        // this needs no field attribute of its own.
+        assert_eq!(
+            old.tunnel_restore_shelf, None,
+            "an absent marker must not be read as a pending restore"
+        );
+
+        let mut prefs = Prefs::default();
+        prefs.tunnel_restore_shelf = Some("shelf-7".to_string());
+        let text = serde_json::to_string(&prefs).expect("prefs serialize");
+        let back: Prefs = serde_json::from_str(&text).expect("prefs round trip");
+        assert_eq!(back.tunnel_restore_shelf.as_deref(), Some("shelf-7"));
+
+        // The ID, never the name: two shelves can share a name, and
+        // restoring the wrong one reopens a session the user shelved
+        // deliberately.
+        assert!(
+            text.contains("shelf-7"),
+            "the marker must store the shelf id verbatim"
+        );
+    }
 
     #[test]
     fn page_theme_round_trips_and_unknown_is_refused() {
@@ -1408,6 +1468,12 @@ mod tests {
         // plainer for someone who does not think of it as "restarting a
         // process". Either wording satisfies this; DROPPING the caveat does
         // not, which is the property worth pinning.
+        // The one-click route must be named too, or the copy sends people
+        // to quit the browser by hand for a restart the panel can do.
+        assert!(
+            d.contains("Apply and restart"),
+            "the Imported description must name the one-click restart"
+        );
         assert!(
             d.contains("restart") || d.contains("next time you start"),
             "must say switching takes effect only after starting again: {d}"

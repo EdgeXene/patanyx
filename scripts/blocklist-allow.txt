@@ -273,3 +273,61 @@ wa.me                   # 71    WhatsApp's own click-to-chat short-link host.
                         #       on WhatsApp" link for every user. Exact match
                         #       only: an abusive subdomain stays blocked.
                         #       Adjudicated at the rebuild, 2026-08-17.
+
+# --- Warn-band review at the 0.9.64 release, 2026-08-19 --------------------
+# Surfaced by review-blocklist-fps.py. NONE of these reached the refuse band
+# (all rank below 10,000), so no build was held up; they are here because the
+# sweep is the only thing that ever looks at the warn band, and a widely-used
+# host wrongly listed there stays wrongly listed for months.
+#
+# Every entry below shares one shape: a SINGLE feed reported a registrable
+# apex that has been resolving for years under an organization's own name.
+# The evidence used is what the sweep can establish without trusting the
+# report it is checking -- registration age, certificate issuer and lifetime,
+# rank, and how many independent feeds agree. Not one of them is corroborated
+# by a second feed.
+#
+# The narrow claim, as everywhere in this file: this exact host does not
+# belong on a PHISHING blocklist. Subdomains stay blocked.
+#
+# What was DELIBERATELY NOT allowed, and stays blocked: tg-me.com (shaped like
+# a Telegram lookalike, which is the case where rank is the symptom rather
+# than the defence), amazonlogistics.eu (an Amazon-branded apex on a ccTLD
+# Amazon's real logistics domain does not use), bit.do, and the gambling,
+# piracy and bulk-SMS hosts further down the queue. Holding an unclear case
+# blocked is the recoverable direction: the user sees a banner and can
+# override it per tab, where a wrong allow is silent and permanent.
+
+# Established services, reported by one feed each.
+traderepublic.com       # 18063 European retail brokerage, regulated. 21.1y
+                        #       registration, organization certificate.
+mempool.space           # 10402 Bitcoin mempool and block explorer. 7.9y, and
+                        #       the certificate carries a subject org, which
+                        #       a throwaway phishing host does not buy.
+phantom.com             # 33296 Long-established wallet vendor, 34.5y apex.
+limewire.com            # 32067 26.1y brand apex.
+airtelkenya.com         # 37471 National mobile carrier, 15.7y, GlobalSign.
+maya.ph                 # 14948 Major Philippine payments provider.
+kpfu.ru                 # 35772 Kazan Federal University. A public university
+                        #       apex on a phishing list takes its whole
+                        #       campus with it.
+anaconda.org            # 34437 Package repository for the Python data stack,
+                        #       26.0y. Blocking it breaks installs, not just
+                        #       browsing, for a large working population.
+123formbuilder.com      # 19318 Form-builder SaaS, 13.6y.
+antispamcloud.com       # 45421 Mail-filtering infrastructure, 17.4y. The
+                        #       sweep reports an invalid web certificate,
+                        #       which is unremarkable for a host whose job is
+                        #       mail rather than a website.
+abload.de               # 27826 Long-running German image host.
+
+# Hosting apexes, where the blast radius IS the argument. Phishing genuinely
+# appears on these services, and that is exactly why the apex gets swept into
+# a feed. The abusive page is a SUBDOMAIN and stays blocked; taking the apex
+# takes every legitimate customer with it. Same reasoning as the platform
+# suffixes in PROTECTED_SUFFIXES, applied case by case.
+unbouncepages.com       # 25764 Landing pages published by a SaaS product's
+                        #       customers, 16.8y.
+bio.link                # 20710 Link-in-bio hosting, 9.1y.
+mssg.me                 # 31539 Link-in-bio hosting.
+ffm.to                  # 11008 Music smart-links, 9.1y.

@@ -108,6 +108,7 @@ pub use windows::*;
 // ordinary unix builds, where nothing calls it.
 #[cfg(any(windows, test))]
 pub mod main_resource;
+pub mod motw;
 
 mod hostset;
 pub use hostset::HostSet;

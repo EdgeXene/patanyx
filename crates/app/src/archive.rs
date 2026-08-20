@@ -190,3 +190,105 @@ mod tests {
         assert_eq!(hits[0].match_count, 0);
     }
 }
+
+// ---------------------------------------------------------------------------
+// The staged picture: how a saved page's screenshot reaches the panel.
+// ---------------------------------------------------------------------------
+
+/// One decrypted archive picture, staged for the chrome to fetch.
+///
+/// THIS SLOT IS THE ONLY PLACE ARCHIVE PLAINTEXT EXISTS OUTSIDE THE STORE.
+/// The picture is encrypted at rest; the panel displays it by asking
+/// `archive_picture_stage` to decrypt ONE record into here, then loading
+/// `rbchrome://…/archive-picture/{token}.png`, which `serve_chrome` answers
+/// from this slot. Same shape as capture.rs's PENDING_REGION, and for the
+/// same reasons: the PNG never crosses the IPC boundary as a string (the
+/// 1 MiB frame cap could not carry a screenshot anyway), the chrome's CSP
+/// keeps `img-src 'self'` untouched, and a stale token is a plain 404.
+///
+/// One slot, not a cache: viewing a second picture replaces the first, so at
+/// most one decrypted screenshot exists at a time, and `clear_staged` runs
+/// on preview close, panel close, and VAULT LOCK -- a locked vault must not
+/// leave a decrypted page servable behind it. The bytes are Zeroizing, so
+/// replace and clear both wipe rather than merely drop.
+struct StagedPicture {
+    token: u64,
+    png: zeroize::Zeroizing<Vec<u8>>,
+}
+
+static STAGED_PICTURE: std::sync::Mutex<Option<StagedPicture>> = std::sync::Mutex::new(None);
+
+/// Stages a decrypted picture, replacing (and wiping) any previous one.
+/// The token is minted here so nothing outside this module can predict or
+/// reuse one; it shares nothing with capture.rs's counter.
+pub fn stash_picture(png: zeroize::Zeroizing<Vec<u8>>) -> Result<u64, &'static str> {
+    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut slot = STAGED_PICTURE.lock().map_err(|_| "stage_failed")?;
+    *slot = Some(StagedPicture { token, png });
+    Ok(token)
+}
+
+/// A clone of the staged bytes, if `token` names them. Non-consuming: the
+/// protocol handler may be asked more than once for one preview (the engine
+/// retries, the panel re-renders). Released by `clear_staged` or the next
+/// `stash_picture`.
+pub fn staged_png(token: u64) -> Option<Vec<u8>> {
+    let slot = STAGED_PICTURE.lock().ok()?;
+    slot.as_ref()
+        .filter(|s| s.token == token)
+        .map(|s| s.png.to_vec())
+}
+
+/// Drops (and wipes) the staged picture. Idempotent; clearing an empty slot
+/// is not an error.
+pub fn clear_staged() {
+    if let Ok(mut slot) = STAGED_PICTURE.lock() {
+        *slot = None;
+    }
+}
+
+#[cfg(test)]
+mod staged_picture_tests {
+    use super::*;
+
+    /// STAGED_PICTURE is one process-wide slot, and cargo runs these in
+    /// parallel threads: without this they clobber each other's token and
+    /// fail intermittently. Caught by an unrelated run going red once while
+    /// the suite passed either side of it, which is exactly how a race
+    /// announces itself. Serialising the tests is right rather than giving
+    /// each its own slot -- the single slot IS the property under test.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn a_staged_picture_is_served_by_its_token_and_only_its_token() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let token = stash_picture(zeroize::Zeroizing::new(vec![1, 2, 3])).unwrap();
+        assert_eq!(staged_png(token).as_deref(), Some(&[1u8, 2, 3][..]));
+        assert_eq!(staged_png(token + 1), None, "a guessed token serves nothing");
+        clear_staged();
+    }
+
+    #[test]
+    fn staging_a_second_picture_retires_the_first_token() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // THE PRIVACY HALF: at most one decrypted screenshot exists at a
+        // time, so an old preview URL cannot keep working after the user
+        // moved on to another record.
+        let first = stash_picture(zeroize::Zeroizing::new(vec![1])).unwrap();
+        let second = stash_picture(zeroize::Zeroizing::new(vec![2])).unwrap();
+        assert_eq!(staged_png(first), None, "the replaced token must die");
+        assert_eq!(staged_png(second).as_deref(), Some(&[2u8][..]));
+        clear_staged();
+    }
+
+    #[test]
+    fn clear_leaves_nothing_servable() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        // The vault-lock path calls exactly this; a token that survived a
+        // lock would serve a decrypted page out of a locked vault.
+        let token = stash_picture(zeroize::Zeroizing::new(vec![9])).unwrap();
+        clear_staged();
+        assert_eq!(staged_png(token), None);
+    }
+}

@@ -319,7 +319,14 @@ echo "tab_search suite FAILS, as the first enforced gate requires."
 # command; an arm missing from it is a premium feature the gate cannot
 # vouch for.
 IPC_REAL="$REPO_ROOT/crates/app/src/ipc.rs"
-PREMIUM_COMMANDS=("find_tabs_search" "find_tabs_goto" "tabs_switcher_list" "tabs_batch_enter" "ocr_region_capture" "ocr_region_scan" "download_compare_request" "change_compare_request" "archive_save" "archive_search" "archive_list" "divergence_site_set" "divergence_site_clear" "divergence_sites_list" "divergence_proof_get")
+# The four divergence_* arms LEFT this list on 2026-08-19, and that is the
+# only way an arm may ever leave it: the feature stopped being Premium.
+# Fingerprint Divergence and its per-site exceptions are free permanently by
+# as of 2026-08-19, so divergence_site_set, _clear, _list and _proof_get no
+# longer gate, and requiring cross_tab_gate in them would fail the build for
+# doing the right thing. Removing an arm from here because it is INCONVENIENT
+# is the misuse this note exists to prevent.
+PREMIUM_COMMANDS=("find_tabs_search" "find_tabs_goto" "tabs_switcher_list" "tabs_batch_enter" "ocr_region_capture" "ocr_region_scan" "download_compare_request" "change_compare_request" "archive_save" "archive_search" "archive_list" "archive_picture_stage")
 if [ "${#PREMIUM_COMMANDS[@]}" -eq 0 ]; then
     echo "gate broken: PREMIUM_COMMANDS is empty" >&2
     exit 2

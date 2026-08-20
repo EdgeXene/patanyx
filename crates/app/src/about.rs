@@ -139,6 +139,26 @@ const F_MALICIOUS: Feature = (
      settings say. The list updates every hour, and you can open a blocked \
      site anyway if you think it is wrong.",
 );
+// Beside the reported-host list on purpose: both are the navigation handler
+// holding a page back and asking, and the answer has the same shape (this
+// tab, this host, gone when the tab closes). "Warns" is the whole claim: the
+// page is still reachable, on the user's say-so, and local addresses typed
+// as numbers are not warned about at all. LITERAL ADDRESSES ONLY: the
+// exemption is `is_private_host`, which matches numeric loopback, RFC1918,
+// link-local and CGNAT plus `localhost`, and NOT a router or printer
+// reached by name (fritz.box, printer.local) -- those still get the
+// warning, and the copy must not promise otherwise. A compliance audit
+// caught the earlier wording ("like a router") saying exactly that.
+const F_INSECURE: Feature = (
+    "Plain-HTTP Warning",
+    "Automatic",
+    "A site that is not encrypted is held back with a warning first, since \
+     anyone on the path could read or change what you send it. You can \
+     continue anyway; that applies to the site in that tab only and ends when \
+     you close it. An address on your own network typed as a number, like \
+     192.168.1.1, opens without the warning, and so does localhost or any \
+     name under it; a device you reach by any other name still gets it.",
+);
 const F_LEDGER: Feature = (
     "Page Connections",
     "Automatic",
@@ -169,6 +189,36 @@ const F_DNS: Feature = (
      of the sites you visit. On Windows the site name is hidden inside the \
      connection too, measured rather than assumed, wherever the site supports \
      it.",
+);
+// HELD OUT OF 0.9.64, and NOT because the row is badly worded. The behaviour
+// it describes does not happen on real Windows. Hardware re-check 2026-08-19,
+// reproduced twice, downloading from our own host straight into PATANYX: the
+// zone half worked -- Explorer still shows "came from another computer" -- but
+// `HostUrl` was STILL ON DISK afterwards, which is the entire point of the
+// feature. Worse for a claim, the browser did not notice: the toast said only
+// "Saved", because Outcome::Clean is silent and a missing stream reads as
+// nothing to remove. So both sentences below were false on hardware, including
+// the one promising the browser would say so.
+//
+// The code is deliberately unchanged (see /root/patanyx-motw-recheck-20260819/
+// FINDING.md; leading theory is a race with Windows writing the stream a beat
+// after the download-completed handler). Every mainstream browser leaves the
+// mark too, so the severity is low and the fix can wait for a release that can
+// prove it. What could NOT wait was the About page asserting it.
+//
+// TO RESTORE: land the fix, re-run the hardware check, then re-add the single
+// `out.push(F_DOWNLOAD_MARK)` in the cfg!(windows) block below. Do not restore
+// it because the tests pass -- the tests passed the day this was written, and
+// rewrite()'s 8 tests never saw the input that failed.
+#[allow(dead_code)]
+const F_DOWNLOAD_MARK: Feature = (
+    "Download Address Removed",
+    "Automatic",
+    "Windows marks each downloaded file with the address it came from, \
+     written on your disk next to the file where any program can read it. \
+     PATANYX removes the address and keeps the mark itself, so Windows still \
+     warns you that the file came from another computer. If the address \
+     cannot be removed, the browser says so.",
 );
 const F_QUARANTINE: Feature = (
     "Strict Tab",
@@ -221,7 +271,8 @@ const F_BOOKMARKS: Feature = (
     "Your bookmarks are encrypted on your computer and open with the vault, \
      so a saved page is not a list anyone can read off your disk. Pin the \
      ones you use most to Quick Access and they stay at the top, whatever \
-     you search for.",
+     you search for. You can also empty the whole manager in one go, which \
+     asks first and cannot be undone.",
 );
 const F_TUNNEL: Feature = (
     "Private Tunnel",
@@ -239,14 +290,21 @@ const F_TUNNEL: Feature = (
      fallback looks exactly like a working tunnel. You picked the server at \
      the far end, and it sees your traffic, so this is not an anonymity \
      feature. Switching it on or off takes effect the next time you start \
-     the browser.",
+     the browser, and the panel can do that restart for you: it reopens the \
+     tabs you had once you unlock the vault. Because the configuration lives \
+     in the vault, a tunnel switched on with the vault locked stops pages \
+     loading until you unlock it.",
 );
 const F_OCR: Feature = (
     "Image Text Review",
     "On demand; future Premium",
-    "Point it at an image and it reads the text inside, flagging e-mail \
-     addresses, card numbers and keys you may not have noticed. It runs on your \
-     machine and sends the picture nowhere.",
+    "Point it at an image and it reads the text inside, then looks for seven \
+     things worth catching before you share it: an e-mail address, a card \
+     number, a long number, an API key or token, a private key header, an IP \
+     address, and text too faint for a person to see. It shows you what it \
+     read as well as what it matched, so its answer can be checked rather \
+     than taken on trust. It runs on your machine and sends the picture \
+     nowhere.",
 );
 const F_INTEGRITY: Feature = (
     "Page Snapshot",
@@ -296,9 +354,13 @@ const F_ARCHIVE: Feature = (
      to keep. Save a page and PATANYX stores a private snapshot alongside the \
      text its on-device reader finds inside it, so months later you can type a \
      word you remember and get the page back, even if that word only appeared \
-     inside an image. It holds only the pages you chose to save, in one \
-     encrypted file on your machine that opens with your vault. Nothing is \
-     uploaded.",
+     inside an image. The picture covers the WHOLE page rather than the part \
+     that happened to be on screen, and you can open it again and zoom in on \
+     it. On a Windows engine too old to render past the visible area the \
+     picture is only what was on screen, and the message when you save says \
+     so rather than leaving you to assume otherwise. It holds only the pages \
+     you chose to save, in one encrypted file on your machine that opens \
+     with your vault. Nothing is uploaded.",
 );
 
 /// Comparing a downloaded file with a contact. Premium-gated from its first
@@ -361,7 +423,10 @@ const F_CHANGE_COMPARE: Feature = (
 /// as one thing.
 const F_DIVERGENCE_SITES: Feature = (
     "Divergence Exceptions",
-    "On demand; future Premium",
+    // FREE PERMANENTLY, 2026-08-19. It was "On demand; future Premium" and
+    // the three IPC arms genuinely refused without a licence; both went with
+    // the decision that Fingerprint Divergence is free, exceptions included.
+    "On demand",
     "Fingerprint Divergence adds noise for every site, and a few sites break \
      under it. Turn it off for just those, named one full hostname at a time, \
      and leave it on everywhere else. The panel also reports what the tab in \
@@ -371,9 +436,10 @@ const F_DIVERGENCE_SITES: Feature = (
 );
 
 fn features() -> Vec<Feature> {
-    let mut out = vec![F_ADS, F_MALICIOUS, F_LEDGER, F_FREEZE];
+    let mut out = vec![F_ADS, F_MALICIOUS, F_INSECURE, F_LEDGER, F_FREEZE];
     if cfg!(windows) {
         out.push(F_DNS);
+        // out.push(F_DOWNLOAD_MARK) -- held; see the const above.
     }
     out.extend([
         F_QUARANTINE,
@@ -485,7 +551,7 @@ const PREMIUM_HEAD: &str = "Free and Premium";
 /// ever to earn money, it has to be NEW accents and NEW schemes on top of
 /// these, which the wording deliberately leaves room for -- "all nine" and
 /// "all three" are counts of what ships today, not a promise about a tenth.
-const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Fingerprint Divergence, private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, the tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, comparing a downloaded file with a contact, and turning fingerprint noise off for named sites will be part of it. Fingerprint Divergence and the photo check are switched on for everyone in this build, and stay that way until Premium launches. The tab pack works differently, and so do the newer features: reading the text you drag a box around, the archive of pages you chose to keep, comparing a downloaded file with a contact, and turning fingerprint noise off for named sites all ask for a Premium license from day one, and they unlock when Premium launches. Fingerprint Divergence itself is not among them: it stays switched on for everyone until Premium launches, and asks for a license from then on. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. How this browser looks is free: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever. A Premium license will activate on up to five devices: the first time your vault opens after you paste the token, PATANYX makes one request to EdgeXene to activate that device, trying again at the next unlock if it could not reach us, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot; a license allows a limited number of activations in all, and the Vault panel says so if you reach it. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
+const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, the tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, and comparing a downloaded file with a contact will be part of it. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. The photo check is switched on for everyone in this build and stays that way until Premium launches. The tab pack works differently, and so do the newer features: reading the text you drag a box around, the archive of pages you chose to keep, and comparing a downloaded file with a contact all ask for a Premium license from day one, and they unlock when Premium launches. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. How this browser looks is free: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever. A Premium license will activate on up to five devices: the first time your vault opens after you paste the token, PATANYX makes one request to EdgeXene to activate that device, trying again at the next unlock if it could not reach us, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot; a license allows a limited number of activations in all, and the Vault panel says so if you reach it. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
 
 
 /// One sentence more on the accent, ON WINDOWS ONLY: there the accent is
