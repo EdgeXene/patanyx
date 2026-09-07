@@ -31,6 +31,30 @@ cargo test -p patanyx --features chat --locked
 # reconnect, backoff, the drain that stops frames surviving a reconnect -- was
 # covered by either line above. It had never run in CI at all.
 cargo test -p patanyx-chat --features relay-client --locked
+
+echo
+echo "=== lints ==="
+# Separate from the test suites on purpose: a suite proves behavior, a linter
+# catches the class of mistake that compiles, passes, and is still wrong. Both
+# components come from the pinned toolchain, so this needs no setup the pin does
+# not already provide.
+#
+# NOT -D warnings, deliberately, and that is the honest state rather than an
+# oversight: there is a small backlog of style findings, and a gate that fails
+# on day one gets switched off within a week. What this buys is the thing that
+# matters, which is that clippy actually RUNS before a release, so a real defect
+# it spots is seen. Tightening it is its own commit, once the backlog is clear.
+cargo clippy --workspace --all-targets --locked
+# RustSec advisories against the locked dependency set. Cheap, and the only
+# thing that notices a dependency going bad between releases.
+if command -v cargo-audit >/dev/null 2>&1; then
+  cargo audit
+else
+  echo "cargo audit: SKIPPED (cargo-audit not installed)"
+fi
+
+echo
+echo "=== gates ==="
 # The chrome scripts are EXECUTED, not parsed: node --check validates syntax
 # and has already let a load-time ReferenceError ship. Also bans innerHTML in
 # the webview that holds IPC and the vault.
