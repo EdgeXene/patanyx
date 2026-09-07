@@ -77,10 +77,9 @@ It is also why the third-party notices describe the rendering engine as somethin
 
 ### About GitHub's language breakdown
 
-A browser repository can produce some surprising language percentages, so two details are worth calling out.
+A browser repository can produce some surprising language percentages, so one detail is worth calling out.
 
-- About half of the JavaScript in this repository never ships. The files under `scripts/` are test gates that run in CI, generally one per feature. A built PATANYX browser contains none of them. They are still counted because they are first-party project code; marking first-party code as vendored simply to make the language statistics look better is not something this repository does.
-- `vendor/` is excluded through an explicit rule in `.gitattributes`. It contains one third-party crate carried with a small documented patch: one conditional per engine, which makes wry's frozen `window.ipc` bootstrap install only where an IPC handler is actually registered. The patch is explained in `vendor/wry/PATANYX-PATCH.md`, so the change can be audited directly in the repository rather than hidden behind a private fork.
+- About half of the JavaScript in this repository never ships. The files under `scripts/` are test gates that run before a release, generally one per feature. A built PATANYX browser contains none of them. They are still counted because they are first-party project code; marking first-party code as vendored simply to make the language statistics look better is not something this repository does.
 
 ### Toolchain
 
