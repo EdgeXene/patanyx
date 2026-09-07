@@ -84,11 +84,11 @@ A browser repository can produce some surprising language percentages, so two de
 
 ### Toolchain
 
-The Rust toolchain is pinned to version `1.98.0` through `rust-toolchain.toml`. Pinning the compiler reduces build-environment drift and is one part of PATANYX's reproducible-build process.
+The Rust toolchain is pinned to version `1.96.0` through `rust-toolchain.toml`. Pinning the compiler reduces build-environment drift and is one part of PATANYX's reproducible-build process.
 
 ## Quick start
 
-The toolchain is pinned to **Rust 1.98.0** by `rust-toolchain.toml` as part of PATANYX's reproducible-build process (see [docs/reproducible-builds.md](docs/reproducible-builds.md)); rustup selects it automatically when you build.
+The toolchain is pinned to **Rust 1.96.0** by `rust-toolchain.toml` as part of PATANYX's reproducible-build process (see [docs/reproducible-builds.md](docs/reproducible-builds.md)); rustup selects it automatically when you build.
 
 ### Linux (native build)
 
