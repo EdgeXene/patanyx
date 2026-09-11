@@ -32,12 +32,68 @@ Third-Party Acknowledgements
    positives and false negatives occur routinely" -- is why the blocked
    banner says a site was REPORTED rather than that it is known malicious.)
 
-3. PP-OCR detection and recognition models (bundled, compiled into the binary)
+3. PhishDestroy (bundled malicious-host list)
+   Copyright (c) 2019 PhishDestroy
+   Licensed under the MIT License.
+   Source: https://github.com/phishdestroy/destroylist (list.txt)
+   Licence verified 2026-09-01 against the repository's LICENSE file, at
+   revision 12f5dfc39bb2.
+   (Added as a source on 2026-08-10 and merged into crates/app/src/blocklist.txt
+   by scripts/build-blocklist.sh; this acknowledgement was omitted at the time,
+   so builds from 2026-08-10 onward redistributed the data without the notice
+   MIT requires. THE PRIMARY LIST ONLY. The same repository publishes
+   community/blocklist.txt, aggregated from 13+ upstreams including ones whose
+   terms forbid redistribution; a permissive label on an aggregate cannot pass
+   on rights the upstreams withheld, so the aggregate is deliberately not used.)
+
+4. ShadowWhisperer BlockLists -- Scam and Malware (bundled malicious-host list)
+   Released into the public domain under the Unlicense.
+   Source: https://github.com/ShadowWhisperer/BlockLists (Lists/Scam,
+   Lists/Malware)
+   Licence verified 2026-09-01 against the repository's own LICENSE and README,
+   at revision a7b84d42b187.
+   Attribution is not required by the Unlicense; it is given because a browser
+   that ships someone else's work should say so.
+   (Enabled 2026-09-01. Its two lists are tracked separately -- Malware commits
+   several times a day, Scam every two to seven -- and merged into
+   crates/app/src/blocklist.txt by scripts/build-blocklist.sh. The basis for
+   redistributing it where aggregated feeds are refused is the README's "I will
+   not merge other lists": the dedication covers the maintainer's own work, and
+   a permissive label on an aggregate cannot pass on rights its upstreams
+   withheld.)
+
+5. CERT Polska (CSIRT NASK) Dangerous Websites Warning List (bundled
+   malicious-host list)
+   The data comes from CERT Polska. Source: https://cert.pl/lista-ostrzezen/
+   Feed: https://hole.cert.pl/domains/v2/domains.txt
+   The list publishes no licence text. On 2026-09-01 EdgeXene LLC asked
+   CERT Polska in writing whether commercial software may use the list for
+   phishing and malicious-domain protection, process or convert it into
+   another technical format, and redistribute an updated copy of the
+   resulting list to its users, with attribution to CERT Polska / NASK and
+   without representing the data as its own or selling the list. On
+   2026-09-11 CSIRT NASK / CERT Polska replied that "All the conditions
+   described are certainly sufficient for implementation" and asked, in
+   addition to stating that the data comes from CERT Polska, for a link to
+   https://cert.pl/lista-ostrzezen/. Both requests are met here, on the
+   About page at patanyx.net, and in the header of every list published
+   through the signed update channel.
+   The CERT Polska entries travel ONLY in that signed update channel, as the
+   request to CERT Polska described. They are not in the committed
+   crates/app/src/blocklist.txt, so they are not compiled into releases and
+   are not published in this repository; scripts/test-certpl.sh refuses a
+   tree whose committed list contains them. Where they do appear they are
+   included by CERT Polska's permission and are not licensed under the
+   Apache 2.0 licence that covers this repository.
+   (Wired in 2026-09-11 behind BLOCKLIST_ENABLE_CERTPL, which the publisher
+   enables in its own environment and which stays off in this tree.)
+
+6. PP-OCR detection and recognition models (bundled, compiled into the binary)
    Copyright (c) Baidu, Inc.
    Licensed under the Apache License 2.0, code and weights.
    (Model files and provenance: models/ocr/)
 
-4. Mozilla Public Suffix List (bundled, compiled into the binary)
+7. Mozilla Public Suffix List (bundled, compiled into the binary)
    Copyright (c) the Mozilla Foundation and contributors
    Licensed under the Mozilla Public License 2.0.
    Source: https://publicsuffix.org/list/public_suffix_list.dat
@@ -48,18 +104,18 @@ Third-Party Acknowledgements
    to decide which saved password a page may be offered -- see
    crates/app/src/psl.rs.)
 
-5. WebKitGTK (Linux) -- NOT distributed with this software
+8. WebKitGTK (Linux) -- NOT distributed with this software
    Copyright (c) the WebKit contributors
    LGPL-2.1-or-later and BSD-2-Clause, dynamically linked against the system
    library so a user may substitute their own build.
 
-6. Microsoft Edge WebView2 Runtime (Windows) -- NOT distributed with this
+9. Microsoft Edge WebView2 Runtime (Windows) -- NOT distributed with this
    software
    Copyright (c) Microsoft Corporation
    Supplied by Microsoft under its own terms. PATANYX links the loader and
    calls the runtime; it neither contains nor redistributes it.
 
-7. Rust crate dependencies (466 packages)
+10. Rust crate dependencies (466 packages)
    Copyright (c) their respective authors
    All permissive. Five are MPL-2.0 (cssparser, cssparser-macros, dtoa-short,
    option-ext, selectors), used unmodified.
