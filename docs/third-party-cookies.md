@@ -1,5 +1,13 @@
 # Third-party cookies
 
+> **WP-AA update, 2026-08-25:** the restart boundary now covers more than
+> cookies. Both backends explicitly clear cookies, DOM/site storage, service
+> workers, Cache Storage, and HTTP cache once per process, and hold every
+> initial navigation until the asynchronous clear completes. The measurements
+> below remain the history of the cookie decision; statements that Linux gets
+> restart behavior only by engine accident are superseded by this explicit
+> wipe.
+
 **Status: MEASURED 2026-08-01. WebKitGTK already refuses them, and not because
 of anything PATANYX does. No code was added.**
 
@@ -133,9 +141,10 @@ On the About page as "Closing it signs you out", with the limit stated under
 what it cannot hide: this is not secure deletion, the data sits on disk between
 sessions.
 
-**Linux still gets this by accident.** WebKitGTK simply never persists them; no
-code asks for it. If that default ever changes, Linux silently starts keeping
-logins with nothing to catch it. Making it explicit, and gating it, is open.
+**Superseded by WP-AA:** Linux originally got cookie loss by accident.
+WebKitGTK simply did not persist them and no code asked for that behavior.
+The session-start website-data-manager clear now makes the restart boundary
+explicit and covers the non-cookie site state the original decision omitted.
 
 ### The measurement that prompted it
 

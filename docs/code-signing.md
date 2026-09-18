@@ -203,7 +203,7 @@ outlive the certificate that produced it.
    check HERE, before signing: Authenticode embeds a wall-clock timestamp, so
    signed output is deliberately not byte-reproducible.
 2. **Copy the unsigned exes to the Windows machine and sign both** --
-   `PATANYX.exe` and `PATANYX-Premium.exe`. The Premium build is not exempt for
+   `PATANYX.exe` and `PATANYX-Nabu-X.exe`. The Nabu-X build is not exempt for
    being the paid tier; an unsigned premium binary would give paying users the
    worse install experience. Both are signed by the same certificate profile,
    so publisher reputation accumulates across them, which matters because the

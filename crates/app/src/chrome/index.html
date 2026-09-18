@@ -11,20 +11,20 @@
     <title>PATANYX Browser</title>
   </head>
   <body>
-    <nav id="tabstrip" aria-label="Tabs">
+    <nav id="tabstrip" aria-label="Tabs" data-msg-aria-label="chrome.tabstrip.aria.label">
       <!-- Select-mode bar for the tab strip (Premium; entry is gated
            server-side by tabs_batch_enter). Follows the find bar's height
            contract: every show/hide goes through syncChromeHeight so the
            content webview is resized before anything paints under it. -->
       <div id="tabbatch-bar" hidden>
         <span id="tabbatch-count" aria-live="polite"></span>
-        <button id="tabbatch-close" type="button">Close</button>
-        <button id="tabbatch-bookmark" type="button">Bookmark</button>
-        <button id="tabbatch-shelf" type="button">Set aside</button>
-        <button id="tabbatch-cancel" type="button">Cancel</button>
+        <button id="tabbatch-close" type="button" data-msg="chrome.tabbatch.close.button">Close</button>
+        <button id="tabbatch-bookmark" type="button" data-msg="chrome.tabbatch.bookmark.button">Bookmark</button>
+        <button id="tabbatch-shelf" type="button" data-msg="chrome.tabbatch.shelf.button">Shelve</button>
+        <button id="tabbatch-cancel" type="button" data-msg="chrome.tabbatch.cancel.button">Cancel</button>
       </div>
       <div id="tabs"></div>
-      <button id="btn-newtab" type="button" title="New tab">+</button>
+      <button id="btn-newtab" type="button" title="New tab" data-msg-title="chrome.btn.newtab.title">+</button>
     </nav>
 
     <!-- Toolbar. Navigation controls are glyph-only because back/forward/
@@ -54,7 +54,7 @@
         type="button"
         title="Back"
         aria-label="Back"
-      >
+       data-msg-aria-label="chrome.btn.back.aria.label" data-msg-title="chrome.btn.back.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M10 3 L5 8 L10 13" />
         </svg>
@@ -65,7 +65,7 @@
         type="button"
         title="Forward"
         aria-label="Forward"
-      >
+       data-msg-aria-label="chrome.btn.fwd.aria.label" data-msg-title="chrome.btn.fwd.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M6 3 L11 8 L6 13" />
         </svg>
@@ -76,7 +76,7 @@
         type="button"
         title="Reload"
         aria-label="Reload"
-      >
+       data-msg-aria-label="chrome.btn.reload.aria.label" data-msg-title="chrome.btn.reload.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M13 8 A5 5 0 1 1 11.4 4.4" />
           <path d="M13 2 L13 5 L10 5" />
@@ -100,7 +100,7 @@
         type="button"
         title="About this site"
         aria-label="About this site"
-      >
+       data-msg-aria-label="chrome.btn.site.info.aria.label" data-msg-title="chrome.btn.site.info.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <rect x="2" y="2" width="12" height="12" rx="3" />
           <path d="M8 7.2 V11.2" />
@@ -115,7 +115,7 @@
         spellcheck="false"
         placeholder="Search or enter address"
         aria-label="Address bar"
-      />
+        data-msg-aria-label="chrome.url.aria.label"data-msg-placeholder="chrome.url.placeholder"/>
 
       <!-- Page zoom, shown only when it is NOT 100%. A permanent "100%" is
            noise; its absence answers "am I zoomed" for the common case. Click
@@ -129,7 +129,19 @@
         class="small"
         title="Page zoom. Click to reset to 100%"
         hidden
-      ></button>
+       data-msg-title="chrome.zoom.chip.title"></button>
+
+      <!-- Translated-page indicator. The zoom chip's twin: a status readout
+           that happens to be clickable, present exactly while the page on
+           screen is translated. Text is set by the render (it needs the
+           catalog), the title is static. -->
+      <button
+        id="translate-chip"
+        type="button"
+        class="small"
+        title="This page is translated. Click to open the Translation panel"
+        hidden
+       data-msg-title="chrome.translate.chip.title"></button>
 
       <!-- ROW ONE ENDS HERE: THE PAGE IN FRONT OF YOU.
            ============================================
@@ -153,9 +165,10 @@
                         activity, vault, resolver, chat, library, integrity,
                         updates.
 
-           Row two is laid out flush RIGHT (`justify-content: flex-end` in the
-           stylesheet). That only affects row two, because `#url` grows to eat
-           row one's free space and leaves none to distribute.
+           Row two follows the Theme placement: flush left by default, or
+           flush right for Top Right. That only affects row two, because
+           `#url` grows to eat row one's free space and leaves none to
+           distribute.
 
            ORDER HERE IS LOAD-BEARING, AND WAS ONCE OVERRIDDEN INVISIBLY.
            `#btn-about` carried `order: 99` left over from the sheet, and
@@ -175,21 +188,21 @@
         type="button"
         title="Bookmark this page"
         aria-label="Bookmark this page"
-      >
+       data-msg-aria-label="chrome.btn.bookmark.aria.label" data-msg-title="chrome.btn.bookmark.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path
             d="M8 2 L9.8 6 L14 6.3 L10.9 9.1 L11.9 13.5 L8 11.2 L4.1 13.5 L5.1 9.1 L2 6.3 L6.2 6 Z"
           />
         </svg>
-        <span class="feature-label">Bookmark this page</span>
+        <span class="feature-label" data-msg="chrome.btn.bookmark.span">Bookmark this page</span>
       </button>
       <button
         id="btn-quarantine-menu"
         class="feature-btn"
         type="button"
         aria-label="New quarantine tab"
-        title="Open a tab with JavaScript off, blocking on, and no stored state"
-      >
+        title="Open a tab with JavaScript off, blocking on, and no saved data"
+       data-msg-aria-label="chrome.btn.quarantine.menu.aria.label" data-msg-title="chrome.btn.quarantine.menu.title">
         <!-- A MASK, AND IT REPLACED A THIRD SHIELD.
              This button used to wear a shield with a check inside it. So does
              Integrity. Privacy wears a shield too. Three shields in one strip
@@ -216,7 +229,7 @@
           <path d="M4.4 7.3 L6.7 7.3" />
           <path d="M9.3 7.3 L11.6 7.3" />
         </svg>
-        <span class="feature-label">New quarantine tab</span>
+        <span class="feature-label" data-msg="chrome.btn.quarantine.menu.span">New quarantine tab</span>
       </button>
       <button
         id="btn-about"
@@ -224,13 +237,13 @@
         type="button"
         aria-pressed="false"
         title="Version, license, and the software this build is made of"
-      >
+       data-msg-title="chrome.btn.about.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <circle cx="8" cy="8" r="6" />
           <path d="M8 7.2 V11.2" />
           <path d="M8 4.9 V5.2" />
         </svg>
-        <span class="feature-label">About</span>
+        <span class="feature-label" data-msg="chrome.btn.about.span">About</span>
       </button>
 
       <!-- ROW BREAK. Everything after this wraps onto a second line, so the
@@ -251,13 +264,13 @@
         type="button"
         aria-pressed="false"
         title="Privacy protections for this browser"
-      >
+       data-msg-title="chrome.btn.privacy.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path
             d="M8 1.5 L13.5 3.5 V8 C13.5 11 11 13.6 8 14.5 C5 13.6 2.5 11 2.5 8 V3.5 Z"
           />
         </svg>
-        <span class="feature-label">Privacy</span>
+        <span class="feature-label" data-msg="chrome.btn.privacy.span">Privacy</span>
         <span id="privacy-count" class="badge" hidden></span>
       </button>
       <button
@@ -266,11 +279,11 @@
         type="button"
         aria-pressed="false"
         title="Theme: how this browser looks"
-      >
+       data-msg-title="chrome.btn.theme.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M8 2.5 A5.5 5.5 0 1 0 13.5 8 L8 8 Z" />
         </svg>
-        <span class="feature-label">Theme</span>
+        <span class="feature-label" data-msg="chrome.btn.theme.span">Theme</span>
       </button>
       <button
         id="btn-freeze"
@@ -278,11 +291,11 @@
         type="button"
         aria-pressed="false"
         title="Freeze this tab: stop it from making network requests"
-      >
+       data-msg-title="chrome.btn.freeze.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M8 2 V14 M3.4 4.8 L12.6 11.2 M12.6 4.8 L3.4 11.2" />
         </svg>
-        <span class="feature-label" id="freeze-label">Live</span>
+        <span class="feature-label" id="freeze-label" data-msg="chrome.freeze.label.span">Live</span>
       </button>
 
       <!-- Quarantine leads, because it is the only entry that is an ACTION
@@ -303,8 +316,8 @@
         type="button"
         aria-pressed="false"
         aria-label="Tab Activity"
-        title="Tab Activity: hosts this tab contacted, freeze, storage"
-      >
+        title="Tab Activity: contacts, freeze, storage"
+       data-msg-aria-label="chrome.btn.tab.aria.label" data-msg-title="chrome.btn.tab.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M4 1.5 H9.5 L12.5 4.5 V14.5 H4 Z" />
           <path d="M6 7.5 H10.5 M6 10 H10.5" />
@@ -322,7 +335,7 @@
                pressed. The visible text is deliberately a case-insensitive
                prefix of the accessible name, so the two do not disagree for
                anyone driving this by voice. -->
-        <span class="feature-label">TA</span>
+        <span class="feature-label" data-msg="chrome.btn.tab.span">TA</span>
       </button>
 
       <!-- Padlock = the vault, and the shackle opens when it is unlocked, so
@@ -333,7 +346,7 @@
         type="button"
         aria-pressed="false"
         title="Passphrase vault"
-      >
+       data-msg-title="chrome.btn.vault.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <rect x="3.5" y="7" width="9" height="7" rx="1.5" />
           <path
@@ -341,7 +354,7 @@
             d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7"
           />
         </svg>
-        <span class="feature-label">Vault</span>
+        <span class="feature-label" data-msg="chrome.btn.vault.span">Vault</span>
         <span id="vault-dot" class="dot" hidden></span>
       </button>
 
@@ -369,7 +382,7 @@
         type="button"
         title="Fill the saved password for this site"
         hidden
-      >
+       data-msg-title="chrome.btn.fill.title">
         <!-- A KEY, and deliberately not a lock: the vault button one position
              to the left already wears the padlock, and its shackle animates
              open and shut to carry locked-vs-unlocked. Repeating that shape
@@ -381,12 +394,12 @@
           <path d="M7.1 8.9 L12.8 3.2" />
           <path d="M10.6 5.4 L12.2 7" />
         </svg>
-        <span class="feature-label">Fill password</span>
+        <span class="feature-label" data-msg="chrome.btn.fill.span">Fill password</span>
       </button>
 
       <!-- Globe = name lookup, coloured by the chrome's one rule: GREY IS NOT
            ACTIVE, GREEN IS ACTIVE. Grey on System, because the browser is
-           doing nothing about DNS; green on Mullvad or Quad9, because it is.
+           doing nothing about DNS; green on Quad9, because it is.
            Green says "the browser is choosing your resolver", not "you are
            private" -- System stays the right answer for a VPN user, and the
            panel's comparison says so in its first entry.
@@ -402,13 +415,13 @@
         aria-pressed="false"
         title="Who resolves the sites you visit"
         hidden
-      >
+       data-msg-title="chrome.btn.dns.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <circle cx="8" cy="8" r="6" />
           <path d="M2.3 6 H13.7 M2.3 10 H13.7" />
           <path d="M8 2 C5.5 4.5 5.5 11.5 8 14 C10.5 11.5 10.5 4.5 8 2" />
         </svg>
-        <span class="feature-label" id="dns-label">DNS</span>
+        <span class="feature-label" id="dns-label" data-msg="chrome.dns.label.span">DNS</span>
       </button>
 
       <!-- No `hidden` here, unlike btn-dns: the tunnel runs on both
@@ -419,31 +432,34 @@
         type="button"
         aria-pressed="false"
         title="Tunnel"
-      >
+       data-msg-title="chrome.btn.tunnel.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path
             d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11.2 13.9 8 14.5 C4.8 13.9 2.5 11.5 2.5 8 V3.5 Z"
           />
         </svg>
-        <span class="feature-label" id="tunnel-label">Tunnel</span>
+        <span class="feature-label" id="tunnel-label" data-msg="chrome.tunnel.label.span">Tunnel</span>
       </button>
 
       <!-- Hidden by default and revealed by chat.js, which is evaluated only
            in chat builds. A default build never runs that script, so the
            button must not be visible there or it would do nothing when
-           clicked. -->
+           clicked. data-premium: private chat asks for a Premium license
+           (the panel still opens, so the lock can be explained in place;
+           every action inside asks the Rust gate). -->
       <button
         id="btn-chat"
         class="feature-btn"
+        data-premium="1"
         type="button"
         aria-pressed="false"
         title="Local-network chat"
         hidden
-      >
+       data-msg-title="chrome.btn.chat.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.5 3.5 H13.5 V11 H7.5 L4.5 13.5 V11 H2.5 Z" />
         </svg>
-        <span class="feature-label">Chat</span>
+        <span class="feature-label" data-msg="chrome.btn.chat.span">Chat</span>
         <!-- Messages that arrived while you were not looking at them. It is
                a COUNT, not a dot, because "three people wrote to you" and "one
                did" are different situations. -->
@@ -460,15 +476,15 @@
         class="feature-btn"
         type="button"
         aria-pressed="false"
-        aria-label="Library: bookmarks, sets of tabs and downloads"
-        title="Bookmarks, sets of tabs and download records"
-      >
+        aria-label="Library: bookmarks, Tab Shelf and downloads"
+        title="Bookmarks, Tab Shelf and download records"
+       data-msg-aria-label="chrome.btn.library.aria.label" data-msg-title="chrome.btn.library.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.5 13.5 H13.5" />
           <path d="M4 13.5 V2.5 H6.5 V13.5" />
           <path d="M6.5 13.5 L8.7 2.8 L11 3.6 L8.8 13.5" />
         </svg>
-        <span class="feature-label">Library</span>
+        <span class="feature-label" data-msg="chrome.btn.library.span">Library</span>
       </button>
 
       <!-- Read text on this page: the Premium region-read mode. Opens a
@@ -485,7 +501,7 @@
         aria-pressed="false"
         aria-label="Read text on this page"
         title="Read any text on this page, even inside images"
-      >
+       data-msg-aria-label="chrome.btn.ocr.region.aria.label" data-msg-title="chrome.btn.ocr.region.title">
         <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
           <path d="M2.5 5 V2.5 H5" />
           <path d="M11 2.5 H13.5 V5" />
@@ -494,7 +510,7 @@
           <path d="M5 6.5 H11" />
           <path d="M5 9.5 H9" />
         </svg>
-        <span class="feature-label">Read text</span>
+        <span class="feature-label" data-msg="chrome.btn.ocr.region.span">Read text</span>
       </button>
 
       <!-- The tools modal's one door (was Deep Recall's own button; the
@@ -510,7 +526,7 @@
         type="button"
         aria-pressed="false"
         title="Page integrity: has this page changed since you saved it?"
-      >
+       data-msg-title="chrome.btn.integrity.title">
         <svg
           class="ico"
           viewBox="0 0 24 24"
@@ -524,7 +540,7 @@
           <path d="M12 3l7 4v5c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V7z" />
           <path d="M9 12l2 2 4-4" />
         </svg>
-        <span class="feature-label">Integrity</span>
+        <span class="feature-label" data-msg="chrome.btn.integrity.span">Integrity</span>
       </button>
 
       <!-- LAST, and kept there by `order` rather than by position.
@@ -539,8 +555,8 @@
     <!-- THE SIDEBAR, and it is EMPTY on purpose.
          =====================================================================
          When the toolbar is set to Left, chrome.js moves the buttons that sit
-         after `.toolbar-break` into here, and moves them back when it is set
-         to Top. Nothing is duplicated: there is one #btn-vault in this
+         after `.toolbar-break` into here, and moves them back for either Top
+         placement. Nothing is duplicated: there is one #btn-vault in this
          document and it changes parent, so every listener, every id lookup
          and every aria-pressed state follows it without knowing this feature
          exists.
@@ -554,7 +570,7 @@
          It is a `nav` with its own label because in Left it IS the toolbar,
          and a screen reader arriving at an unlabelled group of thirteen
          icon-only buttons has been told nothing. -->
-    <nav id="sidebar" aria-label="Browser features" hidden></nav>
+    <nav id="sidebar" aria-label="Browser features" hidden data-msg-aria-label="chrome.sidebar.aria.label"></nav>
 
     <!-- BOOKMARKS BAR. Off by default and shown only when asked for: it is a
          third chrome row, and vertical space on a laptop is the thing this
@@ -580,16 +596,51 @@
       </svg>
       <div class="banner-text">
         <span class="banner-title"
-          >A newer version of PATANYX is available</span
+           data-msg="chrome.update.banner.span">A newer version of PATANYX is available</span
         >
         <span id="update-banner-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="update-banner-open" type="button" class="small">
+        <button id="update-banner-open" type="button" class="small" data-msg="chrome.update.banner.open.button">
           Show me
         </button>
-        <button id="update-banner-dismiss" type="button" class="small">
+        <button id="update-banner-dismiss" type="button" class="small" data-msg="chrome.update.banner.dismiss.button">
           Later
+        </button>
+      </div>
+    </div>
+
+    <!-- THE ENGINE UNDERNEATH HAS A KNOWN, EXPLOITED BUG.
+         Raised at boot from the `engine_status` reply when the runtime's
+         version is below the security floor (platform::MIN_WEBVIEW2 on
+         Windows; MIN_WEBKITGTK in a Linux debug build, since a Linux release
+         build refuses to start instead -- see main.rs::enforce_engine_floor).
+         Windows gets a banner and not a refusal because the Evergreen runtime
+         updates itself on a rollout that takes days, and a GUI application
+         with no console cannot refuse to start and still explain why.
+
+         It offers nothing but Dismiss ON PURPOSE. There is no in-app way to
+         fetch the engine: Microsoft's updater owns the runtime, and a button
+         that pretended otherwise would be a promise this browser cannot keep.
+         The body, composed in Rust from the catalog, names the version found,
+         the version that clears the floor, and what to do meanwhile. Dismiss
+         is for this launch only; the check runs again at the next start,
+         which is the one time the state can have changed. -->
+    <div id="engine-floor-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11 13.8 8 14.8 C5 13.8 2.5 11.5 2.5 8 V3.5 Z" />
+        <path d="M8 5.2 V8.8" />
+        <path d="M8 11 V11.3" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title" id="engine-floor-title" data-msg="chrome.engine.floor.title.span">
+          The web engine on this computer needs a security update
+        </span>
+        <span id="engine-floor-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="engine-floor-dismiss" type="button" class="small" data-msg="chrome.engine.floor.dismiss.button">
+          Dismiss
         </button>
       </div>
     </div>
@@ -610,14 +661,14 @@
         <path d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7" />
       </svg>
       <div class="banner-text">
-        <span class="banner-title">Your vault is about to lock</span>
+        <span class="banner-title" data-msg="chrome.lock.warning.span">Your vault is about to lock</span>
         <span id="lock-warning-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="lock-warning-stay" type="button" class="small">
+        <button id="lock-warning-stay" type="button" class="small" data-msg="chrome.lock.warning.stay.button">
           I'm still here
         </button>
-        <button id="lock-warning-now" type="button" class="small">
+        <button id="lock-warning-now" type="button" class="small" data-msg="chrome.lock.warning.now.button">
           Lock now
         </button>
       </div>
@@ -641,14 +692,14 @@
         <path d="M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7" />
       </svg>
       <div class="banner-text">
-        <span class="banner-title">Save this password?</span>
+        <span class="banner-title" data-msg="chrome.save.password.banner.span">Save this password?</span>
         <span id="save-password-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="save-password-save" type="button" class="small">
+        <button id="save-password-save" type="button" class="small" data-msg="chrome.save.password.save.button">
           Save
         </button>
-        <button id="save-password-dismiss" type="button" class="small">
+        <button id="save-password-dismiss" type="button" class="small" data-msg="chrome.save.password.dismiss.button">
           Not now
         </button>
       </div>
@@ -673,14 +724,47 @@
         <path d="M4 4 L12 12" />
       </svg>
       <div class="banner-text">
-        <span class="banner-title">This site was blocked</span>
+        <span class="banner-title" data-msg="chrome.blocked.warning.span">This site was blocked</span>
         <span id="blocked-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="blocked-allow" type="button" class="small danger">
+        <button id="blocked-allow" type="button" class="small danger" data-msg="chrome.blocked.allow.button">
           Open anyway
         </button>
-        <button id="blocked-dismiss" type="button" class="small">
+        <button id="blocked-dismiss" type="button" class="small" data-msg="chrome.blocked.dismiss.button">
+          Dismiss
+        </button>
+      </div>
+    </div>
+
+    <!-- AD-LIST HOLD. Its own element rather than a variant of
+         #blocked-warning, and that is a deliberate cost.
+
+         Reusing the malicious banner would inherit `class="small danger"` on
+         Open anyway and the crossed-circle glyph, so an ad-list hold would
+         arrive painted as a hazard. It is not one: the site is ordinary and
+         the list that caught it was built for the requests pages make in the
+         background. Every sentence in the body works to stop this reading as
+         an accusation, and a red button with a hazard icon would undo all of
+         them before the text is read. A shield, because that is already this
+         browser's mark for blocking, and no danger class.
+
+         The actions live HERE, in the chrome, for the same reason they do on
+         the other two banners: a held site cannot forge a control it does not
+         host. -->
+    <div id="adlist-warning" role="alert" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1.5 L13.5 4 V8 C13.5 11 11 13.5 8 14.5 C5 13.5 2.5 11 2.5 8 V4 Z" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title" data-msg="chrome.adlist.warning.span">PATANYX held this page</span>
+        <span id="adlist-body"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="adlist-allow" type="button" class="small" data-msg="chrome.adlist.allow.button">
+          Open anyway
+        </button>
+        <button id="adlist-dismiss" type="button" class="small" data-msg="chrome.adlist.dismiss.button">
           Dismiss
         </button>
       </div>
@@ -698,14 +782,14 @@
         <path d="M8 6 V9.5 M8 11.8 V12.4" />
       </svg>
       <div class="banner-text">
-        <span class="banner-title">This site is not encrypted</span>
+        <span class="banner-title" data-msg="chrome.insecure.warning.span">This site is not encrypted</span>
         <span id="insecure-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="insecure-allow" type="button" class="small danger">
+        <button id="insecure-allow" type="button" class="small danger" data-msg="chrome.insecure.allow.button">
           Continue anyway
         </button>
-        <button id="insecure-dismiss" type="button" class="small">
+        <button id="insecure-dismiss" type="button" class="small" data-msg="chrome.insecure.dismiss.button">
           Dismiss
         </button>
       </div>
@@ -734,16 +818,16 @@
              is blocking your DNS service" would assert the one thing the
              browser cannot actually distinguish, directly above a paragraph
              admitting it. -->
-        <span class="banner-title" id="resolver-title">
+        <span class="banner-title" id="resolver-title" data-msg="chrome.resolver.title.span">
           Your DNS service cannot be reached
         </span>
         <span id="resolver-body"></span>
       </div>
       <div class="banner-actions">
-        <button id="resolver-retry" type="button" class="small">
+        <button id="resolver-retry" type="button" class="small" data-msg="chrome.resolver.retry.button">
           Check again
         </button>
-        <button id="resolver-dismiss" type="button" class="small">
+        <button id="resolver-dismiss" type="button" class="small" data-msg="chrome.resolver.dismiss.button">
           Dismiss
         </button>
       </div>
@@ -761,36 +845,40 @@
         />
       </svg>
       <div class="banner-text">
-        <span class="banner-title" id="tunnel-warning-title">
+        <span class="banner-title" id="tunnel-warning-title" data-msg="chrome.tunnel.warning.title.span">
           The tunnel is not carrying traffic
         </span>
-        <span id="tunnel-warning-body">
+        <span id="tunnel-warning-body" data-msg="chrome.tunnel.warning.body.span">
           Pages are not loading because the tunnel is down. PATANYX will NOT
           fall back to a direct connection. Open the tunnel panel.
         </span>
       </div>
       <div class="banner-actions">
-        <button id="tunnel-warning-open" type="button" class="small">
+        <button id="tunnel-warning-open" type="button" class="small" data-msg="chrome.tunnel.warning.open.button">
           Open Tunnel panel
         </button>
       </div>
     </div>
 
-    <div id="tls-warning" role="alert" hidden>
-      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-        <path d="M8 1.5 L15 14 H1 Z" />
-        <path d="M8 6 V9.5 M8 11.8 V12.4" />
-      </svg>
-      <div class="tls-text">
-        <span class="tls-title">This connection is being intercepted</span>
-        <span>
-          Something on this network is decrypting the traffic between you and
-          this site. It can read everything you send and receive, including
-          passwords. This is common on work networks and with some antivirus
-          software.
-        </span>
-      </div>
-    </div>
+    <!-- There is deliberately NO interception banner here. Interception is
+         reported by the Tab Activity pill (a red border, a red glyph and a
+         changed accessible name) and by three lines inside the Tab Activity
+         panel, the last of which names the issuing certificate.
+
+         A full-width banner asserted decryption in prose, across the whole
+         window, without showing the certificate it reasoned from -- so every
+         `classify_issuer` collision was the browser stating something untrue
+         about the user's connection, and no lexical rule removes them all
+         ("Norton Rose Fulbright SSL Issuing CA" matches the `norton` hint).
+
+         In the panel the summary verdict and the certificate that produced it
+         are adjacent: #tab-safety-desc and #tab-issuer-desc, in that order,
+         under "Is this page safe". That ORDER is the point and a gate holds
+         it -- claim and evidence are read together, so a wrong verdict is
+         visibly wrong rather than authoritative. The longer sentence under
+         "Connection" (#tab-tls-desc) sits further down and does NOT have the
+         issuer beside it, which is why it carries its own qualifier about
+         work networks and antivirus software instead. -->
 
     <!-- Find bar. Not a panel: no scrim, no focus trap, and it must stay
          reachable while a page has focus. Options are fixed (case-
@@ -805,15 +893,15 @@
         placeholder="Find in page"
         autocomplete="off"
         spellcheck="false"
-      />
+       data-msg-placeholder="chrome.find.input.placeholder"/>
       <span id="find-count" aria-live="polite"></span>
-      <span id="find-unsupported" hidden>
+      <span id="find-unsupported" hidden data-msg="chrome.find.unsupported.span">
         Find is not available with this browser engine version.
       </span>
-      <button id="find-prev" type="button" title="Previous match (Shift+Enter)">
+      <button id="find-prev" type="button" title="Previous match (Shift+Enter)" data-msg-title="chrome.find.prev.title" data-msg="chrome.find.prev.button">
         Previous
       </button>
-      <button id="find-next" type="button" title="Next match (Enter)">
+      <button id="find-next" type="button" title="Next match (Enter)" data-msg-title="chrome.find.next.title" data-msg="chrome.find.next.button">
         Next
       </button>
       <!-- Opens the find-across-tabs panel. This is the panel's
@@ -826,10 +914,10 @@
         id="find-all"
         type="button"
         title="Find across tabs (Ctrl+Shift+F)"
-      >
+       data-msg-title="chrome.find.all.title" data-msg="chrome.find.all.button">
         All tabs
       </button>
-      <button id="find-close" type="button" title="Close (Esc)">Close</button>
+      <button id="find-close" type="button" title="Close (Esc)" data-msg-title="chrome.find.close.title" data-msg="chrome.find.close.button">Close</button>
     </div>
 
     <!-- First-run tour. Auto-opened once, shown by chrome.js's boot sequence
@@ -848,38 +936,32 @@
          injected Close button and "Got it" are all exactly the same dismiss,
          and every one of them marks the tour seen (onClose below). -->
     <section id="onboarding-panel" hidden>
-      <h1>Welcome to PATANYX</h1>
-      <p class="panel-intro">
-        A few things this browser does differently, in case the icons do not
-        make it obvious.
+      <h1 data-msg="chrome.onboarding.panel.h1">Welcome to PATANYX</h1>
+      <p class="panel-intro" data-msg="chrome.onboarding.panel.p">
+        Start here.
       </p>
 
-      <span class="section-label">Who resolves the sites you visit</span>
-      <p class="panel-note">
-        Pick who looks up the sites you visit. Mullvad and Quad9 encrypt your
-        lookups and block malware and phishing. Nothing changes until you choose
-        one.
+      <span class="section-label" data-msg="chrome.onboarding.panel.span">Who resolves the sites you visit</span>
+      <p class="panel-note" data-msg="chrome.onboarding.panel.p.n2">
+        On Windows you can choose who handles your DNS lookups. Quad9 encrypts them and blocks malware and phishing. Nothing changes until you choose it.
       </p>
 
-      <span class="section-label">Quarantine tabs</span>
-      <p class="panel-note">
-        Not sure about a link? Open it in a quarantine tab. JavaScript is off,
-        blocking is on, and nothing is saved. The page freezes as soon as it
-        loads.
+      <span class="section-label" data-msg="chrome.onboarding.panel.span.n2">Quarantine tabs</span>
+      <p class="panel-note" data-msg="chrome.onboarding.panel.p.n3">
+        Open suspicious links with JavaScript off, blocking on, nothing saved, and the page frozen after loading.
       </p>
 
-      <span class="section-label">The vault</span>
-      <p class="panel-note">
-        Your passwords and notes are encrypted on this computer. Only your
-        passphrase opens them. Add a recovery key in case you ever forget it.
+      <span class="section-label" data-msg="chrome.onboarding.panel.span.n3">The vault</span>
+      <p class="panel-note" data-msg="chrome.onboarding.panel.p.n4">
+        Passwords and notes are encrypted here. Keep a recovery key in case you forget the passphrase.
       </p>
 
-      <p class="panel-note">
-        Tip: press Ctrl+K at any time to search for an action by name.
+      <p class="panel-note" data-msg="chrome.onboarding.panel.p.n5">
+        Ctrl+K searches actions.
       </p>
 
       <div class="form-buttons">
-        <button id="onboarding-done" type="button">Got it</button>
+        <button id="onboarding-done" type="button" data-msg="chrome.onboarding.done.button">Got it</button>
       </div>
     </section>
 
@@ -892,7 +974,7 @@
          `.click()` on the real element -- rather than a second copy of what
          that action does. Two code paths for one action is how they drift. -->
     <section id="palette-panel" hidden>
-      <h1>Jump to</h1>
+      <h1 data-msg="chrome.palette.panel.h1">Jump to</h1>
       <input
         id="palette-query"
         type="text"
@@ -901,9 +983,9 @@
         spellcheck="false"
         placeholder="Type an action's name…"
         aria-label="Search actions"
-      />
+        data-msg-aria-label="chrome.palette.query.aria.label"data-msg-placeholder="chrome.palette.query.placeholder"/>
       <ul id="palette-list" class="items" role="listbox"></ul>
-      <p class="panel-foot" id="palette-empty" hidden>No matching action.</p>
+      <p class="panel-foot" id="palette-empty" hidden data-msg="chrome.palette.empty.p">No matching action.</p>
     </section>
 
     <!-- Detached openers for surfaces with no toolbar button of their own.
@@ -925,7 +1007,7 @@
       class="detached-opener"
       data-premium="1"
       aria-pressed="false"
-    >
+     data-msg="chrome.btn.switcher.button">
       Switch tab
     </button>
     <button
@@ -934,30 +1016,28 @@
       class="detached-opener"
       data-premium="1"
       aria-pressed="false"
-    >
+     data-msg="chrome.btn.tabselect.button">
       Select tabs
     </button>
-
     <!-- Tab switcher (Premium). Same query-plus-list shape as
          #palette-panel, fed by the gated tabs_switcher_list arm.
          #switcher-premium replaces the list when Rust refuses, so a free
          licence never sees an empty list that reads as "no tabs". -->
     <section id="switcher-panel" hidden>
-      <h1>Switch tab</h1>
+      <h1 data-msg="chrome.switcher.panel.h1">Switch tab</h1>
       <input
         id="switcher-query"
         type="text"
         autocomplete="off"
         autocapitalize="off"
         spellcheck="false"
-        placeholder="Type a tab's title or address..."
+        placeholder="Tab title or address..."
         aria-label="Search open tabs"
-      />
+        data-msg-aria-label="chrome.switcher.query.aria.label"data-msg-placeholder="chrome.switcher.query.placeholder"/>
       <ul id="switcher-list" class="items" role="listbox"></ul>
-      <p class="panel-foot" id="switcher-empty" hidden>No matching tab.</p>
-      <p class="panel-foot" id="switcher-premium" hidden>
-        The tab switcher is a Premium feature. The Premium row in the Vault
-        panel shows your status.
+      <p class="panel-foot" id="switcher-empty" hidden data-msg="chrome.switcher.empty.p">No matching tab.</p>
+      <p class="panel-foot" id="switcher-premium" hidden data-msg="chrome.switcher.premium.p">
+        Premium required. Check your status in the Vault.
       </p>
     </section>
 
@@ -974,32 +1054,29 @@
          command: the scan holds no engine sessions and no highlights, a
          new search replaces it wholesale, and a vault lock drops it. -->
     <section id="findtabs-panel" hidden>
-      <h1>Find across tabs</h1>
+      <h1 data-msg="chrome.findtabs.panel.h1">Find across tabs</h1>
       <input
         id="findtabs-query"
         type="text"
         autocomplete="off"
         spellcheck="false"
-        placeholder="Find in every open tab"
-        aria-label="Find in every open tab"
-      />
-      <button id="findtabs-run" type="button">Search every tab</button>
-      <p class="panel-note" id="findtabs-note">
-        Pages are searched as the server delivered them, so text a page builds
-        with scripts after load is not searched. Quarantine tabs are not
-        searched.
+        placeholder="Search open tabs"
+        aria-label="Search open tabs"
+        data-msg-aria-label="chrome.findtabs.query.aria.label"data-msg-placeholder="chrome.findtabs.query.placeholder"/>
+      <button id="findtabs-run" type="button" data-msg="chrome.findtabs.run.button">Search tabs</button>
+      <p class="panel-note" id="findtabs-note" data-msg="chrome.findtabs.note.p">
+        Search reads pages as the server delivered them. It misses text built by scripts. Quarantine tabs are not searched.
       </p>
-      <p class="panel-note" id="findtabs-premium" hidden>
-        Premium unlocks it when it launches. The Premium row in the Vault panel
-        shows your status.
+      <p class="panel-note" id="findtabs-premium" hidden data-msg="chrome.findtabs.premium.p">
+        Available when PATANYX Premium launches. Check the Vault.
       </p>
       <p id="findtabs-progress" aria-live="polite"></p>
       <ul id="findtabs-list" class="items" role="list"></ul>
-      <p class="panel-foot" id="findtabs-empty" hidden>
-        No open tab contains that.
+      <p class="panel-foot" id="findtabs-empty" hidden data-msg="chrome.findtabs.empty.p">
+        No tab contains that.
       </p>
-      <p class="panel-foot" id="findtabs-locked" hidden>
-        The vault locked. Search again after unlocking.
+      <p class="panel-foot" id="findtabs-locked" hidden data-msg="chrome.findtabs.locked.p">
+        Unlock the Vault, then search again.
       </p>
       <!-- The panel ships its OWN close control, at the END on purpose:
            registerPanel injects one as the first child only when a panel
@@ -1012,7 +1089,7 @@
         class="panel-close"
         type="button"
         aria-label="Close this panel"
-      >
+       data-msg-aria-label="chrome.findtabs.close.aria.label" data-msg="chrome.findtabs.close.button">
         Close
       </button>
     </section>
@@ -1023,56 +1100,83 @@
          disabled and say why, rather than silently doing nothing. -->
 
     <section id="tab-panel" hidden>
-      <h1>Tab Activity</h1>
+      <h1 data-msg="chrome.tab.panel.h1">Tab Activity</h1>
 
-      <span class="section-label">Network requests</span>
+      <div id="tab-tabs" role="tablist" aria-label="Tab panel sections" data-msg-aria-label="chrome.tab.tabs.aria.label">
+        <button id="btn-tab-info" type="button" class="small" aria-pressed="true">
+          <!-- The About button's info mark, reused rather than redrawn: the
+               same idea should not have two shapes in one interface. -->
+          <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+            <circle cx="8" cy="8" r="6" />
+            <path d="M8 7.2 V11.2" />
+            <path d="M8 4.9 V5.2" />
+          </svg>
+          <span data-msg="chrome.btn.tab.info.button">Info</span>
+        </button>
+        <button id="btn-tab-translate" type="button" class="small" aria-pressed="false">
+          <!-- The translate mark every browser uses: a glyph beside a letter,
+               one script becoming another. Drawn in the same 16px stroke
+               language as the rest so it sits in the row without shouting. -->
+          <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+            <path d="M1.8 3.4 H7.4" />
+            <path d="M4.6 2.2 V3.4" />
+            <path d="M6.2 3.4 C6.2 6.6 4.4 8.6 2.2 9.6" />
+            <path d="M3.2 5.6 C3.6 7.4 5 8.8 6.8 9.4" />
+            <path d="M8.6 14 L11.4 6.8 L14.2 14" />
+            <path d="M9.6 11.6 H13.2" />
+          </svg>
+          <span data-msg="chrome.btn.tab.translate.button">Translation</span>
+        </button>
+      </div>
+
+      <div id="tab-info-body" class="tab-body">
+      <span class="section-label" data-msg="chrome.tab.info.safety.label">Is this page safe</span>
+      <p class="panel-intro" id="tab-safety-desc"></p>
+      <p class="panel-intro" id="tab-issuer-desc"></p>
+
+      <span class="section-label" data-msg="chrome.tab.panel.span">Network requests</span>
       <p class="panel-intro" id="tab-freeze-desc"></p>
       <div class="form-buttons">
-        <button id="btn-tabfreeze" type="button">Freeze this tab</button>
-        <button id="btn-allow-site" type="button" class="small">
+        <button id="btn-tabfreeze" type="button" data-msg="chrome.btn.tabfreeze.button">Freeze this tab</button>
+        <button id="btn-allow-site" type="button" class="small" data-msg="chrome.btn.allow.site.button">
           Allow this site while frozen
         </button>
       </div>
-      <p class="panel-note">
-        Freezing stops a page from sending anything once it has loaded. Live
-        pages like chat and maps stop working. That is what it is for. It
-        affects this tab only, and you can undo it. A site you allow keeps
-        working until the tab closes.
+      <p class="panel-note" data-msg="chrome.tab.panel.p">
+        Stops this tab from sending data. Chat, maps, and other live pages stop. Allowed sites stay live until the tab closes.
       </p>
 
-      <span class="section-label">Storage</span>
+      <span class="section-label" data-msg="chrome.tab.panel.span.n2">Storage</span>
       <p class="panel-intro" id="tab-profile-desc"></p>
       <div class="form-buttons">
-        <button id="btn-quarantine-panel" type="button" class="small">
+        <button id="btn-quarantine-panel" type="button" class="small" data-msg="chrome.btn.quarantine.panel.button">
           Open a quarantine tab
         </button>
       </div>
-      <p class="panel-note">
-        A quarantine tab opens with JavaScript off, blocking on, and nothing
-        saved. It freezes as soon as the page loads. Storage is set when the tab
-        opens and cannot change afterwards.
+      <p class="panel-note" data-msg="chrome.tab.panel.p.n2">
+        JavaScript off. Blocking on. Nothing saved. Freezes after loading; storage cannot change.
       </p>
 
-      <span class="section-label">Connection</span>
+      <span class="section-label" data-msg="chrome.tab.panel.span.n3">Connection</span>
       <p class="panel-intro" id="tab-tls-desc"></p>
 
-      <span class="section-label">Cookies</span>
+      <span class="section-label" data-msg="chrome.tab.panel.span.n4">Cookies</span>
       <p class="panel-intro" id="tab-forget-desc"></p>
       <div class="form-buttons">
-        <button id="btn-site-forget" type="button" class="small danger">
+        <button id="btn-site-forget" type="button" class="small danger" data-msg="chrome.btn.site.forget.button">
           Forget this site
         </button>
       </div>
       <div id="site-forget-confirm" hidden>
         <p class="destructive-warning">
-          <strong>This clears cookies for this site only.</strong> Your saved
-          passwords and other site data are left alone. This cannot be undone.
+          <strong data-msg="chrome.site.forget.confirm.strong">Clears only this site's cookies.</strong>
+          <span data-msg="chrome.site.forget.confirm.rest">Saved passwords and other site data stay. This cannot be undone.</span>
         </p>
         <div class="form-buttons">
-          <button id="site-forget-yes" type="button" class="small danger">
+          <button id="site-forget-yes" type="button" class="small danger" data-msg="chrome.site.forget.yes.button">
             Yes, forget it
           </button>
-          <button id="site-forget-cancel" type="button" class="small">
+          <button id="site-forget-cancel" type="button" class="small" data-msg="chrome.site.forget.cancel.button">
             Cancel
           </button>
         </div>
@@ -1088,24 +1192,23 @@
       <!-- Saved into the downloads folder rather than a chosen location, and
            the copy says so. Verify only ever looks there, so a file the user
            placed elsewhere would get a record it could never check. -->
-      <span class="section-label">Archive</span>
-      <p class="panel-intro" id="tab-pdf-desc">
-        Saves this page to your downloads as a PDF, along with the address it
-        came from, so you can check later that it has not changed.
+      <span class="section-label" data-msg="chrome.tab.panel.span.n5">Archive</span>
+      <p class="panel-intro" id="tab-pdf-desc" data-msg="chrome.tab.pdf.desc.p">
+        Saves a PDF and its source address to Downloads for later comparison.
       </p>
       <div class="form-buttons">
-        <button id="btn-save-pdf" type="button" class="small">
+        <button id="btn-save-pdf" type="button" class="small" data-msg="chrome.btn.save.pdf.button">
           Save page as PDF
         </button>
-        <button id="btn-capture" type="button" class="small">
+        <button id="btn-capture" type="button" class="small" data-msg="chrome.btn.capture.button">
           Save picture of page
         </button>
       </div>
 
-      <span class="section-label">Passwords</span>
+      <span class="section-label" data-msg="chrome.tab.panel.span.n6">Passwords</span>
       <p class="panel-intro" id="tab-autofill-desc"></p>
       <div class="form-buttons">
-        <button id="btn-autofill-fill" type="button" class="small" disabled>
+        <button id="btn-autofill-fill" type="button" class="small" disabled data-msg="chrome.btn.autofill.fill.button">
           Fill saved password
         </button>
       </div>
@@ -1113,13 +1216,75 @@
       <!-- Privacy receipt: the ledger's own numbers, nothing estimated.
            Where the engine cannot observe blocking these lines say so in
            words; they never show a structural zero as a finding. -->
-      <span class="section-label">What was refused</span>
+      <span class="section-label" data-msg="chrome.tab.panel.span.n7">What was refused</span>
       <p class="panel-intro" id="receipt-session"></p>
+      <p class="panel-note" id="receipt-session-caption"></p>
       <p class="panel-intro" id="receipt-page"></p>
 
-      <h2>Hosts this tab has contacted</h2>
+      <!-- A separate reading, intentionally outside the privacy receipt.
+           The receipt is engine-owned; these are untrusted claims pushed by
+           the page world. Rust supplies every factual label/caveat and JS
+           inserts them with textContent. -->
+      <span class="section-label" id="fingerprint-probe-label"></span>
+      <p class="panel-note" id="fingerprint-probe-caveat"></p>
+      <ul id="fingerprint-probe-list" class="items">
+        <li class="item" id="fingerprint-probe-audio"></li>
+        <li class="item" id="fingerprint-probe-canvas"></li>
+        <li class="item" id="fingerprint-probe-webgl"></li>
+        <li class="item" id="fingerprint-probe-element-measurement"></li>
+      </ul>
+      <p class="panel-foot" id="fingerprint-probe-status"></p>
+
+      <h2 data-msg="chrome.tab.panel.h2">Hosts this tab has contacted</h2>
       <ul id="ledger-list" class="items"></ul>
       <p class="panel-foot" id="ledger-foot"></p>
+      </div>
+
+      <div id="tab-translate-body" class="tab-body" hidden>
+      <span class="section-label" data-msg="chrome.tab.translate.span">Translate this page</span>
+      <p class="panel-intro" data-msg="chrome.tab.translate.intro">
+        Translation runs on your computer. The page is translated where you
+        are reading it, and what you were reading is not sent anywhere.
+      </p>
+      <p class="panel-intro" id="translate-detected" hidden></p>
+      <div class="field-row">
+        <label for="translate-source" data-msg="chrome.tab.translate.source.label">Page language</label>
+        <select id="translate-source"></select>
+      </div>
+      <div class="field-row">
+        <label for="translate-target" data-msg="chrome.tab.translate.target.label">Translate into</label>
+        <select id="translate-target"></select>
+      </div>
+      <div class="form-buttons">
+        <button id="btn-translate" type="button" class="small" data-msg="chrome.btn.translate.button">
+          Translate this page
+        </button>
+        <button id="btn-translate-restore" type="button" class="small" hidden data-msg="chrome.btn.translate.restore.button">
+          Show original
+        </button>
+      </div>
+      <p class="panel-note" data-msg="chrome.tab.translate.disclosure">
+        The first time you choose a language, the browser downloads that language pack from us. That request tells our server which language pair you selected, and nothing about the page you were reading. After the pack is stored, translating contacts nobody.
+      </p>
+      <p class="panel-intro" id="translate-status" hidden></p>
+      <!-- Diagnostic readout: which translator.js is running and how much
+           heap the engine got. Populated by the host, hidden unless a
+           translation is live. Not a control. -->
+      <p class="panel-note muted" id="translate-engine-diag" hidden></p>
+      <div class="form-buttons" id="translate-active" hidden>
+        <button id="btn-translate-stop" type="button" class="small" data-msg="chrome.btn.translate.stop.button">
+          Stop translating
+        </button>
+      </div>
+
+      <span class="section-label" data-msg="chrome.tab.translate.manage.label">Languages you can install</span>
+      <p class="panel-note" data-msg="chrome.tab.translate.manage.note">
+        Install a language to translate pages in it. Packs are a few tens of
+        megabytes and download once, then work offline. Language names are shown
+        in English for now.
+      </p>
+      <ul id="translate-langs" class="items"></ul>
+      </div>
     </section>
     <!-- BOOKMARKS MANAGER. Carries `panel-modal` like every other panel (the
          shared card geometry, positioning and scrolling all hang off it) plus
@@ -1131,13 +1296,13 @@
          it silently did nothing for the first person who tried it. The
          Folders button on each row is the real mechanism. -->
     <section id="bookmarks-panel" class="panel-modal panel-wide" hidden>
-      <!-- The PANEL is "Library": it holds bookmarks, the tabs you set aside
+      <!-- The PANEL is "Library": it holds bookmarks, the tabs you shelved
            and download records, so naming it after only the first would be
            wrong the moment someone opens Downloads. "Bookmark Manager" is the
            <h3> on the bookmarks view below, and that is the name the About
            page carries; a gate compares those two strings so they cannot
            drift apart. -->
-      <h2>Library</h2>
+      <h2 data-msg="chrome.bookmarks.panel.h2">Library</h2>
 
       <!-- Vault locked: bookmarks, shelves and download records all live in
            the encrypted store, so there is nothing to show until it opens.
@@ -1152,97 +1317,107 @@
            to anyway. Typing "example.com" is enough; it is completed to
            https:// on the way in. -->
         <div id="bmm-bookmarks-top">
-          <h3 class="section-head">Bookmark Manager</h3>
+          <h3 class="section-head" data-msg="chrome.bmm.bookmarks.top.h3">Bookmark Manager</h3>
           <div class="form-buttons">
-            <button id="bm-import" type="button" class="small">
+            <button id="bm-import" type="button" class="small" data-msg="chrome.bm.import.button">
               Import bookmarks
             </button>
             <button
               id="set-aside"
               type="button"
               class="small"
-              title="Store this window's tabs as a shelf and close them"
-            >
-              Set aside all tabs
+              title="Shelve and close this window's tabs" data-msg="chrome.set.aside.button" data-msg-title="chrome.set.aside.title">
+              Shelve all tabs
+            </button>
+            <button id="btn-partnerships" type="button" class="small" data-msg="chrome.btn.partnerships.button">
+              Partnerships
             </button>
           </div>
-          <p class="panel-foot" id="bm-import-summary" hidden></p>
-          <div id="bmm-add-row">
-            <input
-              id="bmm-add-url"
-              type="text"
-              placeholder="Address (example.com)"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Address of the bookmark to add"
-            />
-            <input
-              id="bmm-add-title"
-              type="text"
-              placeholder="Name (optional)"
-              autocomplete="off"
-              aria-label="Name for the bookmark"
-            />
-            <button id="bmm-add" type="button" class="small">
-              Add bookmark
-            </button>
-          </div>
-          <p class="panel-note" id="bmm-add-error" hidden></p>
+          <div id="bmm-bookmark-tools">
+            <p class="panel-foot" id="bm-import-summary" hidden></p>
+            <div id="bmm-add-row">
+              <input
+                id="bmm-add-url"
+                type="text"
+                placeholder="Address (example.com)"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Address of the bookmark to add"
+              / data-msg-aria-label="chrome.bmm.add.url.aria.label" data-msg-placeholder="chrome.bmm.add.url.placeholder">
+              <input
+                id="bmm-add-title"
+                type="text"
+                placeholder="Name (optional)"
+                autocomplete="off"
+                aria-label="Name for the bookmark"
+              / data-msg-aria-label="chrome.bmm.add.title.aria.label" data-msg-placeholder="chrome.bmm.add.title.placeholder">
+              <button id="bmm-add" type="button" class="small" data-msg="chrome.bmm.add.button">
+                Add bookmark
+              </button>
+            </div>
+            <p class="panel-note" id="bmm-add-error" hidden></p>
 
-          <!-- Quick Access: PINNED AT THE TOP. It is deliberately outside the
-           filtering below, so choosing a folder, typing a search or changing
-           the sort never takes it away. -->
-          <h3 class="section-head">Quick Access</h3>
-          <div id="bmm-quick"></div>
-          <p class="panel-foot" id="bmm-quick-empty" hidden>
-            Nothing pinned yet. Use Pin on any bookmark to put it here.
-          </p>
+            <!-- Quick Access: PINNED AT THE TOP. It is deliberately outside the
+             filtering below, so choosing a folder, typing a search or changing
+             the sort never takes it away. -->
+            <h3 class="section-head" data-msg="chrome.bmm.bookmarks.top.h3.n2">Quick Access</h3>
+            <div id="bmm-quick"></div>
+            <p class="panel-foot" id="bmm-quick-empty" hidden data-msg="chrome.bmm.quick.empty.p">
+              Nothing pinned. Use Pin to add bookmarks.
+            </p>
 
-          <div id="bmm-controls">
-            <input
-              id="bmm-search"
-              type="text"
-              placeholder="Search bookmarks by name or address"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="Search bookmarks"
-            />
-            <select id="bmm-sort" aria-label="Sort bookmarks">
-              <option value="newest">Newest first</option>
-              <option value="oldest">Oldest first</option>
-              <option value="title">Name A to Z</option>
-            </select>
-            <input
-              id="bmm-new-folder"
-              type="text"
-              maxlength="40"
-              placeholder="New folder name"
-              autocomplete="off"
-              spellcheck="false"
-              aria-label="New folder name"
-            />
-            <button id="bmm-new-folder-add" type="button" class="small">
-              New folder
-            </button>
-            <!-- Last in the row and styled as a danger action: it empties the
+            <div id="bmm-controls">
+              <input
+                id="bmm-search"
+                type="text"
+                placeholder="Search bookmarks by name or address"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="Search bookmarks"
+              / data-msg-aria-label="chrome.bmm.search.aria.label" data-msg-placeholder="chrome.bmm.search.placeholder">
+              <select id="bmm-sort" aria-label="Sort bookmarks" data-msg-aria-label="chrome.bmm.sort.aria.label">
+                <option value="newest" data-msg="chrome.bmm.sort.option">Newest first</option>
+                <option value="oldest" data-msg="chrome.bmm.sort.option.n2">Oldest first</option>
+                <option value="title" data-msg="chrome.bmm.sort.option.n3">Name A to Z</option>
+              </select>
+              <input
+                id="bmm-new-folder"
+                type="text"
+                maxlength="40"
+                placeholder="New folder name"
+                autocomplete="off"
+                spellcheck="false"
+                aria-label="New folder name"
+              / data-msg-aria-label="chrome.bmm.new.folder.aria.label" data-msg-placeholder="chrome.bmm.new.folder.placeholder">
+              <button id="bmm-new-folder-add" type="button" class="small" data-msg="chrome.bmm.new.folder.add.button">
+                New folder
+              </button>
+              <!-- Last in the row and styled as a danger action: it empties the
                whole manager and there is no undo. The confirmation, not this
                button, is what stands between a stray click and the data. -->
-            <button id="bmm-delete-all" type="button" class="small danger">
-              Delete all bookmarks
-            </button>
+              <button id="bmm-delete-all" type="button" class="small danger" data-msg="chrome.bmm.delete.all.button">
+                Delete all bookmarks
+              </button>
+            </div>
+            <p class="panel-note" id="bmm-folder-error" hidden></p>
           </div>
-          <p class="panel-note" id="bmm-folder-error" hidden></p>
         </div>
 
         <div class="bmm-body">
-          <nav id="bmm-folders" aria-label="Folders"></nav>
+          <nav id="bmm-folders" aria-label="Folders" data-msg-aria-label="chrome.bmm.folders.aria.label"></nav>
           <div class="bmm-main-col">
-            <!-- One view at a time, chosen from the sidebar. Bookmarks, the
-               tabs you set aside, and download records all live in this one
-               panel now; they used to be three tabs in a separate Library. -->
+            <!-- One view at a time, chosen from the sidebar or the Partnerships
+               header control. Bookmarks, the tabs you shelved, download
+               records and the consolidated partner list all live in this one
+               panel. -->
             <div id="bmm-view-bookmarks">
               <div id="bmm-batch" hidden></div>
               <div id="bmm-cards"></div>
+              <p class="panel-note" id="bmm-snapshots-caption" hidden data-msg="chrome.bmm.snapshots.caption.p">
+                A snapshot keeps hashes, visible text, and a picture of the
+                page when capture succeeds. Check for changes compares the
+                page as it is now with what you saved.
+              </p>
               <ul id="bmm-list"></ul>
               <p class="panel-foot" id="bmm-empty" hidden></p>
 
@@ -1254,13 +1429,13 @@
                   autocomplete="off"
                   autocapitalize="off"
                   spellcheck="false"
-                />
+                 data-msg-placeholder="chrome.bookmark.url.placeholder"/>
                 <input
                   id="bookmark-title"
                   type="text"
                   placeholder="Title"
                   autocomplete="off"
-                />
+                 data-msg-placeholder="chrome.bookmark.title.placeholder"/>
                 <!-- Tags, comma separated. Plain text rather than a chip editor:
                  the rest of this form is plain inputs, and the store is the
                  thing that normalises (trim, lowercase, dedupe, cap), so the
@@ -1271,39 +1446,43 @@
                   placeholder="Tags, separated by commas"
                   autocomplete="off"
                   autocapitalize="off"
-                />
+                 data-msg-placeholder="chrome.bookmark.tags.placeholder"/>
                 <div class="form-buttons">
-                  <button id="bookmark-submit" type="submit">
+                  <button id="bookmark-submit" type="submit" data-msg="chrome.bookmark.submit.button">
                     Save changes
                   </button>
-                  <button id="bookmark-cancel" type="button">Cancel</button>
+                  <button id="bookmark-cancel" type="button" data-msg="chrome.bookmark.cancel.button">Cancel</button>
                 </div>
                 <p class="error" id="bookmark-error"></p>
               </form>
             </div>
 
             <div id="bmm-view-shelves" hidden>
-              <h3 class="section-head">Sets of tabs</h3>
-              <p class="panel-foot">
-                Whole windows you set aside, with the notes you left on them.
+              <h3 class="section-head" data-msg="chrome.bmm.view.shelves.h3">Tab Shelf</h3>
+              <p class="panel-foot" data-msg="chrome.bmm.view.shelves.p">
+                Windows and notes you shelved.
               </p>
               <ul id="shelf-list-2"></ul>
             </div>
 
             <div id="bmm-view-downloads" hidden>
-              <p class="panel-intro">
-                Every download gets a fingerprint when it finishes. Verify
-                checks the file on this computer against it.
+              <p class="panel-intro" data-msg="chrome.bmm.view.downloads.p">
+                Verify compares a finished download with its saved fingerprint.
               </p>
               <ul id="download-list" class="items"></ul>
-              <p class="panel-foot" id="download-empty" hidden>
-                Nothing here yet. Downloads are fingerprinted when they finish,
-                as long as the vault is unlocked.
+              <p class="panel-foot" id="download-empty" hidden data-msg="chrome.download.empty.p">
+                No downloads yet. Fingerprints require an unlocked vault.
               </p>
-              <p class="panel-foot">
-                A pass means the file has not changed since it arrived. It does
-                not tell you whether the file was safe to begin with.
+              <p class="panel-foot" data-msg="chrome.bmm.view.downloads.p.n2">
+                A pass means the file has not changed. It does not mean the file was safe.
               </p>
+            </div>
+
+            <div id="bmm-view-partnerships" hidden>
+              <h3 class="section-head" data-msg="chrome.bmm.view.partnerships.h3">Partnerships</h3>
+              <p id="partner-library-framing" class="panel-intro"></p>
+              <div id="partner-library"></div>
+              <p id="partner-library-empty" class="panel-foot" hidden></p>
             </div>
           </div>
         </div>
@@ -1320,44 +1499,36 @@
          about.rs beside the sentence that binds it). Nothing here takes a
          `data-premium` marker. -->
     <section id="theme-panel" hidden>
-      <h1>Theme</h1>
-      <p class="panel-intro">
-        How this browser looks. Only the Page colors choice is visible to
-        websites; everything else is yours alone.
-      </p>
+      <h1 data-msg="chrome.theme.panel.h1">Theme</h1>
 
       <section id="theme-choice">
-        <h3 class="section-head">Page colors</h3>
-        <p class="panel-foot">
-          Sites that have a dark theme will use it. Sites without one are
-          unchanged. Nothing is repainted or injected; this only tells sites
-          which look you prefer.
-        </p>
+        <h3 class="section-head" data-msg="chrome.theme.choice.h3">Page colors</h3>
         <div class="form-buttons">
-          <button id="theme-auto" type="button" class="small">
+          <button id="theme-auto" type="button" class="small" data-msg="chrome.theme.auto.button">
             Follow system
           </button>
-          <button id="theme-dark" type="button" class="small">Dark</button>
-          <button id="theme-light" type="button" class="small">Light</button>
+          <button id="theme-dark" type="button" class="small" data-msg="chrome.theme.dark.button">Dark</button>
+          <button id="theme-light" type="button" class="small" data-msg="chrome.theme.light.button">Light</button>
         </div>
         <p class="panel-foot" id="theme-note" hidden></p>
       </section>
 
       <section id="scheme-choice">
-        <h3 class="section-head">Chrome colors</h3>
-        <p class="panel-foot">
-          The look of the browser itself. Your pick sticks; nothing here follows
-          the system. Pages are not affected.
-        </p>
+        <h3 class="section-head" data-msg="chrome.scheme.choice.h3">Chrome colors</h3>
         <div class="form-buttons">
-          <button id="scheme-dark" type="button" class="small">Dark</button>
-          <button id="scheme-white" type="button" class="small">White</button>
-          <button id="scheme-black" type="button" class="small">Black</button>
+          <button id="scheme-dark" type="button" class="small" data-msg="chrome.scheme.dark.button">Dark</button>
+          <button id="scheme-white" type="button" class="small" data-msg="chrome.scheme.white.button">White</button>
+          <button id="scheme-black" type="button" class="small" data-msg="chrome.scheme.black.button">Black</button>
         </div>
       </section>
 
       <section id="accent-choice">
-        <h3 class="section-head">Accent color</h3>
+        <h3 class="section-head" data-msg="chrome.accent.choice.h3">Accent color</h3>
+        <!-- Shown only where chrome_caps.page_scrollbar is "live" (WebView2):
+             chrome.js hides it otherwise. The comment above promised this
+             paragraph since 2026-08-17 and the element never existed, so the
+             sentence could not render anywhere (launch sweep F-005). -->
+        <p class="panel-foot" id="accent-scrollbar-note" hidden data-msg="chrome.accent.scrollbar.p">The accent also colors the scrollbars of pages on this engine.</p>
         <!-- The copy names the tab strip and address bar because the accent
              reaches them now. It used to say "highlight color of this
              browser's own toolbar and panels", which was accurate while the
@@ -1370,15 +1541,6 @@
              it (WebView2 -- WebKitGTK has no scrollbar-color). The title bar
              is deliberately NOT listed: only Windows 11 honours it, and a
              sentence true on one platform is not copy. -->
-        <p class="panel-foot">
-          The color this browser wears: its frame, tab strip, toolbar, address
-          bar and panels. Pages keep their own colors.
-        </p>
-        <p class="panel-foot" id="accent-scrollbar-note" hidden>
-          The scrollbars of the pages you open follow it too. A page that sets
-          its own scrollbar color keeps that, and a page can read the color it
-          was given, so the accent you choose is something a site can tell.
-        </p>
         <!-- EVERY LABEL BELOW IS A LABEL ONLY, and the nine stored values
              are frozen. `default`, `violet`, `blood_red`, `sky`, `green`,
              `amber`, `teal`, `slate` and `purple` are what prefs.rs
@@ -1424,7 +1586,7 @@
             data-theme-choice="default"
             title="PATANYX Original: blue"
             aria-label="PATANYX Original, blue"
-          >
+           data-msg-aria-label="chrome.accent.default.aria.label" data-msg-title="chrome.accent.default.title">
             <span class="swatch"></span>PATANYX Original
           </button>
           <button
@@ -1434,7 +1596,7 @@
             data-theme-choice="violet"
             title="Ion: violet"
             aria-label="Ion, violet"
-          >
+           data-msg-aria-label="chrome.accent.violet.aria.label" data-msg-title="chrome.accent.violet.title">
             <!-- The Greek for the violet flower, and the particle. Also
                  settles what "Lavender" was working around: violet read as
                  a shade of purple beside a Purple, and this name does not
@@ -1448,7 +1610,7 @@
             data-theme-choice="blood_red"
             title="Sardonyx: deep red"
             aria-label="Sardonyx, deep red"
-          >
+           data-msg-aria-label="chrome.accent.blood.red.aria.label" data-msg-title="chrome.accent.blood.red.title">
             <!-- The banded red stone. Ends the way the browser's name does,
                  which is the one place in this list that is allowed to be a
                  wink. -->
@@ -1461,7 +1623,7 @@
             data-theme-choice="sky"
             title="Aether: sky blue"
             aria-label="Aether, sky blue"
-          >
+           data-msg-aria-label="chrome.accent.sky.aria.label" data-msg-title="chrome.accent.sky.title">
             <span class="swatch"></span>Aether
           </button>
           <button
@@ -1471,7 +1633,7 @@
             data-theme-choice="green"
             title="Chloris: green"
             aria-label="Chloris, green"
-          >
+           data-msg-aria-label="chrome.accent.green.aria.label" data-msg-title="chrome.accent.green.title">
             <span class="swatch"></span>Chloris
           </button>
           <button
@@ -1481,7 +1643,7 @@
             data-theme-choice="amber"
             title="Elektron: amber"
             aria-label="Elektron, amber"
-          >
+           data-msg-aria-label="chrome.accent.amber.aria.label" data-msg-title="chrome.accent.amber.title">
             <span class="swatch"></span>Elektron
           </button>
           <button
@@ -1491,7 +1653,7 @@
             data-theme-choice="teal"
             title="Thalassa: teal"
             aria-label="Thalassa, teal"
-          >
+           data-msg-aria-label="chrome.accent.teal.aria.label" data-msg-title="chrome.accent.teal.title">
             <span class="swatch"></span>Thalassa
           </button>
           <button
@@ -1501,7 +1663,7 @@
             data-theme-choice="slate"
             title="Lithos: gray"
             aria-label="Lithos, gray"
-          >
+           data-msg-aria-label="chrome.accent.slate.aria.label" data-msg-title="chrome.accent.slate.title">
             <span class="swatch"></span>Lithos
           </button>
           <button
@@ -1511,7 +1673,7 @@
             data-theme-choice="purple"
             title="Porphyra: purple"
             aria-label="Porphyra, purple"
-          >
+           data-msg-aria-label="chrome.accent.purple.aria.label" data-msg-title="chrome.accent.purple.title">
             <span class="swatch"></span>Porphyra
           </button>
         </div>
@@ -1527,35 +1689,62 @@
            argument is not being reversed -- it is being offered as a choice
            to a reader who already knows the row. Hiding a label never hides
            a name: `title` and `aria-label` are untouched. -->
+      <!-- The chrome's language. Options come from ui_locale_get, so a
+           locale compiled into the binary is offered without an edit here.
+           en-XA is the generated layout-test locale: accented, padded,
+           deliberately strange-looking -- it ships pre-1.0 because a
+           second live locale is what keeps the whole non-English path
+           honest, and its appearance says clearly that it is a tool, not
+           a translation. The change applies IMMEDIATELY, everywhere, no
+           restart: the apply-live rule. What websites see is a separate
+           setting this control never touches (the divergence non-goals
+           carry that ruling). -->
+      <section id="locale-choice">
+        <h3 class="section-head" data-msg="chrome.locale.choice.h3">Language</h3>
+        <p class="panel-foot" data-msg="chrome.locale.choice.p">
+          The browser's own words. Pages are not translated, and what sites
+          see does not change.
+        </p>
+        <div class="form-buttons" id="locale-buttons"></div>
+      </section>
+
       <section id="labels-choice">
-        <h3 class="section-head">Toolbar</h3>
+        <h3 class="section-head" data-msg="chrome.labels.choice.h3">Toolbar</h3>
         <!-- TWO ROWS, ONE SECTION, and the order is the argument: where the
              buttons are, then what they look like. The second question only
-             half applies to the first answer -- a left strip is icons only,
+             half applies to the first answer -- a side strip is icons only,
              because a column wide enough for words is a column taking width
              from the page -- so the note says so rather than leaving a
              control that looks live and does nothing. That is the same rule
              the DNS row follows when the engine cannot honour a resolver. -->
-        <p class="panel-foot">
-          Feature buttons can sit above the page or in a strip down the left.
-          Tabs and the address bar stay at the top either way.
-        </p>
         <div class="form-buttons">
-          <button id="placement-top" type="button" class="small">Top</button>
-          <button id="placement-left" type="button" class="small">Left</button>
+          <button id="placement-top_left" type="button" class="small" data-msg="chrome.placement.top.left.button">
+            Top Left
+          </button>
+          <button id="placement-top_right" type="button" class="small" data-msg="chrome.placement.top.right.button">
+            Top Right
+          </button>
+          <button id="placement-left" type="button" class="small" data-msg="chrome.placement.left.button">Left</button>
+          <button id="placement-right" type="button" class="small" data-msg="chrome.placement.right.button">
+            Right
+          </button>
         </div>
-        <p class="panel-foot" id="placement-note" hidden></p>
         <!-- The two button labels already say "names or icons", so the note
              here answers the question they raise instead of repeating them:
              what you lose by turning the words off, which is nothing. -->
-        <p class="panel-foot">
-          With names off, hovering a button still tells you what it does.
-        </p>
-        <div class="form-buttons">
-          <button id="labels-show" type="button" class="small">
+        <div class="form-buttons" id="labels-buttons">
+          <button
+            id="labels-show"
+            type="button"
+            class="small"
+            title="The left and right strips show icons only." data-msg="chrome.labels.show.button" data-msg-title="chrome.labels.show.title">
             Icons and names
           </button>
-          <button id="labels-hide" type="button" class="small">
+          <button
+            id="labels-hide"
+            type="button"
+            class="small"
+            title="The left and right strips show icons only." data-msg="chrome.labels.hide.button" data-msg-title="chrome.labels.hide.title">
             Icons only
           </button>
         </div>
@@ -1571,33 +1760,63 @@
          string comes from ERROR_TEXT; the strings written here are the
          static frame. -->
     <section id="region-panel" hidden>
-      <h1>Read text on this page</h1>
-      <p class="panel-intro">
-        Captures this page and reads the text you select, even text locked
-        inside images. Every step runs on this device. Nothing leaves it.
+      <h1 data-msg="chrome.region.panel.h1">Read text on this page</h1>
+      <p class="panel-intro" data-msg="chrome.region.panel.p">
+        Select text to read, including text inside images. Nothing leaves this device.
       </p>
-      <p class="panel-note" id="region-premium" hidden>
-        Text Capture is a Premium feature, arriving the day Premium launches.
-        Watch the Premium row in the Vault panel for your status.
+      <p class="panel-note" id="region-premium" hidden data-msg="chrome.region.premium.p">
+        Text Capture is a Premium feature. Add your Premium token in the Vault panel to use it.
       </p>
+      <p class="section-head" data-msg="chrome.region.panel.p.n2">Capture</p>
+      <div
+        class="form-buttons"
+        role="group"
+        aria-label="How much of the page to capture" data-msg-aria-label="chrome.div.aria.label">
+        <button id="region-scope-full" type="button" class="small" data-msg="chrome.region.scope.full.button">
+          Full page
+        </button>
+        <button id="region-scope-viewport" type="button" class="small" data-msg="chrome.region.scope.viewport.button">
+          Just what's on screen
+        </button>
+        <button id="region-capture" type="button" class="small" data-msg="chrome.region.capture.button">
+          Capture page
+        </button>
+      </div>
       <p id="region-status" aria-live="polite"></p>
+      <div id="region-zoom-controls" class="form-buttons" hidden>
+        <button
+          id="region-zoom-out"
+          type="button"
+          class="small"
+          aria-label="Zoom out" data-msg-aria-label="chrome.recall.preview.out.aria.label">
+          &minus;
+        </button>
+        <span id="region-zoom-level" aria-live="polite">100%</span>
+        <button
+          id="region-zoom-in"
+          type="button"
+          class="small"
+          aria-label="Zoom in" data-msg-aria-label="chrome.recall.preview.in.aria.label">
+          +
+        </button>
+      </div>
       <div id="region-stage" hidden>
         <img
           id="region-img"
           alt="Capture of the current page"
           draggable="false"
-        />
+         data-msg-alt="chrome.region.img.alt"/>
         <div id="region-selbox" hidden aria-hidden="true"></div>
       </div>
       <p class="panel-foot" id="region-scope" hidden></p>
       <div id="region-result-wrap" hidden>
-        <h3 class="section-head">Text found</h3>
+        <h3 class="section-head" data-msg="chrome.region.result.wrap.h3">Text found</h3>
         <pre id="region-result"></pre>
         <div class="form-buttons">
-          <button id="region-copy" type="button" class="small">
+          <button id="region-copy" type="button" class="small" data-msg="chrome.region.copy.button">
             Copy text
           </button>
-          <button id="region-again" type="button" class="small">
+          <button id="region-again" type="button" class="small" data-msg="chrome.region.again.button">
             New capture
           </button>
         </div>
@@ -1617,8 +1836,8 @@
          with the panel it already builds. The tab strip is markup so the
          gate harness (which loads chrome.js alone) can drive it. -->
     <section id="integrity-host" hidden>
-      <div id="tools-tabs" role="tablist" aria-label="Page tools">
-        <button id="btn-tab-integrity" type="button" class="small" aria-pressed="true">
+      <div id="tools-tabs" role="tablist" aria-label="Page tools" data-msg-aria-label="chrome.tools.tabs.aria.label">
+        <button id="btn-tab-integrity" type="button" class="small" aria-pressed="true" data-msg="chrome.btn.tab.integrity.button">
           Page integrity
         </button>
         <!-- data-premium came across with the feature. The toolbar button
@@ -1633,79 +1852,109 @@
           class="small"
           data-premium="1"
           aria-pressed="false"
-        >
+         data-msg="chrome.btn.tab.recall.button">
           Deep Recall
         </button>
         <!-- Hidden until the OCR models are confirmed installed, exactly like
              the section it reveals: a tab that cannot work is worse than no
              tab. Unhidden beside #leakcheck in chrome.js's ocr_status probe. -->
-        <button id="btn-tab-imagecheck" type="button" class="small" aria-pressed="false" hidden>
+        <button
+          id="btn-tab-imagecheck"
+          type="button"
+          class="small"
+          aria-pressed="false"
+          hidden data-msg="chrome.btn.tab.imagecheck.button">
           Image check
         </button>
       </div>
       <!-- integrity.js appends its self-built panel content here. -->
       <div id="tools-integrity-slot" class="tools-body"></div>
       <section id="recall-panel" class="tools-body" hidden>
-      <h1>Deep Recall</h1>
-      <p class="panel-intro">
-        Save a page as a picture plus the text read off it, stored encrypted on
-        this device. Search later by any word on the page, including words that
-        only appear inside images. Requires an unlocked vault.
-      </p>
-      <p class="panel-note" id="recall-premium" hidden>
-        Deep Recall arrives when Premium launches. Find it in the Premium row of
-        the Vault panel.
-      </p>
-      <div class="form-buttons">
-        <button id="recall-save" type="button" class="small">
-          Save this page
-        </button>
-      </div>
-      <p id="recall-status" aria-live="polite"></p>
-      <!-- The preview. Hidden until a row's View button stages a picture;
-           the img src is a token URL the rbchrome protocol serves from the
+        <h1 data-msg="chrome.recall.panel.h1">Deep Recall</h1>
+        <p class="panel-intro" data-msg="chrome.recall.panel.p">
+          Save an encrypted picture and searchable text from this page,
+          including words inside images. Requires an unlocked vault.
+        </p>
+        <p class="panel-note" id="recall-premium" hidden data-msg="chrome.recall.premium.p">
+          Deep Recall is a Premium feature. Add your Premium token in the Vault panel to use it.
+        </p>
+        <p class="section-head" data-msg="chrome.recall.panel.p.n2">Capture</p>
+        <div
+          class="form-buttons"
+          role="group"
+          aria-label="How much of the page to capture" data-msg-aria-label="chrome.div.aria.label.n2">
+          <button id="recall-scope-full" type="button" class="small" data-msg="chrome.recall.scope.full.button">
+            Full page
+          </button>
+          <button id="recall-scope-viewport" type="button" class="small" data-msg="chrome.recall.scope.viewport.button">
+            Just what's on screen
+          </button>
+        </div>
+        <div class="form-buttons">
+          <button id="recall-save" type="button" class="small" data-msg="chrome.recall.save.button">
+            Save this page
+          </button>
+        </div>
+        <p id="recall-status" aria-live="polite"></p>
+        <!-- The one shared saved-picture preview. Hidden until a Deep Recall
+           or Library Snapshot row stages a picture; the same node moves next
+           to that row rather than duplicating a decrypted viewer. The img src
+           is a token URL the rbchrome protocol serves from the
            one staged slot (archive.rs), so img-src 'self' already covers it
            and no bytes ever ride the IPC channel. Closing here, closing the
            panel, deleting the record, and locking the vault all clear the
            slot -- the token in a stale src then 404s, which is the design. -->
-      <div id="recall-preview" hidden>
-        <div class="form-buttons">
-          <!-- A saved page is a FULL-PAGE screenshot: squeezed to the width
+        <div id="recall-preview" hidden>
+          <div class="form-buttons">
+            <!-- A saved page is a FULL-PAGE screenshot: squeezed to the width
                of a 600px card it is unreadable, and the panel's own scroll
                moves the whole panel rather than the picture. So the picture
                gets its own scrolling stage and a size the reader chooses.
                Fit is the default because it answers "which page is this?"
                at a glance; Actual size answers "what did it say?" -->
-          <button id="recall-preview-out" type="button" class="small" aria-label="Zoom out">
-            &minus;
-          </button>
-          <span id="recall-preview-level" aria-live="polite">Fit</span>
-          <button id="recall-preview-in" type="button" class="small" aria-label="Zoom in">
-            +
-          </button>
-          <button id="recall-preview-fit" type="button" class="small">
-            Fit
-          </button>
-          <button id="recall-preview-close" type="button" class="small">
-            Close picture
-          </button>
+            <button
+              id="recall-preview-out"
+              type="button"
+              class="small"
+              aria-label="Zoom out" data-msg="chrome.recall.preview.out.button" data-msg-aria-label="chrome.recall.preview.out.aria.label.n2">
+              &minus;
+            </button>
+            <span id="recall-preview-level" aria-live="polite" data-msg="chrome.recall.preview.fit.button">Fit</span>
+            <button
+              id="recall-preview-in"
+              type="button"
+              class="small"
+              aria-label="Zoom in" data-msg-aria-label="chrome.recall.preview.in.aria.label.n2">
+              +
+            </button>
+            <button id="recall-preview-fit" type="button" class="small" data-msg="chrome.recall.preview.level.span">
+              Fit
+            </button>
+            <button id="recall-preview-close" type="button" class="small" data-msg="chrome.recall.preview.close.button">
+              Close picture
+            </button>
+          </div>
+          <p id="recall-preview-scope" class="panel-foot" hidden></p>
+          <div id="recall-preview-stage">
+            <img
+              id="recall-preview-img"
+              alt="Saved picture of the page"
+              draggable="false"
+            / data-msg-alt="chrome.recall.preview.img.alt">
+          </div>
         </div>
-        <div id="recall-preview-stage">
-          <img id="recall-preview-img" alt="Saved picture of the page" draggable="false" />
-        </div>
-      </div>
-      <!-- aria-label rather than a visually-hidden <label>: this chrome has
+        <!-- aria-label rather than a visually-hidden <label>: this chrome has
            no sr-only class, and inventing one here would put an untested
            positioning rule in the stylesheet for a single field. -->
-      <input
-        id="recall-query"
-        type="search"
-        aria-label="Search your saved pages"
-        placeholder="Search your saved pages"
-        autocomplete="off"
-      />
-      <p class="panel-foot" id="recall-empty" hidden>
-        <!-- The Windows half of this sentence stopped being true on
+        <input
+          id="recall-query"
+          type="search"
+          aria-label="Search your saved pages"
+          placeholder="Search your saved pages"
+          autocomplete="off"
+        / data-msg-aria-label="chrome.recall.query.aria.label" data-msg-placeholder="chrome.recall.query.placeholder">
+        <p class="panel-foot" id="recall-empty" hidden>
+          <!-- The Windows half of this sentence stopped being true on
              2026-08-19: capture_page now asks the DevTools protocol for a
              full-page screenshot and only falls back to the viewport on a
              runtime too old to answer. Reported as "It's supposed to capture
@@ -1716,17 +1965,18 @@
              directly above a save message that said the opposite. It now
              describes the normal case and hands the last word to the save
              message, which knows the real scope. -->
-        Nothing saved yet. Saving keeps a picture of the page and the text
-        read off it; each save says how much of the page it captured.
-      </p>
-      <p class="panel-foot" id="recall-none" hidden>
-        No saved page has that word. Try another one.
-      </p>
-      <ul id="recall-list" class="items" role="list"></ul>
-    </section>
+          <span data-msg="chrome.recall.saved.hint.span">Nothing saved yet; each save says how much of the page it captured.</span>
+        </p>
+        <p class="panel-foot" id="recall-none" hidden data-msg="chrome.recall.none.p">
+          No match. Try another word.
+        </p>
+        <ul id="recall-list" class="items" role="list"></ul>
+        <!-- Populated only when partner_list says this placement applies. -->
+        <div id="partner-recall"></div>
+      </section>
       <section id="leakcheck" class="tools-body" hidden>
-        <h3 class="section-head">Check an image before you share it</h3>
-        <p class="panel-foot">
+        <h3 class="section-head" data-msg="chrome.leakcheck.h3">Check an image before you share it</h3>
+        <p class="panel-foot" data-msg="chrome.leakcheck.p">
           <!-- What it looks for is NAMED, because "found nothing sensitive"
                reads as a judgment the browser is not making. The list must
                match LeakKind in crates/ocr/src/leaks.rs, which has SEVEN
@@ -1735,15 +1985,16 @@
                finding, both of which are live and ungated. A counted
                enumeration is a promise; count it against the enum, not
                against scan_text alone (HiddenText comes from scan_regions). -->
-          Reads the text in a picture and looks for seven things that give you
-          away: an email address, a card number, a long number, an API key or
-          token, a private key header, an IP address, and text too faint for a
-          person to see. It can also show you everything it read, so its
-          answer can be checked. It runs on this computer, and the picture is
-          never uploaded or saved.
+          Image Text Review checks a picture for seven clues: an email address,
+          a card number, a long number, an API token, a private key header, an
+          IP address, and faint text. Review all text it read. The picture is
+          not uploaded or saved.
         </p>
         <div class="form-buttons">
-          <button id="leakcheck-pick" type="button" class="small">
+          <button id="leakcheck-pick" type="button" class="small" data-msg="chrome.leakcheck.pick.button"
+            data-premium="1"
+            title="Read the text in a picture before you share it"
+            data-msg-title="chrome.leakcheck.pick.title">
             Choose an image
           </button>
         </div>
@@ -1756,7 +2007,7 @@
              OCR text under it buries the finding list that matters. -->
         <div id="leakcheck-readwrap" hidden>
           <div class="form-buttons">
-            <button id="leakcheck-showtext" type="button" class="small">
+            <button id="leakcheck-showtext" type="button" class="small" data-msg="chrome.leakcheck.showtext.button">
               Show what it read
             </button>
           </div>
@@ -1765,20 +2016,18 @@
       </section>
     </section>
 
-    
-
     <section id="privacy-panel" hidden>
-      <h1>Privacy protections</h1>
-      <p class="panel-intro">
-        These apply to every tab, open now or opened later.
+      <h1 data-msg="chrome.privacy.panel.h1">Privacy protections</h1>
+      <p class="panel-intro" data-msg="chrome.privacy.panel.p">
+        Current and future tabs.
       </p>
 
       <label class="toggle-row" for="pv-block-ads">
         <input id="pv-block-ads" type="checkbox" />
         <span class="toggle-text">
-          <span class="toggle-title">Block ads and trackers</span>
-          <span class="toggle-note" id="pv-block-ads-note">
-            The request never leaves your computer, so the tracker gets nothing.
+          <span class="toggle-title" data-msg="chrome.privacy.panel.span">Block ads and trackers</span>
+          <span class="toggle-note" id="pv-block-ads-note" data-msg="chrome.pv.block.ads.note.span">
+            Blocked requests never leave your computer.
           </span>
         </span>
       </label>
@@ -1786,10 +2035,9 @@
       <label class="toggle-row" for="pv-freeze">
         <input id="pv-freeze" type="checkbox" />
         <span class="toggle-text">
-          <span class="toggle-title">Freeze pages after they load</span>
-          <span class="toggle-note" id="pv-freeze-note">
-            Pages stop sending anything once they finish loading. Chat, maps and
-            other live pages will break.
+          <span class="toggle-title" data-msg="chrome.privacy.panel.span.n2">Freeze pages after they load</span>
+          <span class="toggle-note" id="pv-freeze-note" data-msg="chrome.pv.freeze.note.span">
+            Breaks chat, maps, and other live pages.
           </span>
         </span>
       </label>
@@ -1797,10 +2045,9 @@
       <label class="toggle-row" for="pv-js">
         <input id="pv-js" type="checkbox" />
         <span class="toggle-text">
-          <span class="toggle-title">Allow JavaScript</span>
-          <span class="toggle-note">
-            Turning this off breaks most sites. It is also the strongest
-            protection here.
+          <span class="toggle-title" data-msg="chrome.privacy.panel.span.n3">Allow JavaScript</span>
+          <span class="toggle-note" data-msg="chrome.privacy.panel.span.n4">
+            Most sites break when this is off.
           </span>
         </span>
       </label>
@@ -1809,11 +2056,10 @@
         <input id="pv-ephemeral" type="checkbox" />
         <span class="toggle-text">
           <span class="toggle-title"
-            >Open new tabs without a saved profile</span
+             data-msg="chrome.privacy.panel.span.n5">Open new tabs without a saved profile</span
           >
-          <span class="toggle-note">
-            Cookies and site data are deleted when the tab closes. New tabs
-            only. Tabs already open keep what they started with.
+          <span class="toggle-note" data-msg="chrome.privacy.panel.span.n6">
+            New tabs delete cookies and site data when closed. Open tabs do not change.
           </span>
         </span>
       </label>
@@ -1821,14 +2067,40 @@
       <label class="toggle-row" for="pv-fingerprint">
         <input id="pv-fingerprint" type="checkbox" />
         <span class="toggle-text">
-          <span class="toggle-title">Fingerprint Divergence</span>
-          <span class="toggle-note">
-            Different sites see different canvas, audio, and graphics readings,
-            reducing their ability to correlate your activity across the web.
-            New tabs only. Tabs already open keep what they started with.
+          <span class="toggle-title" data-msg="chrome.privacy.panel.span.n7">Fingerprint Divergence</span>
+          <span class="toggle-note" data-msg="chrome.privacy.panel.span.n8">
+            Changes canvas, audio, and graphics readings to make cross-site matching harder. New tabs only.
           </span>
         </span>
       </label>
+
+      <!-- Windows-only, like #dns-choice below. DRAFT COPY: every string in
+           this section requires the WP-AB marketing-voice pass. The scope
+           sentence is deliberately conservative: WebView2 documents that a
+           profile change reaches every WebView sharing it, but the setter
+           does not reload a document or revisit bytes already loaded. -->
+      <section id="tracking-prevention-choice" hidden>
+        <h3 class="section-head" data-msg="chrome.tracking.prevention.choice.h3">Engine tracker blocking</h3>
+        <p class="panel-foot" id="tracking-prevention-caption" data-msg="chrome.tracking.prevention.caption.p">
+          Strict blocks the most and can break some sites, including Google
+          apps. Balanced is WebView2's default and rarely breaks anything.
+          PATANYX's own blocker works the same under both.
+        </p>
+        <div class="form-buttons">
+          <button id="tracking-prevention-strict" type="button" class="small" data-msg="chrome.tracking.prevention.strict.button">
+            Strict
+          </button>
+          <button id="tracking-prevention-balanced" type="button" class="small" data-msg="chrome.tracking.prevention.balanced.button">
+            Balanced
+          </button>
+        </div>
+        <p class="panel-foot" id="tracking-prevention-scope" data-msg="chrome.tracking.prevention.scope.p">
+          Windows only. A change reaches the WebView2 profiles behind tabs open
+          now and tabs opened later. PATANYX does not reload a page; reload it
+          to give the next navigation the new level from its first request.
+        </p>
+        <p class="panel-foot" id="tracking-prevention-result"></p>
+      </section>
 
       <!-- PER-SITE DIVERGENCE + THE PROOF. Sibling section to
            #permission-choice above, which is the established shape for "what
@@ -1837,9 +2109,9 @@
            proof reports what was REGISTERED rather than what a site was
            fooled by. -->
       <section id="divergence-site">
-        <h3 class="section-head">Fingerprint Divergence on this site</h3>
+        <h3 class="section-head" data-msg="chrome.divergence.site.h3">Fingerprint Divergence on this site</h3>
         <p class="panel-foot" id="dv-host"></p>
-        <p class="panel-note" id="dv-premium" hidden>
+        <p class="panel-note" id="dv-premium" hidden data-msg="chrome.dv.premium.p">
         Choosing per site is free, like Fingerprint Divergence itself.
         Name a full hostname to turn the noise off there and leave it on
         everywhere else.
@@ -1847,20 +2119,18 @@
         <label class="toggle-row" for="dv-off">
           <input id="dv-off" type="checkbox" />
           <span class="toggle-text">
-            <span class="toggle-title">Turn it off for this site</span>
-            <span class="toggle-note">
-              For a site that misbehaves under noise. Takes effect the next time
-              you open this site in a new tab. Sites are matched by full name,
-              so www.example.com and example.com are separate.
+            <span class="toggle-title" data-msg="chrome.divergence.site.span">Turn it off for this site</span>
+            <span class="toggle-note" data-msg="chrome.divergence.site.span.n2">
+              For sites that misbehave. Applies to the next new tab. Full hostnames are separate: www.example.com differs from example.com.
             </span>
           </span>
         </label>
         <p class="panel-foot" id="dv-list"></p>
 
-        <h3 class="section-head">What this tab got</h3>
+        <h3 class="section-head" data-msg="chrome.divergence.site.h3.n2">What this tab got</h3>
         <p class="panel-foot" id="dv-proof"></p>
         <div class="form-buttons">
-          <button id="dv-prove" type="button" class="small">
+          <button id="dv-prove" type="button" class="small" data-msg="chrome.dv.prove.button">
             Test it live
           </button>
         </div>
@@ -1873,17 +2143,15 @@
            list is the healthy state rather than a missing feature, so the
            empty text says so. Rows appear once a site has actually asked. -->
       <section id="permission-choice">
-        <h3 class="section-head">What this site asked for</h3>
-        <p class="panel-foot">
-          Camera, microphone, location and notifications are switched off for
-          every site. Nothing here is allowed until you allow it, and allowed
-          sites reset when PATANYX closes.
+        <h3 class="section-head" data-msg="chrome.permission.choice.h3">What this site asked for</h3>
+        <p class="panel-foot" data-msg="chrome.permission.choice.p">
+          Camera, microphone, location, and notifications are off unless allowed here. Allowances reset when PATANYX closes.
         </p>
         <!-- Load-bearing warning, not decoration: changing a switch below
              reloads the page, and a reload discards anything typed into it.
              The user has to know that BEFORE they click, so it sits above the
              switches rather than in a toast afterwards. -->
-        <p class="panel-warn" id="permission-warn">
+        <p class="panel-warn" id="permission-warn" data-msg="chrome.permission.warn.p">
           Changing any of these reloads the page. Save anything you have typed
           first.
         </p>
@@ -1892,38 +2160,27 @@
       </section>
 
       <section id="dns-choice">
-        <h3 class="section-head">Who resolves the sites you visit</h3>
-        <p class="panel-foot">
-          Every site you visit starts with a DNS lookup, and whoever answers it
-          sees the name. Here you pick who that is. This does NOT hide your
-          browsing from your internet provider. The site name also travels in
-          plain text when the connection starts, and no browser can stop that.
-          Use a VPN or Tor if you need that.
+        <h3 class="section-head" data-msg="chrome.dns.choice.h3">Who resolves the sites you visit</h3>
+        <p class="panel-foot" data-msg="chrome.dns.choice.p">
+          Choose who sees your DNS lookups. This does NOT hide browsing from your internet provider; site names may also be visible when connections start. Use a VPN or Tor to hide them.
         </p>
         <div class="form-buttons">
-          <button id="dns-system" type="button" class="small">
+          <button id="dns-system" type="button" class="small" data-msg="chrome.dns.system.button">
             System or VPN
           </button>
-          <button id="dns-mullvad" type="button" class="small">Mullvad</button>
-          <button id="dns-quad9" type="button" class="small">Quad9</button>
+          <button id="dns-quad9" type="button" class="small" data-msg="chrome.dns.quad9.button">Quad9</button>
         </div>
         <p class="panel-foot" id="dns-describe"></p>
         <p class="ok" id="dns-restart" hidden></p>
-        <p class="panel-note">
-          System is the default. The other two only apply if you pick one.
-          Mullvad and Quad9 both block malware and phishing. If either cannot be
-          reached, PATANYX stops rather than falling back to your network's DNS,
-          because that would put your lookups back in the open. The catch:
-          public WiFi sign-in pages stop working, since they hijack DNS to do
-          their job. Switch back to System and restart to sign in.
+        <p class="panel-note" data-msg="chrome.dns.choice.p.n2">
+          Quad9 blocks malware and phishing and never falls back to network DNS. If it cannot be reached, pages stop loading. Public WiFi sign-in may fail; choose System, restart, and sign in.
         </p>
       </section>
 
       <section id="engine-confirmed">
-        <h3 class="section-head">What the engine confirmed</h3>
-        <p class="panel-foot">
-          What the browser engine actually did, not what PATANYX asked it to do.
-          Anything it refused says so here.
+        <h3 class="section-head" data-msg="chrome.engine.confirmed.h3">What the engine confirmed</h3>
+        <p class="panel-foot" data-msg="chrome.engine.confirmed.p">
+          Engine refusals appear here.
         </p>
         <ul id="engine-list" class="entry-list"></ul>
       </section>
@@ -1942,7 +2199,7 @@
            writes it verbatim through textContent. Copy typed here would be
            copy nothing checks. -->
       <section id="forget-all-choice">
-        <h3 class="section-head">Cookies</h3>
+        <h3 class="section-head" data-msg="chrome.forget.all.choice.h3">Cookies</h3>
         <p class="panel-foot" id="pv-forget-all-desc"></p>
         <div class="form-buttons">
           <button
@@ -1984,218 +2241,216 @@
          remove them, and it does nothing at all about the site name travelling
          in plaintext when the connection is set up. -->
     <section id="dns-panel" hidden>
-      <h1>Who resolves the sites you visit</h1>
-      <p class="panel-intro">
-        Every site you visit starts with a DNS lookup, and whoever answers it
-        sees the name. Here you pick who that is. This does NOT hide your
-        browsing from your internet provider. The site name also travels in
-        plain text when the connection starts, and no browser can stop that. Use
-        a VPN or Tor if you need that.
+      <h1 data-msg="chrome.dns.panel.h1">Choose your DNS resolver</h1>
+      <p class="panel-intro" data-msg="chrome.dns.panel.p">
+        DNS reveals site names to the resolver you pick. This does NOT hide
+        browsing from your internet provider. Use a VPN or Tor for that.
       </p>
-      <div class="form-buttons">
-        <button id="dnsp-system" type="button" class="small">
-          System or VPN
+      <!-- The disclosure is visually the third chip, but it is OUTSIDE the
+           resolver-only button host. That host is the radio-like setting and
+           must never acquire an affiliate action that can masquerade as a
+           resolver. The wrapper keeps all three in one row without changing
+           the structural set of resolver buttons. System first because it is
+           the default; Quad9 second because it is the choice. -->
+      <div class="dns-choice-row">
+        <div id="dnsp-resolver-choices" class="form-buttons">
+          <button id="dnsp-system" type="button" class="small" data-msg="chrome.dnsp.system.button">
+            System or VPN
+          </button>
+          <button id="dnsp-quad9" type="button" class="small" data-msg="chrome.dns.compare.dt.n3">Quad9</button>
+        </div>
+        <button
+          id="dnsp-managed-vpn"
+          type="button"
+          class="small"
+          aria-expanded="false"
+          aria-controls="dnsp-managed-vpn-description" data-msg="chrome.dnsp.managed.vpn.button">
+          Managed VPN
         </button>
-        <button id="dnsp-mullvad" type="button" class="small">Mullvad</button>
-        <button id="dnsp-quad9" type="button" class="small">Quad9</button>
       </div>
-      <p class="panel-foot" id="dnsp-describe"></p>
-      <p class="ok" id="dnsp-restart" hidden></p>
-      <!-- All THREE compared, not just the two encrypted ones. A user cannot
-           judge whether Mullvad is worth choosing without seeing what they
-           already have, and leaving the default out of the comparison would
-           quietly frame it as the option that needs no examination. Each entry
-           names what the choice COSTS as well as what it buys, because the
-           costs here are the part a user finds out about later: an over-blocked
-           page, a VPN split in half, a hotel WiFi that will not load. -->
-      <h2 class="section-head">Which one, and why</h2>
-      <dl id="dns-compare">
-        <dt>System</dt>
-        <dd>
-          <span class="dns-tag">Default. Nothing changes.</span>
-          Whatever your machine already uses: your VPN's resolver if you run
-          one, otherwise your internet provider's. Not encrypted by this
-          browser, so a provider can log what you look up and in some countries
-          sell it. Blocks nothing. Because the lookup is not encrypted, a
-          network can also strip the key that hides the site name inside the
-          connection, putting it back in the clear without telling you. The only
-          setting that works on public WiFi that makes you log in.
-        </dd>
-        <dt>Mullvad</dt>
-        <dd>
-          <span class="dns-tag">Blocks the most.</span>
-          Swedish, no account, no-logging policy. Encrypted, and blocks ads,
-          trackers, malware and phishing. That is more than Quad9, so fewer
-          requests leave your machine, and a slightly higher chance a page loses
-          something it wanted. Also protects the key that hides the site name
-          inside the connection from being stripped in transit. If you already
-          use Mullvad's VPN this keeps your browsing with one company rather
-          than splitting it across two.
-        </dd>
-        <dt>Quad9</dt>
-        <dd>
-          <span class="dns-tag">Interferes the least.</span>
-          Swiss, run by a non-profit foundation. Encrypted, and blocks malware
-          and phishing only, nothing else, so it is the safer pick if you would
-          rather nothing meddled with ordinary pages. It also publishes two
-          things Mullvad does not state: it checks that answers are signed
-          (DNSSEC), and it does not pass any part of your IP address on to the
-          servers it asks. Also protects the key that hides the site name inside
-          the connection from being stripped in transit.
-        </dd>
-      </dl>
-      <p class="panel-note">
-        In short: System changes nothing, Mullvad blocks the most, Quad9 gets in
-        the way least. Both encrypted choices see every site you look up.
-        Someone always does.
-      </p>
-      <p class="panel-note">
-        <strong>The site name inside the connection.</strong> Normally the site
-        you are opening travels in readable text at the very start of every
-        connection, before any encryption applies, so your provider or the WiFi
-        owner can read it even though the page itself is encrypted. This browser
-        encrypts that too, on every setting, wherever the site has set it up on
-        their side. Two limits worth knowing: it does not hide the address of
-        the server you reached, so on a large shared host that address says
-        little but a site on an address of its own is still identifiable by it;
-        and the key that makes it work is published in DNS, so on an unencrypted
-        lookup a network can remove it and quietly put the site name back in the
-        clear. That is what the encrypted choices above protect, and it is a
-        different thing from choosing who answers.
-      </p>
-      <p class="panel-note">
-        Mullvad and Quad9 never fall back to your network's DNS when they cannot
-        be reached, because that would put your lookups back in the open. The
-        catch is that public WiFi sign-in pages stop working, since they hijack
-        DNS to do their job. On hotel or airport WiFi, switch back to System,
-        restart, and sign in.
-      </p>
+      <div id="dnsp-resolver-description">
+        <p class="panel-foot" id="dnsp-describe"></p>
+        <p class="ok" id="dnsp-restart" hidden></p>
+        <!-- BOTH compared, the default included. A user cannot judge whether
+           Quad9 is worth choosing without seeing what they already have, and
+           leaving the default out of the comparison would quietly frame it
+           as the option that needs no examination. Each entry names what the
+           choice COSTS as well as what it buys, because the costs here are
+           the part a user finds out about later: a provider that logs the
+           trail, a VPN split in half, a hotel WiFi that will not load. -->
+        <h2 class="section-head" data-msg="chrome.dnsp.resolver.description.h2">Compare</h2>
+        <dl id="dns-compare">
+          <dt data-msg="chrome.dns.compare.dt">System</dt>
+          <dd>
+            <span class="dns-tag" data-msg="chrome.dns.compare.span">Default. Nothing changes.</span>
+            <span data-msg="chrome.dns.compare.system.rest">Uses an active VPN's resolver; otherwise your internet provider's. This browser leaves lookups unencrypted, letting a provider log what you look up and, in some places, sell it. Blocks nothing, and supports public WiFi sign-in.</span>
+          </dd>
+          <dt data-msg="chrome.dnsp.quad9.button">Quad9</dt>
+          <dd>
+            <span class="dns-tag" data-msg="chrome.dns.compare.span.n3">Encrypted. Blocks malware.</span>
+            <span data-msg="chrome.dns.compare.quad9.rest">Swiss nonprofit. Encrypted. Blocks only malware and phishing, so it rarely breaks a page. States it validates signed answers (DNSSEC) and sends none of your IP address to queried servers. Sees every domain you look up, and never falls back to network DNS, so public WiFi sign-in needs System.</span>
+          </dd>
+        </dl>
+        <p class="panel-note" data-msg="chrome.dnsp.resolver.description.p">
+          Encrypted does not mean unseen. Quad9 sees every site you look up.
+        </p>
+        <p class="panel-note" data-msg="chrome.dnsp.resolver.description.p.n2">
+          The site name is encrypted when the site supports it, but the IP
+          address of the server you connect to remains visible. If the lookup
+          itself is unencrypted, your network can interfere with it and strip
+          away the information needed to enable that protection.
+        </p>
+        <p class="panel-note" data-msg="chrome.dnsp.resolver.description.p.n3">
+          Quad9 never falls back to network DNS, because a fallback would hand
+          your lookups to the network in the open. That breaks public WiFi
+          sign-in. On hotel or airport WiFi, switch to System, restart, and
+          sign in.
+        </p>
+      </div>
+      <div id="dnsp-managed-vpn-description" hidden>
+        <p id="managed-vpn-dns-framing" class="panel-foot"></p>
+        <p id="managed-vpn-dns-wireguard" class="panel-foot"></p>
+        <!-- Populated only when partner_list says this placement applies. -->
+        <div id="partner-dns"></div>
+      </div>
     </section>
 
     <section id="tunnel-panel" hidden>
-      <h1>Private Tunnel</h1>
-      <!-- Every word here about what the tunnel DOES arrives from Rust
-           (TunnelMode::describe, as describe_off / describe_imported in
-           tunnel_get). This markup carries mechanical labels only, so this
-           panel can never word a choice differently from another surface. -->
-      <p class="panel-foot" id="tunnelp-status"></p>
-
-      <!-- THE PREREQUISITE, BEFORE THE CONTROLS IT GATES. This used to be a
-           refusal AFTER the click: the import button was live with a locked
-           vault, the picker opened, a file was chosen, and only then did it
-           fail. Saying it first costs a line and saves that whole walk. -->
-      <p class="panel-note" id="tunnelp-vault-first" hidden>
-        Private Tunnel keeps its configuration in the vault. Create or unlock
-        the vault first.
-      </p>
-
-      <!-- Numbered because the order is not guessable: a configuration has
-           to exist before the switch means anything, and the switch does
-           nothing until the engine restarts. Step LABELS are mechanical and
-           live here; every sentence about what the tunnel DOES still comes
-           from Rust. -->
-      <!-- STANDING, not conditional. The prerequisite note above appears
-           only while the vault is shut; this says the dependency exists at
-           all, so someone reading the panel with an open vault still learns
-           that closing it will take the tunnel down with it. -->
-      <p class="panel-note" id="tunnelp-vault-link">
-        Private Tunnel needs your vault. Its configuration is stored there, so
-        it carries traffic only while the vault is unlocked, and while it is
-        switched on with the vault locked, pages will not load at all.
-      </p>
-
-      <h2 class="tunnelp-step">1. Get a configuration</h2>
-      <p class="panel-note" id="tunnelp-provider">
-        You supply the server: PATANYX does not run one and does not resell
-        anyone else's. Any WireGuard provider that hands you a configuration
-        file will do, as will your own server.
-      </p>
-
-      <h2 class="tunnelp-step">2. Import it</h2>
-      <p class="panel-foot" id="tunnelp-config"></p>
-      <div class="form-buttons">
-        <button id="tunnelp-import" type="button" class="small">
-          Import from a file
+      <nav class="tabs">
+        <button id="tab-tunnel" type="button" class="tab active" data-msg="chrome.tunnel.panel.h1">
+          Private Tunnel
         </button>
-        <button id="tunnelp-remove" type="button" class="small">Remove</button>
-      </div>
-      <!-- The paste path exists because providers increasingly generate a
-           configuration in a web page rather than serving a .conf, and the
-           clipboard is then the only handoff the user has. Same parser, same
-           size cap, same wipe as the file path. -->
-      <label class="tunnelp-paste-label" for="tunnelp-paste">
-        Or paste the configuration text:
-      </label>
-      <textarea
-        id="tunnelp-paste"
-        rows="4"
-        spellcheck="false"
-        autocomplete="off"
-        placeholder="[Interface] ..."
-      ></textarea>
-      <div class="form-buttons">
-        <button id="tunnelp-paste-import" type="button" class="small">
-          Import pasted configuration
+        <button id="tab-managed-vpn" type="button" class="tab" data-msg="chrome.tab.managed.vpn.button">
+          Managed VPN
         </button>
-      </div>
+        <span class="spacer"></span>
+      </nav>
+      <div id="pane-tunnel">
+        <!-- Every word here about what the tunnel DOES arrives from Rust
+             (TunnelMode::describe, as describe_off / describe_imported in
+             tunnel_get). This markup carries mechanical labels only, so this
+             panel can never word a choice differently from another surface. -->
+        <p class="panel-foot" id="tunnelp-status"></p>
 
-      <h2 class="tunnelp-step">3. Switch it on</h2>
-      <div class="form-buttons">
-        <button id="tunnelp-off" type="button" class="small">Off</button>
-        <button id="tunnelp-imported" type="button" class="small">
-          Imported
-        </button>
-      </div>
-      <!-- The engine's own words for each choice, immediately under the
-           choice they describe. The Imported text ends with the restart
-           caveat, so the cost of switching is on screen BEFORE the click
-           rather than only in the note that appears after it. Never retyped
-           here; both strings arrive from TunnelMode::describe. -->
-      <p class="panel-foot" id="tunnelp-describe-off"></p>
-      <p class="panel-foot" id="tunnelp-describe-imported"></p>
-      <p class="panel-note">
-        Importing a configuration does not switch the tunnel on. Use the
-        buttons above for that.
-      </p>
+        <!-- THE PREREQUISITE, BEFORE THE CONTROLS IT GATES. This used to be a
+             refusal AFTER the click: the import button was live with a locked
+             vault, the picker opened, a file was chosen, and only then did it
+             fail. Saying it first costs a line and saves that whole walk. -->
+        <p class="panel-note" id="tunnelp-vault-first" hidden data-msg="chrome.tunnelp.vault.first.p">
+          Create or unlock the vault before using Private Tunnel.
+        </p>
 
-      <h2 class="tunnelp-step">4. Apply it</h2>
-      <!-- Directly under the choice that causes it. It sat below both
-           describe paragraphs, which are long enough that the note landed
-           off the bottom of a 500px panel -- shown, and never seen. -->
-      <p class="ok" id="tunnelp-restart" hidden></p>
-      <!-- Sits with the note, not in the button row above: it is the answer
-           to that note, and it must not read as a third mode choice. Hidden
-           and shown together with it. -->
-      <div id="tunnelp-restart-actions" hidden>
-        <button id="tunnelp-apply-restart" type="button" class="small">
-          Apply and restart now
-        </button>
+        <!-- Numbered because the order is not guessable: a configuration has
+             to exist before the switch means anything, and the switch does
+             nothing until the engine restarts. Step LABELS are mechanical and
+             live here; every sentence about what the tunnel DOES still comes
+             from Rust. -->
+        <!-- STANDING, not conditional. The prerequisite note above appears
+             only while the vault is shut; this says the dependency exists at
+             all, so someone reading the panel with an open vault still learns
+             that closing it will take the tunnel down with it. -->
+        <p class="panel-note" id="tunnelp-vault-link" data-msg="chrome.tunnelp.vault.link.p">
+          Private Tunnel needs an unlocked vault. If it is on when the vault
+          locks, pages will not load.
+        </p>
+
+        <h2 class="tunnelp-step" data-msg="chrome.tunnel.panel.h2">1. Get a configuration</h2>
+        <p class="panel-note" id="tunnelp-provider" data-msg="chrome.tunnelp.provider.p">
+          Import a configuration from any WireGuard provider or your own server.
+          PATANYX does not provide or resell one.
+        </p>
+
+        <h2 class="tunnelp-step" data-msg="chrome.tunnel.panel.h2.n2">2. Import it</h2>
+        <p class="panel-foot" id="tunnelp-config"></p>
+        <div class="form-buttons">
+          <button id="tunnelp-import" type="button" class="small" data-msg="chrome.tunnelp.import.button">
+            Import from a file
+          </button>
+          <button id="tunnelp-remove" type="button" class="small" data-msg="chrome.tunnelp.remove.button">
+            Remove
+          </button>
+        </div>
+        <!-- The paste path exists because providers increasingly generate a
+             configuration in a web page rather than serving a .conf, and the
+             clipboard is then the only handoff the user has. Same parser, same
+             size cap, same wipe as the file path. -->
+        <label class="tunnelp-paste-label" for="tunnelp-paste" data-msg="chrome.tunnel.panel.label">
+          Or paste the configuration text:
+        </label>
+        <textarea
+          id="tunnelp-paste"
+          rows="4"
+          spellcheck="false"
+          autocomplete="off"
+          placeholder="[Interface] ..."></textarea>
+        <div class="form-buttons">
+          <button id="tunnelp-paste-import" type="button" class="small" data-msg="chrome.tunnelp.paste.import.button">
+            Import pasted configuration
+          </button>
+        </div>
+
+        <h2 class="tunnelp-step" data-msg="chrome.tunnel.panel.h2.n3">3. Switch it on</h2>
+        <div class="form-buttons">
+          <button id="tunnelp-off" type="button" class="small" data-msg="chrome.tunnelp.off.button">Off</button>
+          <button id="tunnelp-imported" type="button" class="small" data-msg="chrome.tunnelp.imported.button">
+            Imported
+          </button>
+        </div>
+        <!-- The engine's own words for each choice, immediately under the
+             choice they describe. The Imported text ends with the restart
+             caveat, so the cost of switching is on screen BEFORE the click
+             rather than only in the note that appears after it. Never retyped
+             here; both strings arrive from TunnelMode::describe. -->
+        <p class="panel-foot" id="tunnelp-describe-off"></p>
+        <p class="panel-foot" id="tunnelp-describe-imported"></p>
+        <p class="panel-note" data-msg="chrome.pane.tunnel.p">
+          Importing does not switch Private Tunnel on.
+        </p>
+
+        <h2 class="tunnelp-step" data-msg="chrome.tunnel.panel.h2.n4">4. Apply it</h2>
+        <!-- Directly under the choice that causes it. It sat below both
+             describe paragraphs, which are long enough that the note landed
+             off the bottom of a 500px panel -- shown, and never seen. -->
+        <p class="ok" id="tunnelp-restart" hidden></p>
+        <!-- Sits with the note, not in the button row above: it is the answer
+             to that note, and it must not read as a third mode choice. Hidden
+             and shown together with it. -->
+        <div id="tunnelp-restart-actions" hidden>
+          <button id="tunnelp-apply-restart" type="button" class="small" data-msg="chrome.tunnelp.apply.restart.button">
+            Apply and restart now
+          </button>
+        </div>
+        <p class="panel-note" id="tunnelp-applied-note" data-msg="chrome.tunnelp.applied.note.p">
+          Already applied.
+        </p>
+        <p class="panel-note" id="tunnelp-error" hidden></p>
       </div>
-      <p class="panel-note" id="tunnelp-applied-note">
-        Nothing to apply: the browser is already running with the setting
-        shown above.
-      </p>
-      <p class="panel-note" id="tunnelp-error" hidden></p>
+      <div id="pane-managed-vpn" hidden>
+        <p id="managed-vpn-framing" class="panel-intro"></p>
+        <p id="managed-vpn-wireguard" class="panel-foot"></p>
+        <!-- Populated only when partner_list says this placement applies. -->
+        <div id="partner-tunnel"></div>
+      </div>
     </section>
 
     <section id="vault-panel" hidden>
       <div id="vault-none" class="vault-state" hidden>
-        <h1>Create vault</h1>
+        <h1 data-msg="chrome.vault.none.h1">Create vault</h1>
         <form id="create-form">
           <input
             id="create-pass1"
             type="password"
             placeholder="Passphrase (min. 8 characters)"
             autocomplete="new-password"
-          />
+           data-msg-placeholder="chrome.create.pass1.placeholder"/>
           <input
             id="create-pass2"
             type="password"
             placeholder="Confirm passphrase"
             autocomplete="new-password"
-          />
+           data-msg-placeholder="chrome.create.pass2.placeholder"/>
           <div class="form-buttons">
-            <button type="submit">Create vault</button>
+            <button type="submit" data-msg="chrome.create.form.button">Create vault</button>
           </div>
           <p class="error" id="create-error"></p>
         </form>
@@ -2205,16 +2460,13 @@
          lose and no warning is needed. The same form appears in the Backup
          pane for a machine that already has a vault, and that one carries
          the destructive-replace warning. -->
-        <h1 id="import-heading">Or bring one across</h1>
-        <p id="import-intro">
-          Already use PATANYX on another machine? Export an encrypted backup
-          there and open it here. This builds a new vault with its own
-          passphrase and its own recovery key. The export passphrase then opens
-          nothing but the export file.
+        <h1 id="import-heading" data-msg="chrome.import.heading.h1">Or bring one across</h1>
+        <p id="import-intro" data-msg="chrome.import.intro.p">
+          Open an encrypted backup from another machine. This creates a vault with a new passphrase and recovery key. The export passphrase opens only the backup file.
         </p>
         <form id="import-form" class="entry-form">
           <div class="form-buttons">
-            <button id="import-pick" type="button">Choose backup file</button>
+            <button id="import-pick" type="button" data-msg="chrome.import.pick.button">Choose backup file</button>
           </div>
           <p id="import-chosen" class="item-sub"></p>
           <input
@@ -2224,27 +2476,27 @@
             autocomplete="off"
             autocapitalize="off"
             spellcheck="false"
-          />
+           data-msg-placeholder="chrome.import.src.placeholder"/>
           <input
             id="import-export-pass"
             type="password"
             placeholder="Passphrase for that backup file"
             autocomplete="off"
-          />
+           data-msg-placeholder="chrome.import.export.pass.placeholder"/>
           <input
             id="import-pass1"
             type="password"
             placeholder="New passphrase for this vault (min. 8 characters)"
             autocomplete="new-password"
-          />
+           data-msg-placeholder="chrome.import.pass1.placeholder"/>
           <input
             id="import-pass2"
             type="password"
             placeholder="Confirm new passphrase"
             autocomplete="new-password"
-          />
+           data-msg-placeholder="chrome.import.pass2.placeholder"/>
           <div class="form-buttons">
-            <button type="submit">Import vault</button>
+            <button type="submit" data-msg="chrome.import.form.button">Import vault</button>
           </div>
           <p class="error" id="import-error"></p>
         </form>
@@ -2254,38 +2506,37 @@
        not stored anywhere in readable form, so if the user leaves this screen
        without writing it down it is gone for good. -->
       <div id="vault-recovery" class="vault-state" hidden>
-        <h1>Write this down now</h1>
-        <p>
+        <h1 data-msg="chrome.vault.recovery.h1">Write this down now</h1>
+        <p data-msg="chrome.vault.recovery.p">
           This key is the only way in if you forget your passphrase. You will
           see it once. Nobody can make you another one, including us.
         </p>
         <pre id="recovery-key" class="recovery-key"></pre>
-        <p class="error">
+        <p class="error" data-msg="chrome.vault.recovery.p.n2">
           A backup will not help without this key or your passphrase. Backups
           cover a broken disk, not a forgotten passphrase.
         </p>
         <div class="form-buttons">
-          <button id="recovery-ack" type="button">
+          <button id="recovery-ack" type="button" data-msg="chrome.recovery.ack.button">
             I have written it down
           </button>
         </div>
       </div>
 
       <div id="vault-locked" class="vault-state" hidden>
-        <h1>Unlock vault</h1>
+        <h1 data-msg="chrome.vault.locked.h1">Unlock vault</h1>
         <form id="unlock-form">
           <input
             id="unlock-pass"
             type="password"
             placeholder="Passphrase"
             autocomplete="current-password"
-          />
+           data-msg-placeholder="chrome.unlock.pass.placeholder"/>
           <div class="form-buttons">
-            <button type="submit">Unlock</button>
+            <button type="submit" data-msg="chrome.unlock.form.button">Unlock</button>
           </div>
           <p class="error" id="unlock-error"></p>
         </form>
-
 
         <!-- AUTO-LOCK, moved here from the Backup pane (decided 2026-08-05)
              so it is seen at the moment the passphrase is keyed rather than
@@ -2307,12 +2558,9 @@
              The default is five minutes and stays five minutes. What counts
              as being here includes keys pressed inside a page, and a warning
              arrives a minute before. -->
-        <h2>Lock when idle</h2>
-        <p class="panel-intro">
-          Typing anywhere in the browser counts as being here. A minute before
-          it locks, you get a countdown and a button to stay unlocked. Locking
-          clears your keys from memory. In builds with chat, it signs you out of
-          chat too, because your chat identity lives in the vault.
+        <h2 data-msg="chrome.vault.locked.h2">Lock when idle</h2>
+        <p class="panel-intro" data-msg="chrome.vault.locked.p">
+          Typing anywhere keeps the vault unlocked. You get a one-minute warning before it locks. Locking clears your keys from memory and signs you out of Private Chat.
         </p>
         <div class="form-buttons" id="autolock-choices"></div>
         <p class="panel-note" id="autolock-note"></p>
@@ -2324,7 +2572,7 @@
              written from memory: every arm in ipc.rs guarded by
              unlocked(state) or store_open(state), mapped to the name its own
              surface already uses. An earlier draft of this list named five
-             of them and quietly omitted Sets of tabs, Downloads, Deep Recall
+             of them and quietly omitted Tab Shelf, Downloads, Deep Recall
              and the per-site divergence choice. If a feature is added behind
              either guard, it belongs here; if something here starts working
              while locked, it must come out.
@@ -2340,7 +2588,7 @@
              Actions). None of those belong in this list; unlocking does not
              turn them on.
              
-             Set-aside tabs are deliberately not named: owner's call, on the
+             Shelved tabs are deliberately not named: owner's call, on the
              grounds that the distinction between setting tabs aside and the
              Premium batch actions beside it confuses more than it explains.
              Do not add it back.
@@ -2361,15 +2609,15 @@
              glance where six sentences do not, and they fit one or two rows
              instead of costing twenty lines on a panel that is already
              long. -->
-        <p class="panel-note vault-enables-intro">
+        <p class="panel-note vault-enables-intro" data-msg="chrome.vault.locked.p.n2">
           Unlocking the vault turns these on:
         </p>
         <ul class="vault-enables">
-          <li>Private Tunnel</li>
-          <li>Saved passwords</li>
-          <li>Bookmarks</li>
-          <li>Downloads</li>
-          <li>Notes</li>
+          <li data-msg="chrome.vault.locked.li">Private Tunnel</li>
+          <li data-msg="chrome.vault.locked.li.n2">Saved passwords</li>
+          <li data-msg="chrome.vault.locked.li.n3">Bookmarks</li>
+          <li data-msg="chrome.vault.locked.li.n4">Downloads</li>
+          <li data-msg="chrome.vault.locked.li.n5">Notes</li>
           <!-- Caps the first row at five. Six short names fit a wide panel on
                one line, which is a wall rather than a list; flex-wrap alone
                cannot express "at most five" because it only breaks when the
@@ -2377,17 +2625,16 @@
                break where it is wanted and disappears on a narrow panel,
                where wrapping already happens sooner. -->
           <li class="vault-enables-break" aria-hidden="true"></li>
-          <li>Premium features</li>
+          <li data-msg="chrome.vault.locked.li.n6">Premium features</li>
         </ul>
         <!-- The one that does not merely go missing. With the tunnel on and
              the vault shut, nothing loads at all, which reads as a broken
              browser rather than a feature waiting to be switched on. -->
-        <p class="panel-note" id="vault-enables-tunnel">
-          Private Tunnel is the one to watch: while it is switched on and the
-          vault is locked, no page will load at all.
+        <p class="panel-note" id="vault-enables-tunnel" data-msg="chrome.vault.enables.tunnel.p">
+          If Private Tunnel is on when the vault is locked, no page loads.
         </p>
 
-        <p class="panel-foot">
+        <p class="panel-foot" data-msg="chrome.vault.locked.p.n3">
           Forgotten your passphrase? Use the recovery key from when you set up
           the vault. It is the only other way in. Without it, nobody can recover
           what is inside.
@@ -2399,12 +2646,12 @@
             placeholder="Recovery key"
             autocomplete="off"
             spellcheck="false"
-          />
+           data-msg-placeholder="chrome.recovery.input.placeholder"/>
           <div class="form-buttons">
-            <button type="submit" class="small">
+            <button type="submit" class="small" data-msg="chrome.recovery.form.button">
               Unlock with recovery key
             </button>
-            <button id="recovery-scan" type="button" class="small" hidden>
+            <button id="recovery-scan" type="button" class="small" hidden data-msg="chrome.recovery.scan.button">
               Scan from a photo
             </button>
           </div>
@@ -2415,22 +2662,26 @@
 
       <div id="vault-open" class="vault-state" hidden>
         <nav class="tabs">
-          <button id="tab-creds" type="button" class="tab active">
+          <button id="tab-creds" type="button" class="tab active" data-msg="chrome.tab.creds.button">
             Credentials
           </button>
-          <button id="tab-notes" type="button" class="tab">Notes</button>
-          <button id="tab-backup" type="button" class="tab">Backup</button>
+          <button id="tab-notes" type="button" class="tab" data-msg="chrome.tab.notes.button">Notes</button>
+          <button id="tab-backup" type="button" class="tab" data-msg="chrome.tab.backup.button">Backup</button>
+          <button id="tab-sync" type="button" class="tab" data-msg="chrome.tab.sync.button">
+            Sync Across Devices
+          </button>
           <span class="spacer"></span>
-          <button id="btn-lock" type="button">Lock</button>
+          <button id="btn-lock" type="button" data-msg="chrome.btn.lock.button">Lock</button>
         </nav>
 
         <!-- The Premium row (design 3.4): seen at every unlock, above the
              panes so no tab switch hides it. Every state string here is
              worded by Rust (licence_get / licence_paste payloads) and
-             reaches the DOM via textContent only. There are deliberately
-             no purchase links anywhere in this row: nothing is for sale
-             until the payment flow ships, so the row renders state text
-             and the paste flow only. -->
+             reaches the DOM via textContent only. While Premium is not on
+             sale there are deliberately no purchase affordances anywhere
+             in this row: the launch control starts empty and hidden, and
+             Rust's PREMIUM_ON_SALE-bound payload is the only thing that can
+             give it words and reveal it. -->
         <div id="premium-row" hidden>
           <p id="premium-head" class="panel-intro"></p>
           <p id="premium-sub" class="panel-note"></p>
@@ -2444,17 +2695,66 @@
           <div id="premium-activation" hidden>
             <p class="panel-note" id="premium-activation-note"></p>
             <div class="form-buttons">
-              <button id="premium-activate" type="button" class="small" hidden>
+              <button id="premium-activate" type="button" class="small" hidden data-msg="chrome.premium.activate.button">
                 Activate now
               </button>
-              <button id="premium-release" type="button" class="small" hidden>
+              <button id="premium-release" type="button" class="small" hidden data-msg="chrome.premium.release.button">
                 Release this device
               </button>
             </div>
+            <!-- Offline activation. For a machine that cannot reach EdgeXene
+                 at all (locked-down corporate network). The network operator turns
+                 this device id + the Premium token into a one-time receipt
+                 from any working connection; pasting it here finishes
+                 activation with no network. The receipt is bound to THIS
+                 device and verified the same way as an online activation. -->
+            <details id="premium-offline" hidden>
+              <summary data-msg="chrome.premium.activation.summary">Can't connect? Activate offline</summary>
+              <p class="panel-note">
+                <span data-msg="chrome.premium.activation.lead">On a network that blocks EdgeXene, activate without a connection. On your phone, or any device that can get online, open</span>
+                <strong data-msg="chrome.premium.activation.strong">patanyx.net/premium/offline</strong>
+                <span data-msg="chrome.premium.activation.rest">and enter this device's ID together with your Premium token. Paste the code it gives you below. The code only works on this computer, so it is safe to carry across on a phone screen.</span>
+              </p>
+              <label class="field-label" for="premium-device-id" data-msg="chrome.premium.activation.label">
+                This device's ID
+              </label>
+              <div class="form-buttons">
+                <code id="premium-device-id" class="device-id">&mdash;</code>
+                <button id="premium-device-id-copy" type="button" class="small" data-msg="chrome.premium.device.id.copy.button">
+                  Copy
+                </button>
+              </div>
+              <label class="field-label" for="premium-receipt" data-msg="chrome.premium.activation.label.n2">
+                Activation code (starts with prx1-, not your ptx1- token)
+              </label>
+              <textarea id="premium-receipt" rows="3"
+                placeholder="prx1-&hellip;" spellcheck="false"
+                autocapitalize="off" autocomplete="off" data-msg-placeholder="chrome.premium.receipt.placeholder"></textarea>
+              <div class="form-buttons">
+                <button id="premium-receipt-import" type="button" class="small" data-msg="chrome.premium.receipt.import.button">
+                  Import activation code
+                </button>
+              </div>
+              <p class="panel-note" id="premium-receipt-status" hidden></p>
+            </details>
           </div>
-          <button id="premium-add" type="button" class="small">
+          <button id="premium-add" type="button" class="small" data-msg="chrome.premium.add.button">
             Add Premium token
           </button>
+          <button id="premium-buy" type="button" class="small" hidden></button>
+          <!-- Removing the stored credential is deliberately outside the
+               activation controls: release returns this device's server slot
+               but keeps the token; remove erases the token and local receipts
+               but does not contact the server. The confirmation repeats that
+               distinction before anything is erased. -->
+          <button id="premium-remove" type="button" class="small" hidden data-msg="chrome.premium.remove.button">
+            Remove token from this computer
+          </button>
+          <p id="premium-token-actions" class="panel-note" hidden data-msg="chrome.premium.token.actions.p">
+            Release this device returns its server slot but keeps the token on
+            this computer. Remove token erases the local token and receipts; it
+            does not return a server slot.
+          </p>
           <form id="premium-form" hidden>
             <input
               id="premium-token"
@@ -2462,9 +2762,9 @@
               autocomplete="off"
               spellcheck="false"
               placeholder="ptx1-"
-            />
+             data-msg-placeholder="chrome.premium.token.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" class="small">Add token</button>
+              <button type="submit" class="small" data-msg="chrome.premium.form.button">Add token</button>
             </div>
             <p class="error" id="premium-error"></p>
             <div id="premium-confirm" hidden>
@@ -2474,7 +2774,7 @@
                   id="premium-confirm-replace"
                   type="button"
                   class="small"
-                >
+                 data-msg="chrome.premium.confirm.replace.button">
                   Replace the current token
                 </button>
               </div>
@@ -2492,9 +2792,8 @@
           <!-- Reworded 2026-08-05, replacing "These need the vault
                unlocked, because what they use is stored inside it. While it
                is locked, PATANYX does not offer them." -->
-          <p class="panel-intro">
-            Unlock the Vault to access the features below. If the Vault is
-            locked, the following features will not work.
+          <p class="panel-intro" data-msg="chrome.pane.creds.p">
+            Requires an unlocked Vault:
           </p>
           <!-- The list, not a sentence, because "why is this pane empty" and
                "why did chat sign me out" are the same question and a reader
@@ -2518,17 +2817,16 @@
                list because it needs the vault, not because it is paid.)
                chat.js unhides #np-chat, which is why the row ships hidden. -->
           <ul id="needs-passphrase">
-            <li>Saving and filling passwords.</li>
-            <li>Notes.</li>
-            <li>Backup, export, and import.</li>
-            <li>Changing the passphrase, or creating a recovery key.</li>
-            <li>
-              The Private Tunnel. Its configuration is stored in the vault.
+            <li data-msg="chrome.needs.passphrase.li">Saving and filling passwords.</li>
+            <li data-msg="chrome.needs.passphrase.li.n2">Notes.</li>
+            <li data-msg="chrome.needs.passphrase.li.n3">Backup, export, and import.</li>
+            <li data-msg="chrome.needs.passphrase.li.n4">Creating a recovery key.</li>
+            <li data-msg="chrome.needs.passphrase.li.n5">
+              Private Tunnel configuration.
             </li>
-            <li>Confirming a Premium token, which is stored in the vault.</li>
-            <li id="np-chat" hidden>
-              Private Chat, and checking a page with a contact. Your chat
-              identity is stored in the vault, so locking it signs you out.
+            <li data-msg="chrome.needs.passphrase.li.n6">Confirming a Premium token.</li>
+            <li id="np-chat" hidden data-msg="chrome.np.chat.li">
+              Private Chat and checking a page with a contact. Locking the vault signs you out.
             </li>
           </ul>
           <ul id="cred-list" class="items"></ul>
@@ -2552,8 +2850,8 @@
                 type="text"
                 placeholder="Site (e.g. example.com)"
                 autocomplete="off"
-              />
-              <button id="cred-use-site" type="button" class="small" hidden>
+               data-msg-placeholder="chrome.cred.site.placeholder"/>
+              <button id="cred-use-site" type="button" class="small" hidden data-msg="chrome.cred.use.site.button">
                 Use this site
               </button>
             </div>
@@ -2562,22 +2860,22 @@
               type="text"
               placeholder="Username"
               autocomplete="off"
-            />
+             data-msg-placeholder="chrome.cred.username.placeholder"/>
             <input
               id="cred-password"
               type="password"
               placeholder="Password"
               autocomplete="off"
-            />
+             data-msg-placeholder="chrome.cred.password.placeholder"/>
             <input
               id="cred-note"
               type="text"
               placeholder="Note (optional)"
               autocomplete="off"
-            />
+             data-msg-placeholder="chrome.cred.note.placeholder"/>
             <div class="form-buttons">
-              <button id="cred-submit" type="submit">Add credential</button>
-              <button id="cred-cancel" type="button" hidden>Cancel</button>
+              <button id="cred-submit" type="submit" data-msg="chrome.cred.submit.button">Add credential</button>
+              <button id="cred-cancel" type="button" hidden data-msg="chrome.cred.cancel.button">Cancel</button>
             </div>
             <p class="error" id="cred-error"></p>
           </form>
@@ -2591,15 +2889,15 @@
               type="text"
               placeholder="Title"
               autocomplete="off"
-            />
+             data-msg-placeholder="chrome.note.title.placeholder"/>
             <textarea
               id="note-body"
               rows="4"
               placeholder="Secret note"
-            ></textarea>
+             data-msg-placeholder="chrome.note.body.placeholder"></textarea>
             <div class="form-buttons">
-              <button id="note-submit" type="submit">Add note</button>
-              <button id="note-cancel" type="button" hidden>Cancel</button>
+              <button id="note-submit" type="submit" data-msg="chrome.note.submit.button">Add note</button>
+              <button id="note-cancel" type="button" hidden data-msg="chrome.note.cancel.button">Cancel</button>
             </div>
             <p class="error" id="note-error"></p>
           </form>
@@ -2609,7 +2907,7 @@
              protection against a forgotten passphrase (only the recovery key
              is), and the plaintext export says exactly what it does. -->
         <div id="pane-backup" hidden>
-          <h1>Backup and recovery</h1>
+          <h1 data-msg="chrome.pane.backup.h1">Backup and recovery</h1>
           <p id="bk-recovery-status" class="panel-intro"></p>
 
           <!-- Shown ONLY when this vault has no recovery key.
@@ -2621,18 +2919,17 @@
                creates a permanent second way into everything stored here, and
                an unlocked browser someone walked up to must not be enough. -->
           <form id="recovery-create-form" hidden>
-            <p class="panel-note">
-              You can make one now. You will see it once, so have somewhere to
-              write it down first.
+            <p class="panel-note" data-msg="chrome.recovery.create.form.p">
+              You will see the new key once. Have somewhere to write it down.
             </p>
             <input
               id="recovery-create-pass"
               type="password"
               autocomplete="current-password"
               placeholder="Your vault passphrase"
-            />
+             data-msg-placeholder="chrome.recovery.create.pass.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" class="small">Create a recovery key</button>
+              <button type="submit" class="small" data-msg="chrome.recovery.create.form.button">Create a recovery key</button>
             </div>
             <p class="error" id="recovery-create-error"></p>
           </form>
@@ -2648,26 +2945,20 @@
                Distinct ids because ids are unique; ONE renderer
                (refreshAutolock) fills both, so the two cannot disagree about
                the current value or drift in copy. -->
-          <h2>Lock when idle</h2>
-          <p class="panel-intro">
-            Typing anywhere in the browser counts as being here. A minute before
-            it locks, you get a countdown and a button to stay unlocked. Locking
-            clears your keys from memory. In builds with chat, it signs you out
-            of chat too, because your chat identity lives in the vault.
+          <h2 data-msg="chrome.pane.backup.h2">Lock when idle</h2>
+          <p class="panel-intro" data-msg="chrome.pane.backup.p">
+            Typing anywhere keeps the vault unlocked. You get a one-minute warning before it locks. Locking clears your keys from memory and signs you out of Private Chat.
           </p>
           <div class="form-buttons" id="autolock-choices-open"></div>
           <p class="panel-note" id="autolock-note-open"></p>
 
-          <h2>Encrypted export</h2>
-          <p class="panel-intro">
-            Writes one encrypted file, locked with an export passphrase you
-            choose here. Safe to copy anywhere, and the way to move this vault
-            to another machine. It covers a broken or lost machine. It does not
-            cover a forgotten passphrase. Only your recovery key does.
+          <h2 data-msg="chrome.pane.backup.h2.n2">Encrypted export</h2>
+          <p class="panel-intro" data-msg="chrome.pane.backup.p.n2">
+            Move or back up the vault in one encrypted file protected by a new passphrase. This covers a lost machine, not a forgotten passphrase. Only the recovery key does.
           </p>
           <form id="bk-export-form" class="entry-form">
             <div class="form-buttons">
-              <button id="bk-exp-pick" type="button" hidden>
+              <button id="bk-exp-pick" type="button" hidden data-msg="chrome.bk.exp.pick.button">
                 Choose location
               </button>
             </div>
@@ -2678,27 +2969,27 @@
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
-            />
+             data-msg-placeholder="chrome.bk.exp.dest.placeholder"/>
             <input
               id="bk-exp-pass1"
               type="password"
               placeholder="Export passphrase"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.exp.pass1.placeholder"/>
             <input
               id="bk-exp-pass2"
               type="password"
               placeholder="Confirm export passphrase"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.exp.pass2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit">Write encrypted export</button>
+              <button type="submit" data-msg="chrome.bk.export.form.button">Write encrypted export</button>
             </div>
             <p class="error" id="bk-exp-error"></p>
             <p class="ok" id="bk-exp-ok"></p>
           </form>
 
-          <h2>Import a backup</h2>
+          <h2 data-msg="chrome.pane.backup.h2.n3">Import a backup</h2>
           <!-- Import is offered HERE, on a machine that already has a vault,
                which is the case it used to refuse outright. The refusal meant
                the only people who could see an import control were the ones
@@ -2706,19 +2997,16 @@
                stated in front of the form instead of being enforced behind
                it. -->
           <p class="destructive-warning" role="note">
-            Importing <strong>replaces the vault on this machine</strong>. Every
-            password, note and bookmark here is deleted and replaced by the
-            backup's. There is no undo. If anything here is not in the backup,
-            export it first.
+            <span data-msg="chrome.bk.import.warning.lead">Importing</span>
+            <strong data-msg="chrome.autolock.choices.open.strong">replaces the vault on this machine</strong><span data-msg="chrome.bk.import.warning.rest">. Every password, note, and bookmark here is replaced by the backup. There is no undo. Export anything the backup does not contain first.</span>
           </p>
-          <p class="panel-intro">
-            The imported vault gets a new passphrase you choose below and a new
-            recovery key. The export passphrase then opens nothing but the
-            export file.
+          <p class="panel-intro" data-msg="chrome.autolock.choices.open.p">
+            Choose a new vault passphrase and recovery key. The export
+            passphrase will open only the backup file.
           </p>
           <form id="bk-import-form" class="entry-form">
             <div class="form-buttons">
-              <button id="bk-import-pick" type="button">
+              <button id="bk-import-pick" type="button" data-msg="chrome.bk.import.pick.button">
                 Choose backup file
               </button>
             </div>
@@ -2729,77 +3017,81 @@
               placeholder="Backup file path"
               autocomplete="off"
               spellcheck="false"
-            />
+             data-msg-placeholder="chrome.bk.import.src.placeholder"/>
             <input
               id="bk-import-export-pass"
               type="password"
               placeholder="Passphrase that protects the backup file"
               autocomplete="off"
-            />
+             data-msg-placeholder="chrome.bk.import.export.pass.placeholder"/>
             <input
               id="bk-import-pass1"
               type="password"
               placeholder="New passphrase for this machine"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.import.pass1.placeholder"/>
             <input
               id="bk-import-pass2"
               type="password"
               placeholder="Confirm new passphrase"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.import.pass2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit">Replace this vault with the backup</button>
+              <button type="submit" data-msg="chrome.bk.import.form.button">Replace this vault with the backup</button>
             </div>
             <p class="error" id="bk-import-error"></p>
           </form>
 
-          <h2>Change passphrase</h2>
-          <p class="panel-intro">
-            Only the passphrase changes. Your contents stay as they are and your
-            recovery key keeps working. If it fails, say you typed the current
-            passphrase wrong, nothing changes and your old one still works.
+          <h2 data-msg="chrome.pane.backup.h2.n4">Change passphrase</h2>
+          <!-- 1.0.0 ships WITHOUT passphrase rotation, on purpose: the vault
+               and the Library are two files keyed from the same passphrase,
+               and rotating one without the other strands or exposes the
+               Library (pentest F-001/F-002/F-004, 2026-09-16). The form stays
+               in the markup, hidden, so the submit handler and its gate
+               survive; the arm refuses anyway. Returns with the wrapped
+               Library key in 1.0.1. -->
+          <p class="panel-foot" id="bk-pw-unavailable" data-msg="chrome.bk.pw.unavailable.p">Changing the passphrase is not available in this version. Your current passphrase and your recovery key keep working. It returns in the next update.</p>
+          <!-- The form's own description, hidden with the form: read under
+               the unavailability note it sounded like a remaining step. -->
+          <p class="panel-intro" data-msg="chrome.pane.backup.p.n4" hidden>
+            Your contents and recovery key do not change. If this fails, your old passphrase still works.
           </p>
-          <form id="bk-pw-form" class="entry-form">
+          <form id="bk-pw-form" class="entry-form" hidden>
             <input
               id="bk-pw-current"
               type="password"
               placeholder="Current passphrase"
               autocomplete="current-password"
-            />
+             data-msg-placeholder="chrome.bk.pw.current.placeholder"/>
             <input
               id="bk-pw-new1"
               type="password"
               placeholder="New passphrase (min. 8 characters)"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.pw.new1.placeholder"/>
             <input
               id="bk-pw-new2"
               type="password"
               placeholder="Confirm new passphrase"
               autocomplete="new-password"
-            />
+             data-msg-placeholder="chrome.bk.pw.new2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit">Change passphrase</button>
+              <button type="submit" data-msg="chrome.bk.pw.form.button">Change passphrase</button>
             </div>
             <p class="error" id="bk-pw-error"></p>
             <p class="ok" id="bk-pw-ok"></p>
           </form>
 
-          <h2>Plaintext export: the way out</h2>
-          <p class="error">
-            This writes every password and note into a file anyone can read. No
-            encryption at all. Copies left behind by backups, search tools or
-            the disk itself can keep your passwords readable long after you
-            delete it.
+          <h2 data-msg="chrome.pane.backup.h2.n5">Plaintext export: the way out</h2>
+          <p class="error" data-msg="chrome.pane.backup.p.n5">
+            This writes every password and note into an unencrypted file. Backups, search tools, or the disk may keep readable copies after you delete it.
           </p>
-          <p class="panel-intro">
-            It exists so you can leave. Your data is not locked inside our
-            format. Make the file, use it, then delete it.
+          <p class="panel-intro" data-msg="chrome.pane.backup.p.n6">
+            Use this to leave PATANYX. Delete the file when finished.
           </p>
           <form id="bk-plain-form" class="entry-form">
             <div class="form-buttons">
-              <button id="bk-plain-pick" type="button" hidden>
+              <button id="bk-plain-pick" type="button" hidden data-msg="chrome.bk.plain.pick.button">
                 Choose location
               </button>
             </div>
@@ -2810,9 +3102,9 @@
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
-            />
+             data-msg-placeholder="chrome.bk.plain.dest.placeholder"/>
             <p class="panel-intro">
-              To confirm, type this sentence exactly:
+              <span data-msg="chrome.bk.plain.confirm.intro">To confirm, type this sentence exactly:</span>
               <strong id="bk-plain-sentence"></strong>
             </p>
             <input
@@ -2822,15 +3114,20 @@
               autocomplete="off"
               autocapitalize="off"
               spellcheck="false"
-            />
+             data-msg-placeholder="chrome.bk.plain.confirm.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" class="danger">
+              <button type="submit" class="danger" data-msg="chrome.bk.plain.form.button">
                 Write plaintext export
               </button>
             </div>
             <p class="error" id="bk-plain-error"></p>
             <p class="ok" id="bk-plain-ok"></p>
           </form>
+        </div>
+        <div id="pane-sync" hidden>
+          <p id="vault-sync-framing" class="panel-intro"></p>
+          <!-- Populated only when partner_list says this placement applies. -->
+          <div id="partner-vault"></div>
         </div>
       </div>
     </section>
@@ -2840,41 +3137,43 @@
      side in chat builds and binds every listener — there is deliberately no
      script tag for it here. -->
     <section id="chat-panel" hidden>
+      <!-- Standing Premium note. Chat is a Premium feature; the panel still
+           opens without a license so the reason is read HERE, in place,
+           instead of discovered as a refused click. chat.js fills the
+           sentence from the shared lock note and hides it while Premium is
+           on (or while the vault is locked, when the locked pane already
+           says what to do). -->
+      <p class="chat-note" id="chat-premium-note" hidden></p>
       <div id="chat-locked" class="chat-state" hidden>
-        <h1>Chat is locked</h1>
-        <p>
-          Your chat keys live in the vault, so chat works only while it is
-          unlocked. Open the Vault panel from the toolbar.
+        <h1 data-msg="chrome.chat.locked.h1">Chat is locked</h1>
+        <p data-msg="chrome.chat.locked.p">
+          Unlock the vault to use Private Chat.
         </p>
       </div>
 
       <div id="chat-intro" class="chat-state" hidden>
-        <h1>Set up chat</h1>
-        <p>
-          Your hash number is your chat address. Read it out or paste it to
-          someone on this network so their messages reach you. There is no
-          directory. You swap numbers yourselves.
+        <h1 data-msg="chrome.chat.intro.h1">Set up chat</h1>
+        <p data-msg="chrome.chat.intro.p">
+          Share your hash number with someone on this network so they can message you. There is no directory.
         </p>
-        <p class="chat-note">
-          You can skip this. Adding a contact creates a separate number just for
-          them.
+        <p class="chat-note" data-msg="chrome.chat.intro.p.n2">
+          Skip your own number and add a contact for a separate one.
         </p>
         <div class="form-buttons">
-          <button id="chat-mint" type="button">Create my hash number</button>
-          <button id="chat-intro-add" type="button">Add a contact</button>
+          <button id="chat-mint" type="button" data-msg="chrome.chat.mint.button">Create my hash number</button>
+          <button id="chat-intro-add" type="button" data-msg="chrome.chat.intro.add.button">Add a contact</button>
         </div>
         <pre id="chat-myhash" class="hash-number" hidden></pre>
-        <p class="chat-note" id="chat-myhash-note" hidden>
-          Give this number to the person you want to hear from.
+        <p class="chat-note" id="chat-myhash-note" hidden data-msg="chrome.chat.myhash.note.p">
+          Give this number to your contact.
         </p>
         <p class="error" id="chat-intro-error"></p>
       </div>
 
       <div id="chat-contacts" class="chat-state" hidden>
-        <h1>Contacts</h1>
-        <p class="chat-note">
-          Chat works on this local network only. Other devices here can see that
-          this browser is reachable. They see your hash number and nothing else.
+        <h1 data-msg="chrome.chat.contacts.h1">Contacts</h1>
+        <p class="chat-note" data-msg="chrome.chat.contacts.p">
+          Private Chat works only on this local network. Other devices can see your hash number, but nothing else.
         </p>
         <p id="chat-discovery" class="chat-note"></p>
         <ul id="chat-contact-list" class="items"></ul>
@@ -2892,7 +3191,7 @@
             type="text"
             placeholder="Their name (e.g. Alex)"
             autocomplete="off"
-          />
+           data-msg-placeholder="chrome.chat.add.label.placeholder"/>
           <input
             id="chat-add-hash"
             type="text"
@@ -2900,9 +3199,9 @@
             autocomplete="off"
             autocapitalize="off"
             spellcheck="false"
-          />
+           data-msg-placeholder="chrome.chat.add.hash.placeholder"/>
           <div class="form-buttons">
-            <button id="chat-add-submit" type="submit">Add contact</button>
+            <button id="chat-add-submit" type="submit" data-msg="chrome.chat.add.submit.button">Add contact</button>
           </div>
           <p class="error" id="chat-add-error"></p>
         </form>
@@ -2910,13 +3209,13 @@
 
       <div id="chat-conversation" class="chat-state" hidden>
         <nav class="tabs">
-          <button id="chat-back" type="button">&#x2039; Back</button>
+          <button id="chat-back" type="button" data-msg="chrome.chat.back.button">&#x2039; Back</button>
           <span id="chat-peer-name" class="chat-peer-name"></span>
           <span id="chat-peer-state"></span>
           <span class="spacer"></span>
         </nav>
-        <p class="chat-note">
-          Nothing is kept: closing this panel clears the conversation.
+        <p class="chat-note" data-msg="chrome.chat.conversation.p">
+          Closing this panel clears the conversation.
         </p>
         <div id="chat-messages"></div>
         <form id="chat-send-form">
@@ -2936,7 +3235,7 @@
               aria-controls="chat-emoji-panel"
               aria-label="Insert an emoji"
               title="Insert an emoji"
-            >
+             data-msg-aria-label="chrome.chat.emoji.toggle.aria.label" data-msg-title="chrome.chat.emoji.toggle.title">
               <span class="emoji-glyph" aria-hidden="true">🙂</span>
             </button>
             <input
@@ -2944,24 +3243,24 @@
               type="text"
               placeholder="Message"
               autocomplete="off"
-            />
-            <button id="chat-send" type="submit">Send</button>
+             data-msg-placeholder="chrome.chat.input.placeholder"/>
+            <button id="chat-send" type="submit" data-msg="chrome.chat.send.button">Send</button>
           </div>
           <div class="form-buttons">
-            <button id="chat-send-tab" type="button" class="small">
+            <button id="chat-send-tab" type="button" class="small" data-msg="chrome.chat.send.tab.button">
               Send this tab
             </button>
-            <button id="chat-share-cred" type="button" class="small">
+            <button id="chat-share-cred" type="button" class="small" data-msg="chrome.chat.share.cred.button">
               Share a credential
             </button>
           </div>
           <div id="chat-cred-picker" hidden>
             <select id="chat-cred-select"></select>
             <div class="form-buttons">
-              <button id="chat-cred-send" type="button" class="small">
+              <button id="chat-cred-send" type="button" class="small" data-msg="chrome.chat.cred.send.button">
                 Send login
               </button>
-              <button id="chat-cred-cancel" type="button" class="small">
+              <button id="chat-cred-cancel" type="button" class="small" data-msg="chrome.chat.cred.cancel.button">
                 Cancel
               </button>
             </div>
@@ -2983,36 +3282,46 @@
          around 300 KB for the Windows build, which is not a thing to push
          across the IPC boundary every time somebody glances at About. -->
     <section id="about-panel" hidden>
-      <h1 id="about-title">About</h1>
+      <h1 id="about-title" data-msg="chrome.about.title.h1">About</h1>
       <p class="panel-intro" id="about-build"></p>
       <div class="form-buttons">
-        <button id="about-tour-again" type="button" class="small">
+        <button id="about-tour-again" type="button" class="small" data-msg="chrome.about.tour.again.button">
           Show the tour again
         </button>
       </div>
       <div id="about-description"></div>
 
-      <h2 class="about-head">License</h2>
+      <!-- Optional project support is deliberately OUTSIDE the Premium block
+           rendered into #about-description. It buys no feature and is not an
+           affiliate placement. The button carries only a compiled target's
+           identifier; the destination is absent from every chrome asset. -->
+      <section id="about-support" aria-labelledby="about-support-head" hidden>
+        <h2 class="about-head" id="about-support-head"></h2>
+        <p class="about-para" id="about-support-copy"></p>
+        <div class="form-buttons">
+          <button id="about-support-open" type="button" class="small"></button>
+        </div>
+      </section>
+
+      <h2 class="about-head" data-msg="chrome.about.panel.h2">License</h2>
       <p id="about-license-line"></p>
-      <button id="about-license-toggle" type="button" class="small">
+      <button id="about-license-toggle" type="button" class="small" data-msg="chrome.about.license.toggle.button">
         Show the full license
       </button>
       <pre class="about-text" id="about-license-text" hidden></pre>
 
-      <h2 class="about-head">Notices</h2>
-      <p class="panel-note">
-        Credits that ship with PATANYX: the malicious-site list, the text-
-        recognition models, and the web engines.
+      <h2 class="about-head" data-msg="chrome.about.panel.h2.n2">Notices</h2>
+      <p class="panel-note" data-msg="chrome.about.panel.p">
+        Credits for the Reported Host List, text-recognition models, and web engines.
       </p>
       <pre class="about-text" id="about-notice-text"></pre>
 
-      <h2 class="about-head">Third-party software</h2>
+      <h2 class="about-head" data-msg="chrome.about.panel.h2.n3">Third-party software</h2>
       <p id="about-third-party-line"></p>
-      <p class="panel-note">
-        This is the list for THIS build only. The one in the source repository
-        covers every platform at once, so it names software that is not here.
+      <p class="panel-note" data-msg="chrome.about.panel.p.n2">
+        Licenses for this build only; other platforms are excluded.
       </p>
-      <button id="about-third-party-toggle" type="button" class="small">
+      <button id="about-third-party-toggle" type="button" class="small" data-msg="chrome.about.third.party.toggle.button">
         Show third-party licenses
       </button>
       <pre class="about-text" id="about-third-party-text" hidden></pre>
@@ -3023,17 +3332,15 @@
            are. Nothing here is sent anywhere on its own; copying or saving is
            the only way it leaves the machine, and that is the user's own
            choice to make and act on. -->
-      <h2 class="about-head">Diagnostics</h2>
-      <p class="panel-note">
-        A snapshot of this session, for troubleshooting: version, engine
-        settings, DNS mode, auto-lock and the last update check. No browsing
-        history, nothing from your vault, nothing from any page.
+      <h2 class="about-head" data-msg="chrome.about.panel.h2.n4">Diagnostics</h2>
+      <p class="panel-note" data-msg="chrome.about.panel.p.n3">
+        Session details for troubleshooting: version, engine settings, DNS mode, auto-lock, and last update. Excludes browsing history, vault contents, and page contents.
       </p>
       <div class="form-buttons">
-        <button id="diag-copy" type="button" class="small">
+        <button id="diag-copy" type="button" class="small" data-msg="chrome.diag.copy.button">
           Copy to clipboard
         </button>
-        <button id="diag-pick" type="button" class="small" hidden>
+        <button id="diag-pick" type="button" class="small" hidden data-msg="chrome.diag.pick.button">
           Choose location
         </button>
       </div>
@@ -3044,9 +3351,9 @@
         autocomplete="off"
         autocapitalize="off"
         spellcheck="false"
-      />
+       data-msg-placeholder="chrome.diag.dest.placeholder"/>
       <div class="form-buttons">
-        <button id="diag-save" type="button" class="small">Save to file</button>
+        <button id="diag-save" type="button" class="small" data-msg="chrome.diag.save.button">Save to file</button>
       </div>
       <p class="ok" id="diag-result" hidden></p>
     </section>
@@ -3071,10 +3378,10 @@
       >
         <p id="confirm-text"></p>
         <div class="form-buttons">
-          <button id="confirm-cancel" type="button" class="small">
+          <button id="confirm-cancel" type="button" class="small" data-msg="chrome.confirm.cancel.button">
             Cancel
           </button>
-          <button id="confirm-yes" type="button" class="small danger">
+          <button id="confirm-yes" type="button" class="small danger" data-msg="chrome.confirm.yes.button">
             Delete
           </button>
         </div>

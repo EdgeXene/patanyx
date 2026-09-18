@@ -2,9 +2,10 @@
 #
 # The build host MUST NOT be Debian 12. Its webkit2gtk is end-of-life at
 # 2.50.6 (Debian security tracker, DSA-6232-1), so it will never receive the
-# WSA-2026-0004 fixes: 23 CVEs, several of them memory corruption reachable by
-# visiting a page. Trixie security carries 2.52.5-1~deb13u1 (DSA-6398-1),
-# which is the floor `platform::MIN_WEBKITGTK` enforces at runtime.
+# WSA-2026-0004 fixes (23 CVEs) nor the WSA-2026-0005 fixes (9 more, among
+# them an iframe sandbox violation and use-after-free), all reachable by
+# visiting a page. Trixie security carries 2.52.6-1~deb13u1, which is the
+# floor `platform::MIN_WEBKITGTK` enforces at runtime.
 #
 # This is a container rather than a host upgrade on purpose: the machine this
 # was developed on runs 19 unrelated pm2 services, and a dist-upgrade to pick
@@ -13,12 +14,16 @@ FROM debian:13
 
 # trixie-security is where the fixed webkit lives, so it is not optional here.
 # Failing loudly at build time is better than silently resolving an older one.
+# nodejs is in this same reproducible trixie install because chrome-js-gate
+# executes the chrome scripts against a DOM stub; without it the image cannot
+# run the suite it was built to run.
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \
         build-essential \
         pkg-config \
         curl \
         ca-certificates \
         git \
+        nodejs \
         libwebkit2gtk-4.1-dev \
         libgtk-3-dev \
         libssl-dev \
@@ -32,19 +37,24 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 RUN set -eu; \
     v="$(dpkg-query -W -f='${Version}' libwebkit2gtk-4.1-dev)"; \
     echo "webkit2gtk-4.1-dev = $v"; \
-    case "$v" in \
-      2.5[2-9].*|2.[6-9][0-9].*|[3-9].*) echo "at or above the 2.52.5 floor" ;; \
-      *) echo "REFUSING: $v is below the 2.52.5 security floor" >&2; exit 1 ;; \
-    esac
+    if dpkg --compare-versions "$v" ge 2.52.6; then \
+      echo "at or above the 2.52.6 floor"; \
+    else \
+      echo "REFUSING: $v is below the 2.52.6 security floor" >&2; exit 1; \
+    fi
 
 # Pinned toolchain. rust-toolchain.toml pins the channel, but rustup must
 # exist to honour it, and the pin is repeated here so an image built without
-# the repo mounted still lands on the right compiler.
+# the repo mounted still lands on the right compiler. Repeating a version is
+# how it goes stale -- this one sat a release behind the pin once, so "the
+# right compiler" meant the wrong one. It is now checked against
+# rust-toolchain.toml by scripts/toolchain-pin-gate.sh, which also refuses any
+# other version literal in this file, comments included.
 ENV RUSTUP_HOME=/usr/local/rustup \
     CARGO_HOME=/usr/local/cargo \
     PATH=/usr/local/cargo/bin:$PATH
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --no-modify-path --default-toolchain 1.96.0 \
+      | sh -s -- -y --no-modify-path --default-toolchain 1.98.0 \
         -c rustfmt -c clippy \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 

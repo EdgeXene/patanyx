@@ -55,6 +55,28 @@ pub fn forget_all_copy() -> ForgetAllCopy {
     }
 }
 
+/// Whether this backend can clear cookies at all.
+///
+/// The WebKitGTK backend's `forget_site_cookies` / `forget_all_cookies` are
+/// stubs that refuse WITHOUT ASKING THE ENGINE (see their docs in
+/// platform/unix.rs). So on every non-Windows build the controls are shown
+/// disabled, with `unavailable_intro` above them, instead of an enabled
+/// button whose failure message blames an engine that was never called
+/// (Linux readiness review, 2026-09-15). Implementing the Linux calls is
+/// owed for 1.0.1; `WebKitWebsiteDataManager::clear` can do the browser-wide
+/// one, so this is "not built", not "impossible".
+pub const fn available() -> bool {
+    cfg!(windows)
+}
+
+/// What sits above the disabled controls where `available()` is false.
+/// Says what is true: not built for this platform in this release, and
+/// nothing was touched.
+pub fn unavailable_intro() -> &'static str {
+    "Clearing cookies from inside PATANYX is not available on this platform in \
+     this release. This control is turned off and will not change your cookies."
+}
+
 /// What the panel says once the clear has actually happened.
 ///
 /// Returned by the COMMAND, not by the status payload, so it can only appear
@@ -72,7 +94,17 @@ mod tests {
     /// hold across all of them.
     fn all_strings() -> Vec<&'static str> {
         let c = forget_all_copy();
-        vec![c.intro, c.warning, c.button, c.confirm, c.cancel, cleared_line()]
+        vec![
+            c.intro,
+            c.warning,
+            c.button,
+            c.confirm,
+            c.cancel,
+            cleared_line(),
+            // The unavailable sentence is user-facing copy like the rest, so
+            // the overclaim and em-dash checks below must see it too.
+            unavailable_intro(),
+        ]
     }
 
     #[test]
@@ -92,6 +124,39 @@ mod tests {
         assert_eq!(c.confirm, "Yes, clear them all");
         assert_eq!(c.cancel, "Cancel");
         assert_eq!(cleared_line(), "Cookies cleared for every site.");
+        assert_eq!(
+            unavailable_intro(),
+            "Clearing cookies from inside PATANYX is not available on this platform in \
+             this release. This control is turned off and will not change your cookies."
+        );
+    }
+
+    /// The flag that decides whether the controls are offered at all. Pinned
+    /// to the platform rather than to `true`, because the failure this guards
+    /// is a build where the Linux stubs are still stubs and the button came
+    /// back. Windows has the real `ICoreWebView2CookieManager` calls; nothing
+    /// else does yet.
+    #[test]
+    fn only_the_backend_with_a_real_implementation_offers_the_controls() {
+        assert_eq!(available(), cfg!(windows));
+    }
+
+    /// The unavailable sentence must not blame the engine. The engine is
+    /// never asked on that path, and saying it refused would be a lie about
+    /// where the limit is.
+    #[test]
+    fn the_unavailable_sentence_never_blames_the_engine() {
+        let s = unavailable_intro().to_lowercase();
+        for blame in ["engine refused", "the engine", "refused"] {
+            assert!(
+                !s.contains(blame),
+                "the unavailable copy says {blame:?}, but the engine is never called: {s:?}"
+            );
+        }
+        assert!(
+            s.contains("not available on this platform"),
+            "the unavailable copy does not say where the limit is: {s:?}"
+        );
     }
 
     /// The claim this feature can most easily overstate. A rewrite that

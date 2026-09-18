@@ -63,7 +63,7 @@ function statusEvent(origin) {
       interception: "registered",
       script_setting: "applied",
       smartscreen_off: "applied",
-      tracking_prevention: "applied",
+      tracking_prevention: "strict",
       navigation_tracking: "applied",
       autofill_off: "applied",
       ephemeral_confirmed: "applied",
@@ -75,8 +75,8 @@ function statusEvent(origin) {
 // The section between the two headings this control lives between, so a
 // check here cannot accidentally match the destructive-warning that belongs
 // to vault import or backup restore elsewhere in the same file.
-const sectionStart = html.indexOf('<span class="section-label">Cookies</span>');
-const sectionEnd = html.indexOf("<h2>Hosts this tab has contacted</h2>");
+const sectionStart = html.search(/<span class="section-label"[^>]*>Cookies<\/span>/);
+const sectionEnd = html.search(/<h2[^>]*>Hosts this tab has contacted<\/h2>/);
 const SECTION = html.slice(sectionStart, sectionEnd);
 
 check("the address-bar icon exists and is not a toolbar pill", () => {
@@ -145,6 +145,41 @@ check("the destructive-warning class has somewhere to be drawn", () => {
       "another grey paragraph and reads as intro copy rather than a warning",
   );
 });
+
+// A REPLY THAT SAYS NOTHING ABOUT COOKIE CLEARING MEANS AVAILABLE, NOT
+// UNAVAILABLE. The chrome reads `st.cookie_clear_available !== false`, so an
+// older Rust that does not send the field keeps a working control rather than
+// silently losing it. This gate's stub resolves privacy_get to `{}`, which is
+// exactly that case, so the assertion below is the one that would break if
+// someone inverted the default to `=== true` (readiness review, 2026-09-15).
+//
+// The third state -- privacy_get has not answered YET, where the control is
+// disabled but must NOT be called unavailable -- is reasoned, not gated:
+// chrome.js calls refreshPrivacy() at load and this harness resolves it before
+// any check runs, so the window cannot be reached here. The Linux case that
+// matters, an explicit `cookie_clear_available: false`, is covered in
+// scripts/forget-all-cookies-gate.js.
+check(
+  "a reply that omits the cookie-clear flag leaves the control working",
+  async () => {
+    statusEvent("example.com");
+    await flush();
+    const desc = global.$("tab-forget-desc").textContent;
+    assert(
+      global.$("btn-site-forget").disabled === false,
+      "a backend that said nothing about cookie clearing had its control disabled",
+    );
+    assert(
+      !desc.includes("not available on this platform"),
+      "a backend that said nothing was rendered as a platform limitation: " +
+        JSON.stringify(desc),
+    );
+    assert(
+      desc.includes("example.com"),
+      "the ordinary origin description should be shown: " + JSON.stringify(desc),
+    );
+  },
+);
 
 check(
   "pressing Forget opens a confirmation; it does not act immediately",

@@ -20,13 +20,18 @@ New-Item -ItemType Directory -Path $smokeDir | Out-Null
 
 $previousDataDir = $env:PATANYX_DATA_DIR
 $env:PATANYX_DATA_DIR = $smokeDir
+$targetDir = if ($env:CARGO_TARGET_DIR) {
+    [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR)
+} else {
+    Join-Path $repoRoot "target"
+}
 $code = 1
 try {
     cargo build --manifest-path (Join-Path $repoRoot "Cargo.toml")
     if ($LASTEXITCODE -ne 0) {
         $code = $LASTEXITCODE
     } else {
-        & (Join-Path $repoRoot "target\debug\patanyx.exe") --smoke-test
+        & (Join-Path $targetDir "debug\patanyx.exe") --smoke-test
         $code = $LASTEXITCODE
     }
 } finally {

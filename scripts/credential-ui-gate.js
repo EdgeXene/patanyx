@@ -59,7 +59,7 @@ function statusEvent(origin, overrides) {
         interception: "registered",
         script_setting: "applied",
         smartscreen_off: "applied",
-        tracking_prevention: "applied",
+        tracking_prevention: "strict",
         navigation_tracking: "applied",
         autofill_off: "applied",
         ephemeral_confirmed: "applied",
@@ -89,12 +89,12 @@ async function openTabPanel() {
 // The Passwords section, isolated the same way site-forget-gate.js isolates
 // Cookies -- so a check here cannot accidentally match the destructive
 // warning or ledger markup that live in the same panel.
-const pwStart = html.indexOf('<span class="section-label">Passwords</span>');
-const pwEnd = html.indexOf("<h2>Hosts this tab has contacted</h2>");
+const pwStart = html.search(/<span class="section-label"[^>]*>Passwords<\/span>/);
+const pwEnd = html.search(/<h2[^>]*>Hosts this tab has contacted<\/h2>/);
 const PW_SECTION = html.slice(pwStart, pwEnd);
 
 check("the Passwords section exists between Cookies and the ledger", () => {
-  const cookiesAt = html.indexOf('<span class="section-label">Cookies</span>');
+  const cookiesAt = html.search(/<span class="section-label"[^>]*>Cookies<\/span>/);
   assert(cookiesAt !== -1, "the Cookies section-label is missing");
   assert(pwStart !== -1, "the Passwords section-label is missing");
   assert(pwEnd !== -1, "the ledger heading it must precede is missing");
@@ -118,8 +118,9 @@ check(
     await openTabPanel();
     statusEvent(null);
     assert(
-      /no site/i.test(global.$("tab-autofill-desc").textContent),
-      "a page with no origin must say there is no site to check",
+      global.$("tab-autofill-desc").dataset.state === "no-site",
+      "a page with no origin must report the no-site reason; got " +
+        JSON.stringify(global.$("tab-autofill-desc").dataset.state),
     );
     assert(
       global.$("btn-autofill-fill").disabled === true,
@@ -135,9 +136,10 @@ check(
     global.rbCalls.length = 0;
     statusEvent("example.com", { content_script_registered: "failed" });
     assert(
-      /not available/i.test(global.$("tab-autofill-desc").textContent),
-      "an unregistered content script must say autofill is unavailable in " +
-        'this tab, not silently show "no saved password"',
+      global.$("tab-autofill-desc").dataset.state === "unavailable",
+      "an unregistered content script must report the unavailable reason, " +
+        "not silently the no-match one; got " +
+        JSON.stringify(global.$("tab-autofill-desc").dataset.state),
     );
     assert(
       global.$("btn-autofill-fill").disabled === true,
@@ -152,20 +154,370 @@ check(
   },
 );
 
+// WHY THESE FOUR CHECKS REPLACED ONE.
+//
+// This gate used to assert that an empty offer list "must report the no-match
+// reason" -- which enshrined the bug a tester found. An empty list meant four
+// different things (no origin, no vault, a LOCKED vault, or a completed search
+// that matched nothing) and the chrome rendered all four as "No saved password
+// for this site." For three of them that is a claim it has no basis for: with
+// the vault shut, nothing was searched. The host now says which happened
+// (ipc.rs `autofill_offer_reason`), and each reason gets its own check here.
+//
+// The TEXT is asserted, not just `dataset.state`. A state attribute nobody
+// reads could be correct while the sentence on screen stayed wrong, and the
+// sentence is the whole defect.
+const REASON_CASES = [
+  {
+    reason: "locked",
+    // THE TESTER'S BUG.
+    must: /unlock the vault/i,
+    mustNot: /no saved password for this site/i,
+    why: "a locked vault has not looked, so it must not report a result",
+  },
+  {
+    reason: "no-vault",
+    must: /no vault yet/i,
+    mustNot: /unlock the vault/i,
+    why: "with no vault created, telling the user to unlock one sends them " +
+      "to a control that cannot do what the text says",
+  },
+  {
+    reason: "no-site",
+    must: /no site to check/i,
+    mustNot: /no saved password for this site/i,
+    why: "the host had no origin, so no lookup ran",
+  },
+  {
+    reason: "no-match",
+    must: /no saved password for this site/i,
+    mustNot: /unlock the vault/i,
+    why: "the only reason that may assert a search happened and found nothing",
+  },
+];
+
+for (const c of REASON_CASES) {
+  check(
+    `reason "${c.reason}": the Passwords section says the right thing`,
+    async () => {
+      await openTabPanel();
+      global.rbResolve["cred_autofill_offer_get"] = {
+        items: [],
+        reason: c.reason,
+      };
+      statusEvent("example.com", { content_script_registered: "applied" });
+      await flush();
+      const desc = global.$("tab-autofill-desc");
+      assert(
+        desc.dataset.state === c.reason,
+        `reason ${c.reason} must reach the surface as its own state; got ` +
+          JSON.stringify(desc.dataset.state),
+      );
+      assert(
+        c.must.test(desc.textContent),
+        `${c.why}: expected ${c.must} but the user is shown ` +
+          JSON.stringify(desc.textContent),
+      );
+      assert(
+        !c.mustNot.test(desc.textContent),
+        `${c.why}: must not say ${c.mustNot}, but does: ` +
+          JSON.stringify(desc.textContent),
+      );
+      assert(
+        global.$("btn-autofill-fill").disabled === true,
+        "the fill button must stay disabled when there is nothing to fill",
+      );
+    },
+  );
+}
+
 check(
-  "no match: the Passwords section says so and the button stays disabled",
+  "a reply with no reason at all still degrades to no-match",
   async () => {
+    // DELIBERATELY SUPPORTED. The chrome assumed no-match unconditionally
+    // before this change, so a host that does not send a reason must land on
+    // the old behaviour rather than on a blank line or a thrown error.
     await openTabPanel();
     global.rbResolve["cred_autofill_offer_get"] = { items: [] };
     statusEvent("example.com", { content_script_registered: "applied" });
     await flush();
+    const desc = global.$("tab-autofill-desc");
     assert(
-      /no saved password/i.test(global.$("tab-autofill-desc").textContent),
-      "an empty offer list must say there is no saved password for this site",
+      desc.dataset.state === "no-match",
+      "a reasonless reply must fall back to no-match; got " +
+        JSON.stringify(desc.dataset.state),
+    );
+    assert(
+      /no saved password/i.test(desc.textContent),
+      "the fallback must still render a sentence, got " +
+        JSON.stringify(desc.textContent),
+    );
+  },
+);
+
+// The last three of these are not hypothetical. With an ordinary object
+// literal, "constructor" rendered "[object Object]" with state "constructor",
+// "toString" rendered "[object Undefined]", and "__proto__" threw and landed
+// on check-failed -- none of them degrading to no-match. A reason arrives over
+// IPC as a string, so the table it indexes must inherit nothing.
+for (const bogus of [
+  "something-this-build-has-never-heard-of",
+  "constructor",
+  "toString",
+  "__proto__",
+]) {
+  check(
+    `an unknown reason (${bogus}) degrades to no-match, not to something invented`,
+    async () => {
+      await openTabPanel();
+      global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: bogus };
+      statusEvent("example.com", { content_script_registered: "applied" });
+      await flush();
+      const desc = global.$("tab-autofill-desc");
+      assert(
+        desc.dataset.state === "no-match",
+        `reason ${bogus} must not become a state of its own; got ` +
+          JSON.stringify(desc.dataset.state),
+      );
+      // POSITIVE assertion, not just the absence of the code. Without this, a
+      // fallback that returned an empty string passed the whole gate.
+      assert(
+        /^No saved password for this site\.$/.test(desc.textContent),
+        "the fallback must render the no-match sentence, got " +
+          JSON.stringify(desc.textContent),
+      );
+      assert(
+        !new RegExp(bogus.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).test(
+          desc.textContent,
+        ),
+        "a reason code must never be shown to the user as text: " +
+          JSON.stringify(desc.textContent),
+      );
+    },
+  );
+}
+
+check(
+  "a fill that returns AFTER a lock does not re-enable the button",
+  async () => {
+    // The click handler's `finally` used to set `disabled = false`
+    // unconditionally. The vault can lock while a fill is in flight, and that
+    // blanket re-enable put a live-looking Fill control back underneath a
+    // panel reading "Unlock the vault".
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-1", site: "Example", username: "alice" }],
+      reason: "match",
+    };
+    statusEvent("example.com", { content_script_registered: "applied" });
+    await flush();
+    assert(
+      global.$("btn-autofill-fill").disabled === false,
+      "setup failed: the offer should be live before the fill starts",
+    );
+
+    let releaseFill;
+    global.rbResolve["cred_autofill_fill"] = new Promise((r) => {
+      releaseFill = r;
+    });
+    global.$("btn-autofill-fill")._fire("click");
+    await flush();
+
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "locked" };
+    global.window.__rb_event({ event: "vault_locked", data: {} });
+    await flush();
+    assert(
+      global.$("btn-autofill-fill").disabled === true,
+      "setup failed: the lock should have disabled the button",
+    );
+
+    releaseFill({});
+    await flush();
+    assert(
+      global.$("btn-autofill-fill").disabled === true,
+      "the held fill re-enabled the button after the vault locked",
+    );
+    assert(
+      global.$("tab-autofill-desc").dataset.state === "locked",
+      "the panel must still report the vault as locked; got " +
+        JSON.stringify(global.$("tab-autofill-desc").dataset.state),
+    );
+    delete global.rbResolve["cred_autofill_fill"];
+    delete global.rbResolve["vault_status"];
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+  },
+);
+
+check(
+  "a translation that lands after a lock cannot put the account name back",
+  async () => {
+    // `i18nSet` guards completions with a per-element token, but the
+    // empty-offer branch writes textContent directly, which left the previous
+    // token valid. In a non-English locale a translation requested for a LIVE
+    // OFFER landed after the vault had locked and restored the account name --
+    // in the description AND on the button -- under a panel saying "Unlock the
+    // vault". Only reachable with a non-en locale, which is why no earlier
+    // check saw it.
+    global.window.__rb_event({
+      event: "ui_locale_fill",
+      data: { locale: "xx", generation: 1, messages: {} },
+    });
+    await flush();
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+
+    let releaseI18n;
+    global.rbResolve["i18n_resolve"] = new Promise((r) => {
+      releaseI18n = r;
+    });
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-1", site: "Example", username: "alice" }],
+      reason: "match",
+    };
+    statusEvent("example.com", { content_script_registered: "applied" });
+    await flush();
+
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "locked" };
+    global.window.__rb_event({ event: "vault_locked", data: {} });
+    await flush();
+
+    releaseI18n({ text: "A saved password for alice is available." });
+    await flush();
+
+    const desc = global.$("tab-autofill-desc");
+    assert(
+      !/alice/.test(desc.textContent),
+      "a late translation restored the account name after the lock: " +
+        JSON.stringify(desc.textContent),
+    );
+    assert(
+      !/alice/.test(global.$("btn-autofill-fill").textContent),
+      "a late translation restored the account name on the button: " +
+        JSON.stringify(global.$("btn-autofill-fill").textContent),
+    );
+    assert(
+      !/alice/.test(global.$("btn-fill").title || ""),
+      "a late translation restored the account name in the toolbar tooltip: " +
+        JSON.stringify(global.$("btn-fill").title),
+    );
+    assert(
+      desc.dataset.state === "locked",
+      "the panel must still report the vault as locked; got " +
+        JSON.stringify(desc.dataset.state),
+    );
+    delete global.rbResolve["i18n_resolve"];
+    delete global.rbResolve["vault_status"];
+    global.window.__rb_event({
+      event: "ui_locale_fill",
+      data: { locale: "en", generation: 2, messages: {} },
+    });
+    await flush();
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+  },
+);
+
+check(
+  "locking the vault retracts a live offer BEFORE the replacement reply lands",
+  async () => {
+    // THE INTERVAL, not the steady state. `refreshAutofillOffer` clears the
+    // offer in memory and then waits for `cred_autofill_offer_get`. Until this
+    // check existed, nothing repainted in between, so locking the vault left
+    // "Fill password for alice" in the panel with its button ENABLED and the
+    // toolbar button lit for as long as the lookup took. Reproduced in a real
+    // browser by holding the reply and screenshotting the gap.
+    // The chrome has to BELIEVE the vault is open, or locking it changes
+    // nothing and this check passes without exercising anything. Opening the
+    // vault panel runs `refreshVault`, which is the real path to that state.
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-1", site: "Example", username: "alice" }],
+    };
+    statusEvent("example.com", { content_script_registered: "applied" });
+    await flush();
+    assert(
+      global.$("btn-autofill-fill").disabled === false,
+      "setup failed: the offer should be live before the vault locks",
+    );
+
+    // From here the lookup hangs. `Promise.resolve` adopts a pending promise,
+    // so rb() never settles until this check says so.
+    let release;
+    global.rbResolve["cred_autofill_offer_get"] = new Promise((r) => {
+      release = r;
+    });
+    global.window.__rb_event({ event: "vault_locked", data: {} });
+    await flush();
+
+    const desc = global.$("tab-autofill-desc");
+    assert(
+      desc.dataset.state !== "offer",
+      "the offer survived the lock: the panel still asserts a saved password " +
+        "is available while the vault is shut",
     );
     assert(
       global.$("btn-autofill-fill").disabled === true,
-      "the fill button must stay disabled with no match",
+      "the fill button stayed ENABLED after the vault locked",
+    );
+    assert(
+      !/alice/.test(desc.textContent),
+      "the locked panel still names the account: " +
+        JSON.stringify(desc.textContent),
+    );
+    const toolbar = global.$("btn-fill");
+    assert(
+      toolbar.hidden === true,
+      "the toolbar fill button stayed on screen after the vault locked",
+    );
+
+    // Now let the truthful answer arrive.
+    release({ items: [], reason: "locked" });
+    await flush();
+    assert(
+      global.$("tab-autofill-desc").dataset.state === "locked",
+      "after the reply the panel must say the vault is locked; got " +
+        JSON.stringify(global.$("tab-autofill-desc").dataset.state),
+    );
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+    delete global.rbResolve["vault_status"];
+  },
+);
+
+check(
+  "an offer describes itself in one sentence, not two glued together",
+  async () => {
+    // A SEPARATE DEFECT IN THE SAME ROW, found while fixing the locked-vault
+    // message. Two drafts of this sentence were concatenated in the English
+    // fallback, and `i18nSet` writes that argument to textContent
+    // synchronously -- and on the default "en" locale writes nothing else. So
+    // every English user with a saved password read
+    // "A saved password for aliceSaved password available for ".
+    // The catalog entry was right the whole time; only the fallback was wrong,
+    // and nothing asserted the sentence, which is why it shipped.
+    await openTabPanel();
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-1", site: "Example", username: "alice" }],
+      reason: "match",
+    };
+    statusEvent("example.com", { content_script_registered: "applied" });
+    await flush();
+    const text = global.$("tab-autofill-desc").textContent;
+    assert(
+      /^A saved password for alice is available\.$/.test(text),
+      "the offer line must be one finished sentence, got " +
+        JSON.stringify(text),
+    );
+    assert(
+      !/aliceSaved|available for\s*$/.test(text),
+      "two phrasings were concatenated instead of one being chosen: " +
+        JSON.stringify(text),
     );
   },
 );
@@ -515,6 +867,156 @@ check(
   },
 );
 
+check(
+  "a locked vault says a password was not saved, and raises no save banner",
+  async () => {
+    // The silence a tester reported. Rust emits this when a login is submitted
+    // with the vault locked: nothing was stored, and until now nothing said
+    // so. The event deliberately carries NO payload -- no password, no
+    // username, no origin -- because the sentence names no site.
+    const before = global.$("toasts").children.length;
+    global.window.__rb_event({ event: "vault_locked_no_save", data: {} });
+    await flush();
+    const notices = [...global.$("toasts").children];
+    assert(
+      notices.length === before + 1,
+      `expected exactly one new notice, got ${notices.length - before}`,
+    );
+    const node = notices[notices.length - 1];
+    assert(
+      node.className === "toast",
+      "the notice must be a plain .toast, which is now the centred bold " +
+        "surface, got " + JSON.stringify(node.className),
+    );
+    // A dismiss control the user can reach when they are done reading.
+    const close = node.querySelector(".toast-close");
+    assert(close, "the notice has no dismiss button");
+    assert(
+      close.tagName === "BUTTON" && close.type === "button",
+      "the dismiss control must be a real button, got " +
+        JSON.stringify(close.tagName),
+    );
+    assert(
+      (close.getAttribute("aria-label") || "").length > 0,
+      "the dismiss button needs an accessible name; its label is an X glyph",
+    );
+    // The message must not be swallowed by the button markup.
+    assert(
+      /^Password not saved\. The vault is locked, so unlock it and sign in again to save it\.$/.test(
+        node.querySelector(".toast-text").textContent,
+      ),
+      "the message text is wrong once the button is in the node: " +
+        JSON.stringify(node.textContent),
+    );
+    // THE TWO BEHAVIOURS, ACTUALLY ASSERTED.
+    //
+    // The first version of this check just called `close._fire("click")` and
+    // asserted nothing after it. A review removed BOTH the click wiring and
+    // the expiry scheduling and all 34 checks still passed -- so the test
+    // could not protect either of the things it existed for. domstub's
+    // `remove()` is a no-op and its `setTimeout` runs synchronously, so the
+    // work is to observe the wiring rather than the disappearance.
+    assert(
+      close._listeners && close._listeners.click,
+      "the dismiss button has no click handler, so pressing it does nothing",
+    );
+    // Give this node a removal we can see, then fire the button.
+    let removedByClick = false;
+    node.remove = () => {
+      removedByClick = true;
+    };
+    close._fire("click");
+    await flush();
+    assert(
+      removedByClick,
+      "clicking dismiss did not remove the notification",
+    );
+
+    // And the automatic expiry: capture what toast() schedules instead of
+    // letting the stub run it, so both the delay and the effect are checked.
+    const realSetTimeout = global.setTimeout;
+    const scheduled = [];
+    global.setTimeout = (fn, ms) => {
+      scheduled.push({ fn, ms });
+      return 0;
+    };
+    try {
+      global.window.__rb_event({ event: "vault_locked_no_save", data: {} });
+      await flush();
+    } finally {
+      global.setTimeout = realSetTimeout;
+    }
+    assert(
+      scheduled.length === 1,
+      `a notification must schedule exactly one expiry, got ${scheduled.length}`,
+    );
+    assert(
+      scheduled[0].ms === 15000,
+      "a notification must clear itself after 15 seconds, got " +
+        JSON.stringify(scheduled[0].ms),
+    );
+    const late = [...global.$("toasts").children].pop();
+    let removedByTimer = false;
+    late.remove = () => {
+      removedByTimer = true;
+    };
+    scheduled[0].fn();
+    assert(
+      removedByTimer,
+      "the expiry fired but did not remove the notification",
+    );
+    // It must not imply a save is pending: the banner is the surface that
+    // offers to save, and there is nothing to offer.
+    assert(
+      global.$("save-password-banner").hidden === true,
+      "a locked vault must not raise the save banner",
+    );
+    assert(
+      !global.rbCalls.some((c) => c.cmd === "cred_save_confirm"),
+      "the notice must never confirm a save",
+    );
+  },
+);
+
+check(
+  "no more than three notifications are on screen at once",
+  async () => {
+    // Centred, bold, wrapping and fifteen seconds each were fine alone.
+    // Together, one long message already covers the address bar and most of
+    // the toolbar, and a burst pushes later notices below the visible strip --
+    // the document is `overflow: hidden`, so those are unreachable rather than
+    // merely out of view, and their dismiss buttons go with them.
+    const host = global.$("toasts");
+    // The harness never really removes nodes (domstub's `remove()` is a
+    // no-op), so start from a known floor rather than from whatever earlier
+    // checks left behind.
+    host.children = [];
+    // DISTINGUISHABLE messages, through the same helper every caller uses.
+    // Five identical notices cannot show WHICH three survived, and the first
+    // version of this check could not tell keeping the newest from keeping
+    // the oldest.
+    for (const n of ["one", "two", "three", "four", "five"]) {
+      global.window.__rb_toast(n, false);
+      await flush();
+    }
+    assert(
+      host.children.length === 3,
+      `at most three notifications may be visible, got ${host.children.length}`,
+    );
+    // It is the OLDEST that goes. The newest message is the one the user is
+    // looking for, so a flood must not silence the thing it buried.
+    const surviving = host.children.map((n) =>
+      n.querySelector(".toast-text").textContent,
+    );
+    assert(
+      JSON.stringify(surviving) === JSON.stringify(["three", "four", "five"]),
+      "the wrong three survived; expected the newest three, got " +
+        JSON.stringify(surviving),
+    );
+    host.children = [];
+  },
+);
+
 check("the save banner is hidden by default", () => {
   assert(
     global.$("save-password-banner").hidden === true,
@@ -620,7 +1122,7 @@ check(
       interception: "registered",
       script_setting: "applied",
       smartscreen_off: "applied",
-      tracking_prevention: "applied",
+      tracking_prevention: "strict",
       navigation_tracking: "applied",
       autofill_off: "applied",
       ephemeral_confirmed: "applied",

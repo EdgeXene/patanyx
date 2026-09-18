@@ -127,6 +127,37 @@ check(
   },
 );
 
+check("a FREE user returning to default clears the exception row", async () => {
+  state(
+    {
+      host: "example.com",
+      enabled_globally: true,
+      off_for_this_site: true,
+      registered: false,
+      surfaces: [],
+    },
+    [{ host: "example.com", off: true }],
+    false,
+  );
+  await openPrivacy();
+  global.rbCalls.length = 0;
+
+  const box = $("dv-off");
+  box.checked = false;
+  box._fire("change");
+  await flush();
+
+  const clears = global.rbCalls.filter((call) => call.cmd === "divergence_site_clear");
+  const sets = global.rbCalls.filter((call) => call.cmd === "divergence_site_set");
+  await closePrivacy();
+  assert(clears.length === 1, "returning to default did not clear the stored row");
+  assert(
+    clears[0].args.host === "example.com",
+    "the clear command carried the wrong host: " + JSON.stringify(clears[0].args),
+  );
+  assert(sets.length === 0, "returning to default stored another override row");
+});
+
 check("a registered tab is described as installed, not as proven", async () => {
   state({
     host: "example.com",

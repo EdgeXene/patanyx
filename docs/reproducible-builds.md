@@ -45,12 +45,40 @@ not match the source — and would have been right to.
 
 ## The fix
 
-`scripts/repro-build.sh` normalizes the two path roots that reach the binary:
+`scripts/repro-build.sh` normalizes the three path roots that reach the binary:
 
 ```
 --remap-path-prefix=$CARGO_HOME=/cargo
 --remap-path-prefix=$PWD=/build
+--remap-path-prefix=$(rustc --print sysroot)=/rust
 ```
+
+The sysroot was added 2026-08-27 and the first two alone were not enough. std's
+own panic locations carry the toolchain path, not our source path and not a
+dependency path, so neither of the other prefixes could reach them: a shipped
+Windows exe still contained 25 copies of
+`/root/.rustup/toolchains/1.96.0-x86_64-unknown-linux-gnu/lib/rustlib/src/rust/library/...`,
+naming the build account, the pinned toolchain version and the build host
+triple. Remapping the sysroot removes all three facts at once.
+
+> **Historical note.** This finding refers to the 0.9.65 / pre-release
+> artifact, which was built with Rust 1.96.0. The stable release toolchain was
+> subsequently moved to Rust 1.98.0. The path above is quoted as it was
+> recovered from that binary and is deliberately not updated: it is evidence of
+> what a shipped artifact contained, not a statement of current configuration.
+> The same applies to the published 0.9.65 source snapshot, which keeps its
+> 1.96.0 pin because that pin is part of what its published hashes verify
+> against. `scripts/toolchain-pin-gate.sh` enforces the current pin across
+> active build configuration and deliberately does not police this document. (The separate
+`/rustc/<hash>/library/...` paths in the binary are normalized by rustc itself
+upstream and never named this machine.)
+
+`scripts/build-windows.sh` sets the SAME three, spelled identically. If the two
+scripts ever disagree they produce different bytes, which is the failure this
+document exists to prevent. `build-windows.sh` also asserts the result: it
+fails the build if any `.cargo` or `.rustup` path survives into the exe, with a
+positive control so that a binary containing neither the real paths nor the
+remapped ones cannot pass silently.
 
 computed at runtime rather than checked into `.cargo/config.toml`, because a
 hardcoded `/root/.cargo` would only be correct on one machine and would defeat

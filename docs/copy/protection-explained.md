@@ -57,10 +57,10 @@ hour ago won't be on it yet. It blocks whole sites, so it won't catch a single
 bad page on an otherwise legitimate site, and it doesn't inspect files you
 download.
 
-For stronger cover you can switch on a filtering DNS provider in Privacy
-settings. Mullvad and Quad9 both refuse to look up known malicious sites at
-all, and they update continuously rather than hourly. The trade is that the
-provider you pick sees which sites you look up.
+For stronger cover you can switch on Quad9, the encrypted DNS service, in
+Privacy settings. It refuses to look up known malicious sites at all, and
+updates continuously rather than hourly. The trade is that Quad9 sees which
+sites you look up.
 
 ---
 
@@ -83,8 +83,8 @@ off.
 
 **Limits, plainly:** it covers sites that have been reported, so a brand-new
 scam may not be listed yet; it blocks whole sites rather than single pages;
-and it does not scan downloads. Choosing Mullvad or Quad9 below adds a second
-layer that updates continuously and applies to every request.
+and it does not scan downloads. Choosing Quad9 below adds a second layer
+that updates continuously and applies to every request.
 
 _Currently blocking: {count} sites. Last updated: {age}._
 

@@ -67,3 +67,74 @@ cash.app       # 8291  Block's payment service, reported by PhishDestroy
                #       blocked on review's call. The per-tab override
                #       remains for users who choose to proceed, which is the
                #       recoverable direction for a payment brand.
+
+# --- ShadowWhisperer onboarding review, 2026-09-01 -------------------------
+# The nine of eighteen the review found genuinely malicious. The other nine are
+# in blocklist-allow.txt. All nine are single-source: no other feed here
+# reports them, and none appears in the 2.18M-host aggregate consulted as a
+# cross-check. The clustering evidence below is what carried the decision, and
+# it is circumstantial -- infrastructure shared between disposable domains, not
+# an observed phishing page. Recorded so the tripwire stops re-asking.
+
+# Cluster A. Four domains, one registrant: all Amazon Registrar, all AWS Route 53
+# nameservers, all registered between 2025-11-04 and 2025-12-12, all with DV
+# certificates from Google Trust Services, all three-random-English-word names,
+# and ALL FOUR resolving to the single IP 94.242.247.34, which has no reverse
+# DNS. Their Tranco rank is consistent with malvertising redirect traffic
+# rather than organic popularity.
+
+buffermotivatorsuffice.com   # 8364  Cluster A.
+decafeligiblyhad.com         # 8882  Cluster A.
+acquaintjokinglyscoring.com  # 8946  Cluster A.
+bondeddarkenedswerve.com     # 9306  Cluster A.
+
+# Cluster B. Two domains sharing the IDENTICAL Cloudflare nameserver pair
+# (aragorn / diana) and identical addresses, which means one Cloudflare
+# account. NameCheap, registered 2021 and 2022, short alphanumeric names.
+
+ey43.com             # 1592  Cluster B.
+obqj2.com            # 9009  Cluster B.
+
+# Individually adjudicated.
+
+b7510.com            # 1723  Serves an empty 200, application/octet-stream,
+                     #       zero bytes, no redirect; hosted on a legacy RIPE
+                     #       block registered to networkclaim-com (NL).
+                     #       Review read this as adtech or SDK telemetry and
+                     #       recommended allowing it as out of scope; the
+                     #       decision went the other way on 2026-09-01 and it
+                     #       stays blocked. Recorded plainly because the file
+                     #       is worth nothing if it hides which calls were
+                     #       contested.
+bangcdn.net          # 4725  NXDOMAIN. Resolves nowhere, so it cannot serve
+                     #       anything and the block costs nothing; Amazon
+                     #       Registrar, 2019. Kept blocked in case it returns.
+13o.net              # 8417  Cloudflare, but a DIFFERENT nameserver pair from
+                     #       cluster B, so the profile fits and the cluster
+                     #       evidence does not exist. NameCheap, 2023. Kept
+                     #       blocked by decision, 2026-09-01.
+
+# --- Tranco snapshot of 2026-09-02 armed these two -------------------------
+# Both arrived with ShadowWhisperer's Malware list and sat in the 10000-100000
+# report band until the weekly snapshot moved them into the refuse band, which
+# froze publishing until they were ruled on. Both single-source here: no other
+# feed carries them.
+#
+# THE PROBE SAID ALLOW AND THE PROBE WAS WRONG, which is worth recording. From
+# this host both serve a plain 301 to google.com, identical under a default and
+# a browser user-agent, with no form and no password field -- so no cloaking was
+# visible and no phishing page was reachable. That was one vantage point at one
+# moment, and it is exactly what a Google-impersonation kit shows a visitor it
+# does not want. Independent classification outranked it.
+#
+# Decision 2026-09-01, on evidence this machine could not see:
+
+workdeadlinededicate.com  # 9109  Phishing per Malwarebytes and ANY.RUN, with
+                          #       multi-vendor detections and GOOGLE-BRAND
+                          #       IMPERSONATION OBSERVED. Brand impersonation
+                          #       to harvest credentials is rule 3 exactly, so
+                          #       this is in scope rather than merely
+                          #       disreputable.
+kettledroopingcontinuation.com # 8923  Phishing per Kaspersky and SafeToOpen,
+                          #       multiple independent malicious detections and
+                          #       further phishing-report corroboration.

@@ -192,6 +192,41 @@ check("a locked Deep Recall never asks Rust to save", async () => {
   await closePanel();
 });
 
+check("Deep Recall shares and uses the remembered capture scope", async () => {
+  licensed(true);
+  global.rbResolve.capture_scope_get = { scope: "viewport" };
+  global.rbResolve.archive_list = { items: [], count: 0, max: 200 };
+  await openPanel();
+  assert(
+    $("recall-scope-viewport").classList.contains("active"),
+    "Deep Recall did not load the remembered viewport choice",
+  );
+
+  global.rbResolve.capture_scope_set = { scope: "full_page" };
+  $("recall-scope-full").click();
+  await flush();
+  assert(
+    global.rbCalls.some(
+      (c) => c.cmd === "capture_scope_set" && c.args.scope === "full_page",
+    ),
+    "Deep Recall's Full page option is not reachable",
+  );
+
+  global.rbResolve.capture_scope_set = { scope: "viewport" };
+  global.rbResolve.capture_scope_get = { scope: "viewport" };
+  $("recall-scope-viewport").click();
+  await flush();
+  global.rbCalls.length = 0;
+  $("recall-save").click();
+  await flush();
+  assert(
+    global.rbCalls.some((c) => c.cmd === "capture_scope_get"),
+    "Save this page did not re-read the persisted scope",
+  );
+  assert(saveCalls().length === 1, "Save this page did not reach archive_save");
+  await closePanel();
+});
+
 check("a licensed panel lists what is saved", async () => {
   licensed(true);
   global.rbResolve.archive_list = {
@@ -522,6 +557,220 @@ check("a saved picture can actually be looked at", async () => {
       $("recall-preview-img").getAttribute("src"),
   );
   assert(!$("recall-preview").hidden, "the preview stayed hidden");
+  await ensureClosed();
+});
+
+check("View puts the one preview directly after its row and moves it", async () => {
+  // THE HARDWARE DEFECT: the preview used to stay above the search box, so
+  // View on a mid-list row staged a picture outside the visible list.
+  // This assertion is intentionally about sibling order, not merely about a
+  // visible img. Leaving the preview at the top is the planted defect.
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "inline-1",
+        url: "https://example.com/one",
+        title: "One",
+        created_at: 1700000003,
+        scope: "full page",
+        has_picture: true,
+        words: 1,
+      },
+      {
+        id: "inline-2",
+        url: "https://example.com/two",
+        title: "Two",
+        created_at: 1700000002,
+        scope: "full page",
+        has_picture: true,
+        words: 1,
+      },
+      {
+        id: "inline-3",
+        url: "https://example.com/three",
+        title: "Three",
+        created_at: 1700000001,
+        scope: "full page",
+        has_picture: true,
+        words: 1,
+      },
+    ],
+    count: 3,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 31 };
+  await ensureOpen();
+  const list = $("recall-list");
+  const rows = Array.from(list.children);
+  const preview = $("recall-preview");
+
+  global.rbCalls.length = 0;
+  findButton(rows[2], "View")._fire("click");
+  await flush();
+  let at = Array.from(list.children).indexOf(rows[2]);
+  assert(
+    list.children[at + 1] === preview,
+    "View on row 3 did not make the preview row 3's next sibling",
+  );
+  assert(
+    Array.from(list.children).filter((node) => node === preview).length === 1,
+    "the list contains more than one preview node",
+  );
+
+  global.rbCalls.length = 0;
+  findButton(rows[0], "View")._fire("click");
+  await flush();
+  at = Array.from(list.children).indexOf(rows[0]);
+  assert(
+    list.children[at + 1] === preview,
+    "View on another row did not move the preview under that row",
+  );
+  const slotCalls = global.rbCalls
+    .filter((call) =>
+      ["archive_picture_clear", "archive_picture_stage"].includes(call.cmd),
+    )
+    .map((call) => call.cmd);
+  assert(
+    slotCalls.join(",") === "archive_picture_clear,archive_picture_stage",
+    "moving between rows was not close-then-stage: " + slotCalls.join(","),
+  );
+
+  global.rbCalls.length = 0;
+  $("recall-preview-close")._fire("click");
+  await flush();
+  assert(preview.hidden, "Close left the inline preview visible");
+  assert(
+    preview.parentNode !== list,
+    "Close left the preview in the list's row flow",
+  );
+  assert(
+    global.rbCalls.some((call) => call.cmd === "archive_picture_clear"),
+    "Close did not clear the one staged slot",
+  );
+  await ensureClosed();
+});
+
+check("the open-picture caption claims viewport scope and nothing else", async () => {
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "scope-full",
+        url: "https://example.com/full",
+        title: "Full",
+        created_at: 1700000003,
+        scope: "full page",
+        has_picture: true,
+        words: 1,
+      },
+      {
+        id: "scope-view",
+        url: "https://example.com/view",
+        title: "Viewport",
+        created_at: 1700000002,
+        scope: "visible area",
+        has_picture: true,
+        words: 1,
+      },
+      {
+        id: "scope-unknown",
+        url: "https://example.com/unknown",
+        title: "Unknown",
+        created_at: 1700000001,
+        has_picture: true,
+        words: 1,
+      },
+    ],
+    count: 3,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 41 };
+  await ensureOpen();
+  const rows = Array.from($("recall-list").children);
+  const caption = $("recall-preview-scope");
+
+  findButton(rows[0], "View")._fire("click");
+  await flush();
+  assert(caption.hidden, "a full-page record grew a viewport claim");
+  assert(caption.textContent === "", "a full-page record retained caption text");
+
+  findButton(rows[1], "View")._fire("click");
+  await flush();
+  assert(!caption.hidden, "a viewport record has no scope caption");
+  assert(
+    caption.textContent === "The picture is the part that was on screen. Nothing below it was captured, so there is nothing more to scroll to -- a scrollbar you see inside the picture is part of the page it shows.",
+    "the viewport caption did not reuse the established sentence exactly: " +
+      caption.textContent,
+  );
+
+  findButton(rows[2], "View")._fire("click");
+  await flush();
+  assert(caption.hidden, "a record with no scope grew a scope claim");
+  assert(caption.textContent === "", "an unknown-scope record retained a claim");
+  await ensureClosed();
+});
+
+check("deleting an unviewed row leaves the inline preview alone", async () => {
+  licensed(true);
+  global.rbResolve.archive_list = {
+    items: [
+      {
+        id: "kept-view",
+        url: "https://example.com/kept",
+        title: "Kept",
+        created_at: 1700000002,
+        scope: "visible area",
+        has_picture: true,
+        words: 1,
+      },
+      {
+        id: "deleted-other",
+        url: "https://example.com/other",
+        title: "Other",
+        created_at: 1700000001,
+        scope: "full page",
+        has_picture: true,
+        words: 1,
+      },
+    ],
+    count: 2,
+    max: 200,
+  };
+  global.rbResolve.archive_picture_stage = { token: 51 };
+  global.rbResolve.archive_delete = {};
+  await ensureOpen();
+  const list = $("recall-list");
+  const rows = Array.from(list.children);
+  const preview = $("recall-preview");
+  findButton(rows[0], "View")._fire("click");
+  await flush();
+
+  global.rbCalls.length = 0;
+  findButton(rows[1], "Delete")._fire("click");
+  await flush();
+  $("confirm-yes")._fire("click");
+  await flush();
+
+  const at = Array.from(list.children).indexOf(rows[0]);
+  assert(!preview.hidden, "deleting another row closed the preview");
+  assert(
+    list.children[at + 1] === preview,
+    "deleting another row moved the preview away from its viewed row",
+  );
+  assert(
+    $("recall-preview-img").getAttribute("src") ===
+      "/archive-picture/51.png",
+    "deleting another row dropped the viewed token URL",
+  );
+  assert(
+    !global.rbCalls.some((call) => call.cmd === "archive_picture_clear"),
+    "deleting another row asked chrome to clear the viewed slot",
+  );
+  assert(
+    !Array.from(list.children).includes(rows[1]),
+    "the confirmed row was not removed",
+  );
   await ensureClosed();
 });
 

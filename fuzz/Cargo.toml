@@ -5,7 +5,10 @@
 # and `cargo build` at the repo root never sees it.
 #
 # Requires a nightly toolchain (libFuzzer needs -Z flags). The repo's pinned
-# 1.96.0 still governs every real build; nightly is only ever used here:
+# 1.98.0 still governs every real build; nightly is only ever used here.
+# The nightly is deliberately UNPINNED -- it floats, unlike every other
+# toolchain surface here -- which is tolerable only because nothing this
+# directory produces is ever released:
 #
 #     cargo +nightly fuzz run <target> -- -max_total_time=300
 #

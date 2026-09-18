@@ -55,14 +55,14 @@ CONFIGS = [
         "windows-chat",
         "x86_64-pc-windows-msvc",
         ["chat", "relay-client"],
-        "PATANYX-Premium for Windows",
+        "PATANYX-Nabu-X for Windows",
     ),
     ("linux", "x86_64-unknown-linux-gnu", [], "PATANYX for Linux"),
     (
         "linux-chat",
         "x86_64-unknown-linux-gnu",
         ["chat", "relay-client"],
-        "PATANYX-Premium for Linux",
+        "PATANYX-Nabu-X for Linux",
     ),
 ]
 
@@ -177,6 +177,31 @@ def body_without_copyright(text):
     return "\n".join(kept).strip()
 
 
+ARTIFACT_REGISTER = "shipped-artifacts.json"
+
+
+def artifact_lines():
+    """The register's entries, formatted like the crate rows above.
+
+    Deliberately indistinguishable in style from a crate entry: a reader of the
+    About panel should not have to know which mechanism produced which line.
+    Absent register = hard failure, not a silent skip, because a missing
+    attribution block is exactly the failure this exists to prevent.
+    """
+    with open(ARTIFACT_REGISTER, encoding="utf-8") as handle:
+        reg = json.load(handle)
+    out = ["", "Bundled third-party artifacts (not Cargo packages)", ""]
+    for a in sorted(reg.get("artifacts", []), key=lambda x: x["component"].lower()):
+        out.append(f"  {a['component']}")
+        out.append(f"    {a['copyright']}")
+        out.append(f"    Licensed under {a['licence']}.")
+        upstream = a.get("upstream")
+        if upstream:
+            out.append(f"    Upstream: {upstream} ({a.get('upstream_version') or 'unrecorded'})")
+        out.append("")
+    return out
+
+
 def build(name, target, features, title, index):
     pkgs = sorted(shipping_packages(target, features))
     bodies = {}  # sha -> text
@@ -274,6 +299,16 @@ def build(name, target, features, title, index):
         for ln in bodies[sha].splitlines():
             lines.append(f"  {ln}" if ln.strip() else "")
         lines.append("")
+
+    # NON-CRATE ARTIFACTS. `cargo metadata` sees Cargo packages and nothing
+    # else, so a shipped .wasm, .onnx or model file appears in no inventory
+    # above -- which is how ten components could have shipped with their
+    # licence terms unmet while this script printed a clean file. The register
+    # in shipped-artifacts.json is the second source of truth, and it lands
+    # HERE so the notices actually reach the About panel rather than only
+    # being verified on disk. MIT, BSD, ISC, Apache-2.0 and MPL-2.0 all require
+    # the notice to travel with the binary.
+    lines.extend(artifact_lines())
 
     text = "\n".join(lines).rstrip() + "\n"
     OUTDIR.mkdir(parents=True, exist_ok=True)

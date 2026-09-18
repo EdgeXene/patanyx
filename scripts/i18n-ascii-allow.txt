@@ -1,0 +1,18 @@
+# Exact node texts the coverage scan may see in plain ASCII after a
+# non-English fill. Two kinds live here, and the stale-entry check makes
+# the second kind self-cleaning: when a TEMPORARY entry's element is
+# restructured and extracted, the text stops occurring, the entry goes
+# stale, and the gate fails until the line is deleted -- cleanup is forced,
+# not remembered.
+
+# PERMANENT: brand vocabulary and configuration syntax. Not language.
+PATANYX Original
+Ion
+Sardonyx
+Aether
+Chloris
+Elektron
+Thalassa
+Lithos
+Porphyra
+[Interface] ...

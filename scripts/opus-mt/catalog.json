@@ -1,0 +1,665 @@
+{
+  "_comment": "Language-pack catalog (OPUS-MT; FREE tier since the operator ruling of 2026-09-01): pairs PATANYX offers from converted OPUS-MT models where Mozilla publishes none. Read by gen-language-registry.py (merged BELOW Mozilla: a token Mozilla publishes always wins) and by publish-langpacks.py's catalog mode. Conversion recipe and measurements: docs/opus-mt-spike.md; tools: scripts/opus-mt/. The  hashes PIN the exact artifact bytes that may be signed for each pair: the publisher refuses anything else, so an unrelated or tampered model cannot receive this pair's provenance and the trusted key.",
+  "pairs": [
+    {
+      "token": "en-eo",
+      "from": "en",
+      "to": "eo",
+      "from_name": "English",
+      "to_name": "Esperanto",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-05-23",
+      "approx_bytes": 48714915,
+      "upstream": {
+        "model": "en-eo opus-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 49.5)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-eo/opus-2020-05-23.zip",
+        "release_sha256": "0ccb4fc5ff7bdf9f95c8166046174369bbe61d0e02b1e9bb4e4b816737fc218e",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "0b882db11c78c015867c024ddbabd3bed6834dc2f8a010ab5384d9a638c27010",
+          "size": 48337947
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "55b79f3f31473d59374941e64bd4e0196da2659f9cced2ebcf9e91cef7db5e07",
+          "size": 376968
+        }
+      }
+    },
+    {
+      "token": "en-ga",
+      "from": "en",
+      "to": "ga",
+      "from_name": "English",
+      "to_name": "Irish",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2019-12-18",
+      "approx_bytes": 75143053,
+      "upstream": {
+        "model": "en-ga opus-2019-12-18 (transformer-align, bilingual; Tatoeba BLEU 37.5)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-ga/opus-2019-12-18.zip",
+        "release_sha256": "ac9e88ad3f3dbc361dd345196c1ddeff68b69c2dfb7d4522db388625cd21c437",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "4c66b9cc1d8fe7daf0cc753515256a43822841c4ac3def4695b565e267c38cab",
+          "size": 73733405
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "7466b17588566fb901bfd2210a462cfee2334584877bebc85bca86d1b47a3aae",
+          "size": 1409648
+        }
+      }
+    },
+    {
+      "token": "en-ht",
+      "from": "en",
+      "to": "ht",
+      "from_name": "English",
+      "to_name": "Haitian Creole",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus+bt-2020-05-23",
+      "approx_bytes": 48752598,
+      "upstream": {
+        "model": "en-ht opus+bt-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 45.2)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-ht/opus+bt-2020-05-23.zip",
+        "release_sha256": "cbc57b36b51c6c22a6c8ef92f9cc6aee4e00c1d13bbcb85e5fc9a502e0f60850",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "3d3055befa18acffd084455f02e009ae1cbd892f9f19d6824e3669cd93099e30",
+          "size": 48370971
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "44bf4e8fbdbf27592db0f6ac101446af850d1eb14e8478473693f5c62695a39a",
+          "size": 381627
+        }
+      }
+    },
+    {
+      "token": "en-mg",
+      "from": "en",
+      "to": "mg",
+      "from_name": "English",
+      "to_name": "Malagasy",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-01-08",
+      "approx_bytes": 74080402,
+      "upstream": {
+        "model": "en-mg opus-2020-01-08 (transformer-align, bilingual; Tatoeba BLEU 35.5)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-mg/opus-2020-01-08.zip",
+        "release_sha256": "2f352f7ea0419202f93073b1af11b13b1bef11ce63f020512c518c9dceabce05",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "716f806d6433c5ee2436d9584f1a6d979cdf37d00d5c42decd029af536e9068a",
+          "size": 72742685
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "13ad7260c1419f246fc551d24a4fd7c19e34c2a8d30760057325d6f0b441eb9b",
+          "size": 1337717
+        }
+      }
+    },
+    {
+      "token": "en-mk",
+      "from": "en",
+      "to": "mk",
+      "from_name": "English",
+      "to_name": "Macedonian",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2019-12-18",
+      "approx_bytes": 78135117,
+      "upstream": {
+        "model": "en-mk opus-2019-12-18 (transformer-align, bilingual English->Macedonian; Tatoeba BLEU 52.1)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-mk/opus-2019-12-18.zip",
+        "release_sha256": "36f8ea2ee87c7d0ee5c66b35fc77cf80348d63b3de55254636c60344c3962519",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration from the official Tatoeba test set; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "329daf4393836d55387f651a2be973e35551417266c56a1d89db31e3374c12b0",
+          "size": 76474397
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "477412aa2e8b340d15ae6d5e740896a15b1165cd0e37bf3c064c1b43967efcc5",
+          "size": 1660720
+        }
+      }
+    },
+    {
+      "token": "en-ny",
+      "from": "en",
+      "to": "ny",
+      "from_name": "English",
+      "to_name": "Chichewa",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-01-08",
+      "approx_bytes": 76868268,
+      "upstream": {
+        "model": "en-ny opus-2020-01-08 (transformer-align, bilingual; Tatoeba BLEU 26.8)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-ny/opus-2020-01-08.zip",
+        "release_sha256": "677e0d77969fa308aafcf80fff64bda61afa290e77206e3a3847e932dedd1aab",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "7510375e2ebf30cfc25c44199b0c06a7625d530bed51c4ba7e7262b35e4c47ce",
+          "size": 75384605
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "227fb7d30b6928e17a3af06606a82e3e630e992701b5897ed5c0b2596a252596",
+          "size": 1483663
+        }
+      }
+    },
+    {
+      "token": "en-tl",
+      "from": "en",
+      "to": "tl",
+      "from_name": "English",
+      "to_name": "Tagalog",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus+bt-2020-02-26",
+      "approx_bytes": 75560165,
+      "upstream": {
+        "model": "en-tl opus+bt-2020-02-26 (transformer-align, back-translation augmented, English->Tagalog; Tatoeba BLEU 26.6)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/en-tl/opus+bt-2020-02-26.zip",
+        "release_sha256": "a48692617f2faf21cbe12dc2fb58ffc0f76ddfaa5ecdc1cfa561528c264ad544",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration from the official Tatoeba test set; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "237fd59957e78605f15cb0f7ffaa8edf08bc723991402ef6dfd5c082b7a6fc8e",
+          "size": 74129693
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "ab8074a7fa0137fea547101da6a03f5cdfc2b3501314f546d93b78286daafb71",
+          "size": 1430472
+        }
+      }
+    },
+    {
+      "token": "eo-en",
+      "from": "eo",
+      "to": "en",
+      "from_name": "Esperanto",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-05-23",
+      "approx_bytes": 48714915,
+      "upstream": {
+        "model": "eo-en opus-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 54.8)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/eo-en/opus-2020-05-23.zip",
+        "release_sha256": "df108ae78da47657a6c1f8bbb9a11519a811320a4f022df51c7eb3d1c5395185",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "8425766375a347a02532956e459afe007dfe9bf6902e872c47235906a268314b",
+          "size": 48337947
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "51c510dff4571a197ac44099f31ebeced9257fee2883c52f546179b8542bc23a",
+          "size": 376968
+        }
+      }
+    },
+    {
+      "token": "frm-en",
+      "from": "frm",
+      "to": "en",
+      "from_name": "Middle French",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus2m-2020-08-01",
+      "approx_bytes": 77439940,
+      "upstream": {
+        "model": "ine-eng opus2m (transformer-base, multilingual Indo-European -> English; the SAME converted artifact as la-en, source frm_Latn; Tatoeba BLEU 30.0, chr-F 0.457)",
+        "release": "https://object.pouta.csc.fi/Tatoeba-MT-models/ine-eng/opus2m-2020-08-01.zip",
+        "release_sha256": "6b40c6eb0711f7deaf3bf9783e970e61c5b00ae820b17f88ba0e69a118615e19",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to=61056) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "17591d8be20dfe269f4ba5e7846232340a06464360a09252a8f5a0d7fbe10873",
+          "size": 76012063
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "de9957c8f305d660d3451169e53a71aec5bb0ac668cd5910cdacce487eef5526",
+          "size": 1427850
+        }
+      }
+    },
+    {
+      "token": "ga-en",
+      "from": "ga",
+      "to": "en",
+      "from_name": "Irish",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2019-12-18",
+      "approx_bytes": 75143053,
+      "upstream": {
+        "model": "ga-en opus-2019-12-18 (transformer-align, bilingual; Tatoeba BLEU 51.6)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ga-en/opus-2019-12-18.zip",
+        "release_sha256": "a479a48bb3942f8aaeef96769daa62ca092da4429572da013144274e3655c6f0",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "682959a55bae5c32b2a51cf2e9347d8efd9871ea899b1db51f59ac4f6f638a2b",
+          "size": 73733405
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "b2b47c0a7206924a40d811b25ba64fdcc3a9c88ba3c26b0c263ba608cb0eb7be",
+          "size": 1409648
+        }
+      }
+    },
+    {
+      "token": "ha-en",
+      "from": "ha",
+      "to": "en",
+      "from_name": "Hausa",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus+bt-2020-05-23",
+      "approx_bytes": 48786674,
+      "upstream": {
+        "model": "ha-en opus+bt-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 39.0)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ha-en/opus+bt-2020-05-23.zip",
+        "release_sha256": "34818133833d8835f1fd625fdaba183b40a2b05cbe2e40b02c93185cb09f2686",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "60d51a74df29807469e7fa228877ab46f4173c8083fbfa9262651faa09c67e51",
+          "size": 48403995
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "91896486abb2ec76ee2808cea93abc313e2df84da6c0321753edca81b6b5cf70",
+          "size": 382679
+        }
+      }
+    },
+    {
+      "token": "ht-en",
+      "from": "ht",
+      "to": "en",
+      "from_name": "Haitian Creole",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-05-23",
+      "approx_bytes": 48752598,
+      "upstream": {
+        "model": "ht-en opus-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 57.0)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ht-en/opus-2020-05-23.zip",
+        "release_sha256": "71f943edf9ae76b7be8754dfa089e4f2f9429d233a9b4a5c4121d30d6a5d6e33",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "f7fabfdd2642be12804345bf19d1a524cb42374b1393ad40aa10b0d95b5a0185",
+          "size": 48370971
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "aad14550b9479b8cbe8d9313926c7155f5dc05d252041b36c1397741ae9de2e9",
+          "size": 381627
+        }
+      }
+    },
+    {
+      "token": "ig-en",
+      "from": "ig",
+      "to": "en",
+      "from_name": "Igbo",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus+bt-2020-05-23",
+      "approx_bytes": 48684319,
+      "upstream": {
+        "model": "ig-en opus+bt-2020-05-23 (transformer-align, bilingual; Tatoeba BLEU 46.3)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ig-en/opus+bt-2020-05-23.zip",
+        "release_sha256": "19fd44ce417f0f729ef0bd0d43db0efd2d23888c5355da81391f98537e1410e2",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "8e8bd4bef506d2f097e09acd5a10b295a98c94536832ad5e928c1faf94e13628",
+          "size": 48304923
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "a5dbd31eb1f8fdc26166e1616fd62509ee5343343373030687c04d4fcc0787aa",
+          "size": 379396
+        }
+      }
+    },
+    {
+      "token": "ka-en",
+      "from": "ka",
+      "to": "en",
+      "from_name": "Georgian",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2019-12-18",
+      "approx_bytes": 78714083,
+      "upstream": {
+        "model": "ka-en opus-2019-12-18 (transformer-align, bilingual; Tatoeba BLEU 37.9)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ka-en/opus-2019-12-18.zip",
+        "release_sha256": "6b7c5e91b5cf96da1dbabe169b770505bf167674f6de37c40d5c1f5b0808ad52",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "f74cf324b696cb4f0fa92e07d12dc319d9bbb772a56207df162611ad444d9391",
+          "size": 76738589
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "029f0f94ef6bf2b5aee2b8863c61dc885f6f160c6992009f938b66182fdd344b",
+          "size": 1975494
+        }
+      }
+    },
+    {
+      "token": "la-en",
+      "from": "la",
+      "to": "en",
+      "from_name": "Latin",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus2m-2020-08-01",
+      "approx_bytes": 77439940,
+      "upstream": {
+        "model": "ine-eng opus2m (transformer-base, multilingual Indo-European -> English; best available Latin->English, Tatoeba BLEU 24.4)",
+        "release": "https://object.pouta.csc.fi/Tatoeba-MT-models/ine-eng/opus2m-2020-08-01.zip",
+        "release_sha256": "6b40c6eb0711f7deaf3bf9783e970e61c5b00ae820b17f88ba0e69a118615e19",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to=61056) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "17591d8be20dfe269f4ba5e7846232340a06464360a09252a8f5a0d7fbe10873",
+          "size": 76012063
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "de9957c8f305d660d3451169e53a71aec5bb0ac668cd5910cdacce487eef5526",
+          "size": 1427850
+        }
+      }
+    },
+    {
+      "token": "mg-en",
+      "from": "mg",
+      "to": "en",
+      "from_name": "Malagasy",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-01-09",
+      "approx_bytes": 74080402,
+      "upstream": {
+        "model": "mg-en opus-2020-01-09 (transformer-align, bilingual; Tatoeba BLEU 50.2)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/mg-en/opus-2020-01-09.zip",
+        "release_sha256": "5969eabeb012289d199273758b60cedda8ec200aac6b9062279730fee1de5fda",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "24100d22a81789fe4e2bb6dacdb1beadd9c67c498f72b46dcfe2b31a308d58b5",
+          "size": 72742685
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "97730ef7c80c164d62e86ed42e380a22cbf7540e2017f50c5e11b39c05aab5fe",
+          "size": 1337717
+        }
+      }
+    },
+    {
+      "token": "mk-en",
+      "from": "mk",
+      "to": "en",
+      "from_name": "Macedonian",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2019-12-18",
+      "approx_bytes": 78135117,
+      "upstream": {
+        "model": "mk-en opus-2019-12-18 (transformer-align, bilingual Macedonian->English; Tatoeba BLEU 59.8)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/mk-en/opus-2019-12-18.zip",
+        "release_sha256": "054c3a7bd8f8d3b94b876ed3f1229cb7cac43e30b543a7c3cda1385790a6f970",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration from the official Tatoeba test set; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "dd104e2254b651f04c931dae2de19fbe14801f33c1bdd67313ef0f61bc75e6bb",
+          "size": 76474397
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "194c7f96f920d05f315f0b2c161796a3ad3ea33ec423a72f0daa99f6ddb41a4e",
+          "size": 1660720
+        }
+      }
+    },
+    {
+      "token": "ny-en",
+      "from": "ny",
+      "to": "en",
+      "from_name": "Chichewa",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-01-16",
+      "approx_bytes": 76868268,
+      "upstream": {
+        "model": "ny-en opus-2020-01-16 (transformer-align, bilingual; Tatoeba BLEU 44.2)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/ny-en/opus-2020-01-16.zip",
+        "release_sha256": "19289043c5ceefd22541ddf7083e6040ce1008aac92367d313e048bbb70e4b6d",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "9e64754a42139b51451cf40a20a9e1221e1f74cc550443bd406273330737dd64",
+          "size": 75384605
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "75cb3b6b1a4ef2054caac5446f11dc33914964b8612d6bd8f85bfc62db658e69",
+          "size": 1483663
+        }
+      }
+    },
+    {
+      "token": "rw-en",
+      "from": "rw",
+      "to": "en",
+      "from_name": "Kinyarwanda",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-01-16",
+      "approx_bytes": 77133449,
+      "upstream": {
+        "model": "rw-en opus-2020-01-16 (transformer-align, bilingual; Tatoeba BLEU 49.8)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/rw-en/opus-2020-01-16.zip",
+        "release_sha256": "9ab28db85a04dec53687f218e823220bf44f94a0d00d8ab3f71707504119377c",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to, validated against source-language text from the official Tatoeba test set) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "090205a1754960051d9f737d6bfc905bf5979d36ec224fe1b33ddf1091424e2a",
+          "size": 75681821
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "aa290b1025f769c6bd6f6e39f56f3fcf54bcbdc30bfc5aeaa0b9e42a615bfbdf",
+          "size": 1451628
+        }
+      }
+    },
+    {
+      "token": "tl-en",
+      "from": "tl",
+      "to": "en",
+      "from_name": "Tagalog",
+      "to_name": "English",
+      "tier": 1,
+      "source": "opus-mt",
+      "upstream_version": "opus-2020-02-11",
+      "approx_bytes": 75560165,
+      "upstream": {
+        "model": "tl-en opus-2020-02-11 (transformer-align, bilingual Tagalog->English; Tatoeba BLEU 35.0)",
+        "release": "https://object.pouta.csc.fi/OPUS-MT-models/tl-en/opus-2020-02-11.zip",
+        "release_sha256": "3eb7dc1b1626235d6b855e93a61158a5e0cebd805a21cac544602c53ae5e5498",
+        "licence": "CC-BY-4.0",
+        "licence_evidence": "LICENSE file inside the release zip (Attribution 4.0 International)"
+      },
+      "conversion": "aligned vocab (build-aligned-vocab.py --pad-to) + pad-marian-vocab.py + marian-conv intgemm8 with alphas calibration from the official Tatoeba test set; empty lex.bin (no shortlist); gemm-precision int8shiftAll (the alphas the calibration produced are IGNORED at run time: int8shiftAlphaAll computes wrongly on WebView2 and plain int8 measured equal or better on every pack once the vocabulary alignment was fixed); beam 1",
+      "converted": {
+        "model": {
+          "sha256": "2d55142c461c5e67bb36adbbd3fc1f98a535c4d1037b1220a24aa002ca0c90d2",
+          "size": 74129693
+        },
+        "lex": {
+          "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+          "size": 0
+        },
+        "vocab": {
+          "sha256": "e602d68ccc2cefec75b0fcb41b997c3fe135e59a006b0078a0f99b897eaef318",
+          "size": 1430472
+        }
+      }
+    }
+  ]
+}

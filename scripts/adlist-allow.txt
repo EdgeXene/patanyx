@@ -1,0 +1,47 @@
+# PATANYX ad-list allowlist -- hosts that must never reach the shipped ad and
+# tracker rules, whatever an upstream list says.
+#
+# This is the ad blocker's counterpart to scripts/blocklist-allow.txt, and the
+# bar for an entry is DIFFERENT. The malicious blocklist stops navigation, so
+# its allowlist protects reachability. These rules silently drop subresource
+# REQUESTS, so an entry here protects the browser's own plumbing and this
+# project's first-party infrastructure from ever being filtered by a bad
+# upstream pull -- nothing else. "This ad network is legitimate" is NOT a
+# reason: legitimate ad networks are exactly what the feature blocks.
+#
+# EXACT MATCH ONLY, same parse as the blocklist allowlist: removing
+# `example.com` does not remove `sub.example.com`.
+#
+# Format: one host per line. Blank lines and lines beginning with # ignored.
+# Inline # comments carry the reason.
+
+patanyx.com          # First-party. The front door, AreaGram, Travel, Recall.
+patanyx.net          # First-party. The web home.
+edgexene.io          # First-party. The dl/ channel and the relay live under
+                     # this apex; a rule here would break updates and sync.
+
+# ---- Google gates and Maps imagery, added 2026-09-14 ----
+# Not ad hosts. consent.google.com is the interstitial Google sends you
+# through BEFORE it will serve Maps, Search or anything else; blocking it
+# does not block an ad, it makes Google return "an error has occurred" and
+# the site unusable. Reproduced on 1.0.0: with this host refused, a load of
+# google.com/maps stops at the consent screen; with consent stored, the same
+# page works with every other rule here still in force.
+consent.google.com   # Google's consent gate. Blocking it breaks all of Google.
+consent.google.com.af
+consent.google.com.ag
+consent.google.com.ai
+consent.google.com.ar
+consent.google.com.au
+consent.google.com.bd
+consent.google.com.mm
+consent.google.com.pk
+# Map tiles and Street View imagery. Upstream files these under Tracking;
+# they carry the pictures, and a map with no tiles is a broken map.
+t1.gstatic.com       # Map tiles (also favicons).
+t2.gstatic.com
+geo1.ggpht.com       # Street View and photo imagery.
+geo2.ggpht.com
+geo3.ggpht.com
+# NOT allowed, deliberately: csi.gstatic.com and metric.gstatic.com are
+# client-side instrumentation and nothing renders from them.

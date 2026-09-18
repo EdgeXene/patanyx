@@ -762,11 +762,21 @@ struct Established {
     outstanding_ping: Option<(MessageId, Instant)>,
     /// Consecutive probes that went unanswered.
     missed_pings: u8,
-    /// Message ids already delivered to the app on THIS session.
+    /// Message ids already delivered to the app on this peer's session.
     ///
-    /// Deliberately NOT carried across a rekey, unlike `seen_ephemerals`: a
+    /// CARRIED ACROSS A REKEY, and it did not used to be. The old note said a
     /// promoted session has new keys, so an id from the old one cannot be
-    /// replayed into it — the frame would not open at all.
+    /// replayed into it and the history was therefore pointless to keep. That
+    /// is true of an ATTACKER replaying a captured sealed frame, which cannot
+    /// open under the new keys. It is not true of the SENDER, who holds the
+    /// plaintext, reseals the same message id under the new session, and is
+    /// now expected to do exactly that: the promotion path carries in-flight
+    /// messages onto the new session rather than failing them. Without this
+    /// history the peer would show that resend a second time to the user.
+    ///
+    /// The bound travels with it: SEEN_MID_LIMIT by count and
+    /// SEEN_MID_RETENTION by age, both applied on the receive path, so
+    /// carrying cannot grow this without limit.
     seen_mids: VecDeque<(MessageId, Instant)>,
 }
 
@@ -1376,6 +1386,54 @@ impl Core {
         }
     }
 
+    /// Takes the state a REPLACED session must hand to its successor.
+    ///
+    /// TWO paths replace a live session: our own handshake completing, and a
+    /// provisional session proving itself. Both used to call
+    /// `fail_session_messages(peer, SessionEnded)` and the second one said
+    /// "same as the promotion path" in a comment, which is exactly how they
+    /// drifted apart later. They share this instead, so a third path cannot
+    /// quietly do something different.
+    ///
+    /// What must survive a replacement, and why:
+    ///
+    ///   * `outstanding` -- a message may already have ARRIVED and be on the
+    ///     peer's screen while its acknowledgement is still in flight.
+    ///     Condemning it there tells the user a message failed that the peer
+    ///     is reading. It holds plaintext, never sealed bytes, so it can be
+    ///     resealed under the new keys; `last_attempt` is backdated past the
+    ///     deadline so the reaper that already runs picks it up on its next
+    ///     tick rather than waiting a full deadline first.
+    ///   * `seen_mids` -- the other half of the same fix. If the sender may
+    ///     resend an id across a rekey, the receiver must still recognise it,
+    ///     or the resend is displayed to the user twice.
+    ///   * `seen_ephemerals` -- unchanged, and load-bearing for replay
+    ///     defence rather than for delivery.
+    ///
+    /// `attempts` is deliberately NOT reset: a session that flaps must not
+    /// buy an unbounded retry budget.
+    fn take_carryover(
+        &mut self,
+        peer: Fingerprint,
+    ) -> (
+        VecDeque<[u8; 32]>,
+        VecDeque<(MessageId, Instant)>,
+        HashMap<MessageId, Outstanding>,
+    ) {
+        let deadline = self.timings.ack_deadline;
+        let Some(previous) = self.sessions.remove(&peer) else {
+            return (VecDeque::new(), VecDeque::new(), HashMap::new());
+        };
+        let resend_at = Instant::now()
+            .checked_sub(deadline)
+            .unwrap_or_else(Instant::now);
+        let mut outstanding = previous.outstanding;
+        for pending in outstanding.values_mut() {
+            pending.last_attempt = resend_at;
+        }
+        (previous.seen_ephemerals, previous.seen_mids, outstanding)
+    }
+
     /// Seals and routes a transport-level envelope (ack, ping, pong).
     ///
     /// Best-effort by design and never retried: an acknowledgement that does
@@ -1555,22 +1613,25 @@ impl Core {
         let peer_identity = their_hs.identity_public;
         match entry.pending.complete(&identity, &their_hs, expected.as_ref()) {
             Ok(session) => {
-                let mut seen_ephemerals = self
-                    .sessions
-                    .get(&peer)
-                    .map(|e| e.seen_ephemerals.clone())
-                    .unwrap_or_default();
+                // Shares take_carryover with the promotion path rather than
+                // repeating it. The comment that used to sit here said "same
+                // as the promotion path" while doing the same WRONG thing:
+                // condemning in-flight messages that may already have been
+                // delivered. Fixing only the promotion path left this one
+                // still failing about one probe run in thirty.
+                let (mut seen_ephemerals, seen_mids, outstanding) =
+                    self.take_carryover(peer);
                 seen_ephemerals.push_back(their_hs.ephemeral_public);
                 while seen_ephemerals.len() > SEEN_EPHEMERAL_LIMIT {
                     seen_ephemerals.pop_front();
                 }
-                // Same as the promotion path: whatever the outgoing session
-                // still had in flight was sealed under keys nobody will hold
-                // a moment from now.
-                self.fail_session_messages(peer, SendFailure::SessionEnded);
                 self.sessions.insert(
                     peer,
-                    Established::new(session, entry.our_fp, seen_ephemerals),
+                    Established {
+                        seen_mids,
+                        outstanding,
+                        ..Established::new(session, entry.our_fp, seen_ephemerals)
+                    },
                 );
                 self.emit(TransportEvent::SessionEstablished {
                     peer,
@@ -1782,21 +1843,49 @@ impl Core {
                             }
                         }
                         let winner = won.entry;
-                        let carried = self
-                            .sessions
-                            .get(&peer)
-                            .map(|e| e.seen_ephemerals.clone())
-                            .unwrap_or_default();
+                        // THE INCUMBENT'S IN-FLIGHT MESSAGES ARE CARRIED, NOT
+                        // FAILED, and this is a correctness fix rather than a
+                        // nicety.
+                        //
+                        // This block used to call fail_session_messages(peer,
+                        // SessionEnded) here, reasoning that those messages
+                        // were sealed under keys about to be dropped and so
+                        // could never be acknowledged. The reasoning about the
+                        // KEYS is right. The conclusion was wrong, because a
+                        // message can be sealed, DELIVERED, and displayed by
+                        // the peer before its acknowledgement gets back, and
+                        // failing it then reports a message the peer is
+                        // already reading as one that never arrived.
+                        //
+                        // That is not hypothetical. It is what the delivery
+                        // probe was catching about one run in twenty: two
+                        // peers that discover each other simultaneously each
+                        // dial the other, the reverse session proves itself
+                        // here, and the message that just landed is settled
+                        // Failed(SessionEnded) at the same millisecond the
+                        // peer emits Message for it.
+                        //
+                        // Outstanding holds the PLAINTEXT envelope, never the
+                        // sealed bytes, precisely so a retry can be resealed.
+                        // So the messages move to the new session and the
+                        // existing reaper resends them under the new keys.
+                        // Whichever was true becomes true again: if the peer
+                        // never had it, it arrives; if the peer already had
+                        // it, the resend is acknowledged as a duplicate and
+                        // settles Delivered, which is what actually happened.
+                        //
+                        // attempts is deliberately NOT reset. A session that
+                        // flaps must not buy an unbounded retry budget, and
+                        // MAX_SEND_ATTEMPTS still ends it honestly.
+                        let (seen_ephemerals, seen_mids, outstanding) =
+                            self.take_carryover(peer);
                         let peer_identity = *winner.session.peer_identity();
-                        // The incumbent's in-flight messages were sealed
-                        // under keys that are about to be dropped, so they
-                        // can never be acknowledged. Fail them before the
-                        // session they belong to disappears.
-                        self.fail_session_messages(peer, SendFailure::SessionEnded);
                         self.sessions.insert(
                             peer,
                             Established {
-                                seen_ephemerals: carried,
+                                seen_ephemerals,
+                                seen_mids,
+                                outstanding,
                                 ..winner
                             },
                         );
@@ -4005,6 +4094,94 @@ mod tests {
         );
     }
 
+    /// A rekey must not condemn a message the peer is already reading.
+    ///
+    /// THE DEFECT THIS PINS, measured 2026-08-27. Two peers that discover each
+    /// other simultaneously each dial the other. One side sends, the message
+    /// arrives and is displayed, and then the reverse session proves itself
+    /// and is promoted. The promotion used to call fail_session_messages,
+    /// which settled that message Failed(SessionEnded) in the same
+    /// millisecond the peer emitted Message for it. The delivery probe caught
+    /// it about one run in twenty and reported only the word "failed",
+    /// because the probe formatted the state through as_str and threw the
+    /// reason away.
+    ///
+    /// The rule is the one an_acknowledged_message_is_not_undelivered_by_a
+    /// _later_link_death and a_message_stranded_by_a_link_is_retried already
+    /// state for links: a message that MAY already have arrived is retried,
+    /// never condemned. This makes the rekey path agree with the link path.
+    #[test]
+    fn a_rekey_does_not_condemn_a_message_the_peer_already_has() {
+        let ours = Identity::generate();
+        let our_fp = ours.fingerprint();
+        let mut h = harness(vec![ours]);
+        let peer_id = Identity::generate();
+        let peer_fp = peer_id.fingerprint();
+        let (peer_fp2, _their, _rx) = established_pair(&mut h, our_fp, &peer_id);
+        assert_eq!(peer_fp, peer_fp2);
+
+        h.core
+            .on_send_text(peer_fp, "did this arrive?", envelope::new_message_id());
+        let mid = deliveries(&h)[0].0;
+
+        // The peer's own initiation arrives and earns the slot, exactly as it
+        // does when both sides dial at once.
+        let their_pending = Pending::start(&peer_id, Role::Initiator);
+        let their_hs = their_pending.handshake().to_bytes();
+        let rx2 = inject_unassociated_link(&mut h.core, 2);
+        h.core.on_handshake_frame(
+            Some(2),
+            *our_fp.as_bytes(),
+            *peer_fp.as_bytes(),
+            their_hs,
+            false,
+        );
+        let reply = rx2
+            .try_iter()
+            .find_map(|f| match f.kind {
+                FrameKind::Handshake { body, response: true, .. } => Some(body),
+                _ => None,
+            })
+            .expect("we answered the initiation");
+        let our_hs = Handshake::from_bytes(&reply).unwrap();
+        let mut their_new = their_pending.complete(&peer_id, &our_hs, None).unwrap();
+        let proof = their_new.seal(&user_message(b"i am back")).unwrap();
+        h.core.on_frame(Some(2), Frame::payload(our_fp, peer_fp, proof));
+
+        // Not condemned, and still tracked so the resend can happen.
+        assert!(
+            !deliveries(&h).iter().any(|(m, s)| *m == mid && s.is_terminal()),
+            "the promotion must not settle a message that may have arrived: {:?}",
+            deliveries(&h)
+        );
+        assert!(
+            h.core
+                .sessions
+                .get(&peer_fp)
+                .is_some_and(|e| e.outstanding.contains_key(&mid)),
+            "the message must be carried onto the promoted session"
+        );
+
+        // And the acknowledgement, arriving under the NEW session, still
+        // settles it Delivered. Under the old behaviour this could never
+        // happen: settle had already removed the id, so the ack found nothing
+        // and the user kept a message marked failed that the peer had read.
+        let ack = their_new
+            .seal(&SessionEnvelope::Ack { mid }.encode().unwrap())
+            .unwrap();
+        h.core.on_frame(Some(2), Frame::payload(our_fp, peer_fp, ack));
+        let states: Vec<Delivery> = deliveries(&h)
+            .into_iter()
+            .filter(|(m, _)| *m == mid)
+            .map(|(_, s)| s)
+            .collect();
+        assert_eq!(
+            states.last(),
+            Some(&Delivery::Delivered),
+            "an ack under the promoted session must still deliver: {states:?}"
+        );
+    }
+
     /// Only an acknowledgement that OPENED under the session key may deliver.
     /// A relay holds no key, so everything it could fabricate is fed here and
     /// must fail to move the message.
@@ -4599,9 +4776,39 @@ mod tests {
             h.core
                 .on_frame(Some(2), Frame::payload(our_fp, peer_fp, proof));
 
+            // A REKEY NO LONGER SETTLES IN FLIGHT MESSAGES, it carries them,
+            // and this arm asserts the replacement contract rather than the
+            // old one. Settling here reported Failed for messages the peer
+            // had already received and displayed, because an acknowledgement
+            // can still be in flight when the reverse session proves itself.
+            //
+            // The invariant this whole test exists for is unchanged and is
+            // asserted below in its stronger form: nothing may be STRANDED at
+            // Sending. Carrying is only correct if the message still reaches
+            // a verdict, so that is checked too.
+            assert!(
+                !deliveries(&h).iter().any(|(m, s)| *m == mid && s.is_terminal()),
+                "a rekey must not settle a message that may already have arrived: {:?}",
+                deliveries(&h)
+            );
+            assert!(
+                h.core
+                    .sessions
+                    .get(&peer_fp)
+                    .is_some_and(|e| e.outstanding.contains_key(&mid)),
+                "the in-flight message must be carried onto the promoted session"
+            );
+            // Zero the deadline the way the other reaper tests do: each
+            // attempt stamps last_attempt = now, so without this only the
+            // first reap of the loop is ever eligible and the rest are
+            // skipped, which reads as a strand when it is only the clock.
+            h.core.timings.ack_deadline = Duration::from_millis(0);
+            for _ in 0..MAX_SEND_ATTEMPTS + 2 {
+                h.core.reap_unacknowledged();
+            }
             assert!(
                 deliveries(&h).iter().any(|(m, s)| *m == mid && s.is_terminal()),
-                "a rekey must settle what the old session still had in flight: {:?}",
+                "a carried message must still reach a verdict, never strand: {:?}",
                 deliveries(&h)
             );
         }

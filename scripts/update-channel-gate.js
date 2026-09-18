@@ -1,4 +1,4 @@
-// Staged/beta update channel (update.js's Stable/Beta row). Behavioural
+// The update channel row (update.js). 1.0.0 offers ONE channel. Behavioural
 // checks run against the DOM harness so the file is EXECUTED rather than
 // parsed.
 //
@@ -43,99 +43,57 @@ function openUpdatePanel() {
   global.$("btn-update")._fire("click");
 }
 
-check("opening Updates reflects the channel Rust reports", async () => {
-  global.rbResolve.update_status = { available: true, state: "idle" };
-  global.rbResolve.update_channel_get = { channel: "beta" };
+// The button is a TOGGLE: a click on an open panel closes it, and a closed
+// panel never runs refreshChannel, so a check that "opens" an already-open
+// panel measures stale state. Open only when actually closed.
+function reopenUpdatePanel() {
+  // refreshChannel runs in the panel's onOpen hook and nowhere else, so a
+  // panel left open by an earlier check has to be closed and opened again
+  // for a check to observe a FRESH read of the stored channel.
+  if (!global.$("update-panel").hidden) openUpdatePanel();
   openUpdatePanel();
-  await flush();
-  const beta = global.$("update-channel-beta");
-  assert(beta, "the Beta button was not built");
-  assert(
-    beta.style.fontWeight === "700",
-    "the panel must reflect Rust's reported channel (beta), not default to " +
-      "stable regardless of what update_channel_get returns",
-  );
-});
+}
 
-// WHILE THE WHOLE BROWSER IS PRE-RELEASE THERE IS NO STABLE BUTTON. Offering
-// the pair implies two kinds of build exist; they do not yet, and both
-// channels are served the identical signed manifest. This pins the absence so
-// the row cannot drift back without the decision being remade.
-check("no Stable button is offered during pre-release", async () => {
-  global.rbResolve.update_status = { available: true, state: "idle" };
-  global.rbResolve.update_channel_get = { channel: "beta" };
-  openUpdatePanel();
-  await flush();
-  assert(
-    !global.$("update-channel-stable"),
-    "a Stable button is being offered, which claims a maturity that does " +
-      "not exist while every release is a pre-release",
-  );
-});
-
-// A user left on the stored default would otherwise see one unlit button
-// describing a channel they are not on: the panel misreporting its own
-// state. Only a no-op while both channels serve the same manifest.
-check("a user still on stable is moved to beta on open", async () => {
+check("1.0.0 offers ONE channel: Stable is shown fixed, and there is no Beta button", async () => {
   global.rbResolve.update_status = { available: true, state: "idle" };
   global.rbResolve.update_channel_get = { channel: "stable" };
-  global.rbResolve.update_channel_set = { channel: "beta" };
-  // ONE toggle only: openUpdatePanel fires a click, and a click on an open
-  // panel closes it. Re-opening to "get a fresh read" shuts it instead and
-  // the assertion then measures nothing.
   global.rbCalls.length = 0;
-  openUpdatePanel();
+  reopenUpdatePanel();
   await flush();
-  const call = global.rbCalls.find((c) => c.cmd === "update_channel_set");
+  const stable = global.$("update-channel-stable");
+  assert(stable, "the Stable button was not built");
+  assert(!global.$("update-channel-beta"), "a Beta button was built; there is no Beta in 1.0.0 (decided 2026-09-16)");
+  assert(stable.disabled, "Stable must read as the channel this install follows, not a choice");
+  assert(stable.style.fontWeight === "700", "Stable must be shown as the active channel");
   assert(
-    call && call.args && call.args.channel === "beta",
-    "opening the panel on the stored stable default must move the install " +
-      "to beta, or the panel shows a channel the install is not on",
-  );
-  assert(
-    global.$("update-channel-beta").style.fontWeight === "700",
-    "after the move the sole channel button must read as active",
+    !global.rbCalls.some((c) => c.cmd === "update_channel_set"),
+    "opening the panel on Stable must not rewrite the stored channel",
   );
 });
 
-check(
-  "clicking Beta calls update_channel_set with the right value",
-  async () => {
-    global.rbResolve.update_channel_get = { channel: "stable" };
-    openUpdatePanel();
-    await flush();
-    global.rbCalls.length = 0;
-    global.rbResolve.update_channel_set = { channel: "beta" };
-    global.$("update-channel-beta")._fire("click");
-    await flush();
-    const call = global.rbCalls.find((c) => c.cmd === "update_channel_set");
-    assert(call, "update_channel_set was not called");
-    assert(
-      call.args && call.args.channel === "beta",
-      `update_channel_set was called with the wrong channel: ${JSON.stringify(call.args)}`,
-    );
-    assert(
-      global.$("update-channel-beta").style.fontWeight === "700",
-      "the panel did not switch to showing Beta as the active channel after " +
-        "Rust confirmed the change",
-    );
-  },
-);
+check("an install still stored on Beta is moved to Stable once, and told", async () => {
+  global.rbResolve.update_status = { available: true, state: "idle" };
+  global.rbResolve.update_channel_get = { channel: "beta" };
+  global.rbResolve.update_channel_set = { channel: "stable" };
+  global.rbCalls.length = 0;
+  reopenUpdatePanel();
+  await flush();
+  const sets = global.rbCalls.filter((c) => c.cmd === "update_channel_set");
+  assert(sets.length === 1, `expected exactly one update_channel_set, got ${sets.length}`);
+  assert(sets[0].args && sets[0].args.channel === "stable", `moved to the wrong channel: ${JSON.stringify(sets[0].args)}`);
+  const note = global.$("update-channel-note");
+  assert(note, "the channel note was not built");
+  assert(/Beta/.test(note.textContent) && /Stable/.test(note.textContent), `the note must say the install was on Beta and now follows Stable; got ${JSON.stringify(note.textContent)}`);
+});
 
-check(
-  "a build with no update networking cannot choose a channel it can never fetch from",
-  async () => {
-    global.rbResolve.update_status = { available: false, state: "idle" };
-    openUpdatePanel();
-    await flush();
-    assert(
-      global.$("update-channel-beta").disabled,
-      "the channel button must be disabled when this build has no update " +
-        "networking at all -- selecting a channel it can never fetch from " +
-        "is not a real choice",
-    );
-  },
-);
+check("a build with no update networking still shows the fixed channel without offering a choice", async () => {
+  global.rbResolve.update_status = { available: false, state: "idle" };
+  global.rbResolve.update_channel_get = { channel: "stable" };
+  reopenUpdatePanel();
+  await flush();
+  assert(global.$("update-channel-stable").disabled, "the channel control must never be a live choice");
+  assert(!global.$("update-channel-beta"), "no Beta button in any build");
+});
 
 (async () => {
   for (const [name, fn] of checks) {

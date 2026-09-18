@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The version in crates/app/Cargo.toml and the version in the AppStream
-# metainfo must be the same number.
+# metainfo must be the same release number supplied by the caller.
 #
 # WHY THIS EXISTS. They drifted, silently, from 0.9.0 to 0.9.52. The metainfo
 # even carried a comment declaring the drift resolved -- accurate the day it
@@ -15,6 +15,12 @@ cd "$(dirname "$0")/.."
 
 CARGO=crates/app/Cargo.toml
 META=packaging/flatpak/io.edgexene.Patanyx.metainfo.xml
+
+if [ -z "${EXPECTED_VERSION:-}" ]; then
+  echo "GATE FAIL: EXPECTED_VERSION is required" >&2
+  echo "  pass the release being built, for example EXPECTED_VERSION=0.9.66" >&2
+  exit 2
+fi
 
 for f in "$CARGO" "$META"; do
   [ -f "$f" ] || { echo "GATE FAIL: $f is missing" >&2; exit 1; }
@@ -56,7 +62,15 @@ if [ "$cargo_version" != "$meta_version" ]; then
   exit 1
 fi
 
-echo "  version ok: $cargo_version (Cargo.toml == metainfo)"
+if [ "$cargo_version" != "$EXPECTED_VERSION" ]; then
+  echo "GATE FAIL: release identity mismatch" >&2
+  echo "  expected : $EXPECTED_VERSION" >&2
+  echo "  $CARGO : $cargo_version" >&2
+  echo "  $META  : $meta_version" >&2
+  exit 1
+fi
+
+echo "  version ok: $cargo_version (expected == Cargo.toml == metainfo)"
 
 # Negative control. A gate that has never been observed to fail is a gate
 # nobody has tested, and this one is two greps that could each silently
@@ -69,7 +83,8 @@ if [ "${PATANYX_VERSION_GATE_CONTROL:-}" != "1" ]; then
     > "$probe/$CARGO"
   cp "$META" "$probe/$META"
   cp "$0" "$probe/scripts/check-version.sh"
-  if PATANYX_VERSION_GATE_CONTROL=1 bash "$probe/scripts/check-version.sh" \
+  if EXPECTED_VERSION="$EXPECTED_VERSION" PATANYX_VERSION_GATE_CONTROL=1 \
+      bash "$probe/scripts/check-version.sh" \
       >/dev/null 2>&1; then
     echo "GATE FAIL: a planted version mismatch was not detected" >&2
     exit 1

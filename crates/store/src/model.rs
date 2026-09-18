@@ -18,7 +18,7 @@ pub struct StoreData {
     pub bookmark_folders: Vec<String>,
     #[serde(default)]
     pub downloads: Vec<DownloadRecord>,
-    /// Set-aside shelves. ADDITIVE ONLY: files written before this field
+    /// Shelves. ADDITIVE ONLY: files written before this field
     /// existed deserialize with an empty list, and older builds ignore the
     /// key on read -- which is why `schema` stays at SCHEMA_VERSION.
     #[serde(default)]
@@ -39,6 +39,15 @@ pub struct StoreData {
     /// stays at SCHEMA_VERSION.
     #[serde(default)]
     pub archive: Vec<ArchiveRecord>,
+    /// Page-integrity history. These records live in the same encrypted
+    /// document as their bookmarks, but outside `Bookmark` so retention can
+    /// be enforced across exact URLs and across the whole store in one pass.
+    ///
+    /// ADDITIVE ONLY: stores written before snapshot text/history existed
+    /// have only `Bookmark::digest`; this reads as an empty list and that
+    /// digest is promoted lazily by the store when history is next saved.
+    #[serde(default)]
+    pub page_snapshots: Vec<PageSnapshot>,
     /// Per-site Fingerprint Divergence choices.
     ///
     /// HERE RATHER THAN IN prefs.json, and that is a privacy decision, not a
@@ -62,6 +71,7 @@ impl Default for StoreData {
             shelves: Vec::new(),
             next_shelf_seq: 0,
             archive: Vec::new(),
+            page_snapshots: Vec::new(),
             divergence_overrides: Vec::new(),
         }
     }
@@ -91,6 +101,13 @@ pub struct Bookmark {
     /// field existed read as `false`, so `SCHEMA_VERSION` stays put.
     #[serde(default)]
     pub quick_access: bool,
+    /// User-chosen position in Quick Access. `None` means this bookmark has
+    /// never participated in a manual reorder.
+    ///
+    /// ADDITIVE: bookmarks written before ordering existed carry no such
+    /// field and therefore read as `None`, without a schema-version bump.
+    #[serde(default)]
+    pub quick_access_order: Option<u32>,
     /// What the page looked like when last seen, and when that was
     /// recorded. Owned by the entry, so deleting the bookmark necessarily
     /// deletes the digest.
@@ -101,6 +118,40 @@ pub struct Bookmark {
 pub struct RecordedDigest {
     pub digest: ContentDigest,
     pub recorded_at: u64,
+}
+
+/// One saved page-integrity baseline. The digest remains authoritative for
+/// detecting change; `text` is additive evidence used only to explain what
+/// changed. `None` is the load-compatible shape of a pre-text snapshot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PageSnapshot {
+    pub id: String,
+    pub bookmark_id: String,
+    /// Copied exactly from the bookmark at save time. Retention deliberately
+    /// compares this string byte-for-byte rather than normalising addresses.
+    pub url: String,
+    pub digest: ContentDigest,
+    pub recorded_at: u64,
+    #[serde(default)]
+    pub text: Option<String>,
+    /// True when the visible text crossed the store's character cap. Older
+    /// records default to false; absent text is distinguished by `text`.
+    #[serde(default)]
+    pub text_trimmed: bool,
+    /// What part of the page the stored picture covers, using the same
+    /// persisted vocabulary as Deep Recall ("visible area" or "full page").
+    /// `None` is the load-compatible shape of every pre-picture snapshot.
+    #[serde(default)]
+    pub picture_scope: Option<String>,
+    /// Bytes occupied by the encrypted blob, used for the independent
+    /// snapshot-picture byte cap. Zero for records without a picture.
+    #[serde(default)]
+    pub picture_bytes: u64,
+    /// Whether the encrypted blob was successfully kept. This is explicit,
+    /// as it is on `ArchiveRecord`, so a missing picture never renders as a
+    /// blank page.
+    #[serde(default)]
+    pub has_picture: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,7 +170,7 @@ pub struct DownloadRecord {
     pub hmac: [u8; 32],
 }
 
-/// A named set-aside shelf: one window's tabs, stored so they could be
+/// A named shelf: one window's tabs, stored so they could be
 /// closed without being lost.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Shelf {
@@ -133,7 +184,7 @@ pub struct Shelf {
     /// `Bookmark::created_at`. Never shown in the name.
     pub created_at: u64,
     /// Free text the user attached to this shelf, for the reason a set of
-    /// tabs was set aside in the first place ("chem lab, due Friday").
+    /// tabs was shelved in the first place ("chem lab, due Friday").
     ///
     /// ADDITIVE, under the same rule the `shelves` field itself documents:
     /// shelves written before this existed deserialize with an empty string
@@ -148,7 +199,7 @@ pub struct Shelf {
 
 /// One tab on a shelf: title + URL. Nothing else is stored anywhere in the
 /// feature -- no favicons, no scroll positions, no cookies, no history.
-/// That minimality is the privacy contract of set-aside, not a shortcut.
+/// That minimality is the privacy contract of shelving, not a shortcut.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ShelfTab {
     pub title: String,
@@ -315,8 +366,8 @@ mod tests {
     #[test]
     fn shelf_seq_is_monotonic_and_never_reused() {
         let mut data = StoreData::default();
-        let a = data.plan_new_shelf("Set aside 2 tabs".to_string(), vec![], 100);
-        let b = data.plan_new_shelf("Set aside 3 tabs".to_string(), vec![], 200);
+        let a = data.plan_new_shelf("Shelf with 2 tabs".to_string(), vec![], 100);
+        let b = data.plan_new_shelf("Shelf with 3 tabs".to_string(), vec![], 200);
         assert_eq!(a.seq, 0);
         assert_eq!(a.id, "shelf-0");
         assert_eq!(a.created_at, 100);
@@ -326,7 +377,7 @@ mod tests {
         assert_eq!(index, 0);
         assert_eq!(taken.id, "shelf-0");
         // The next shelf must not reuse the deleted one's seq or id.
-        let c = data.plan_new_shelf("Set aside 4 tabs".to_string(), vec![], 300);
+        let c = data.plan_new_shelf("Shelf with 4 tabs".to_string(), vec![], 300);
         assert_eq!(c.seq, 2);
         assert_eq!(c.id, "shelf-2");
         assert_eq!(data.shelves.len(), 2);
@@ -364,7 +415,7 @@ mod tests {
     fn store_data_with_shelves_roundtrips_through_json() {
         let mut data = StoreData::default();
         data.plan_new_shelf(
-            "Set aside 1 tabs".to_string(),
+            "Shelf with 1 tabs".to_string(),
             vec![ShelfTab {
                 title: "Example".to_string(),
                 url: "https://example.test/".to_string(),
@@ -386,6 +437,7 @@ mod tests {
             created_at: 0,
             tags: tags.iter().map(|t| t.to_string()).collect(),
             quick_access: false,
+            quick_access_order: None,
             digest: None,
         }
     }
@@ -409,6 +461,21 @@ mod tests {
         let data: StoreData = serde_json::from_str(json).expect("old file still loads");
         assert!(!data.bookmarks[0].quick_access, "absent reads as unpinned");
         assert_eq!(data.bookmarks[0].tags, vec!["chem".to_string()], "tags survive");
+        assert_eq!(data.schema, SCHEMA_VERSION, "no version bump");
+    }
+
+    #[test]
+    fn bookmarks_written_before_quick_access_order_still_load() {
+        // A store from a build that has quick_access but predates its order
+        // field must load with no manual position. Same additive promise as
+        // quick_access itself; in particular, the schema version stays put.
+        let json = r#"{"schema":1,"bookmarks":[{"id":"b1","url":"https://a.test/","title":"A","created_at":0,"tags":[],"quick_access":true,"digest":null}],"downloads":[]}"#;
+        let data: StoreData = serde_json::from_str(json).expect("old file still loads");
+        assert!(data.bookmarks[0].quick_access, "the existing pin survives");
+        assert_eq!(
+            data.bookmarks[0].quick_access_order, None,
+            "absent reads as no manual order"
+        );
         assert_eq!(data.schema, SCHEMA_VERSION, "no version bump");
     }
 

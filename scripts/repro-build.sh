@@ -30,10 +30,19 @@ ROOT="$(pwd)"
 
 CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
 
-# Normalize the two path roots that reach the binary. Computed at runtime rather
-# than checked into .cargo/config.toml, because a hardcoded /root/.cargo would
-# only ever be correct on one machine — which would defeat the entire point.
-export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${ROOT}=/build ${RUSTFLAGS:-}"
+# Normalize the three path roots that reach the binary. Computed at runtime
+# rather than checked into .cargo/config.toml, because a hardcoded /root/.cargo
+# would only ever be correct on one machine, which would defeat the entire
+# point.
+#
+# The SYSROOT is the third and was missing until 2026-08-27. std's own panic
+# locations carry the toolchain path, so they escaped both other prefixes and
+# put the build account, the toolchain version and the host triple into every
+# published artifact. build-windows.sh spells these three IDENTICALLY; if the
+# two ever disagree they produce different bytes, which is exactly what
+# docs/reproducible-builds.md exists to prevent.
+SYSROOT_DIR="$(rustc --print sysroot)"
+export RUSTFLAGS="--remap-path-prefix=${CARGO_HOME_DIR}=/cargo --remap-path-prefix=${ROOT}=/build --remap-path-prefix=${SYSROOT_DIR}=/rust ${RUSTFLAGS:-}"
 
 # Incremental compilation splits codegen differently depending on what was built
 # before, so a clean build and a rebuild can differ. Releases are never

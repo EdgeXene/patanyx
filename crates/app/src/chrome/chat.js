@@ -26,7 +26,21 @@
   // than half-initialise a panel whose every action would throw.
   if (!window.__rb || typeof window.__rb.request !== "function") return;
   const rb = window.__rb.request;
-  const friendlyChat = window.__rb.friendly;
+  // Chat is a Premium feature: every action arm can answer premium_required.
+  // That code is explained with the shared lock note (locked vault / not on
+  // sale yet / lapsed / upgrade), never with the tab pack's sentence that the
+  // shared table maps it to.
+  const friendlyChat = (e) => {
+    const code = e && typeof e === "object" ? e.message : e;
+    if (code === "premium_required" && typeof window.__rb.premiumLockNote === "function") {
+      return window.__rb.premiumLockNote();
+    }
+    return window.__rb.friendly(e);
+  };
+  // The catalog helpers, shared through the same bridge object every
+  // cross-script capability rides (__rb.request, __rb.askConfirm...).
+  const { i18nText, i18nResolve, i18nSet, rebuildOnLocaleFill } =
+    window.__rb || {};
   // The chrome's confirmation dialog. Guarded rather than assumed: if an
   // older chrome.js is ever loaded beside this file, removing a contact must
   // still work -- it falls back to acting without a prompt only if the shared
@@ -70,48 +84,46 @@
   // What an out-message may say about itself. "Delivered" means it reached
   // the peer's DEVICE and their key said so; there is no read receipt and its
   // absence is deliberate, not an omission.
-  const DELIVERY_TEXT = {
-    sending: "Sending…",
-    delivered: "Delivered",
-  };
-  const DELIVERY_TITLE = {
-    sending: "Handed to the network. They have not confirmed it.",
-    delivered: "Their device confirmed this message with its own key.",
-  };
-  // One line per cause. These used to be one line for every cause, which is
-  // how "they are not on this network right now" ended up under a message to
-  // someone who was demonstrably on this network.
-  const FAILURE_TEXT = {
-    peer_offline: "Not sent. They are not reachable, and nothing is waiting.",
-    no_session: "Not sent. Reopen the conversation and try again.",
-    link_lost: "Not delivered. The connection dropped on the way.",
-    refused:
-      "Not delivered. The relay could not pass it on, and nothing is waiting.",
-    no_ack: "Not delivered. No confirmation came back, so try again.",
-    session_ended: "Not delivered. The session ended before it arrived.",
-    too_many_outstanding:
-      "Not sent. Too many messages are still unconfirmed, so wait a moment.",
-  };
-
-  const NOTICE_TEXT = {
-    session_failed:
-      "The secure session could not be opened. Try reopening the conversation.",
-    undecodable:
-      "A message from this peer could not be read and was discarded.",
-    dropped:
-      "A message from this peer failed its security checks and was dropped.",
-    peer_offline:
-      "They are not on this network right now. Nothing was sent, and nothing is waiting.",
-    no_session:
-      "There is no open session with this peer. Reopen the conversation to start one.",
-    refused_url:
-      "This peer sent a link this browser refuses to open, so it was blocked. That refusal is the security policy working, not a lost message.",
-    too_long: "A message was too long and was not delivered.",
-    candidates_capped:
-      "This network is announcing more addresses than can be tracked, so a contact may not appear here. Nothing is wrong with your own connection.",
-    not_announced:
-      "One of your addresses could not be announced on this network, so contacts using it cannot find you. Your other addresses are unaffected.",
-  };
+  // Module-level maps keyed by wire token (state, reason), so they are
+  // filled inside the rebuild hook: a live locale switch re-runs this and
+  // every later lookup reads the new catalog. The KEYS stay bare.
+  let DELIVERY_TEXT;
+  let DELIVERY_TITLE;
+  let FAILURE_TEXT;
+  let NOTICE_TEXT;
+  rebuildOnLocaleFill(function () {
+    DELIVERY_TEXT = {
+      sending: i18nText("chrome-js-chat-delivery-sending", "Sending…"),
+      delivered: i18nText("chrome-js-chat-delivery-delivered", "Delivered"),
+    };
+    DELIVERY_TITLE = {
+      sending: i18nText("chrome-js-chat-delivery-title-sending", "Sent, but not confirmed."),
+      delivered: i18nText("chrome-js-chat-delivery-title-delivered", "Confirmed by their device."),
+    };
+    // One line per cause. These used to be one line for every cause, which is
+    // how "they are not on this network right now" ended up under a message to
+    // someone who was demonstrably on this network.
+    FAILURE_TEXT = {
+      peer_offline: i18nText("chrome-js-chat-failure-peer-offline", "Not sent. They are not reachable, and nothing is waiting."),
+      no_session: i18nText("chrome-js-chat-failure-no-session", "Not sent. Reopen the conversation and try again."),
+      link_lost: i18nText("chrome-js-chat-failure-link-lost", "Not delivered. The connection dropped on the way."),
+      refused: i18nText("chrome-js-chat-failure-refused", "Not delivered. The relay could not pass it on, and nothing is waiting."),
+      no_ack: i18nText("chrome-js-chat-failure-no-ack", "Not delivered. No confirmation came back, so try again."),
+      session_ended: i18nText("chrome-js-chat-failure-session-ended", "Not delivered. The session ended before it arrived."),
+      too_many_outstanding: i18nText("chrome-js-chat-failure-too-many-outstanding", "Not sent. Too many messages are still unconfirmed, so wait a moment."),
+    };
+    NOTICE_TEXT = {
+      session_failed: i18nText("chrome-js-chat-notice-session-failed", "The secure session could not be opened. Try reopening the conversation."),
+      undecodable: i18nText("chrome-js-chat-notice-undecodable", "A message from this peer could not be read and was discarded."),
+      dropped: i18nText("chrome-js-chat-notice-dropped", "A message from this peer failed its security checks and was dropped."),
+      peer_offline: i18nText("chrome-js-chat-notice-peer-offline", "They are not on this network right now. Nothing was sent, and nothing is waiting."),
+      no_session: i18nText("chrome-js-chat-notice-no-session", "There is no open session with this peer. Reopen the conversation to start one."),
+      refused_url: i18nText("chrome-js-chat-notice-refused-url", "Blocked a link this browser refuses to open. The message was not lost."),
+      too_long: i18nText("chrome-js-chat-notice-too-long", "A message was too long and was not delivered."),
+      candidates_capped: i18nText("chrome-js-chat-notice-candidates-capped", "Some contacts may be missing because this network is announcing too many addresses. Your connection is unaffected."),
+      not_announced: i18nText("chrome-js-chat-notice-not-announced", "Contacts using one of your addresses cannot find you. Your other addresses still work."),
+    };
+  });
 
   // ---- element handles ---------------------------------------------------------
   const statePanes = {
@@ -159,7 +171,11 @@
   /// visible, so there is no menu button that needs to relay the number on its
   /// behalf. That relay existed only because the entry was hidden inside a
   /// sheet, which is the arrangement this layout replaced.
-  function paintUnread() {
+  // Async for the aria-label's count arg; the badge itself is numbers only
+  // and stays sync. Strictly-newest: paints race their resolve.
+  let unreadGen = 0;
+  async function paintUnread() {
+    const gen = ++unreadGen;
     const total = unreadTotal();
     const label = total > 99 ? "99+" : String(total);
     for (const id of ["chat-unread"]) {
@@ -170,14 +186,17 @@
     }
     const button = document.getElementById("btn-chat");
     if (button) {
-      button.setAttribute(
-        "aria-label",
+      const aria = await i18nResolve(
+        "chrome-js-chat-unread-aria",
+        { count: total },
         total === 0
           ? "Local-network chat"
           : "Local-network chat, " +
               total +
               (total === 1 ? " unread message" : " unread messages"),
       );
+      if (gen !== unreadGen) return;
+      button.setAttribute("aria-label", aria);
     }
   }
 
@@ -228,11 +247,16 @@
     },
   });
 
-  const PRESENCE_TEXT = {
-    online: "Online: they have said they are reachable",
-    offline: "Offline: nothing can be sent to them right now",
-    away: "Away: reachable, but they have flagged themselves as not at the keyboard",
-  };
+  // Dot titles, keyed by the presence token. Rebuilt on locale fill like
+  // the vocabularies above.
+  let PRESENCE_TEXT;
+  rebuildOnLocaleFill(function () {
+    PRESENCE_TEXT = {
+      online: i18nText("chrome-js-chat-presence-title-online", "Online: they have said they are reachable"),
+      offline: i18nText("chrome-js-chat-presence-title-offline", "Offline: nothing can be sent to them right now"),
+      away: i18nText("chrome-js-chat-presence-title-away", "Away: reachable, but they have flagged themselves as not at the keyboard"),
+    };
+  });
 
   // ---- own presence + relay surface --------------------------------------------
   // Note: index.html was not in this drafter's context, so the presence
@@ -252,35 +276,36 @@
   let relayOpen = false;
   let relayDirty = false; // user is mid-edit; live events must not clobber inputs
 
-  const RELAY_STATE_TEXT = {
-    not_compiled:
-      "This build contains no relay support. Chat works on local networks only.",
-    off: "Off. You are not registered with any relay.",
-    not_configured:
-      "Enabled but incomplete. Set a server address and choose which of your addresses to register.",
-    connecting: "Connecting to the relay…",
-    up: "Connected. Your chosen address is registered with the relay.",
-    down: "Connection to the relay lost. Retrying.",
-  };
-
-  const RELAY_ERROR_TEXT = {
-    already_registered:
-      "The relay says this address is already registered from another connection: a second device, or a stale registration that has not expired yet.",
-    unavailable: "The relay is refusing registrations right now.",
-    version_mismatch:
-      "The relay speaks a different protocol version than this build.",
-    // Premium licence refusals (P3, design 4.4). DRAFT copy pending
-    // review; no purchase links anywhere -- nothing is for sale
-    // until the payment flow ships. There is no fallback license: a lapsed
-    // subscription has no Premium features until renewal.
-    token_required: "Chat is a Premium feature.",
-    token_expired: "Chat disconnected: your subscription has ended.",
-    token_invalid:
-      "Chat could not verify your subscription. Try again, or contact support if it keeps happening.",
-    key_rejected:
-      "Chat could not verify your subscription. Try again, or contact support if it keeps happening.",
-    error: "The relay reported an error.",
-  };
+  // Rebuilt on locale fill. The ERROR clauses are only ever appended to a
+  // state line, so each carries its own leading space ({" "} in the
+  // catalog) and the join in renderRelayState is a plain append -- the
+  // chrome-engine-blocklist / recall-shortfall shape.
+  let RELAY_STATE_TEXT;
+  let RELAY_ERROR_TEXT;
+  rebuildOnLocaleFill(function () {
+    RELAY_STATE_TEXT = {
+      not_compiled: i18nText("chrome-js-chat-relay-state-not-compiled", "Private Chat works only on local networks in this build."),
+      off: i18nText("chrome-js-chat-relay-state-off", "Off. You are not registered with any relay."),
+      not_configured: i18nText("chrome-js-chat-relay-state-not-configured", "Enabled but incomplete. Set a server address and choose which of your addresses to register."),
+      connecting: i18nText("chrome-js-chat-relay-state-connecting", "Connecting to the relay\u2026"),
+      up: i18nText("chrome-js-chat-relay-state-up", "Connected. Your chosen address is registered with the relay."),
+      down: i18nText("chrome-js-chat-relay-state-down", "Connection to the relay lost. Retrying."),
+    };
+    RELAY_ERROR_TEXT = {
+      already_registered: i18nText("chrome-js-chat-relay-error-already-registered", " The relay says this address is already registered from another connection: a second device, or a stale registration that has not expired yet."),
+      unavailable: i18nText("chrome-js-chat-relay-error-unavailable", " The relay is refusing registrations right now."),
+      version_mismatch: i18nText("chrome-js-chat-relay-error-version-mismatch", " This relay is incompatible with this PATANYX version."),
+      // Premium licence refusals (P3, design 4.4). DRAFT copy pending
+      // review; no purchase links anywhere -- nothing is for sale
+      // until the payment flow ships. There is no fallback license: a lapsed
+      // subscription has no Premium features until renewal.
+      token_required: i18nText("chrome-js-chat-relay-error-token-required", " Private Chat requires PATANYX Premium."),
+      token_expired: i18nText("chrome-js-chat-relay-error-token-expired", " Chat disconnected: your subscription has ended."),
+      token_invalid: i18nText("chrome-js-chat-relay-error-token-invalid", " Chat could not verify your subscription. Try again, or contact support if it keeps happening."),
+      key_rejected: i18nText("chrome-js-chat-relay-error-key-rejected", " Chat could not verify your subscription. Try again, or contact support if it keeps happening."),
+      error: i18nText("chrome-js-chat-relay-error-error", " The relay reported an error."),
+    };
+  });
 
   function buildPresenceUI() {
     const root = el("div", "chat-presence");
@@ -290,13 +315,13 @@
     const text = el("span", "chat-presence-text");
     const buttons = el("span", "chat-presence-buttons");
 
-    const goOnline = el("button", "small", "Go online");
+    const goOnline = el("button", "small", i18nText("chrome-js-chat-go-online", "Go online"));
     goOnline.type = "button";
-    const goOffline = el("button", "small", "Go offline");
+    const goOffline = el("button", "small", i18nText("chrome-js-chat-go-offline", "Go offline"));
     goOffline.type = "button";
-    const away = el("button", "small", "Flag as away");
+    const away = el("button", "small", i18nText("chrome-js-chat-away-flag", "Flag as away"));
     away.type = "button";
-    const relayToggle = el("button", "small", "Relay settings");
+    const relayToggle = el("button", "small", i18nText("chrome-js-chat-relay-toggle", "Relay settings"));
     relayToggle.type = "button";
     relayToggle.setAttribute("aria-expanded", "false");
 
@@ -315,37 +340,30 @@
     // ---- relay section ----
     const relay = el("div", "chat-relay");
     relay.hidden = true;
-    relay.appendChild(
-      el("div", "chat-relay-title", "Reachable beyond this network (optional)"),
+    const relayTitle = el(
+      "div",
+      "chat-relay-title",
+      "Reachable beyond this network (optional)",
     );
-    relay.appendChild(
-      el(
-        "div",
-        "chat-relay-note",
-        "A relay server keeps you reachable when a contact is not on your " +
-          "local network. Only one of your addresses, the one you pick, " +
-          "is registered with it; the relay operator learns that address and " +
-          "when it is online, never your whole contact list. Off by default, " +
-          "and nothing contacts a relay you did not configure.",
-      ),
+    relay.appendChild(relayTitle);
+    const relayNote = el(
+      "div",
+      "chat-relay-note",
+      i18nText("chrome-js-chat-relay-note", "A relay keeps one chosen address reachable outside your local network. Whoever runs it sees that address and when it is online, not your contacts or messages. Off by default; nothing connects until configured."),
     );
+    relay.appendChild(relayNote);
     // The field is PRE-FILLED, not pre-enabled, and the distinction is the
     // whole design. A hardcoded relay that connects on its own would mean every
     // install announces itself to one relay operator the moment chat comes up --
     // exactly the phoning-home this product refuses. Filling the box removes
     // the barrier (nobody types a WebSocket URL correctly from memory) while
     // leaving the decision where it belongs: the user still ticks the box.
-    relay.appendChild(
-      el(
-        "div",
-        "chat-relay-note",
-        "The address below is the relay run by this browser's publisher, " +
-          "filled in for convenience. You can replace it with any relay you " +
-          "trust, or one you run yourself. A relay never sees your messages, " +
-          "only that you are online and connected to someone. Both people " +
-          "need to be on the same relay to reach each other through it.",
-      ),
+    const relayPublisherNote = el(
+      "div",
+      "chat-relay-note",
+      i18nText("chrome-js-chat-relay-publisher-note", "The prefilled relay is run by this browser's publisher. You can replace it with any relay you trust, or one you run yourself. Both people need the same relay. It sees when you are online and connected, not messages."),
     );
+    relay.appendChild(relayPublisherNote);
     const rState = el("div", "chat-relay-state");
     relay.appendChild(rState);
 
@@ -353,10 +371,14 @@
     const rEnable = document.createElement("input");
     rEnable.type = "checkbox";
     rEnableLabel.appendChild(rEnable);
-    rEnableLabel.appendChild(document.createTextNode(" Use a relay server"));
+    // The label text leads with a space ({" "} in the catalog) so the
+    // checkbox keeps its gap after a fill.
+    const rEnableText = document.createTextNode(" Use a relay server");
+    rEnableLabel.appendChild(rEnableText);
     relay.appendChild(rEnableLabel);
 
-    relay.appendChild(el("div", "chat-relay-label", "Server address"));
+    const rUrlLabel = el("div", "chat-relay-label", i18nText("chrome-js-chat-relay-url-label", "Server address"));
+    relay.appendChild(rUrlLabel);
     const rUrl = document.createElement("input");
     rUrl.type = "text";
     rUrl.className = "chat-relay-url";
@@ -366,26 +388,23 @@
     rUrl.spellcheck = false;
     relay.appendChild(rUrl);
 
-    relay.appendChild(
-      el("div", "chat-relay-label", "Your address to register"),
-    );
+    const rIdLabel = el("div", "chat-relay-label", i18nText("chrome-js-chat-relay-identity-label", "Your address to register"));
+    relay.appendChild(rIdLabel);
     const rId = document.createElement("select");
     rId.className = "chat-relay-identity";
     relay.appendChild(rId);
 
-    const rSave = el("button", "small", "Save relay settings");
+    const rSave = el("button", "small", i18nText("chrome-js-chat-relay-save", "Save relay settings"));
     rSave.type = "button";
     const rSaveRow = el("div", "chat-relay-save");
     rSaveRow.appendChild(rSave);
     relay.appendChild(rSaveRow);
-    relay.appendChild(
-      el(
-        "div",
-        "chat-relay-note",
-        "Saving while you are online briefly reconnects chat, so the running " +
-          "state always matches these settings.",
-      ),
+    const rSaveNote = el(
+      "div",
+      "chat-relay-note",
+      i18nText("chrome-js-chat-relay-save-note", "Saving while online reconnects Private Chat briefly."),
     );
+    relay.appendChild(rSaveNote);
     const rErr = el("div", "error");
     relay.appendChild(rErr);
     root.appendChild(relay);
@@ -433,8 +452,9 @@
       if (rEnable.checked && (!rUrl.value.trim() || !rId.value)) {
         // The Rust side refuses the same shape with bad_args; saying which
         // half is missing here is kinder than the generic code.
-        rErr.textContent =
-          "Enabling needs both a server address and one of your addresses to register.";
+        rErr.textContent = i18nText("chrome-js-chat-relay-needs-both",
+          "Enabling needs both a server address and one of your addresses to register.",
+        );
         return;
       }
       rSave.disabled = true;
@@ -447,7 +467,7 @@
           rSave.disabled = false;
           relayDirty = false;
           applyRelay(data);
-          toast("Relay settings saved.");
+          toast(i18nText("chrome-js-chat-relay-saved", "Relay settings saved."));
         })
         .catch((e) => {
           rSave.disabled = false;
@@ -456,6 +476,26 @@
               ? RELAY_STATE_TEXT.not_compiled
               : friendlyChat(e);
         });
+    });
+
+    // Build-once labels, re-labelled on every locale fill. The away button
+    // is NOT here: its label toggles with state, so renderPresence owns it
+    // (and renderPresence is itself re-run on fill, registered below where
+    // presenceUI exists). The fallbacks are the joined single-line strings:
+    // the source-width concatenations were never runtime composition.
+    rebuildOnLocaleFill(function () {
+      goOnline.textContent = i18nText("chrome-js-chat-go-online", "Go online");
+      goOffline.textContent = i18nText("chrome-js-chat-go-offline", "Go offline");
+      relayToggle.textContent = i18nText("chrome-js-chat-relay-toggle", "Relay settings");
+      relayTitle.textContent = i18nText("chrome-js-chat-relay-title", "Reachable beyond this network (optional)");
+      relayNote.textContent = i18nText("chrome-js-chat-relay-note", "A relay keeps one chosen address reachable outside your local network. Whoever runs it sees that address and when it is online, not your contacts or messages. Off by default; nothing connects until configured.");
+      relayPublisherNote.textContent = i18nText("chrome-js-chat-relay-publisher-note", "The prefilled relay is run by this browser's publisher. You can replace it with any relay you trust, or one you run yourself. Both people need the same relay. It sees when you are online and connected, not messages.");
+      rEnableText.textContent = i18nText("chrome-js-chat-relay-enable", " Use a relay server");
+      rUrlLabel.textContent = i18nText("chrome-js-chat-relay-url-label", "Server address");
+      rUrl.placeholder = i18nText("chrome-js-chat-relay-url-placeholder", "wss://relay.example/ws");
+      rIdLabel.textContent = i18nText("chrome-js-chat-relay-identity-label", "Your address to register");
+      rSave.textContent = i18nText("chrome-js-chat-relay-save", "Save relay settings");
+      rSaveNote.textContent = i18nText("chrome-js-chat-relay-save-note", "Saving while online reconnects Private Chat briefly.");
     });
 
     return {
@@ -479,6 +519,14 @@
   panel.insertBefore(presenceUI.root, panel.firstChild);
   renderPresence();
   renderRelayState();
+  // The presence line and the toggling away button follow a live locale
+  // switch too. Registered HERE, not inside buildPresenceUI: the hook runs
+  // its callback at registration, and presenceUI does not exist yet inside
+  // the builder. Both renders are idempotent.
+  rebuildOnLocaleFill(function () {
+    renderPresence();
+    renderRelayState();
+  });
 
   function setRelayFormDisabled(off) {
     presenceUI.rEnable.disabled = off;
@@ -497,19 +545,19 @@
     let text;
     if (!ownOnline) {
       state = "offline";
-      text =
-        "You are offline. Nobody can find or message you. Going online " +
-        "announces you on this network (and on your relay, if one is configured).";
+      text = i18nText("chrome-js-chat-presence-line-offline",
+        "Offline. Nobody can find or message you.",
+      );
     } else if (ownAway) {
       state = "away";
-      text =
-        "You are online and flagged away. You are still reachable and messages " +
-        "arrive normally; your contacts see you as away.";
+      text = i18nText("chrome-js-chat-presence-line-away",
+        "Away, but reachable; messages still arrive.",
+      );
     } else {
       state = "online";
-      text =
-        "You are online, announcing on this network. Contacts can find " +
-        "and message you.";
+      text = i18nText("chrome-js-chat-presence-line-online",
+        "Online and reachable on this network.",
+      );
     }
     ui.dot.className = "presence presence-" + state;
     ui.dot.title = PRESENCE_TEXT[state];
@@ -517,7 +565,9 @@
     ui.goOnline.hidden = ownOnline;
     ui.goOffline.hidden = !ownOnline;
     ui.away.hidden = !ownOnline;
-    ui.away.textContent = ownAway ? "I'm back" : "Flag as away";
+    ui.away.textContent = ownAway
+      ? i18nText("chrome-js-chat-away-im-back", "I'm back")
+      : i18nText("chrome-js-chat-away-flag", "Flag as away");
     ui.root.hidden = viewState === "locked";
     chatButton.classList.toggle("is-active", ownOnline);
 
@@ -534,13 +584,15 @@
     if (dot) {
       dot.hidden = !(ownOnline && ownAway);
       dot.className = "dot warn";
-      dot.title = "You are flagged as away";
+      dot.title = i18nText("chrome-js-chat-dot-away-title", "You are flagged as away");
     }
   }
 
   function renderRelayState() {
     if (!relayInfo) {
-      presenceUI.rState.textContent = "Reading relay settings…";
+      presenceUI.rState.textContent = i18nText("chrome-js-chat-relay-reading",
+        "Reading relay settings…",
+      );
       setRelayFormDisabled(true);
       return;
     }
@@ -548,7 +600,9 @@
     const state = relayInfo.state || (compiled ? "off" : "not_compiled");
     let line = RELAY_STATE_TEXT[state] || RELAY_STATE_TEXT.off;
     if (relayInfo.error && RELAY_ERROR_TEXT[relayInfo.error]) {
-      line += " " + RELAY_ERROR_TEXT[relayInfo.error];
+      // The error clause carries its own leading space ({" "} in the
+      // catalog); the join is a plain append.
+      line += RELAY_ERROR_TEXT[relayInfo.error];
     }
     presenceUI.rState.textContent = line;
     // A control the build cannot honour is shown, disabled, and explained —
@@ -584,7 +638,9 @@
       if (data.identity_choices.length === 0) {
         const o = document.createElement("option");
         o.value = "";
-        o.textContent = "No addresses yet. Create one or add a contact first";
+        o.textContent = i18nText("chrome-js-chat-relay-no-identities",
+          "No addresses yet. Create one or add a contact first",
+        );
         sel.appendChild(o);
       } else {
         for (const choice of data.identity_choices) {
@@ -617,13 +673,15 @@
     input.rows = 2;
     input.maxLength = 2000;
     input.value = contact.note || "";
-    input.placeholder = "Anything you do not want to forget about this contact";
+    input.placeholder = i18nText("chrome-js-chat-note-placeholder",
+      "Anything you do not want to forget about this contact",
+    );
     wrap.appendChild(input);
 
     const row = el("div", "form-buttons");
-    const save = el("button", "small", "Save");
+    const save = el("button", "small", i18nText("chrome-js-chat-note-save", "Save"));
     save.type = "button";
-    const cancel = el("button", "small", "Cancel");
+    const cancel = el("button", "small", i18nText("chrome-js-chat-note-cancel", "Cancel"));
     cancel.type = "button";
     const err = el("div", "error");
 
@@ -675,19 +733,51 @@
     for (const key of Object.keys(statePanes)) {
       statePanes[key].hidden = key !== name;
     }
+    renderPremiumNote(name);
     // The presence bar follows the pane: hidden while locked, visible for
     // intro/contacts/conversation, since "am I discoverable" matters most
     // exactly when the panel is showing people.
     renderPresence();
   }
 
+  // DELEGATES. This used to be a second implementation: a plain `.toast` with
+  // no dismiss button, removed after 6000ms. It inherited the centred bold
+  // styling automatically and so LOOKED like every other notification while
+  // behaving like the old ones -- no X, and gone in six seconds instead of
+  // fifteen. chrome.js owns the one implementation and publishes it.
+  // The standing Premium sentence at the top of the panel: shown whenever
+  // Premium is off and the vault is not the thing in the way (the locked pane
+  // already tells the user what to do). Reads chrome.js's state through the
+  // shared bridge, so the wording is the toolbar pill's, verbatim.
+  function renderPremiumNote(name) {
+    const note = $("chat-premium-note");
+    if (!note) return;
+    const bridge = window.__rb;
+    const active =
+      typeof bridge.premiumActive === "function" ? bridge.premiumActive() : true;
+    if (active || name === "locked") {
+      note.hidden = true;
+      note.textContent = "";
+      return;
+    }
+    note.textContent =
+      typeof bridge.premiumLockNote === "function"
+        ? bridge.premiumLockNote()
+        : "A Premium feature.";
+    note.hidden = false;
+  }
+
   function toast(text, isError) {
-    const wrap = $("toasts");
-    if (!wrap) return;
-    const node = el("div", "toast" + (isError ? " error" : ""), text);
-    node.title = text;
-    wrap.appendChild(node);
-    setTimeout(() => node.remove(), 6000);
+    if (typeof window.__rb_toast === "function") {
+      window.__rb_toast(text, isError);
+      return;
+    }
+    // NO FALLBACK. An earlier version appended a notice here with no dismiss
+    // button and no timer, which a review pointed out is worse than showing
+    // nothing: those accumulate for the life of the document and cannot be
+    // cleared. chrome.js publishes the hook at load and is always loaded
+    // before this file in a chat build, so reaching this line at all means the
+    // chrome is broken in a way one dropped notice does not describe.
   }
 
   // ---- refresh -----------------------------------------------------------------
@@ -827,11 +917,19 @@
     return "offline";
   }
 
-  function labelFor(contactId, peerHash) {
+  // Async now: the fallback carries the truncated hash as a catalog arg.
+  // The hash itself is peer data -- displayed, never translated.
+  async function labelFor(contactId, peerHash) {
     const found = contacts.find((c) => c.id === contactId);
     if (found) return found.label;
     const hash = String(peerHash || "");
-    return hash ? "Peer " + hash.slice(0, 12) + "…" : "Unknown peer";
+    if (!hash) return i18nText("chrome-js-chat-unknown-peer", "Unknown peer");
+    const short = hash.slice(0, 12);
+    return i18nResolve(
+      "chrome-js-chat-peer-fallback",
+      { hash: short },
+      "Peer " + short + "…",
+    );
   }
 
   function renderContacts() {
@@ -863,9 +961,11 @@
       const noteText = el("div", "note-text", contact.note || "");
       if (!contact.note) {
         noteText.classList.add("note-empty");
-        noteText.textContent = "Add a note about this contact";
+        noteText.textContent = i18nText("chrome-js-chat-contact-note-empty",
+          "Add a note about this contact",
+        );
       }
-      noteText.title = "Click to edit";
+      noteText.title = i18nText("chrome-js-chat-contact-note-title", "Click to edit");
       noteText.addEventListener("click", () =>
         startNoteEdit(contact, noteWrap),
       );
@@ -874,17 +974,17 @@
 
       const row = el("div", "item-row");
 
-      const chatBtn = el("button", "small", "Chat");
+      const chatBtn = el("button", "small", i18nText("chrome-js-chat-contact-chat", "Chat"));
       chatBtn.type = "button";
       chatBtn.addEventListener("click", () => openConversation(contact));
       row.appendChild(chatBtn);
 
-      const numBtn = el("button", "small", "My number");
+      const numBtn = el("button", "small", i18nText("chrome-js-chat-contact-number", "My number"));
       numBtn.type = "button";
       numBtn.addEventListener("click", () => selectContact(contact));
       row.appendChild(numBtn);
 
-      const delBtn = el("button", "small danger", "Remove");
+      const delBtn = el("button", "small danger", i18nText("chrome-js-chat-remove", "Remove"));
       delBtn.type = "button";
       delBtn.addEventListener("click", async () => {
         // The chrome's own dialog, shared through window.__rb: the engine's
@@ -892,8 +992,12 @@
         // question used to arrive headed "JavaScript - rbchrome://...".
         if (
           !(await askConfirmChat(
-            "Remove contact " + contact.label + "?",
-            "Remove",
+            await i18nResolve(
+              "chrome-js-chat-remove-confirm",
+              { label: contact.label },
+              "Remove contact " + contact.label + "?",
+            ),
+            i18nText("chrome-js-chat-remove", "Remove"),
           ))
         ) {
           return;
@@ -926,12 +1030,13 @@
     renderContacts();
     $("chat-ourhash-wrap").hidden = true;
     rb("chat_identity", { contact_id: contact.id })
-      .then((data) => {
+      .then(async (data) => {
         if (selectedId !== contact.id) return;
-        $("chat-ourhash-label").textContent =
-          "Your hash number for " +
-          contact.label +
-          ". Read it aloud or paste it to them so their messages reach you:";
+        $("chat-ourhash-label").textContent = await i18nResolve(
+          "chrome-js-chat-ourhash-label",
+          { label: contact.label },
+          "Give this hash number to " + contact.label + ":",
+        );
         $("chat-ourhash").textContent = (data && data.hash) || "";
         $("chat-ourhash-wrap").hidden = false;
       })
@@ -942,19 +1047,19 @@
     const node = $("chat-discovery");
     let text;
     if (transportDown) {
-      text = "Chat is unavailable right now.";
+      text = i18nText("chrome-js-chat-discovery-transport-down", "Chat is unavailable right now.");
     } else if (discoveryState === "unavailable") {
-      text = "Local discovery is unavailable. This network may block it.";
+      text = i18nText("chrome-js-chat-discovery-unavailable", "Local discovery is unavailable. This network may block it.");
     } else if (discoveryState === "starting") {
       // Rust emits exactly "active", "quiet" and "unavailable" (DiscoveryState
       // in crates/chat/src/discovery.rs). "starting" is this panel's own
       // placeholder from before the transport has reported anything.
-      text = "Looking for devices on this network…";
+      text = i18nText("chrome-js-chat-discovery-starting", "Looking for devices on this network…");
     } else if (discoveryState === "quiet") {
       // Discovery is running but has never seen anyone. mDNS cannot tell that
       // apart from "this network ate the multicast", so say both rather than
       // showing a bare empty list that reads as "nobody is there".
-      text = "No peers found. This network may block local discovery.";
+      text = i18nText("chrome-js-chat-discovery-empty", "No peers found. This network may block local discovery.");
     } else {
       let anyOnline = false;
       for (const st of peerStates.values()) {
@@ -964,8 +1069,8 @@
       // there", which is a lie the user would act on: mDNS is routinely
       // blocked on public and guest WiFi.
       text = anyOnline
-        ? "Local discovery is on."
-        : "No peers found. This network may block local discovery.";
+        ? i18nText("chrome-js-chat-discovery-on", "Local discovery is on.")
+        : i18nText("chrome-js-chat-discovery-empty", "No peers found. This network may block local discovery.");
     }
     node.textContent = text;
   }
@@ -999,7 +1104,9 @@
     const label = $("chat-add-label").value.trim();
     const peerHash = $("chat-add-hash").value.trim();
     if (!label || !peerHash) {
-      err.textContent = "Both a name and their hash number are required.";
+      err.textContent = i18nText("chrome-js-chat-add-required",
+        "Both a name and their hash number are required.",
+      );
       return;
     }
     try {
@@ -1012,12 +1119,11 @@
       // The reply carries our fresh per-contact number — the address the new
       // contact must dial to reach us. Showing it immediately is the whole
       // point of adding someone.
-      $("chat-added-label").textContent =
-        "Added " +
-        label +
-        ". Your hash number for " +
-        label +
-        ". Give it to them so they can reach you:";
+      $("chat-added-label").textContent = await i18nResolve(
+        "chrome-js-chat-added-label",
+        { label: label },
+        "Added " + label + ". Give them this hash number:",
+      );
       $("chat-added-hash").textContent = (added && added.hash) || "";
       $("chat-added-wrap").hidden = false;
       await refreshContacts();
@@ -1040,10 +1146,16 @@
   (() => {
     const backBtn = $("chat-back");
     if (!backBtn || !backBtn.parentNode) return;
-    const endBtn = el("button", "small", "End session");
+    const endBtn = el("button", "small", i18nText("chrome-js-chat-end-session", "End session"));
     endBtn.type = "button";
-    endBtn.title =
-      "Destroy this conversation's keys; reopening starts a fresh session";
+    endBtn.title = i18nText("chrome-js-chat-end-session-title",
+      "Clear this conversation and start a Fresh Session",
+    );
+    // Built once; label and tooltip follow a live locale switch.
+    rebuildOnLocaleFill(function () {
+      endBtn.textContent = i18nText("chrome-js-chat-end-session", "End session");
+      endBtn.title = i18nText("chrome-js-chat-end-session-title", "Clear this conversation and start a Fresh Session");
+    });
     backBtn.parentNode.insertBefore(endBtn, backBtn.nextSibling);
     endBtn.addEventListener("click", () => {
       if (!current) return;
@@ -1083,7 +1195,14 @@
       // the throwaway one.
       await rb("chat_open", { contact_id: contact.id });
     } catch (e) {
-      addSys(current.peer_hash, "Could not open a session: " + friendlyChat(e));
+      addSys(
+        current.peer_hash,
+        await i18nResolve(
+          "chrome-js-chat-open-session-failed",
+          { detail: friendlyChat(e) },
+          "Could not open a session: " + friendlyChat(e),
+        ),
+      );
     }
   }
 
@@ -1111,7 +1230,7 @@
   // so it is not going to say "Smileys & Emotion".
   const EMOJI_GROUPS = [
     {
-      label: "Faces",
+      label: { id: "chrome-js-chat-emoji-faces", text: "Faces" },
       items: [
         "😀",
         "😄",
@@ -1146,11 +1265,11 @@
       ],
     },
     {
-      label: "Hands",
+      label: { id: "chrome-js-chat-emoji-hands", text: "Hands" },
       items: ["👍", "👎", "👌", "✌️", "🤞", "👋", "🙏", "💪", "👏", "🤙"],
     },
     {
-      label: "Hearts and marks",
+      label: { id: "chrome-js-chat-emoji-hearts-marks", text: "Hearts and marks" },
       items: [
         "❤️",
         "🧡",
@@ -1171,7 +1290,7 @@
       ],
     },
     {
-      label: "Things",
+      label: { id: "chrome-js-chat-emoji-things", text: "Things" },
       items: [
         "🎉",
         "🎂",
@@ -1196,6 +1315,14 @@
   const emojiPanel = $("chat-emoji-panel");
   const emojiToggle = $("chat-emoji-toggle");
   let emojiBuilt = false;
+  // The label nodes are kept so a live locale switch can re-label them --
+  // the one-shot emojiBuilt guard below forbids rebuilding the grid itself.
+  const emojiLabelEls = [];
+  rebuildOnLocaleFill(function () {
+    for (const entry of emojiLabelEls) {
+      entry.node.textContent = i18nText(entry.id, entry.text);
+    }
+  });
 
   /// Put an emoji where the caret is, not at the end.
   ///
@@ -1223,7 +1350,17 @@
     if (emojiBuilt) return;
     emojiBuilt = true;
     for (const group of EMOJI_GROUPS) {
-      emojiPanel.appendChild(el("div", "chat-emoji-label", group.label));
+      const labelNode = el(
+        "div",
+        "chat-emoji-label",
+        i18nText(group.label.id, group.label.text),
+      );
+      emojiLabelEls.push({
+        node: labelNode,
+        id: group.label.id,
+        text: group.label.text,
+      });
+      emojiPanel.appendChild(labelNode);
       const grid = el("div", "chat-emoji-grid");
       for (const glyph of group.items) {
         const button = el("button", "chat-emoji", glyph);
@@ -1306,13 +1443,19 @@
     const err = $("chat-send-error");
     err.textContent = "";
     rb("chat_send_tab", { peer_hash: current.peer_hash })
-      .then(() => addSys(current.peer_hash, "You sent this tab's address."))
+      .then(() =>
+        addSys(
+          current.peer_hash,
+          i18nText("chrome-js-chat-sent-tab", "You sent this tab's address."),
+        ),
+      )
       .catch((e) => {
         // bad_args here means the current tab's address is not one we would
-        // open ourselves, so it cannot be shared either.
+        // open ourselves, so it cannot be shared either. The COMPARISON
+        // stays bare; only the display side is catalogued.
         err.textContent =
           e && e.message === "bad_args"
-            ? "This tab cannot be shared."
+            ? i18nText("chrome-js-chat-tab-not-shareable", "This tab cannot be shared.")
             : friendlyChat(e);
       });
   });
@@ -1332,7 +1475,9 @@
         const select = $("chat-cred-select");
         select.textContent = "";
         if (items.length === 0) {
-          err.textContent = "There are no credentials in the vault to share.";
+          err.textContent = i18nText("chrome-js-chat-no-credentials",
+            "There are no credentials in the vault to share.",
+          );
           return;
         }
         for (const item of items) {
@@ -1358,14 +1503,23 @@
     const err = $("chat-send-error");
     err.textContent = "";
     const chosen = select.options[select.selectedIndex];
-    const what = chosen ? chosen.textContent : "login";
+    const what = chosen
+      ? chosen.textContent
+      : i18nText("chrome-js-chat-login-fallback", "login");
     rb("chat_share_credential", {
       contact_id: current.contact_id,
       cred_id: credId,
     })
-      .then(() => {
+      .then(async () => {
         $("chat-cred-picker").hidden = true;
-        addSys(current.peer_hash, "You shared the login for " + what + ".");
+        addSys(
+          current.peer_hash,
+          await i18nResolve(
+            "chrome-js-chat-shared-login",
+            { what: what },
+            "You shared the login for " + what + ".",
+          ),
+        );
       })
       .catch((e) => {
         err.textContent = friendlyChat(e);
@@ -1472,7 +1626,9 @@
     if (desc.state === "failed") {
       return (
         FAILURE_TEXT[desc.reason] ||
-        "Not delivered. The reason was not recognized."
+        i18nText("chrome-js-chat-delivery-unknown-failure",
+          "Not delivered. The reason was not recognized.",
+        )
       );
     }
     return DELIVERY_TEXT[desc.state] || "";
@@ -1510,27 +1666,31 @@
   // peer can never take the foreground.
   function buildTabOffer(desc) {
     const node = el("div", "msg offer");
-    node.appendChild(el("div", "offer-title", desc.peerLabel + " sent a link"));
+    // desc.title was composed at event time (it carries the peer's label);
+    // this builder only places wording, like the Rust-headline renders.
+    node.appendChild(el("div", "offer-title", desc.title));
     node.appendChild(el("div", "chat-url", desc.url));
     node.appendChild(
       el(
         "div",
         "chat-note",
-        "It opens in a background tab, and only if you choose to open it.",
+        i18nText("chrome-js-chat-tab-offer-note", "Opens in a background tab only if you choose."),
       ),
     );
     const actions = el("div", "form-buttons");
-    const open = el("button", "small", "Open in background tab");
+    const open = el("button", "small", i18nText("chrome-js-chat-tab-open", "Open in background tab"));
     open.type = "button";
-    const dismiss = el("button", "small", "Dismiss");
+    const dismiss = el("button", "small", i18nText("chrome-js-chat-tab-dismiss", "Dismiss"));
     dismiss.type = "button";
     open.addEventListener("click", () => {
       open.disabled = true;
       rb("chat_accept_tab", { url: desc.url })
-        .then(() => settle(actions, "Opened in a background tab."))
+        .then(() => settle(actions, i18nText("chrome-js-chat-tab-opened", "Opened in a background tab.")))
         .catch((e) => settle(actions, friendlyChat(e), true));
     });
-    dismiss.addEventListener("click", () => settle(actions, "Dismissed."));
+    dismiss.addEventListener("click", () =>
+      settle(actions, i18nText("chrome-js-chat-tab-dismissed", "Dismissed.")),
+    );
     actions.appendChild(open);
     actions.appendChild(dismiss);
     node.appendChild(actions);
@@ -1544,32 +1704,33 @@
   function buildCredOffer(desc) {
     const offer = desc.offer;
     const node = el("div", "msg offer");
-    node.appendChild(
-      el("div", "offer-title", desc.peerLabel + " shared a login"),
-    );
-    node.appendChild(offerRow("Site", offer.site));
-    node.appendChild(offerRow("Username", offer.username));
-    if (offer.note) node.appendChild(offerRow("Note", offer.note));
+    // desc.title was composed at event time (it carries the peer's label).
+    node.appendChild(el("div", "offer-title", desc.title));
+    node.appendChild(offerRow(i18nText("chrome-js-chat-offer-site", "Site"), offer.site));
+    node.appendChild(offerRow(i18nText("chrome-js-chat-offer-username", "Username"), offer.username));
+    if (offer.note) node.appendChild(offerRow(i18nText("chrome-js-chat-offer-note", "Note"), offer.note));
 
     const pwRow = el("div", "offer-row");
-    pwRow.appendChild(el("span", "offer-key", "Password"));
+    pwRow.appendChild(el("span", "offer-key", i18nText("chrome-js-chat-offer-password", "Password")));
     const pwVal = el("span", null, "••••••••");
     pwRow.appendChild(pwVal);
-    const revealBtn = el("button", "small", "Reveal");
+    const revealBtn = el("button", "small", i18nText("chrome-js-chat-offer-reveal", "Reveal"));
     revealBtn.type = "button";
     let shown = false;
     revealBtn.addEventListener("click", () => {
       shown = !shown;
       pwVal.textContent = shown ? offer.password || "" : "••••••••";
-      revealBtn.textContent = shown ? "Hide" : "Reveal";
+      revealBtn.textContent = shown
+        ? i18nText("chrome-js-chat-offer-hide", "Hide")
+        : i18nText("chrome-js-chat-offer-reveal", "Reveal");
     });
     pwRow.appendChild(revealBtn);
     node.appendChild(pwRow);
 
     const actions = el("div", "form-buttons");
-    const save = el("button", "small", "Save to vault");
+    const save = el("button", "small", i18nText("chrome-js-chat-offer-save", "Save to vault"));
     save.type = "button";
-    const decline = el("button", "small", "Decline");
+    const decline = el("button", "small", i18nText("chrome-js-chat-offer-decline", "Decline"));
     decline.type = "button";
     save.addEventListener("click", () => {
       save.disabled = true;
@@ -1579,10 +1740,12 @@
         password: offer.password,
         note: offer.note,
       })
-        .then(() => settle(actions, "Saved to your vault."))
+        .then(() => settle(actions, i18nText("chrome-js-chat-offer-saved", "Saved to your vault.")))
         .catch((e) => settle(actions, friendlyChat(e), true));
     });
-    decline.addEventListener("click", () => settle(actions, "Declined."));
+    decline.addEventListener("click", () =>
+      settle(actions, i18nText("chrome-js-chat-offer-declined", "Declined.")),
+    );
     actions.appendChild(save);
     actions.appendChild(decline);
     node.appendChild(actions);
@@ -1612,7 +1775,7 @@
     renderDiscovery();
   }
 
-  function onChatMessage(data) {
+  async function onChatMessage(data) {
     if (!data) return;
     const hash = String(data.peer_hash || "");
     if (!hash) return;
@@ -1624,16 +1787,29 @@
       // removed itself and you have looked back at the screen.
       unread.set(hash, (unread.get(hash) || 0) + 1);
       paintUnread();
-      toast("Message from " + labelFor(data.contact_id, hash));
+      const label = await labelFor(data.contact_id, hash);
+      toast(
+        await i18nResolve(
+          "chrome-js-chat-toast-message",
+          { label: label },
+          "Message from " + label,
+        ),
+      );
     }
   }
 
-  function onChatNotice(data) {
+  async function onChatNotice(data) {
     if (!data) return;
     const hash = String(data.peer_hash || "");
+    // The reason is a wire token: it selects the message, and only the
+    // unrecognized fallback DISPLAYS it (as an arg, never translated).
     const text =
       NOTICE_TEXT[data.reason] ||
-      "Unrecognized chat notice: " + String(data.reason);
+      (await i18nResolve(
+        "chrome-js-chat-notice-unknown",
+        { reason: String(data.reason) },
+        "Unrecognized chat notice: " + String(data.reason),
+      ));
     if (hash) addSys(hash, text);
     if (!hash || !viewing(hash)) toast(text, true);
   }
@@ -1643,24 +1819,45 @@
     renderDiscovery();
   }
 
-  function onTabReceived(data) {
+  // Async now: the offer title and the toast are composed here, at event
+  // time, because renderDesc is synchronous and re-renders in loops. The
+  // descriptor stores display strings, not the label.
+  async function onTabReceived(data) {
     if (!data) return;
     const hash = String(data.peer_hash || "");
     const url = String(data.url || "");
     if (!hash || !url) return;
-    const label = labelFor(data.contact_id, hash);
-    pushDesc(hash, { kind: "tab", url, peerLabel: label });
-    if (!viewing(hash)) toast("Link received from " + label);
+    const label = await labelFor(data.contact_id, hash);
+    const title = await i18nResolve(
+      "chrome-js-chat-tab-offer-title",
+      { label: label },
+      label + " sent a link",
+    );
+    pushDesc(hash, { kind: "tab", url, title });
+    if (!viewing(hash)) {
+      toast(
+        await i18nResolve(
+          "chrome-js-chat-toast-link",
+          { label: label },
+          "Link received from " + label,
+        ),
+      );
+    }
   }
 
-  function onCredOffered(data) {
+  async function onCredOffered(data) {
     if (!data) return;
     const hash = String(data.peer_hash || "");
     if (!hash) return;
-    const label = labelFor(data.contact_id, hash);
+    const label = await labelFor(data.contact_id, hash);
+    const title = await i18nResolve(
+      "chrome-js-chat-cred-offer-title",
+      { label: label },
+      label + " shared a login",
+    );
     pushDesc(hash, {
       kind: "cred",
-      peerLabel: label,
+      title,
       offer: {
         site: String(data.site || ""),
         username: String(data.username || ""),
@@ -1668,7 +1865,15 @@
         note: String(data.note || ""),
       },
     });
-    if (!viewing(hash)) toast("Login shared by " + label);
+    if (!viewing(hash)) {
+      toast(
+        await i18nResolve(
+          "chrome-js-chat-toast-login",
+          { label: label },
+          "Login shared by " + label,
+        ),
+      );
+    }
   }
 
   function onChatState(data) {
@@ -1693,12 +1898,14 @@
     if (current) {
       addSys(
         current.peer_hash,
-        "Chat has stopped. Messages cannot be sent or received.",
+        i18nText("chrome-js-chat-down-line",
+          "Chat has stopped. Messages cannot be sent or received.",
+        ),
       );
     }
     if (viewState === "contacts") renderContacts();
     renderDiscovery();
-    toast("Chat has stopped", true);
+    toast(i18nText("chrome-js-chat-down-toast", "Chat has stopped"), true);
   }
 
   // Our own presence (online/offline/away) and the relay's live state. Both
@@ -1738,6 +1945,14 @@
   // know, and today it does not know chat_presence / chat_relay_state, so
   // without this every presence and relay transition would be discarded.
   // Everything else flows on to the previous handler (chrome.js's router).
+  // The standing Premium note follows the LICENCE, not only the pane: when
+  // chrome.js finishes a premium_status refresh (paste, activate, remove,
+  // unlock) the note re-renders for whichever pane is showing.
+  if (window.__rb && typeof window.__rb.onPremiumChange === "function") {
+    window.__rb.onPremiumChange(() => {
+      if (viewState) renderPremiumNote(viewState);
+    });
+  }
   const previousEventHandler = window.__rb_event;
   window.__rb_event = function (msg) {
     if (msg && msg.event === "chat_presence") {

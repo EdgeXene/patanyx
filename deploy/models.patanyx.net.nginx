@@ -1,0 +1,115 @@
+# models.patanyx.net -- the language-pack feed.
+#
+# NOT INSTALLED BY THIS FILE. Copying it into sites-enabled and reloading nginx
+# publishes language packs to the internet, which needs an explicit go from the
+# operator. It is checked in so the review happens before the deploy, not after.
+#
+# WHAT THIS HOST IS. A static file server for two kinds of object and nothing
+# else: signed manifests (/packs/<pair>.json) and pack bodies
+# (/packs/<pair>.pxpack). It runs no application, holds no state, and has no
+# upload path.
+#
+# WHERE THE SIGNING KEY ACTUALLY IS, stated honestly because an earlier version
+# of this comment claimed it was elsewhere. This machine is BOTH the build host
+# and the web server, so /root/.patanyx-keys/models.key sits on the same box
+# that serves the packs. That is not the separation the comment used to claim,
+# and it is not an accident either: blocklist.key lives here on the same terms,
+# because both feeds are republished by automation and an offline key cannot
+# sign on a schedule.
+#
+# What the signature still buys, and it is not nothing: the browser refuses any
+# pack whose bytes do not match a signed hash, so file-level tampering, a bad
+# mirror or a corrupted copy are all caught. What it does NOT buy while the key
+# is here is protection against an attacker who gets root on this machine --
+# they would have the key and could sign whatever they served. Moving the model
+# key to a separate signer is a real improvement and an open question for the
+# operator, not something this config should imply is already true.
+#
+# WHY A SEPARATE HOST rather than a path on an existing one. It is the
+# network-level half of the key-class separation: the model-feed key authorises
+# model-feed artifacts only, and serving them from their own name means
+# compromising this host does not put an attacker in the request path of the
+# update or blocklist feeds.
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name models.patanyx.net;
+    # ACME only, then everything else upgraded. No pack is ever served over
+    # plain HTTP: the client refuses a non-https manifest url anyway, and
+    # serving one would only teach a network that a translation is starting.
+    location /.well-known/acme-challenge/ { root /var/www/certbot; }
+    location / { return 301 https://$host$request_uri; }
+}
+
+server {
+    # `listen ... ssl http2` rather than the newer `http2 on;` directive: this
+    # nginx predates 1.25 and rejects the latter outright. Caught by `nginx -t`
+    # before any reload, which is why the test runs before the reload and not
+    # after.
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name models.patanyx.net;
+
+    ssl_certificate     /etc/letsencrypt/live/models.patanyx.net/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/models.patanyx.net/privkey.pem;
+
+    root /srv/patanyx-models;
+
+    # NO ACCESS LOG. This is the one request in the product that discloses a
+    # per-user fact -- which language pair somebody chose -- and the policy
+    # promise is that it is not kept. A default access_log would write that
+    # choice next to a client IP on disk, which is precisely the record this
+    # feature is designed not to create. Errors are still logged, because an
+    # error line carries the failure and not the user.
+    access_log off;
+    error_log /var/log/nginx/models.patanyx.net.error.log warn;
+
+    # Nothing here is generated, so nothing here needs a method other than GET.
+    if ($request_method !~ ^(GET|HEAD)$) { return 405; }
+
+    # Version banner off: it tells a scanner which nginx to look up and tells
+    # a user nothing.
+    server_tokens off;
+
+    # THESE ARE REPEATED IN EVERY LOCATION BELOW, and that is not redundancy.
+    # nginx's `add_header` does not merge: a location that sets ANY add_header
+    # discards every one inherited from the server block. Both locations set
+    # Cache-Control, so declaring these only here meant they were silently
+    # absent from every actual response -- confirmed by reading the headers off
+    # the live host rather than by trusting the config.
+    add_header X-Content-Type-Options nosniff always;
+    add_header Referrer-Policy no-referrer always;
+    # HSTS: this host serves only over TLS and always will.
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    # The ONLY two routes. Everything else is a 404, so a stray file left in
+    # the web root is not reachable by guessing its name.
+    # QUOTED, because nginx reads an unquoted `{` as a block delimiter and
+    # refuses a regex containing one. `nginx -t` catches it; a reload without
+    # a test first would have taken the whole server down.
+    location ~ "^/packs/[a-z0-9]{2,12}-[a-z0-9]{2,12}(-[a-z0-9]{2,12})?\.json$" {
+        default_type application/json;
+        # Manifests change when a pack is republished. Short, so a fix reaches
+        # users quickly; the signature is what makes staleness safe rather than
+        # dangerous.
+        add_header Cache-Control "public, max-age=300" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+    }
+
+    location ~ "^/packs/[a-z0-9]{2,12}-[a-z0-9]{2,12}(-[a-z0-9]{2,12})?\.pxpack$" {
+        default_type application/octet-stream;
+        # Immutable by construction: the manifest names this file by hash, so a
+        # cached copy that no longer matches is REFUSED by the client rather
+        # than used. Long cache is therefore safe and saves users a repeat of a
+        # 36 MB download.
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header Referrer-Policy no-referrer always;
+        add_header Strict-Transport-Security "max-age=31536000" always;
+    }
+
+    location / { return 404; }
+}

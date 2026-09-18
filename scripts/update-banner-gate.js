@@ -15,6 +15,23 @@
 //   * the states that must NOT: checking, downloading, uptodate, failed
 //     -- those belong in the panel, not across the top of the window
 //
+// THE KIND SPLIT. `kind`, `security` and `auto_apply` joined the snapshot
+// when updates learned to install themselves, and they change WHO the banner
+// is for:
+//
+//   auto off  every offered/ready release announces, exactly as before
+//   auto on   a release that will install ITSELF at the next launch
+//             (maintenance, or anything carrying a security fix) says
+//             nothing -- announcing a decision nobody has to make is how a
+//             banner trains people to dismiss the one that matters
+//   auto on   a pure feature release still announces, because changing what
+//             the user sees without warning is the thing this split exists
+//             to prevent
+//
+// The absent-field case is load-bearing and is covered by the first checks
+// below omitting the fields entirely: every manifest published before this
+// existed carries none of them, and must keep behaving exactly as it did.
+//
 // Run: node scripts/update-banner-gate.js  (or via scripts/chrome-js-gate.sh)
 const fs = require("fs");
 const path = require("path");
@@ -96,6 +113,10 @@ check("no banner state claims an install", async () => {
   for (const data of [
     { state: "offered", offered: "0.9.62" },
     { state: "ready", offered: "0.9.62", wired: true },
+    // The feature wording is newer and says the most, so it is the likeliest
+    // to drift into claiming the install already happened.
+    { state: "ready", offered: "0.9.67", kind: "feature", auto_apply: true },
+    { state: "ready", offered: "0.9.67", kind: "feature", auto_apply: false },
   ]) {
     sendChecked({ state: "uptodate" });
     await flush();
@@ -134,6 +155,124 @@ check("in-flight and settled-quiet states stay out of the way", async () => {
         "that never comes down stops meaning anything",
     );
   }
+});
+
+// ---- the kind split -------------------------------------------------------
+
+check("with automatic updates on, a release that installs itself says nothing", async () => {
+  for (const data of [
+    { state: "ready", offered: "0.9.67", auto_apply: true, kind: "maintenance", security: false },
+    { state: "offered", offered: "0.9.67", auto_apply: true, kind: "maintenance", security: false },
+    // A security fix takes the quiet path even inside a feature release --
+    // that is the entire reason `security` is a field of its own and not a
+    // third kind. It installs at the next launch, so there is nothing to ask.
+    { state: "ready", offered: "0.9.67", auto_apply: true, kind: "feature", security: true },
+  ]) {
+    sendChecked({ state: "uptodate" });
+    await flush();
+    sendChecked(data);
+    await flush();
+    assert(
+      banner().hidden === true,
+      "kind=" +
+        data.kind +
+        " security=" +
+        data.security +
+        " raised a banner while automatic updates were on. That release " +
+        "installs itself at the next launch, so the banner is asking for a " +
+        "decision nobody has to make",
+    );
+  }
+});
+
+check("a feature release announces itself in both modes", async () => {
+  // Auto ON: it lands on its own eventually, and the banner has to say so.
+  // Without that clause "restart when it suits you" is not the whole truth.
+  sendChecked({ state: "uptodate" });
+  await flush();
+  sendChecked({
+    state: "ready",
+    offered: "0.9.67",
+    auto_apply: true,
+    kind: "feature",
+    security: false,
+  });
+  await flush();
+  assert(
+    banner().hidden === false,
+    "a feature release raised no banner with automatic updates on. This is " +
+      "the one release type that changes what the user sees, and it is the " +
+      "only thing the banner still exists for in auto mode",
+  );
+  assert(
+    /new features/i.test(bodyText()),
+    "the feature banner does not say the thing that makes it worth reading: " +
+      "that this release adds something new",
+  );
+  assert(
+    /on its own/i.test(bodyText()),
+    "with automatic updates on, the banner must disclose that an ignored " +
+      "feature release installs itself once the grace period lapses",
+  );
+
+  // Auto OFF: the same announcement, minus a sentence that would be false.
+  sendChecked({ state: "uptodate" });
+  await flush();
+  sendChecked({
+    state: "ready",
+    offered: "0.9.67",
+    auto_apply: false,
+    kind: "feature",
+    security: false,
+  });
+  await flush();
+  assert(
+    banner().hidden === false,
+    "a feature release raised no banner with automatic updates off",
+  );
+  assert(
+    /new features/i.test(bodyText()),
+    "the feature banner lost its point with automatic updates off",
+  );
+  assert(
+    !/on its own/i.test(bodyText()),
+    "with automatic updates OFF nothing installs itself, so the banner must " +
+      "not tell the user it will",
+  );
+});
+
+check("a feature OFFER is honest about what has not been downloaded", async () => {
+  // The coverage gap a compliance audit caught after this gate first went
+  // green: every feature row above is `ready`. In `offered` nothing has been
+  // fetched, so "restart to get them" names an action that installs nothing,
+  // and a self-install promise is false -- apply_pending_at_startup needs a
+  // STAGED release, which only the ready path writes.
+  sendChecked({ state: "uptodate" });
+  await flush();
+  sendChecked({
+    state: "offered",
+    offered: "0.9.67",
+    auto_apply: true,
+    kind: "feature",
+    security: false,
+  });
+  await flush();
+  assert(banner().hidden === false, "a feature offer raised no banner");
+  assert(
+    /nothing has been downloaded/i.test(bodyText()),
+    "the feature-offer banner does not say nothing has been downloaded, so " +
+      "it reads as though the bytes are already here",
+  );
+  assert(
+    !/on its own/i.test(bodyText()),
+    "the feature-offer banner promises a self-install, but nothing is " +
+      "staged and nothing can apply at a launch",
+  );
+  assert(
+    !/restart .*to get them/i.test(bodyText()),
+    "the feature-offer banner tells the user to restart, which installs " +
+      "nothing in the offered state",
+  );
 });
 
 check("a malformed event changes nothing", async () => {

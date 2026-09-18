@@ -331,3 +331,88 @@ unbouncepages.com       # 25764 Landing pages published by a SaaS product's
 bio.link                # 20710 Link-in-bio hosting, 9.1y.
 mssg.me                 # 31539 Link-in-bio hosting.
 ffm.to                  # 11008 Music smart-links, 9.1y.
+
+# --- 2026-08-27: the three that froze publishing for fourteen days ----------
+#
+# THE RULE APPLIED HERE, and it is meant to generalize: this list blocks
+# PHISHING. Its published name is the Reported Host List and its published
+# description is "sites reported as phishing, refused on sight". A host that is
+# disreputable for some other reason does not belong in it, however little one
+# might want to visit the place. Scope creep in a blocklist is invisible to the
+# user and unappealable, which is the same argument this file already makes.
+#
+# All three were reported by feeds that also carry malware, which is the likely
+# route in. None of them is a phishing site.
+telegram.im          # Telegram profile/username links, Tranco #7716. A whole
+                     # messaging service's link domain; blocking it takes every
+                     # t.me-style profile link with it. WORTH A SECOND LOOK by
+                     # a person: it is a third-party-operated Telegram
+                     # mirror rather than Telegram itself, so if the intent is
+                     # to block mirrors, move it to blocklist-confirm.txt.
+playmods.net         # Modded-APK distribution, Tranco #8280. Warez, not
+                     # phishing. Out of scope by the rule above.
+getmodsapk.com       # Modded-APK distribution, Tranco #8985. Same as above.
+
+# --- ShadowWhisperer onboarding review, 2026-09-01 -------------------------
+# Adding ShadowWhisperer's Scam and Malware lists brought eighteen top-10k
+# hosts to the tripwire, all of them from the Malware list; Scam brought none.
+# These nine are the false positives and the out-of-scope entries. The other
+# nine are in blocklist-confirm.txt.
+#
+# CONTEXT THAT APPLIES TO ALL EIGHTEEN: none is corroborated by any other feed
+# here, and none appears in the 2.18M-host aggregate consulted as a
+# cross-check. That cuts both ways -- it is why a fourth source was worth
+# adding, and it is why every one of these rests on one curator's opinion plus
+# the evidence recorded below.
+
+bbtec.net            # 1930  SoftBank / Yahoo! BB Japan residential broadband
+                     #       suffix. Reverse DNS on 219.188.200.1 returns
+                     #       bbtec.net; MarkMonitor, registered 2001. Blocking
+                     #       the apex takes every residential customer
+                     #       hostname under it.
+ztomy.com            # 2164  Domain-parking infrastructure: Akamai
+                     #       nameservers, PDR registrar, registered 2007, and
+                     #       a parking IP with no reverse DNS. Parking is not
+                     #       phishing, and at this rank a wrong block is
+                     #       expensive. THINNEST EVIDENCE OF THE NINE -- worth
+                     #       revisiting if a second feed ever reports it.
+guard.io             # 3184  Guardio, a browser security product with its own
+                     #       research arm. Google Cloud, GTS certificate.
+                     #       Blocking a security vendor.
+localto.net          # 4289  Tunnelling service; customers are handed
+                     #       <name>.localto.net. Same shape as the
+                     #       ec2-*.compute-1.amazonaws.com case the public
+                     #       suffix screen exists for, but not on the PSL.
+temporary.site       # 5502  Shared free-hosting suffix on a rented VPS
+                     #       (reverse DNS vps-13005218.r8d.com.br). Apex
+                     #       certificate does not validate, which is what
+                     #       per-subdomain hosting looks like.
+clickadu.net         # 6875  Ad network. DigiCert OV certificate names
+                     #       "Clickadu S.R.O.", so this is a real business.
+                     #       Adware-adjacent, not phishing: out of scope by
+                     #       the rule above, and the worked example for the
+                     #       Malware list's drift into PUP territory.
+tencentcs.com        # 8911  Tencent Cloud shared infrastructure. DigiCert OV
+                     #       certificate names "Tencent Technology (Shenzhen)
+                     #       Company Limited". Apex block hits every customer.
+hentaiheroes.com     # 8963  Adult browser game, registered 2016 and paid
+                     #       through 2030. Disreputable to some is not
+                     #       phishing. Out of scope by the rule above.
+intensedebate.com    # 9675  Automattic's comment system, embedded across many
+                     #       blogs. Reverse DNS on 192.0.123.246 returns
+                     #       intensedebate.com; MarkMonitor, registered 2006.
+
+# --- Decision 2026-09-09 --------------------------------------------------
+# PhishDestroy listed the LINE apex on 2026-09-08 and the tripwire refused
+# every build for the next day (Tranco #415, refuse band). The proposer's
+# recommendation was ALLOW; accepted on 2026-09-09.
+
+line.me              # 415   LINE, the messaging platform. GlobalSign OV
+                     #       certificate names "LY Corporation" (Tokyo); the
+                     #       apex redirects to www.line.me. Only PhishDestroy
+                     #       carries it; phishunt and Phishing.Database do
+                     #       not. Blocking the apex would take every LINE
+                     #       page with it, and phishing hosted on a LINE-owned
+                     #       page is a claim about that page, not about the
+                     #       service. Exact-match: a listed subdomain stays
+                     #       blocked.

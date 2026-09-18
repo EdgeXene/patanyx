@@ -21,6 +21,24 @@
 
 use serde_json::{json, Value};
 
+/// The warning carried by every visible and machine-checked surface of the
+/// unlocked test artifact. Distinctive on purpose: public-package guards grep
+/// this exact ASCII text, while a screenshot of either the title or About
+/// identifies the bypass without needing any other context.
+#[cfg(feature = "premium-unlocked")]
+pub const UNLOCKED_BUILD_MARKER: &str =
+    "UNLOCKED TEST BUILD: Premium forced on; no license checked";
+
+#[cfg(feature = "premium-unlocked")]
+const fn build_warning() -> Option<&'static str> {
+    Some(UNLOCKED_BUILD_MARKER)
+}
+
+#[cfg(not(feature = "premium-unlocked"))]
+const fn build_warning() -> Option<&'static str> {
+    None
+}
+
 /// PATANYX's own terms, verbatim from the file that ships beside the binary.
 const LICENSE: &str = include_str!("../../../LICENSE");
 
@@ -39,15 +57,20 @@ const ATTRIBUTION: &str = include_str!("chrome/attribution/linux-chat.txt");
 #[cfg(all(not(windows), not(feature = "chat")))]
 const ATTRIBUTION: &str = include_str!("chrome/attribution/linux.txt");
 
-/// The artifact name. `PATANYX` or `PATANYX-Premium` and nothing else -- not
+/// The artifact name. `PATANYX` or `PATANYX-Nabu-X` and nothing else -- not
 /// the version, not the platform, not the architecture. See
-/// docs/update-channel.md. (The private build was renamed from PATANYX-chat
-/// on 2026-08-05, deliberate: chat is one premium feature, not the
-/// whole of them. The attribution FILES keep their `-chat` suffix because
-/// they are keyed to the cargo feature's name, which is frozen.)
+/// docs/update-channel.md.
+///
+/// Renamed twice, and the second reason matters: PATANYX-chat became
+/// PATANYX-Premium on 2026-08-05 because chat is one premium feature rather
+/// than the whole of them, then PATANYX-Nabu-X on 2026-08-27 because the
+/// plain browser now carries Premium features too, so "Premium" had stopped
+/// distinguishing the two builds at all. The attribution FILES keep their
+/// `-chat` suffix because they are keyed to the cargo feature's name, which
+/// is frozen.
 pub const fn product_name() -> &'static str {
     if cfg!(feature = "chat") {
-        "PATANYX-Premium"
+        "PATANYX-Nabu-X"
     } else {
         "PATANYX"
     }
@@ -121,12 +144,45 @@ type Feature = (&'static str, &'static str, &'static str);
 // inverted -- it told a reader they had to go and enable the one protection
 // that is already running. The body sentence carried the same implication and
 // is reworded with it: the switch turns blocking OFF now, not on.
+// SPLIT BY BACKEND, for the same reason F_LEDGER is: the row describes what
+// the user can DO, and the two platforms do not offer the same thing. The
+// per-address exception is a WebView2 feature. On WebKitGTK the engine
+// enforces with a compiled content filter and there is no way to except one
+// host from it for one tab, so the only route past the list is the browser
+// wide switch, which is a different promise and has to be described as one.
+//
+// A single sentence covering both would be false on one of them, which is the
+// exact defect this file already carries a fix for one row further down.
+#[cfg(windows)]
 const F_ADS: Feature = (
     "Ads & Tracker Blocker",
     "Automatic",
     "Ads and trackers are blocked from the first time you open \
-     PATANYX, and one switch turns it off. A blocked request never leaves \
+     PATANYX, and one switch turns it off. Some pages you actually want end up \
+     on the list. You can open one for that address in that tab, and it closes \
+     behind you instead of becoming a permanent exception. A blocked request \
+     never leaves your computer, so nobody has a record of it.",
+);
+#[cfg(not(windows))]
+const F_ADS: Feature = (
+    "Ads & Tracker Blocker",
+    "Automatic",
+    "Ads and trackers are blocked from the first time you open \
+     PATANYX, and one switch turns it off. Some pages you actually want end up \
+     on the list. On Linux that switch is the only way past it, and it applies \
+     to every site until you turn it back on. A blocked request never leaves \
      your computer, so nobody has a record of it.",
+);
+// DRAFT COPY: WP-AB marketing-voice pass required. Windows-only for the same
+// reason as F_DNS: WebKitGTK has ITP on/off, not WebView2's level picker.
+// Kept separate from F_ADS because the engine layer is belt-and-braces;
+// choosing Balanced must never sound like it weakens PATANYX's own blocker.
+const F_ENGINE_TRACKING: Feature = (
+    "Engine Tracker Blocking",
+    "Automatic, Windows",
+    "On Windows, WebView2 tracker blocking starts at Strict. You can choose \
+     Balanced when Strict breaks a site; PATANYX's own blocker keeps working \
+     the same way under both.",
 );
 // The phishing count is NOT written here. The published page says 390,628,
 // which was true when it was written; a number typed into a string is a claim
@@ -159,12 +215,31 @@ const F_INSECURE: Feature = (
      192.168.1.1, opens without the warning, and so does localhost or any \
      name under it; a device you reach by any other name still gets it.",
 );
+// Split by backend because the two ledgers can observe different things, and
+// the description is a claim about what the user will see. WebView2 answers
+// the blocked request from its own callback and can count it; WebKitGTK's
+// content blocker stops the request inside the engine and reports no
+// per-request match, so a stopped request never reaches the ledger at all
+// (`ledger` and `blocked_total` in platform/unix.rs say so in those words).
+// `state::LEDGER_COUNTS_BLOCKED` is the same distinction for the panel
+// itself; this pair is it for the About page (Linux readiness review,
+// 2026-09-15).
+#[cfg(windows)]
 const F_LEDGER: Feature = (
     "Page Connections",
     "Automatic",
     "Open one panel to see every other company the page just contacted, and \
      how many requests were allowed or stopped. Most pages talk to more of \
      them than you would guess.",
+);
+#[cfg(not(windows))]
+const F_LEDGER: Feature = (
+    "Page Connections",
+    "Automatic",
+    "Open one panel to see every other company the page just contacted, and \
+     how many requests were allowed through. A request the blocker stops \
+     never leaves the browser, so it does not appear in the count. Most pages \
+     talk to more of them than you would guess.",
 );
 const F_FREEZE: Feature = (
     "Tab Freeze",
@@ -184,11 +259,12 @@ const F_DNS: Feature = (
     "Encrypted DNS",
     "Opt-in, Windows",
     "Every site you visit starts with a lookup that normally goes \
-     unencrypted to whoever runs your network. Switch it to Mullvad or Quad9 \
-     and it is encrypted instead, so your provider never gets a readable list \
-     of the sites you visit. On Windows the site name is hidden inside the \
-     connection too, measured rather than assumed, wherever the site supports \
-     it.",
+     unencrypted to whoever runs your network. Switch it to Quad9 and it is \
+     encrypted instead: your network and your provider stop seeing your \
+     lookups, and Quad9 sees them. The address of the server you connect to \
+     stays visible either way. On Windows the site name is hidden inside the \
+     connection too, measured rather than assumed, wherever the site \
+     supports it.",
 );
 // HELD OUT OF 0.9.64, and NOT because the row is badly worded. The behaviour
 // it describes does not happen on real Windows. Hardware re-check 2026-08-19,
@@ -297,7 +373,7 @@ const F_TUNNEL: Feature = (
 );
 const F_OCR: Feature = (
     "Image Text Review",
-    "On demand; future Premium",
+    "On demand; Premium",
     "Point it at an image and it reads the text inside, then looks for seven \
      things worth catching before you share it: an e-mail address, a card \
      number, a long number, an API key or token, a private key header, an IP \
@@ -327,7 +403,7 @@ const F_INTEGRITY: Feature = (
 /// was made explicitly.
 const F_HIDDEN_TEXT: Feature = (
     "Text Capture",
-    "On demand; future Premium",
+    "On demand; Premium",
     "Text can be hidden in a picture by coloring it to match the background: \
      white on white, or a gray a shade off the paper. Sometimes that is \
      careless, and sometimes someone did not want it read. When you check a \
@@ -349,7 +425,7 @@ const F_HIDDEN_TEXT: Feature = (
 /// unlimited history either.
 const F_ARCHIVE: Feature = (
     "Deep Recall",
-    "On demand; future Premium",
+    "On demand; Premium",
     "History remembers where you went. Deep Recall remembers what you chose \
      to keep. Save a page and PATANYX stores a private snapshot alongside the \
      text its on-device reader finds inside it, so months later you can type a \
@@ -377,7 +453,7 @@ const F_ARCHIVE: Feature = (
 /// claim, not at the end.
 const F_DOWNLOAD_COMPARE: Feature = (
     "Copy Compare",
-    "On demand; future Premium",
+    "On demand; Premium",
     "Download an installer and a contact who took the same file from the same \
      address can tell you whether their copy comes out to the same hash as \
      yours. The case this is built for is the targeted swap: the file everyone \
@@ -397,7 +473,7 @@ const F_DOWNLOAD_COMPARE: Feature = (
 /// reading like a claim the snapshot alone could already make.
 const F_CHANGE_COMPARE: Feature = (
     "Change Cross-Check",
-    "On demand; future Premium",
+    "On demand; Premium",
     "PATANYX can tell you a saved page changed since you last looked at it. It \
      cannot tell you on its own whether it changed for everyone or only for \
      you. Ask a contact with the same page open and you get the other half: \
@@ -415,15 +491,13 @@ const F_CHANGE_COMPARE: Feature = (
 /// was fooled. The in-app panel is gated on both by
 /// scripts/divergence-site-gate.js. This entry may not imply either one away.
 ///
-/// Note the split: the per-site CHOICE asks for a licence from day one,
-/// while Fingerprint Divergence itself is a Premium SEED -- switched on for
-/// everyone until launch and gated from then on (design preamble
-/// 2026-08-06, reaffirmed 2026-08-16 after a 2026-08-14 About rewrite had
-/// briefly called it "stays free"). Its own entry so the two are not read
-/// as one thing.
+/// Fingerprint Divergence and its per-site choices are one permanently free
+/// protection. The exceptions briefly asked for a licence, but that gate was
+/// removed on 2026-08-19 with the published permanent-free decision. Neither
+/// the global switch nor any exception arm may join the launch-day flip.
 const F_DIVERGENCE_SITES: Feature = (
     "Divergence Exceptions",
-    // FREE PERMANENTLY, 2026-08-19. It was "On demand; future Premium" and
+    // FREE PERMANENTLY, 2026-08-19. It was "On demand; Premium" and
     // the three IPC arms genuinely refused without a licence; both went with
     // the decision that Fingerprint Divergence is free, exceptions included.
     "On demand",
@@ -436,7 +510,11 @@ const F_DIVERGENCE_SITES: Feature = (
 );
 
 fn features() -> Vec<Feature> {
-    let mut out = vec![F_ADS, F_MALICIOUS, F_INSECURE, F_LEDGER, F_FREEZE];
+    let mut out = vec![F_ADS];
+    if cfg!(windows) {
+        out.push(F_ENGINE_TRACKING);
+    }
+    out.extend([F_MALICIOUS, F_INSECURE, F_LEDGER, F_FREEZE]);
     if cfg!(windows) {
         out.push(F_DNS);
         // out.push(F_DOWNLOAD_MARK) -- held; see the const above.
@@ -506,6 +584,13 @@ const LIMITS: &[(&str, &str)] = &[
          else; it tries to keep one site's picture of you from matching \
          another's.",
     ),
+    (
+        "Closing it is not immediate erasure",
+        "Before the first page opens, a new PATANYX session clears the last \
+         session's cookies, site storage, service workers, and caches. Those \
+         bytes can still sit on disk after PATANYX closes until the next \
+         launch clears them, so this is not secure deletion.",
+    ),
 ];
 
 const HONESTY: &str = "PATANYX will not lie to you about your safety. If you turn a \
@@ -514,23 +599,20 @@ instead of showing you a tick you did not earn.";
 
 const PREMIUM_HEAD: &str = "Free and Premium";
 
-/// Future tense THROUGHOUT, on purpose: nothing is for sale today, and a
-/// page that reads as if it were would be the exact dishonesty the rest of
-/// this file exists to prevent. The one standing commitment -- "Features
-/// designated as part of the free tier will remain free forever." -- has
-/// deliberate wording, and the test below pins it so a rewrite cannot soften
-/// it into marketing.
+/// PRESENT TENSE THROUGHOUT, decided 2026-08-27: this tree
+/// is the release build, so the copy describes the product a reader has in
+/// front of them rather than a plan. It used to open "PATANYX will offer a
+/// paid Premium tier" while those features sat in the panel behind it.
 ///
-/// REWORDED 2026-08-14 from "Free features always remain free." The promise is now SCOPED to the free tier rather
-/// than to whatever happens to be free in a given build. The one-way tiering
-/// rule below is unchanged and still binding: a feature that ships free is
-/// not gated later. What the new wording drops is the accidental reading
-/// that a Premium feature temporarily switched on for everyone (Fingerprint
-/// Divergence and the photo check) had thereby become free
-/// forever. Do not soften it further: it is a published commitment, not
-/// copy. When Premium actually launches, this paragraph changes to present
-/// tense IN THE SAME COMMIT as the licensing ships, never before.
+/// WRITING IT AS SHIPPED IS NOT THE SAME AS SELLING IT. PREMIUM_ON_SALE is
+/// still false, the Vault purchase button is still hidden and
+/// premium_purchase_open still refuses. Those flip together, once, in the
+/// launch commit. Do not let a copy edit drag the sale along with it.
 ///
+/// The sentence "Nothing is for sale yet" was REMOVED here, and the test
+/// below now forbids it rather than requiring it. That reverses a
+/// deliberate earlier decision, so it should be reversed deliberately too
+/// and not by a copy sweep.
 /// THEME PACKS LEFT THE PREMIUM LIST 2026-08-16, and that is a ONE-WAY DOOR
 /// taken deliberately.
 ///
@@ -551,8 +633,23 @@ const PREMIUM_HEAD: &str = "Free and Premium";
 /// ever to earn money, it has to be NEW accents and NEW schemes on top of
 /// these, which the wording deliberately leaves room for -- "all nine" and
 /// "all three" are counts of what ships today, not a promise about a tenth.
-const PREMIUM: &str = "PATANYX will offer a paid Premium tier. Private chat between PATANYX users, checking a page together with a contact, reading the text in a photo, the tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, and comparing a downloaded file with a contact will be part of it. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. The photo check is switched on for everyone in this build and stays that way until Premium launches. The tab pack works differently, and so do the newer features: reading the text you drag a box around, the archive of pages you chose to keep, and comparing a downloaded file with a contact all ask for a Premium license from day one, and they unlock when Premium launches. Private chat and checking a page with a contact are not in this build at all -- they are compiled into a separate PATANYX-Premium build, which is also a free download. The built-in tunnel is free, and so is light and dark following your system setting. How this browser looks is free: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever. A Premium license will activate on up to five devices: the first time your vault opens after you paste the token, PATANYX makes one request to EdgeXene to activate that device, trying again at the next unlock if it could not reach us, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot; a license allows a limited number of activations in all, and the Vault panel says so if you reach it. Nothing is for sale yet; when Premium launches, this page will say so plainly.";
+/// TWO VARIANTS, one per compiled build, because this string names what
+/// payment unlocks IN THIS BINARY. The four contact features exist only
+/// where the `chat` feature does (ipc.rs answers `unsupported` without it),
+/// so the public build must not list them as unlockable, and the Nabu-X
+/// build must not tell its user they are absent.
+#[cfg(not(feature = "chat"))]
+const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, and checking an image for text before you share it all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nPrivate chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact are not in this build. They are compiled into a separate Nabu-X build, which is also a free download, and ask for the same license inside it.\n\nThe built-in tunnel is free, and so is how this browser looks: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
+#[cfg(feature = "chat")]
+const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, checking an image for text before you share it, private chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nThe built-in tunnel is free, and so is how this browser looks: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
 
+/// Sponsorship is a THIRD business-model path, not a way around the standing
+/// Premium rule above and not an affiliate placement. Keep the negations
+/// explicit: a nearby button must not make optional project support look like
+/// a licence checkout or a transaction that changes the browser.
+const SUPPORT_HEAD: &str = "Support PATANYX";
+const SUPPORT: &str = "Back the browser directly. Supporting PATANYX is optional support for continued development. It buys no features and unlocks nothing. It is not a Premium license and does not become one. It is separate from both Premium and the disclosed affiliate placements: no partner in the middle, no advertising profile and no data exchange.";
+const SUPPORT_LABEL: &str = "support PATANYX";
 
 /// One sentence more on the accent, ON WINDOWS ONLY: there the accent is
 /// handed to the scrollbars of pages (privacy.rs, page_scrollbar_css), and
@@ -585,7 +682,7 @@ const DISCLOSURE_HEAD: &str = "What it is built from";
 /// THE RESOLVER PROBE IS NAMED HERE, and the published page currently does not
 /// name it. That page says the only self-initiated network activity is the
 /// update and blocklist checks. There is a third: `resolver_probe` sends an
-/// HTTPS request to Mullvad or Quad9 to find out whether the resolver is still
+/// HTTPS request to Quad9 to find out whether the resolver is still
 /// reachable, triggered by a failed navigation rather than by the user.
 ///
 /// It is gated -- `configured_template()` returns `None` on System DNS, so a
@@ -601,6 +698,10 @@ const DISCLOSURE_HEAD: &str = "What it is built from";
 /// sentence says "only". Named as what it is -- a page you can see open, not
 /// a check -- and with the fact that lets it be harmless: the server writes
 /// no log line for that page or what it loads.
+///
+/// Partner destinations do not join this list: `partner_open` runs only after
+/// the user presses a labeled card. That navigation is user-initiated, not
+/// something PATANYX reaches out for on its own.
 const DISCLOSURE: &str = "One Rust program, with nothing downloaded at runtime. PATANYX itself \
 collects nothing about you. The only things it reaches out for on its own are \
 an anonymous, signed update check and blocklist refreshes, plus an occasional \
@@ -705,6 +806,8 @@ fn all_copy() -> String {
     out.push_str(&premium_text());
     out.push(' ');
     out.push_str(DISCLOSURE);
+    out.push(' ');
+    out.push_str(SUPPORT);
     out
 }
 
@@ -713,6 +816,7 @@ pub fn ipc_info() -> Result<Value, &'static str> {
     Ok(json!({
         "name": product_name(),
         "version": env!("CARGO_PKG_VERSION"),
+        "build_warning": build_warning(),
         "intro": INTRO,
         "features_head": "What it does that others don't",
         "features": feature_json(),
@@ -724,7 +828,15 @@ pub fn ipc_info() -> Result<Value, &'static str> {
         "premium": premium_text(),
         "disclosure_head": DISCLOSURE_HEAD,
         "disclosure": DISCLOSURE,
+        "support_head": SUPPORT_HEAD,
+        "support": SUPPORT,
+        "support_label": SUPPORT_LABEL,
         "engine": engine_name(),
+        // The RUNTIME the engine actually is, read at the moment the panel
+        // opens, because a security fix is a property of the loaded engine
+        // and not of the name. Every field: on WebView2 the fourth is the
+        // one that says whether 152.0.4191.53 became .62.
+        "engine_version": crate::platform::engine_info().version_string(),
         "license_spdx": "Apache-2.0",
         "license_text": LICENSE,
         "notice_text": NOTICE,
@@ -758,6 +870,26 @@ fn package_count() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlocked_warning_matches_the_compiled_variant() {
+        let info = ipc_info().expect("About data");
+        assert_eq!(
+            info["build_warning"].as_str(),
+            build_warning(),
+            "About must identify the compiled licence-gate variant"
+        );
+        assert_eq!(
+            build_warning().is_some(),
+            cfg!(feature = "premium-unlocked"),
+            "only premium-unlocked may carry the unlocked About warning"
+        );
+        let chrome = include_str!("chrome/chrome.js");
+        assert!(
+            chrome.contains("info.build_warning + \". \" + buildSummary"),
+            "the About renderer must put the compiled warning on screen"
+        );
+    }
 
     #[test]
     fn attribution_is_compiled_in_and_describes_itself() {
@@ -817,7 +949,13 @@ mod tests {
         // this page may read as purchasable today -- the tier does not exist
         // yet, and copy that invites payment for it would be a false offer.
         let lowered = all_copy().to_lowercase();
-        for banned in ["buy now", "subscribe now", "purchase", "per month", "/month"] {
+        for banned in [
+            "buy now",
+            "subscribe now",
+            "purchase",
+            "per month",
+            "/month",
+        ] {
             assert!(
                 !lowered.contains(banned),
                 "premium copy reads as purchasable today: {banned:?}"
@@ -826,8 +964,12 @@ mod tests {
         // The future-tense marker: remove it only in the commit that
         // actually ships purchasable licensing.
         assert!(
-            lowered.contains("nothing is for sale yet"),
-            "the premium section must say nothing is for sale until it is"
+            lowered.contains("is on sale"),
+            "the premium section must say Premium is on sale, now that it is"
+        );
+        assert!(
+            !lowered.contains("nothing is for sale"),
+            "the pre-launch marker must not survive the launch"
         );
         // SECOND: the standing free-forever commitment, exact and brittle on
         // purpose -- a rewrite must look this sentence in the eye.
@@ -851,6 +993,42 @@ mod tests {
             !lowered.contains("at most five devices") && !lowered.contains("at most 5 devices"),
             "the honest claim is 'up to', never 'at most'"
         );
+        assert!(
+            lowered.contains("affiliate placements on four panels")
+                && lowered.contains("labeled affiliate partner")
+                && lowered.contains("may earn a commission"),
+            "the Premium business-model paragraph must disclose all four labeled affiliate placements and the possible commission"
+        );
+    }
+
+    #[test]
+    fn sponsorship_is_distinct_from_premium_and_affiliate_revenue() {
+        let lowered = SUPPORT.to_lowercase();
+        for required in [
+            "optional support for continued development",
+            "buys no features",
+            "unlocks nothing",
+            "not a premium license",
+            "does not become one",
+            "separate from both premium and the disclosed affiliate placements",
+        ] {
+            assert!(
+                lowered.contains(required),
+                "sponsorship copy lost its business-model boundary: {required:?}"
+            );
+        }
+        for forbidden in [
+            "buy premium",
+            "purchase premium",
+            "unlock features",
+            "premium for supporters",
+            "premium included",
+        ] {
+            assert!(
+                !lowered.contains(forbidden),
+                "sponsorship copy reads like a Premium purchase: {forbidden:?}"
+            );
+        }
     }
 
     #[test]
@@ -916,6 +1094,20 @@ mod tests {
              https://patanyx.com/ in the first tab of a plain launch, so a \
              sentence listing what the browser reaches out for on its own has \
              to include it."
+        );
+        // The session reset is a start-of-next-launch clear, not an exit-time
+        // shred. Both halves stay in the same public paragraph: what the next
+        // page inherits, and what someone inspecting the disk between runs
+        // may still recover. Losing either half turns a precise property into
+        // an anonymity or secure-deletion claim the implementation cannot
+        // make.
+        assert!(
+            lowered.contains("before the first page opens")
+                && lowered.contains("site storage")
+                && lowered.contains("until the next launch clears them")
+                && lowered.contains("not secure deletion"),
+            "the About copy must state both the complete site-data reset and \
+             its between-session on-disk limit"
         );
     }
 
@@ -986,7 +1178,7 @@ mod tests {
         // here is gone rather than left passing vacuously. What survives is the
         // half that is still load-bearing.
         assert!(
-            F_HIDDEN_TEXT.1.contains("future Premium"),
+            F_HIDDEN_TEXT.1.contains("Premium"),
             "it is tagged future Premium from first appearance on purpose: a \
              feature that ships free and is gated later breaks the free-stays-\
              free promise, one that was never free does not"
@@ -1042,6 +1234,10 @@ mod tests {
                 leads.contains(&F_DNS.0),
                 "the Windows build must advertise encrypted DNS"
             );
+            assert!(
+                leads.contains(&F_ENGINE_TRACKING.0),
+                "the Windows build must disclose the engine tracking-level choice"
+            );
         } else {
             assert!(
                 !leads.contains(&F_DNS.0),
@@ -1049,7 +1245,112 @@ mod tests {
                  WebKitGTK cannot do it, and a marketing bullet is a claim like \
                  any other"
             );
+            assert!(
+                !leads.contains(&F_ENGINE_TRACKING.0),
+                "a non-Windows build must NOT advertise WebView2 tracking levels -- \
+                 WebKitGTK's ITP is on/off only"
+            );
         }
+    }
+
+    /// The About description of the ledger is a claim about what the user
+    /// will SEE, and the two backends can see different things. WebView2
+    /// answers the blocked request from its own callback and can count it;
+    /// WebKitGTK's content blocker stops the request inside the engine and
+    /// reports no per-request match, so a stopped request never reaches the
+    /// ledger at all.
+    ///
+    /// Tied to `LEDGER_COUNTS_BLOCKED` rather than to `cfg!(windows)` on its
+    /// own, so that the day a backend gains or loses the ability to count, the
+    /// copy and the capability flag cannot drift apart silently: whichever one
+    /// is changed, this test fails until the other follows.
+    #[test]
+    fn the_ledger_description_only_promises_counts_the_backend_can_observe() {
+        let body = F_LEDGER.2;
+        if crate::state::LEDGER_COUNTS_BLOCKED {
+            assert!(
+                body.contains("allowed or stopped"),
+                "this backend counts blocked requests, so the description \
+                 should say so: {body:?}"
+            );
+        } else {
+            for overclaim in ["or stopped", "were stopped", "and stopped"] {
+                assert!(
+                    !body.contains(overclaim),
+                    "the description says {overclaim:?}, but this backend \
+                     cannot observe a stopped request: the content blocker \
+                     drops it inside the engine and reports no match, so the \
+                     count would always be zero. See `blocked_total` in \
+                     platform/unix.rs. Body: {body:?}"
+                );
+            }
+            assert!(
+                body.contains("does not appear in the count"),
+                "a backend that cannot count stopped requests must SAY that a \
+                 stopped request does not appear, rather than leaving the \
+                 reader to assume zero means nothing was blocked: {body:?}"
+            );
+        }
+    }
+
+    /// The row says what the user can DO, and the platforms do not offer the
+    /// same thing. Each variant is pinned, and each is pinned NEGATIVELY as
+    /// well: neither may describe what the other platform does. A single test
+    /// that only checked the Windows wording would go green while the Linux
+    /// build shipped a promise it cannot keep, which is how this row got here.
+    #[test]
+    fn the_ads_row_describes_what_this_platform_actually_offers() {
+        let body = F_ADS.2;
+
+        if cfg!(windows) {
+            // "ADDRESS", NOT "SITE", and it is load-bearing rather than a
+            // style choice. The exception is exact-host: equality on the
+            // request host. "Site" is the word a reader takes to include
+            // subdomains, so it would describe a wider permission than the
+            // code grants and than the banner asked for.
+            assert!(
+                body.contains("for that address in that tab"),
+                "the exception is described as something other than one \
+                 address in one tab: {body:?}"
+            );
+            assert!(
+                !body.contains("for that site"),
+                "\"site\" reads as including subdomains, which the exception \
+                 does not cover: {body:?}"
+            );
+            assert!(
+                body.contains("closes behind you") && body.contains("permanent"),
+                "the row does not say the exception ends, which is the half of \
+                 the promise the revocation path exists to keep: {body:?}"
+            );
+        } else {
+            // There is no per-address exception on this backend at all, so the
+            // row must not imply one, and it must say the switch is
+            // browser-wide rather than letting the reader assume otherwise.
+            assert!(
+                !body.contains("for that address") && !body.contains("for that site"),
+                "the Linux row promises a per-site exception this backend does \
+                 not offer: {body:?}"
+            );
+            assert!(
+                !body.contains("closes behind you"),
+                "the Linux row describes an exception ending, but none is ever \
+                 granted here: {body:?}"
+            );
+            assert!(
+                body.contains("only way past it")
+                    && body.contains("applies \
+     to every site"),
+                "the Linux row does not say the switch is the only route and \
+                 that it is browser-wide, so a user would expect a per-site \
+                 option that does not exist: {body:?}"
+            );
+        }
+
+        // The claim this row must never lose, on either platform. Four other
+        // surfaces repeat it, and a consented request is ALLOWED and ledgered
+        // as such rather than being a blocked request that left.
+        assert!(body.contains("A blocked request never leaves your computer"));
     }
 
     #[test]

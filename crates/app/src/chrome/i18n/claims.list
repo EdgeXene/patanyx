@@ -1,0 +1,169 @@
+# Message ids whose content is pinned by claims-manifest.txt. Membership is
+# decided by the claim register (a string asserting what the product does,
+# does not do, sees, stores, or sends), not by this file's editor. The full
+# interface register counts 251 such messages; they join this list as their
+# surfaces are extracted.
+prefs-dns-system-description
+prefs-dns-quad9-description
+prefs-tunnel-off-description
+prefs-tunnel-imported-description
+
+# index.html claims, matched from the claim register. The register's
+# mixed-content rows (the dns-compare dd bodies, the vault-import warning
+# and six others) are NOT here yet: their elements hold inline markup the
+# extractor refuses, and they stay English inline until restructured.
+chrome-about-panel-p-n3
+chrome-blocked-warning-span
+chrome-bmm-view-downloads-p
+chrome-bmm-view-downloads-p-n2
+chrome-btn-freeze-title
+chrome-btn-quarantine-menu-title
+chrome-chat-contacts-p
+chrome-chat-conversation-p
+chrome-chat-locked-p
+chrome-divergence-site-h3
+chrome-divergence-site-span-n2
+chrome-dns-choice-p
+chrome-dns-compare-span
+chrome-dns-compare-span-n3
+chrome-download-empty-p
+chrome-dv-premium-p
+chrome-engine-confirmed-p
+chrome-import-intro-p
+chrome-insecure-warning-span
+chrome-leakcheck-p
+chrome-needs-passphrase-li-n5
+chrome-needs-passphrase-li-n6
+chrome-np-chat-li
+chrome-onboarding-panel-p-n2
+chrome-onboarding-panel-p-n3
+chrome-onboarding-panel-p-n4
+chrome-pane-backup-p
+chrome-pane-backup-p-n2
+chrome-pane-backup-p-n4
+chrome-pane-backup-p-n5
+chrome-permission-choice-p
+chrome-privacy-panel-p
+chrome-privacy-panel-span
+chrome-privacy-panel-span-n2
+chrome-privacy-panel-span-n3
+chrome-privacy-panel-span-n4
+chrome-privacy-panel-span-n5
+chrome-privacy-panel-span-n6
+chrome-privacy-panel-span-n7
+chrome-privacy-panel-span-n8
+chrome-pv-block-ads-note-span
+chrome-pv-freeze-note-span
+chrome-recovery-create-form-p
+chrome-region-panel-p
+chrome-resolver-title-span
+chrome-tab-panel-p
+chrome-tab-panel-p-n2
+chrome-js-tls-intercepted
+chrome-js-safety-intercepted
+chrome-js-safety-unreadable
+chrome-js-issuer-prefix
+chrome-js-issuer-none
+chrome-js-tab-aria-intercepted
+chrome-js-update-intercepted
+chrome-tunnel-warning-body-span
+chrome-tunnel-warning-title-span
+chrome-tunnelp-provider-p
+chrome-tunnelp-vault-first-p
+chrome-tunnelp-vault-link-p
+chrome-vault-enables-tunnel-p
+chrome-vault-locked-p
+chrome-vault-locked-p-n3
+chrome-vault-recovery-p
+chrome-vault-recovery-p-n2
+
+# The restructured mixed-content claims: the dns comparison bodies, the
+# ECH limits note, the site-forget scope line, the vault-import warning.
+chrome-site-forget-confirm-rest
+chrome-dns-compare-quad9-rest
+chrome-dns-compare-system-rest
+
+# Composed claims, resolved in Rust with arguments.
+chrome-blocked-body
+chrome-blocked-rule-clause
+
+# Reclassified static claims (tunnel fail-closed bodies, restart notes,
+# unreadable-settings warning).
+chrome-tunnel-warn-vault-body
+chrome-tunnel-warn-down-body
+chrome-tunnel-restart-note
+chrome-dns-settings-unreadable
+chrome-dns-settings-unreadable-pending
+
+# The resolver-unreachable banner (both producers, one helper).
+chrome-resolver-body
+chrome-resolver-name-fallback
+
+# Locally-argued claims through i18n_resolve / i18nSet.
+chrome-confirm-delete-folder
+chrome-manager-delete-folder
+chrome-batch-left-out
+chrome-shelf-left-out
+chrome-leakcheck-clean
+chrome-leakcheck-found
+chrome-permissions-granted
+chrome-permissions-refused
+
+# Download MOTW claim toasts and the update banner (four branches).
+chrome-download-mark-failed-body
+chrome-download-mark-unknown-body
+chrome-update-ready-version
+chrome-update-ready-plain
+chrome-update-offered-version
+chrome-update-offered-plain
+
+# Tab-status claim bodies and the blocklist status.
+chrome-insecure-body
+chrome-site-forget-desc
+chrome-cred-fills-subdomains
+chrome-cred-fills-only
+chrome-engine-blocklist-ok
+chrome-engine-blocklist-failed
+chrome-engine-blocklist-count
+
+# The straggler claims.
+chrome-compare-request-toast
+chrome-recall-saved-words
+chrome-recall-saved-notext
+chrome-recall-short-whole
+chrome-recall-short-partial
+chrome-recall-screen-only
+chrome-licence-release-confirm
+
+# integrity verdicts, chat trust copy, and the locale picker's own claim.
+chrome-js-integrity-marked-body
+chrome-js-integrity-marked-head
+chrome-js-integrity-note-bad-message
+chrome-js-integrity-note-no-page-local
+chrome-js-integrity-note-no-page-remote
+chrome-js-integrity-note-too-large
+chrome-js-integrity-note-unexpected
+chrome-js-integrity-note-unsupported-local
+chrome-js-integrity-note-unsupported-remote
+chrome-js-integrity-note-url-mismatch
+chrome-js-integrity-verdict-caveat
+chrome-js-integrity-verdict-changed-head
+chrome-js-integrity-verdict-identical-body
+chrome-js-integrity-verdict-identical-head
+chrome-js-integrity-verdict-line
+chrome-js-integrity-verdict-structure-body
+chrome-js-integrity-verdict-structure-head
+chrome-js-integrity-verdict-when
+chrome-js-integrity-x-note-bad-message
+chrome-js-integrity-x-note-no-baseline
+chrome-js-integrity-x-note-no-page
+chrome-js-integrity-x-note-unexpected
+chrome-js-integrity-x-note-unsupported
+chrome-locale-choice-p
+
+# The engine-below-floor banner: what the engine is, what version clears the
+# floor, and (WebView2 only) that Windows delivers it without the user.
+chrome-engine-floor-title-span
+chrome-engine-floor-body
+chrome-engine-floor-evergreen
+chrome-engine-floor-body-restart

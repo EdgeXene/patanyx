@@ -44,13 +44,18 @@ new Function(chromeJs)();
 // heavier parser and every entry in this file writes `label` first, so this
 // is deliberately only as general as the source actually is.
 function extractRegistry() {
-  const start = chromeJs.indexOf("const PALETTE_ACTIONS = [");
+  // The registry now lives inside a rebuildOnLocaleFill builder (so its
+  // labels follow a live locale switch); the anchor follows the assignment.
+  const start = chromeJs.indexOf("PALETTE_ACTIONS = [");
   assert(start !== -1, "PALETTE_ACTIONS not found in chrome.js");
-  const end = chromeJs.indexOf("\n  ];", start);
+  const end = chromeJs.indexOf("\n    ];", start);
   assert(end !== -1, "PALETTE_ACTIONS has no terminator");
   const body = chromeJs.slice(start, end);
   const entries = [];
-  const re = /label:\s*"([^"]+)"\s*,\s*buttonId:\s*"([^"]+)"/g;
+  // Both shapes the source writes: a bare literal, and the catalog-backed
+  // i18nText("id", "English") whose second argument is the golden English.
+  const re =
+    /label:\s*(?:i18nText\(\s*"[a-z0-9-]+"\s*,\s*)?"([^"]+)"\)?\s*,\s*buttonId:\s*"([^"]+)"/g;
   let m;
   while ((m = re.exec(body))) entries.push({ label: m[1], buttonId: m[2] });
   return entries;

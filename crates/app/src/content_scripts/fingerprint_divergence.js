@@ -35,11 +35,12 @@
  * and a different one again after a restart. Cross-site linkage by
  * fingerprint is what breaks.
  *
- * TRUST BOUNDARY. This script has ZERO channels: no network primitive of
- * any kind, no dynamic import, no message passing, no IPC. (A pinned Rust
- * test enforces the exact list, which is why this comment does not spell
- * out the API names.) It reads the token from its own closure, patches
- * prototypes, and stops existing. The token cannot leak through
+ * TRUST BOUNDARY. This script has one count-only, one-way host report. It
+ * batches four closure-local integers (audio, canvas, WebGL, measurement)
+ * and never sends a readout, argument, URL, token, method name, or sample.
+ * It has no network primitive or dynamic import. The host treats every
+ * report as untrusted because hostile page code can use the same native
+ * bridge. The token cannot leak through
  * Function.prototype.toString on the patched functions: toString returns
  * source text, and closure VALUES are not in it.
  *
@@ -61,6 +62,17 @@
  *     defineProperty: polyfills and a11y tools legitimately wrap these; a
  *     page that actively unhooks gets its real fingerprint, which is the
  *     same outcome as a page that detects the noise and special-cases it.
+ *   - LANGUAGE IS DELIBERATELY UNTOUCHED, in both directions. This script
+ *     does not noise navigator.language/languages, and -- the ruling that
+ *     matters once the interface speaks more than English -- the INTERFACE
+ *     locale must never be wired into what pages see: not here, not
+ *     Accept-Language, not the engine's content-language surface. A user
+ *     who switches the chrome to German while their pages keep announcing
+ *     whatever the OS announces has changed nothing a site can measure; a
+ *     build that "helpfully" forwards the chrome locale hands every
+ *     localized user a smaller anonymity set as the price of a cosmetic
+ *     preference. Interface language and site-visible language are two
+ *     settings, and only the user connects them.
  *   - WORKERS, PARTIAL. Neither engine injects registered scripts into
  *     worker contexts, so the Worker constructor is wrapped here to hand the
  *     real worker a shim that installs the OffscreenCanvas and WebGL hooks
@@ -153,6 +165,83 @@
       // skipping each hook keeps the "off" path from depending on every
       // later branch staying correct.
       return;
+    }
+
+    // COUNT-ONLY REPORTING. A wrapper does one integer increment per call;
+    // the first dirty call schedules one flush two seconds later. There is no
+    // per-call message and no repeating idle timer. pagehide is the only
+    // early flush, so short-lived pages do not lose their last batch.
+    //
+    // Every operation is best-effort and guarded independently. A missing or
+    // hostile bridge, timer, serializer, or event listener can only lose the
+    // reading; it must never throw into the API the page called. The bridge
+    // receives exactly a fixed surface name and an integer delta. Counts are
+    // reset only after a send attempt, so reporting work never touches any
+    // value the divergence math returns.
+    var probeCounts = {
+      audio: 0,
+      canvas: 0,
+      webgl: 0,
+      element_measurement: 0,
+    };
+    var probeTimer = null;
+    var probeSetTimeout = typeof setTimeout === "function" ? setTimeout : null;
+    var probeStringify = JSON.stringify;
+    var flushProbeCounts = function () {
+      probeTimer = null;
+      try {
+        var counts = [];
+        var names = ["audio", "canvas", "webgl", "element_measurement"];
+        for (var i = 0; i < names.length; i++) {
+          var surface = names[i];
+          var count = probeCounts[surface];
+          if (count > 0) {
+            counts.push({ surface: surface, count: count });
+            probeCounts[surface] = 0;
+          }
+        }
+        if (!counts.length) {
+          return;
+        }
+        var payload = probeStringify({
+          kind: "fingerprint_probe_counts",
+          counts: counts,
+        });
+        if (
+          window.chrome &&
+          window.chrome.webview &&
+          typeof window.chrome.webview.postMessage === "function"
+        ) {
+          window.chrome.webview.postMessage(payload);
+        } else if (
+          window.webkit &&
+          window.webkit.messageHandlers &&
+          window.webkit.messageHandlers.ipc &&
+          typeof window.webkit.messageHandlers.ipc.postMessage ===
+            "function"
+        ) {
+          window.webkit.messageHandlers.ipc.postMessage(payload);
+        }
+      } catch (eReport) {
+        /* reporting is optional; page behaviour is not */
+      }
+    };
+    var noteProbe = function (surface) {
+      try {
+        if (probeCounts[surface] < 9007199254740991) {
+          probeCounts[surface] += 1;
+        }
+        if (probeTimer === null && probeSetTimeout) {
+          probeTimer = probeSetTimeout(flushProbeCounts, 2000);
+        }
+      } catch (eCount) {
+        /* a counter must never alter the intercepted call */
+      }
+    };
+    try {
+      window.addEventListener("pagehide", flushProbeCounts, true);
+    } catch (eHide) {
+      /* the delayed batch still has a chance to report */
     }
 
     // Seed mix + PRNG: cyrb128 into sfc32, both public-domain standards.
@@ -275,6 +364,7 @@
         origGID = CanvasRenderingContext2D.prototype.getImageData;
         CanvasRenderingContext2D.prototype.getImageData = keepShape(
           function () {
+            noteProbe("canvas");
             var img = origGID.apply(this, arguments);
             try {
               if (img && img.data) {
@@ -326,6 +416,7 @@
         };
         patchMethod(HTMLCanvasElement.prototype, "toDataURL", function (orig) {
           return function () {
+            noteProbe("canvas");
             try {
               var c = noisedClone(this);
               if (c) {
@@ -339,6 +430,7 @@
         });
         patchMethod(HTMLCanvasElement.prototype, "toBlob", function (orig) {
           return function () {
+            noteProbe("canvas");
             try {
               var c = noisedClone(this);
               if (c) {
@@ -539,6 +631,7 @@
         var origGetChannelData = AudioBuffer.prototype.getChannelData;
         patchMethod(AudioBuffer.prototype, "getChannelData", function (orig) {
           return function (channel) {
+            noteProbe("audio");
             var arr = orig.apply(this, arguments);
             try {
               var ch = channel | 0;
@@ -555,6 +648,7 @@
         });
         patchMethod(AudioBuffer.prototype, "copyFromChannel", function (orig) {
           return function (destination, channelNumber, bufferOffset) {
+            noteProbe("audio");
             // COERCE ONCE, BEFORE the native call, and hand the natives the
             // primitives. Reading these arguments again afterwards is a real
             // bypass: an object whose valueOf() answers differently each time
@@ -639,6 +733,7 @@
         var analyserPatch = function (name, shift) {
           patchMethod(AnalyserNode.prototype, name, function (orig) {
             return function (array) {
+              noteProbe("audio");
               var out = orig.apply(this, arguments);
               try {
                 if (array && array.length) {
@@ -689,9 +784,11 @@
           return function (pname) {
             try {
               if (pname === 37445) {
+                noteProbe("webgl");
                 return orig.call(this, 0x1f00);
               }
               if (pname === 37446) {
+                noteProbe("webgl");
                 return orig.call(this, 0x1f01);
               }
             } catch (e) {
@@ -719,13 +816,14 @@
     // seed handed in from here; the pixel loop is the shared applyCanvasNoise
     // either way. Defined as a named function so the worker shim can reuse
     // its exact source rather than a second copy that could drift.
-    function patchOffscreenCanvas(scope, rngFactory, noiseCore) {
+    function patchOffscreenCanvas(scope, rngFactory, noiseCore, note) {
       try {
         if (typeof scope.OffscreenCanvasRenderingContext2D !== "undefined") {
           var octx = scope.OffscreenCanvasRenderingContext2D.prototype;
           if (octx && typeof octx.getImageData === "function") {
             var origOGID = octx.getImageData;
             octx.getImageData = keepShape(function () {
+              note("canvas");
               var img = origOGID.apply(this, arguments);
               try {
                 if (img && img.data) {
@@ -746,6 +844,7 @@
                 "convertToBlob",
                 function (orig) {
                   return function () {
+                    note("canvas");
                     try {
                       var w = this.width;
                       var h = this.height;
@@ -780,6 +879,7 @@
         return rngFor("canvas");
       },
       applyCanvasNoise,
+      noteProbe,
     );
 
     // ----- workers ---------------------------------------------------------
@@ -845,7 +945,7 @@
           fnSource.call(patchOffscreenCanvas) +
           "try{" +
           "var __rng=function(){return sfc32(__s[0],__s[1],__s[2],__s[3]);};" +
-          "patchOffscreenCanvas(self,__rng,applyCanvasNoise);" +
+          "patchOffscreenCanvas(self,__rng,applyCanvasNoise,function(){});" +
           "var __mask=function(p){patchMethod(p,'getParameter',function(o){" +
           "return function(n){try{if(n===37445)return o.call(this,7936);" +
           "if(n===37446)return o.call(this,7937);}catch(e){}return o.apply(this,arguments);};});};" +
@@ -1390,6 +1490,7 @@
       // guarded, and on any failure the true result is returned.
       var wrapOneRect = function (orig) {
         return function () {
+          noteProbe("element_measurement");
           var rect = orig.apply(this, arguments);
           try {
             return farbleRect(rect);
@@ -1400,6 +1501,7 @@
       };
       var wrapRectList = function (orig) {
         return function () {
+          noteProbe("element_measurement");
           var list = orig.apply(this, arguments);
           try {
             return farbleRectList(list);

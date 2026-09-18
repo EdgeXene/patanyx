@@ -1,0 +1,16 @@
+# Hosts ADDED to the shipped ad and tracker rules beyond what the upstream
+# lists carry. The counterpart to adlist-allow.txt, in the other direction.
+#
+# WHY THIS EXISTS. The bundled rules this pipeline replaced were 59 hand-picked
+# hosts, and the upstream lists cover 58 of them. The one they miss is
+# recorded here, because replacing a curated list with a bigger list must not
+# quietly UNBLOCK something the curated list had reasons for. If an upstream
+# list later adds one of these, the merge dedups and the entry here becomes
+# harmless; leave it, the reason still documents intent.
+#
+# Same format and parse as adlist-allow.txt.
+
+connect.facebook.net # Meta's SDK/pixel loader. In the original 59 bundled
+                     # hosts; absent from ShadowWhisperer Ads and Tracking
+                     # (measured 2026-09-01). The single non-covered survivor
+                     # of the hand-picked list.

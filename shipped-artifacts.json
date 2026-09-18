@@ -1,0 +1,129 @@
+{
+  "_why": [
+    "The machine-readable register of THIRD-PARTY BINARY ARTIFACTS that ship",
+    "with PATANYX but are not Cargo packages: model weights, prebuilt WASM,",
+    "vocabularies. scripts/shipping-licenses.py builds the About panel's",
+    "attribution from `cargo metadata`, so it sees Rust crates and NOTHING",
+    "ELSE. A shipped .onnx or .wasm appears in no inventory, and the",
+    "attribution gate regenerates an identical file, diffs clean and prints OK",
+    "while those components ship with their licence terms unmet.",
+    "",
+    "That is not hypothetical. The PP-OCR models below shipped attributed only",
+    "by a hand-written NOTICE entry, with no gate verifying it stayed true and",
+    "no hash pinning the bytes it described.",
+    "",
+    "MIT, BSD, ISC and Apache-2.0 all require the copyright notice to travel",
+    "with the binary. A missing entry here is a licence term unmet, not a",
+    "formatting slip -- the same standard attribution-gate.sh already applies",
+    "to crates.",
+    "",
+    "scripts/artifact-manifest-gate.py enforces three things: every declared",
+    "artifact exists and still hashes to what is recorded; every file under a",
+    "watched directory has a row; and every row carries a licence and a",
+    "copyright line."
+  ],
+  "watched_dirs": [
+    {
+      "path": "models/ocr",
+      "note": "Every file here ships. A new model dropped in without a row below fails the gate."
+    },
+    {
+      "path": "models/translator",
+      "note": "The translation engine and its glue. Both ship in the installer; the language models do NOT -- they download on demand."
+    }
+  ],
+  "ignore_in_watched_dirs": [
+    "LICENSE",
+    "README.md"
+  ],
+  "artifacts": [
+    {
+      "component": "PP-OCR detection model",
+      "path": "models/ocr/det.onnx",
+      "sha256": "b5b801420efe9effc8be8a2aec4794122beab96dc6fdc2c425d86b98238f9760",
+      "licence": "Apache-2.0",
+      "copyright": "Copyright (c) Baidu, Inc.",
+      "upstream": "https://github.com/PaddlePaddle/PaddleOCR",
+      "upstream_version": "unrecorded",
+      "notes": "Apache-2.0 covers code and weights, per the upstream project. Provenance predates this register; upstream_version is honestly 'unrecorded' rather than guessed."
+    },
+    {
+      "component": "PP-OCR angle classification model",
+      "path": "models/ocr/cls.onnx",
+      "sha256": "458264796502e96a6200eb6f71258739b954b6678a56b2e562a06025deae41af",
+      "licence": "Apache-2.0",
+      "copyright": "Copyright (c) Baidu, Inc.",
+      "upstream": "https://github.com/PaddlePaddle/PaddleOCR",
+      "upstream_version": "ch_ppocr_mobile_v2.0_cls (PaddleOCR 2.10 cache entry)",
+      "notes": "Decides 0 vs 180 degrees for a detected crop. Same Apache-2.0 clearance over code and weights as det/rec; models/ocr/README.md records the source inference.pdmodel and pdiparams hashes it was converted from."
+    },
+    {
+      "component": "PP-OCR recognition model",
+      "path": "models/ocr/rec.onnx",
+      "sha256": "80a96295bed4de993c35429099447dee96860fe4039b98cfe34f510b6da14511",
+      "licence": "Apache-2.0",
+      "copyright": "Copyright (c) Baidu, Inc.",
+      "upstream": "https://github.com/PaddlePaddle/PaddleOCR",
+      "upstream_version": "unrecorded",
+      "notes": "See det.onnx."
+    },
+    {
+      "component": "PP-OCR recognition dictionary",
+      "path": "models/ocr/rec_dict.txt",
+      "sha256": "aab362a7748f5e47d2440f67ecbcb7aab0f1a4d43dda470edb46570fbccf7f82",
+      "licence": "Apache-2.0",
+      "copyright": "Copyright (c) Baidu, Inc.",
+      "upstream": "https://github.com/PaddlePaddle/PaddleOCR",
+      "upstream_version": "unrecorded",
+      "notes": "Character set for rec.onnx; ships with it and is covered by the same licence."
+    },
+    {
+      "licence": "MPL-2.0",
+      "copyright": "Copyright (c) Mozilla Foundation and contributors; bergamot-translator contributors",
+      "upstream": "https://github.com/mozilla/translations",
+      "upstream_version": "v0.6.0 @ 1de4a085d3a7afb625c51a60aabb5ad298e4059f",
+      "component": "Bergamot translation engine (WebAssembly)",
+      "path": "models/translator/bergamot-translator.wasm",
+      "sha256": "f38ef807636a7c994afedaab7ff8ffe0d590d21897f05139f747b80fd7bbe926",
+      "notes": "From Mozilla Remote Settings main/translations-wasm-v2. That record states its own licence, revision and Firefox release, and publishes BOTH the zstd hash (327fcfc7...) and this decompressed hash. Taken from Mozilla rather than browsermt because browsermt has been dormant since 2024-05-12."
+    },
+    {
+      "licence": "MPL-2.0",
+      "copyright": "Copyright (c) Mozilla Foundation and contributors; bergamot-translator contributors",
+      "upstream": "https://github.com/mozilla/translations",
+      "upstream_version": "v0.6.0 @ 1de4a085d3a7afb625c51a60aabb5ad298e4059f",
+      "component": "Bergamot translation engine (emscripten glue)",
+      "path": "models/translator/bergamot-translator.js",
+      "sha256": "972fa0450146fe06f4006a2ba56e8c4834403e27873cfe47fb3ba85aa7b9b082",
+      "notes": "NOT in Remote Settings -- Firefox vendors it and so do we, from mozilla-central toolkit/components/translations/bergamot-translator/. Its moz.yaml names the SAME revision as the wasm record, so the pair is matched by provenance rather than by proximity. A wasm and a glue from different revisions fail like data corruption."
+    },
+    {
+      "licence": "MPL-2.0",
+      "copyright": "Copyright (c) Mozilla Foundation and contributors; bergamot-translator contributors",
+      "upstream": "https://github.com/mozilla/translations",
+      "upstream_version": "v0.6.0 @ 1de4a085d3a7afb625c51a60aabb5ad298e4059f",
+      "component": "Bergamot engine licence text",
+      "path": "models/translator/LICENSE",
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5",
+      "notes": "MPL-2.0 full text, shipped beside the binary it covers, as MPL section 3.1 requires."
+    }
+  ],
+  "_pending": [
+    "THE ENGINE IS NOW VENDORED and has rows above. What remains pending here is",
+    "the MODEL side, and it stays pending on purpose: the language packs are NOT",
+    "vendored -- they download on demand from models.patanyx.net, so they are not",
+    "files in this repository and cannot have rows in a register that verifies",
+    "files in this repository.",
+    "",
+    "Their identities are pinned in docs/page-translation-assets/fetch-models.sh",
+    "and docs/page-translation-provenance.md: model.enes.intgemm.alphas.bin v2.1,",
+    "lex.50.50.enes.s2t.bin v2.1 and vocab.enes.spm v2.1, all en->es, all",
+    "hash-matched against Mozilla's Remote Settings records.",
+    "",
+    "OPERATOR RULING 2026-08-30: the model weights are attributed AS IF MPL-2.0",
+    "applies to them. Mozilla states no licence for the weights specifically and",
+    "the models collection carries no licence field -- unlike the WASM collection,",
+    "which states MPL-2.0 outright. When the download path is built, the delivery",
+    "manifest is where those hashes get verified; this register cannot do it."
+  ]
+}

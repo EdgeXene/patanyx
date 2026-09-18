@@ -35,9 +35,12 @@ pub enum Key {
     K,
     F,
     P,
+    /// Developer tools, on the PAGE. Both spellings every browser binds.
+    I,
     Tab,
     F5,
     F3,
+    F12,
     Left,
     Right,
     /// 1 through 9. Zero is not bound as a TAB shortcut -- Ctrl+0 is zoom
@@ -78,6 +81,16 @@ pub enum Shortcut {
     /// while a content webview has focus -- see this file's top doc for why
     /// that means native, not a page-side listener.
     OpenCommandPalette,
+    /// Developer tools for the PAGE in front of the user.
+    ///
+    /// Bound natively for the same reason Ctrl+T is: left to the engine the
+    /// key lands on whichever webview holds focus, which is usually the
+    /// chrome -- and the chrome's inspector is deliberately unavailable in a
+    /// release build. Resolving it here aims it at the CONTENT webview, so
+    /// the trust boundary stays where `chrome_devtools_opted_in` puts it
+    /// while the page a user is actually looking at becomes inspectable.
+    OpenDeveloperTools,
+
     /// Print the PAGE.
     ///
     /// Bound natively for the same reason Ctrl+T is: left to the engine, the
@@ -148,6 +161,7 @@ pub fn keypad_scan_code(scan: u32, extended: bool) -> Option<Key> {
 pub fn vk_key(virtual_key: u32) -> Option<Key> {
     const VK_TAB: u32 = 0x09;
     const VK_F5: u32 = 0x74;
+    const VK_F12: u32 = 0x7B;
     const VK_LEFT: u32 = 0x25;
     const VK_RIGHT: u32 = 0x27;
     const VK_OEM_PLUS: u32 = 0xBB;
@@ -163,9 +177,11 @@ pub fn vk_key(virtual_key: u32) -> Option<Key> {
         0x4B => Key::K,
         0x46 => Key::F,
         0x50 => Key::P,
+        0x49 => Key::I,
         VK_TAB => Key::Tab,
         VK_F5 => Key::F5,
         0x72 => Key::F3,
+        VK_F12 => Key::F12,
         VK_LEFT => Key::Left,
         VK_RIGHT => Key::Right,
         // Zoom. VK_OEM_PLUS/MINUS are the main-row keys and report the same
@@ -211,6 +227,14 @@ pub fn resolve(mods: Mods, key: Key) -> Option<Shortcut> {
         // is suppressed (windows.rs), so a page-side find would open nothing,
         // and one find bar -- ours, with honest counts -- answers everywhere.
         Key::F if mods.ctrl && !mods.alt => Some(Shortcut::OpenFind),
+
+        // Developer tools, both spellings every browser binds. F12 is
+        // unmodified by convention; the letter form is Ctrl+Shift+I exactly,
+        // so a stray Alt or a bare "i" typed into a page stays unbound.
+        Key::F12 if !mods.ctrl && !mods.shift && !mods.alt => {
+            Some(Shortcut::OpenDeveloperTools)
+        }
+        Key::I if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::OpenDeveloperTools),
 
         Key::Tab if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::PrevTab),
         Key::Tab if mods.ctrl && !mods.alt => Some(Shortcut::NextTab),
@@ -272,6 +296,39 @@ mod zoom_tests {
         for k in [Key::Equal, Key::Plus, Key::Minus, Key::Zero] {
             assert_eq!(resolve(none, k), None, "{k:?} must reach the page");
         }
+    }
+
+    #[test]
+    fn developer_tools_answer_both_spellings_and_nothing_near_them() {
+        // Bare F12 and exact Ctrl+Shift+I. The near misses matter more than
+        // the hits: a bare "i" is text the user is typing, and swallowing it
+        // would break every form on the web.
+        let none = Mods { ctrl: false, shift: false, alt: false };
+        assert_eq!(resolve(none, Key::F12), Some(Shortcut::OpenDeveloperTools));
+        assert_eq!(
+            resolve(
+                Mods { ctrl: true, shift: true, alt: false },
+                Key::I
+            ),
+            Some(Shortcut::OpenDeveloperTools)
+        );
+        assert_eq!(resolve(none, Key::I), None, "a bare i is typing");
+        assert_eq!(resolve(ctrl(), Key::I), None, "Ctrl+I is not the binding");
+        assert_eq!(
+            resolve(Mods { ctrl: true, shift: false, alt: true }, Key::F12),
+            None,
+            "modified F12 is unbound"
+        );
+    }
+
+    #[test]
+    fn the_native_key_codes_for_developer_tools_decode() {
+        // The defect this exists for is real and recent: the shortcut was
+        // reported as shipped while neither backend's translator carried the
+        // codes, so nothing could ever reach `resolve`. Asserted through the
+        // translator, not the enum.
+        assert_eq!(vk_key(0x7B), Some(Key::F12), "VK_F12");
+        assert_eq!(vk_key(0x49), Some(Key::I), "VK_I");
     }
 
     #[test]

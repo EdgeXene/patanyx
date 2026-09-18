@@ -203,9 +203,9 @@ check(
       "a restart pending at open time must be shown without any click",
     );
     assert(
-      /not in effect/i.test(note.textContent),
-      "the note must lead with the setting not being live; got " +
-        JSON.stringify(note.textContent),
+      note.dataset.state === "restart-pending",
+      "the note must carry the restart-pending state; got " +
+        JSON.stringify(note.dataset.state),
     );
     // And it must CLEAR when the engine says nothing is pending -- a note
     // that cannot go away is one the user learns to ignore.
@@ -279,12 +279,12 @@ check(
     );
     const note = global.$("tunnelp-restart");
     assert(
-      note.hidden === false && /not in effect/i.test(note.textContent),
+      note.hidden === false && note.dataset.state === "restart-pending",
       "the restart note must be visible after an accepted change; got " +
         "hidden=" +
         note.hidden +
-        " text=" +
-        JSON.stringify(note.textContent),
+        " state=" +
+        JSON.stringify(note.dataset.state),
     );
     assert(
       global.$("tunnelp-imported").classList.contains("active"),
@@ -408,7 +408,7 @@ check("the remove button sends tunnel_remove", async () => {
   // restart note is owed here exactly as after the mode buttons.
   const note = global.$("tunnelp-restart");
   assert(
-    note.hidden === false && /not in effect/i.test(note.textContent),
+    note.hidden === false && note.dataset.state === "restart-pending",
     "removing the config must show the restart note; got hidden=" + note.hidden,
   );
 });
@@ -652,7 +652,7 @@ check("the command palette can open the tunnel panel", () => {
     .readFileSync(path.join(chromeDir, "chrome.js"), "utf8")
     .replace(/\s+/g, " ");
   assert(
-    /label:\s*"Open Tunnel",\s*buttonId:\s*"btn-tunnel"/.test(src),
+    /"Open Tunnel"\)?,\s*buttonId:\s*"btn-tunnel"/.test(src),
     'PALETTE_ACTIONS needs { label: "Open Tunnel", buttonId: "btn-tunnel" }',
   );
 });
@@ -692,20 +692,17 @@ check(
     // Immediately: this cause needs no measurement, so it must not wait out
     // the failure grace period. Fifteen seconds of blank window before any
     // explanation is most of the confusion.
-    const title = String(global.$("tunnel-warning-title").textContent || "");
-    const body = String(global.$("tunnel-warning-body").textContent || "");
+    const cause = String(global.$("tunnel-warning").dataset.cause || "");
     assert(
-      /vault/i.test(title) || /vault/i.test(body),
-      "the banner never mentions the vault: " + title + " / " + body,
-    );
-    assert(
-      !/tunnel is down/i.test(body),
-      "the banner still blames the tunnel: " + body,
+      cause === "vault-locked",
+      "the banner must explain the LOCKED VAULT, not the tunnel; cause=" +
+        JSON.stringify(cause),
     );
     // And it offers the thing that fixes it.
     assert(
-      /vault/i.test(String(global.$("tunnel-warning-open").textContent || "")),
-      "the banner's button does not offer the vault",
+      global.$("tunnel-warning-open").dataset.target === "vault",
+      "the banner's button does not open the vault; target=" +
+        JSON.stringify(global.$("tunnel-warning-open").dataset.target),
     );
   },
 );
@@ -762,7 +759,7 @@ check(
     // a privacy promise, not a preference -- and "Open new tabs without a
     // saved profile" is BROWSER-WIDE. With it on, every tab is dropped, the
     // plan comes out empty, and the old code restarted anyway underneath a
-    // note promising "your tabs are set aside and reopen after you unlock".
+    // note promising "your tabs are shelved and reopen after you unlock".
     // One click, whole session gone, no confirmation, no count, and the copy
     // said the opposite.
     stubTunnel({

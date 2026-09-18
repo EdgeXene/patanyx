@@ -42,17 +42,21 @@
 /// dependency set.
 mod about;
 mod activation;
+mod adlist_consent;
+mod toplevel_request;
+/// Searching the personal archive: which archived pages answer a query, and
+/// what each row shows. Pure logic over records the store owns.
+mod archive;
 /// Known-malicious hosts, refused in the navigation handler. Present in every
 /// build: this is the protection for users who change no settings.
 mod blocklist;
+mod bookmark_import;
+mod capture;
 /// Chat exists only under `--features chat`, which is off by default. The
 /// published browser contains none of it: `patanyx-chat` is an optional
 /// dependency and this module is the only place the app references it.
 #[cfg(feature = "chat")]
 mod chat_panel;
-/// Searching the personal archive: which archived pages answer a query, and
-/// what each row shows. Pure logic over records the store owns.
-mod archive;
 /// Every user-facing string the cookie-clearing controls say. Pure copy with
 /// the wording pinned by tests, so the sentence that keeps "clears cookies"
 /// from becoming "clears everything" is checked rather than remembered.
@@ -62,35 +66,58 @@ mod cookie_control;
 /// that has one.
 #[cfg(feature = "chat")]
 mod download_compare;
-mod ipc;
-mod ocr_support;
-mod prefs;
-/// Page digesting and peer corroboration. Needs the page's real bytes, which
-/// come from the ENGINE (never from evaluating script in a content webview).
-mod page_integrity;
-mod platform;
-mod psl;
-mod resolver_probe;
-/// The browser's only self-initiated network activity, and its timing.
-mod schedule;
-mod bookmark_import;
-mod capture;
+mod engine_advisory;
+/// The message catalog and its resolver: every user-facing string in the
+/// chrome and in Rust comes from here, so a second locale is a file rather
+/// than a rewrite.
+mod i18n;
+/// Debug-only in-product isolation battery; see the module header.
+#[cfg(debug_assertions)]
+mod isolation_probe;
+/// Debug-only in-product proof of the translation reply channel; see the
+/// module header. Unix-only for now: it exercises the WebKitGTK parked-reply
+/// mechanism, and the Windows half of the seam is a different mechanism that
+/// needs its own proof rather than a shared one that would only pretend to
+/// cover both.
+#[cfg(all(debug_assertions, unix))]
+mod translate_channel_probe;
+/// Downloading, verifying and installing language packs.
+mod langpack;
+/// The generated language/pair registry (see scripts/gen-language-registry.py).
+mod languages;
+/// Page-language sanity checking by Unicode script (the corruption guard).
+mod detect;
 mod find;
 mod hover;
 /// Colours, font metrics and geometry for the hover readout, kept apart from
 /// both backends so the Windows-only arithmetic is testable on any box.
 mod hover_style;
-mod shelf;
-mod shortcuts;
-mod state;
-/// Cross-tab text search over each tab's visible text: pure matching,
-/// snippet shaping and refusal wording, identical on every platform.
-mod tab_search;
+mod ipc;
 /// Engine-side tunnel lifecycle: bind the proxy port before the vault
 /// exists, start the tunnel when it opens. Unconditional, like the tunnel
 /// crate itself.
 mod licence_control;
+mod marker;
 mod net;
+mod ocr_support;
+/// Page digesting and peer corroboration. Needs the page's real bytes, which
+/// come from the ENGINE (never from evaluating script in a content webview).
+mod page_integrity;
+mod partner;
+mod platform;
+mod prefs;
+mod premium_purchase;
+mod psl;
+mod resolver_probe;
+/// The browser's only self-initiated network activity, and its timing.
+mod schedule;
+mod shelf;
+mod shortcuts;
+mod sponsorship;
+mod state;
+/// Cross-tab text search over each tab's visible text: pure matching,
+/// snippet shaping and refusal wording, identical on every platform.
+mod tab_search;
 mod tunnel_control;
 /// Signed update checking. Verification is `patanyx-update`; this is the
 /// fetch, decide and prompt layer around it.
@@ -115,7 +142,21 @@ use state::AppState;
 /// only `EventLoopProxy` clones (`Send`) plus Copy data — keep it that way.
 enum UserEvent {
     Ipc(String),
+    /// The once-per-process engine-profile wipe has completed (successfully
+    /// or not), so tabs held blank behind it may issue their initial
+    /// navigation. Failure still releases them; the platform diagnostic says
+    /// plainly which data were NOT cleared instead of turning an unavailable
+    /// privacy primitive into a browser that never loads.
+    SessionWipeFinished,
     UrlChanged(u64, String),
+    /// A message a CONTENT webview's translation script posted UP.
+    ///
+    /// Deliberately NOT `Ipc`. `Ipc` carries privileged commands from the
+    /// trusted chrome origin; this carries text scraped from a hostile page,
+    /// and the two must never arrive through the same door. Tagged with the
+    /// tab id because the sender is a page, and a page does not get to say
+    /// which tab it is.
+    ContentTranslate(u64, String),
     LoadState(u64, bool),
     TitleChanged(u64, String),
     OpenInNewTab(String),
@@ -156,6 +197,28 @@ enum UserEvent {
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
     AutoLockTick,
+    /// Drive one step of an in-flight translation.
+    ///
+    /// A POLL, because the translator document cannot push. It has no ipc
+    /// handler by design -- that is the isolation the separate origin exists
+    /// for -- so the only way to read it is `evaluate_script_with_callback`,
+    /// which the host must initiate. Raised by a thread that runs ONLY while
+    /// work is in flight and stops itself when there is none.
+    TranslateTick,
+    /// Drives the debug-only full-loop self-test. Absent from release builds.
+    #[cfg(all(debug_assertions, unix))]
+    TranslateSelfTest,
+    /// A language pack finished installing, or failed to. Carries the pair
+    /// and, on failure, a catalog key the panel can render.
+    PackInstalled(&'static str, Option<&'static str>),
+    /// Download progress for an in-flight pack: pair, bytes so far, total when
+    /// the server offered one. Advisory -- drives the UI only.
+    PackProgress(&'static str, u64, Option<u64>),
+    /// The translator document's `status()`, as it answered it.
+    TranslateEngine(String),
+    /// A finished (or still-pending) translation job, as `result()` answered.
+    /// Carries the job id the host chose, never one the document invented.
+    TranslateResult(u64, String),
     /// The window finished a maximize or a restore a moment ago; the title
     /// bar colours are re-applied AFTER Windows has repainted the frame in
     /// the system colour, which it does on that transition (see
@@ -172,11 +235,17 @@ enum UserEvent {
     /// and refuses anything it does not recognise rather than guessing.
     /// Editing commands (cut/copy/paste/select-all) never arrive here: they
     /// run engine-local in the platform layer.
-    ContextMenuAction { action: u32, target: Option<String> },
+    ContextMenuAction {
+        action: u32,
+        target: Option<String>,
+    },
     /// A save-as-PDF render finished, or failed. Carries the destination
     /// rather than a tab id: by the time this arrives the tab may have
     /// navigated or closed, and the path is what identifies the job.
-    PdfSaved { path: String, success: bool },
+    PdfSaved {
+        path: String,
+        success: bool,
+    },
     /// The workstation locked, or the machine is suspending.
     ///
     /// Carries nothing: what happened is the whole message, and the decision
@@ -206,6 +275,18 @@ enum UserEvent {
     },
     /// A finished (or failed) page capture, from the engine's async callback.
     Capture(capture::CaptureEvent),
+    /// A native region capture has been turned into its bounded chrome
+    /// preview on a worker. The event loop only publishes its dimensions.
+    RegionCapturePrepared {
+        result: Result<(u64, u32, u32, u32, u32), &'static str>,
+        scope: capture::CaptureScope,
+    },
+    /// A snapshot capture has passed through WP-Z's bounded picture path on
+    /// a worker. Hash/text storage remains possible when `result` is Err.
+    SnapshotPicturePrepared {
+        result: Result<Vec<u8>, &'static str>,
+        scope: capture::CaptureScope,
+    },
     /// An engine find callback, normalised by the platform layer. Carries the
     /// webview identity key so a count landing after a tab switch is dropped
     /// instead of painted onto another tab's bar.
@@ -230,6 +311,18 @@ enum UserEvent {
         tab_id: u64,
         url: String,
     },
+    /// A TOP-LEVEL navigation to a host on the ad/tracker list was refused by
+    /// the engine, and the tab is now showing our placeholder instead of the
+    /// engine's error page. Carries the complete URL (fragment included) so
+    /// consent can resume exactly what was asked for, the host the banner
+    /// names, and the method, because a held form submission cannot be
+    /// replayed and the banner must say so before the click.
+    AdlistBlocked {
+        tab_id: u64,
+        url: String,
+        host: String,
+        method: String,
+    },
     /// A content tab's password form was submitted. Carries exactly what the
     /// save-password banner needs -- the PASSWORD IS HERE because the banner
     /// offers to save it on the strength of this one message, held only in
@@ -247,6 +340,13 @@ enum UserEvent {
         username: String,
         password: String,
     },
+    /// Batched count deltas claimed by a tab's page-world divergence
+    /// wrappers. Unlike request blocking, this is not an engine observation:
+    /// hostile page code can use the same bridge and forge the report.
+    FingerprintProbes {
+        tab_id: u64,
+        counts: Vec<(state::FingerprintSurface, u64)>,
+    },
     /// An hourly blocklist refresh finished: the new list version and host
     /// count, or why it did not happen. A failure leaves the previous list in
     /// force and is reported, never swallowed -- a protection that silently
@@ -261,7 +361,10 @@ enum UserEvent {
     ResolverProbe(bool),
     /// The resolver-unreachable banner should be shown or hidden. Carries the
     /// user's own setting name and nothing else — never a hostname or a URL.
-    ResolverBanner { visible: bool, mode: &'static str },
+    ResolverBanner {
+        visible: bool,
+        mode: &'static str,
+    },
     /// A transport event from the chat subsystem. The transport's callback
     /// runs on its own thread and, like every other callback here, only
     /// forwards — all mutation happens in the match arm below.
@@ -289,27 +392,259 @@ fn chrome_devtools_opted_in() -> bool {
     std::env::var_os("PATANYX_CHROME_DEVTOOLS").is_some_and(|value| value == "1")
 }
 
+/// The translator document's policy. TWO DIRECTIVES LOOSER than `CSP`, and
+/// exactly two, established by bisection against both engines rather than from
+/// specs (`docs/page-translation-spike.md`):
+///
+///   * `connect-src 'self'` -- under the chrome policy's `connect-src 'none'`
+///     the engine cannot fetch its OWN `.wasm`, before any model file is
+///     touched.
+///   * `'wasm-unsafe-eval'` -- granting the fetch, WebAssembly then refuses to
+///     compile: "Refused to create a WebAssembly object because 'unsafe-eval'
+///     or 'wasm-unsafe-eval' is not an allowed source of script".
+///
+/// Both engines agreed exactly on that cost. Being on a SEPARATE ORIGIN is
+/// what contains it: these two directives are granted to the translator
+/// document and to nothing else, where on the shared origin the privileged UI
+/// would have had to be granted them too.
+const TRANSLATE_CSP: &str = "default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'none'; base-uri 'none'";
+
+/// The translator document, its script, and the engine it hosts.
+///
+/// Compiled in, like the OCR models (`crates/ocr/src/lib.rs:165`) and for the
+/// same reason: the engine SHIPS IN THE INSTALLER. The language packs do not —
+/// those download on demand, which is the whole point of not bundling every
+/// pair. That split is what the privacy copy promises, so it is worth stating
+/// where the bytes actually are.
+const TRANSLATOR_HTML: &str = include_str!("chrome/translator.html");
+const TRANSLATOR_JS: &str = include_str!("chrome/translator.js");
+/// Mozilla's build, v0.6.0 @ 1de4a085. Provenance, licence and the rule that
+/// these two move together: `models/translator/README.md`.
+const TRANSLATOR_GLUE: &str = include_str!("../../../models/translator/bergamot-translator.js");
+const TRANSLATOR_WASM: &[u8] = include_bytes!("../../../models/translator/bergamot-translator.wasm");
+
+/// Serves the translator origin, and NOTHING the chrome origin serves.
+///
+/// Deliberately not `serve_chrome` with an extra route. The chrome handler
+/// answers `/region-capture/<token>.png` with a screen capture and
+/// `/archive-picture/<token>.png` with a DECRYPTED page from the encrypted
+/// archive; phase 0 confirmed a fetch from a second webview reaches that
+/// handler. A view that will hold text scraped from hostile pages must not be
+/// wired to it, so this is a separate function with its own, closed, route
+/// table and a 404 for everything else.
+///
+/// Must not panic on ANY input: a wry protocol handler runs across an
+/// `extern "C"` boundary, so a panic here ABORTS the process rather than
+/// unwinding. Phase 0 lost three hardware runs to exactly that, because
+/// WebView2 requests `/favicon.ico` from a custom scheme unprompted.
+/// Where language packs are read from.
+///
+/// A `OnceLock` because the protocol handler is a free function with no place
+/// to carry state: wry hands it a request and nothing else. Resolved on FIRST
+/// USE rather than at startup, so there is no ordering requirement between
+/// this and webview construction and therefore no window in which a request
+/// could see a half-initialised path.
+static PACK_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// The directory packs are read from, resolved once.
+///
+/// DEBUG BUILDS TAKE AN OVERRIDE, release builds do not. The override exists so
+/// a probe can prove translation against a pack placed in a scratch directory
+/// without writing into a tester's real profile. It is compiled out of
+/// release binaries entirely rather than merely ignored there: a shipped
+/// product must not contain an environment variable that redirects where model
+/// weights are loaded from.
+fn pack_root() -> &'static std::path::Path {
+    PACK_ROOT.get_or_init(|| {
+        #[cfg(debug_assertions)]
+        if let Ok(dir) = std::env::var("PATANYX_PACK_ROOT") {
+            if !dir.is_empty() {
+                return std::path::PathBuf::from(dir);
+            }
+        }
+        platform::translator_pack_dir_for(&patanyx_vault::Vault::default_path())
+    })
+}
+
+/// Serves one file of an installed language pack.
+///
+/// THIS IS THE ONLY PATH IN THE PRODUCT WHERE A REQUEST REACHES THE DISK, so
+/// it is built to make traversal impossible rather than to detect it:
+///   - the pair is matched against the PUBLISHED REGISTRY and replaced with the
+///     matching `&'static str` (`validate_translation_pair` -> languages::PAIRS),
+///     so what reaches the path is a registry-owned constant and never the
+///     caller's bytes. The set is larger than it was (one pair -> the whole
+///     published registry), but the property is identical: membership, not
+///     shape, and the returned value is not the caller's;
+///   - the filename is matched against a fixed three-entry table and likewise
+///     replaced with a constant;
+///   - the two constants are joined onto a root this process chose.
+/// There is no request-derived string anywhere in the resulting path. `..`,
+/// encoded separators, NUL, absolute paths and unicode homoglyphs are all
+/// answered by the same thing: they match no allowlist entry, so they 404.
+///
+/// IT MUST NOT PANIC. A wry protocol handler runs across an `extern "C"`
+/// boundary, so a panic here ABORTS the process rather than unwinding -- phase
+/// 0 lost three hardware runs to exactly that. Every step below returns None
+/// rather than unwrapping, and the read is size-capped so a corrupt or
+/// substituted file cannot be turned into an allocation the size of the disk.
+fn serve_translator_pack(path: &str) -> Option<Vec<u8>> {
+    let rest = path.strip_prefix("/pack/")?;
+    let (pair, file) = rest.split_once('/')?;
+    // Allowlist, then DISCARD the caller's copy: `pair` is shadowed by the
+    // static the allowlist returned.
+    let pair = state::validate_translation_pair(pair)?;
+    // Allowlisted against EVERY layout's filenames, then replaced with the
+    // constant: which layout a pair actually uses is the registry's business,
+    // not this handler's, and serving a name the pair does not have simply
+    // finds no file on disk.
+    let file = platform::PACK_FILES_ANY.iter().find(|f| **f == file)?;
+    let full = pack_root().join(pair).join(file);
+    let meta = std::fs::metadata(&full).ok()?;
+    if !meta.is_file() || meta.len() > patanyx_update::MAX_MODEL_PACK_BYTES {
+        return None;
+    }
+    std::fs::read(&full).ok()
+}
+
+/// Never cache a compiled-in asset.
+///
+/// THE UI AND THE ENGINE GLUE CHANGE WITH EVERY BUILD, and the profile they
+/// are served into OUTLIVES the build: the data directory is keyed to the
+/// vault, not the version. Neither handler set a cache directive, so WebView2
+/// applied its own heuristic and kept serving the PREVIOUS build's files to
+/// the new binary.
+///
+/// That is how a fix to `translator.js` -- raising the engine heap so a
+/// converted model fits -- reached a tester's machine and changed
+/// nothing: the running engine was still the cached copy. The Rust-side
+/// change in the same build DID take effect, so the output changed once and
+/// then stopped changing, which is what finally identified this: identical
+/// bytes out of two different binaries.
+///
+/// These are not network assets. They are compiled into the executable, cost
+/// nothing to serve, and are wrong the moment they are stale.
+const NO_STORE: (&str, &str) = ("Cache-Control", "no-store, must-revalidate");
+
+/// A short revision derived from the compiled-in assets themselves.
+///
+/// `no-store` fixes the FUTURE and cannot heal a profile that already cached
+/// these files: a stored entry is reused without ever asking the handler, so
+/// the header on the response the handler would have sent is never seen. That
+/// is not a theory -- three consecutive builds served a tester the same
+/// stale `translator.js` and produced byte-identical wrong output, while
+/// Rust-side changes in the same builds took effect normally.
+///
+/// Changing the URL is what actually evicts it, because a different URL is a
+/// different cache key. Derived from the bytes rather than the app version so
+/// that a rebuild WITHIN a version -- which is every build a tester runs
+/// -- also gets a fresh key.
+pub fn asset_revision() -> &'static str {
+    static REV: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    REV.get_or_init(|| {
+        let mut h = <sha2::Sha256 as sha2::Digest>::new();
+        for part in [
+            TRANSLATOR_JS.as_bytes(),
+            TRANSLATOR_GLUE.as_bytes(),
+            TRANSLATOR_WASM,
+            INDEX_HTML.as_bytes(),
+        ] {
+            sha2::Digest::update(&mut h, part);
+        }
+        let digest = sha2::Digest::finalize(h);
+        digest[..6].iter().map(|b| format!("{b:02x}")).collect()
+    })
+}
+
+/// The same document with its asset URLs carrying the revision.
+///
+/// Rewritten at serve time rather than templated into the file so the HTML
+/// stays a plain, readable document that opens correctly on its own.
+fn with_asset_revision(html: &str) -> String {
+    let rev = asset_revision();
+    html.replace(".js\"", &format!(".js?v={rev}\""))
+        .replace(".css\"", &format!(".css?v={rev}\""))
+}
+
+fn serve_translator(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> {
+    if request.uri().path().starts_with("/pack/") {
+        return match serve_translator_pack(request.uri().path()) {
+            // `application/octet-stream`: these are opaque weights, and the
+            // document reads them as an ArrayBuffer. Naming any richer type
+            // would be a claim about the bytes that nothing here checks.
+            Some(bytes) => http::Response::builder()
+                .header("Content-Type", "application/octet-stream")
+                .header("Content-Security-Policy", TRANSLATE_CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+                .body(Cow::Owned(bytes))
+                .expect("pack response"),
+            None => http::Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Security-Policy", TRANSLATE_CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+                .body(Cow::Borrowed(&b"not found"[..]))
+                .expect("pack 404 response"),
+        };
+    }
+    let (mime, body): (&str, &[u8]) = match request.uri().path() {
+        // Rewritten, so a profile holding the previous build's scripts asks
+        // for new URLs instead of reusing what it has.
+        "/" | "/translator.html" => {
+            return http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Content-Security-Policy", TRANSLATE_CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+                .body(Cow::Owned(with_asset_revision(TRANSLATOR_HTML).into_bytes()))
+                .expect("translator html response");
+        }
+        "/translator.js" => ("text/javascript; charset=utf-8", TRANSLATOR_JS.as_bytes()),
+        "/bergamot-translator.js" => ("text/javascript; charset=utf-8", TRANSLATOR_GLUE.as_bytes()),
+        // The engine. `application/wasm` is not decoration: a browser refuses
+        // to compile a wasm response served under any other type.
+        "/bergamot-translator.wasm" => ("application/wasm", TRANSLATOR_WASM),
+        _ => {
+            return http::Response::builder()
+                .status(404)
+                .header("Content-Type", "text/plain; charset=utf-8")
+                .header("Content-Security-Policy", TRANSLATE_CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+                .body(Cow::Borrowed(&b"not found"[..]))
+                .expect("translator 404 response");
+        }
+    };
+    http::Response::builder()
+        .header("Content-Type", mime)
+        .header("Content-Security-Policy", TRANSLATE_CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+        .body(Cow::Borrowed(body))
+        .expect("translator asset response")
+}
+
 fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> {
     // The region-read panel's image. Token-addressed, chrome-origin only (this
-    // protocol exists on no other webview), and served from the in-memory
-    // capture -- the CSP's img-src 'self' stays exactly as it is, and the PNG
-    // never crosses the IPC boundary as a string. A token that names nothing
+    // protocol exists on no other webview), and served from the bounded
+    // in-memory PREVIEW -- the CSP's img-src 'self' stays exactly as it is,
+    // and the native PNG never crosses into the chrome renderer. OCR retains
+    // and crops the native buffer separately. A token that names nothing
     // (stale panel, replaced capture) is a plain 404.
     if let Some(name) = request.uri().path().strip_prefix("/region-capture/") {
         let png = name
             .strip_suffix(".png")
             .and_then(|t| t.parse::<u64>().ok())
-            .and_then(capture::region_png);
+            .and_then(capture::region_preview_png);
         return match png {
             Some(bytes) => http::Response::builder()
                 .header("Content-Type", "image/png")
                 .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
                 .body(Cow::Owned(bytes))
                 .expect("region capture response"),
             None => http::Response::builder()
                 .status(404)
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
                 .body(Cow::Borrowed(&b"not found"[..]))
                 .expect("static 404 response"),
         };
@@ -329,18 +664,29 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
             Some(bytes) => http::Response::builder()
                 .header("Content-Type", "image/png")
                 .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
                 .body(Cow::Owned(bytes))
                 .expect("archive picture response"),
             None => http::Response::builder()
                 .status(404)
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
                 .body(Cow::Borrowed(&b"not found"[..]))
                 .expect("static 404 response"),
         };
     }
     let (mime, body): (&str, &[u8]) = match request.uri().path() {
-        "/" | "/index.html" => ("text/html; charset=utf-8", INDEX_HTML.as_bytes()),
+        // Same reason as the translator document: a stale chrome.js is how a
+        // shipped UI fix silently does not run.
+        "/" | "/index.html" => {
+            return http::Response::builder()
+                .header("Content-Type", "text/html; charset=utf-8")
+                .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
+                .body(Cow::Owned(with_asset_revision(INDEX_HTML).into_bytes()))
+                .expect("chrome html response");
+        }
         "/chrome.css" => ("text/css; charset=utf-8", CHROME_CSS.as_bytes()),
         "/chrome.js" => ("text/javascript; charset=utf-8", CHROME_JS.as_bytes()),
         "/integrity.js" => ("text/javascript; charset=utf-8", INTEGRITY_JS.as_bytes()),
@@ -350,6 +696,7 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
                 .status(404)
                 .header("Content-Type", "text/plain; charset=utf-8")
                 .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
                 .body(Cow::Borrowed(&b"not found"[..]))
                 .expect("static 404 response");
         }
@@ -357,11 +704,13 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
     http::Response::builder()
         .header("Content-Type", mime)
         .header("Content-Security-Policy", CSP)
+                .header(NO_STORE.0, NO_STORE.1)
         .body(Cow::Borrowed(body))
         .expect("static asset response")
 }
 
-/// Refuses to start a RELEASE build on an engine below the security floor.
+/// Refuses to start a RELEASE build on a WebKitGTK below the security floor;
+/// warns and continues on a WebView2 below its floor.
 ///
 /// A warning that never blocks becomes wallpaper, and this one would be
 /// printed on every launch of a stock Debian 12 box, which is precisely how
@@ -371,10 +720,20 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
 /// browser onto a runtime with known memory-corruption bugs reachable by
 /// visiting a page.
 ///
-/// PATANYX_ALLOW_OLD_ENGINE=1 overrides, for someone who has genuinely
-/// decided to accept it. It is deliberately an environment variable rather
-/// than a setting in the UI: this should be an explicit act, not a checkbox
-/// someone clicks past.
+/// WINDOWS IS THE OTHER WAY ROUND, on purpose. The WebKitGTK floor refuses
+/// because Debian 12 will NEVER ship its fix, so the only way forward is an
+/// act by the user. The WebView2 Evergreen runtime updates itself, on a
+/// rollout that takes days from the Edge release, and nothing the user does
+/// in PATANYX hurries it. Refusing to start would lock someone out of their
+/// browser for those days, with no console to read the reason in -- so the
+/// chrome raises a banner instead (`engine_status` at boot,
+/// `#engine-floor-warning`), which says what version clears it and that a
+/// restart after the update is all that is needed.
+///
+/// PATANYX_ALLOW_OLD_ENGINE=1 overrides the Linux refusal, for someone who
+/// has genuinely decided to accept it. It is deliberately an environment
+/// variable rather than a setting in the UI: this should be an explicit act,
+/// not a checkbox someone clicks past.
 fn enforce_engine_floor() {
     let engine = platform::engine_info();
     if !engine.below_floor {
@@ -382,20 +741,33 @@ fn enforce_engine_floor() {
     }
     let override_set = std::env::var("PATANYX_ALLOW_OLD_ENGINE").is_ok_and(|v| v == "1");
     eprintln!(
-        "PATANYX: {} {} is below the security floor {}.{}.{}",
+        "PATANYX: {} {} is below the security floor {}",
         engine.name,
         engine.version_string(),
-        platform::MIN_WEBKITGTK.0,
-        platform::MIN_WEBKITGTK.1,
-        platform::MIN_WEBKITGTK.2,
+        engine.floor_string(),
     );
-    eprintln!(
-        "  WSA-2026-0004 fixes 23 CVEs in this engine, several of them memory\n  \
-         corruption reachable by visiting a page. Debian marks webkit2gtk in\n  \
-         bookworm END-OF-LIFE, so no update is coming on that release: the fix\n  \
-         is Debian 13 (2.52.5-1~deb13u1) or a Flatpak carrying its own runtime."
-    );
-    if cfg!(debug_assertions) {
+    eprintln!("  {}", engine.advisory);
+    if engine.floor_raised() {
+        eprintln!(
+            "  (The floor was raised past the compiled {} by a signed update manifest \
+             or engine advisory; the advisory above names the earlier fix.)",
+            platform::join_version(engine.compiled_floor)
+        );
+    }
+    if engine.restart_clears() {
+        eprintln!(
+            "  The installed runtime is already {}; restarting PATANYX is all that is \
+             needed to use it.",
+            engine.installed_string()
+        );
+    }
+    if cfg!(windows) {
+        eprintln!("  The runtime updates itself; the banner in the window says so. Continuing.");
+    } else if !engine.below_compiled_floor {
+        // Only a floor raised by a signed manifest is unmet. A signed
+        // document may make the browser warn; it may not turn it off.
+        eprintln!("  Above the compiled floor; the banner in the window says so. Continuing.");
+    } else if cfg!(debug_assertions) {
         eprintln!("  Debug build: continuing anyway.");
     } else if override_set {
         eprintln!("  PATANYX_ALLOW_OLD_ENGINE=1 set: continuing at your own risk.");
@@ -444,19 +816,36 @@ mod build_variant_tests {
     #[test]
     fn the_window_title_names_the_build_variant() {
         let title = super::window_title();
-        assert!(title.starts_with("PATANYX Browser"), "{title}");
-        assert_eq!(
-            title.contains("Premium"),
-            cfg!(feature = "chat"),
-            "the title must say whether this is the Premium build: {title}"
-        );
-        // The relay is a SEPARATE feature. A chat build without it reaches
-        // the local network only, and the title must not imply otherwise.
-        assert_eq!(
-            title.contains("relay"),
-            cfg!(feature = "relay-client"),
-            "the title must not claim a relay this build does not have: {title}"
-        );
+        assert!(title.starts_with("PATANYX"), "{title}");
+        #[cfg(feature = "premium-unlocked")]
+        {
+            assert!(
+                title.contains(crate::about::UNLOCKED_BUILD_MARKER),
+                "an unlocked title must carry the exact public-build tripwire: {title}"
+            );
+            return;
+        }
+        #[cfg(not(feature = "premium-unlocked"))]
+        {
+            assert_eq!(
+                title.contains("PATANYX Nabu-X"),
+                cfg!(feature = "chat"),
+                "the title must say whether this is the Nabu-X build: {title}"
+            );
+            // A chat build WITHOUT the relay reaches the local network only,
+            // and the title must not let it pass for a complete Nabu-X. The
+            // word "relay" is deliberately absent from both titles now, so
+            // this is asserted on the LAN-only marker instead.
+            assert_eq!(
+                title.contains("(LAN chat only)"),
+                cfg!(feature = "chat") && !cfg!(feature = "relay-client"),
+                "only a chat build with no relay may say LAN chat only: {title}"
+            );
+            assert!(
+                !title.contains("relay"),
+                "no title says relay any more; Nabu-X already means it: {title}"
+            );
+        }
     }
 }
 
@@ -499,19 +888,43 @@ fn app_icon() -> Option<tao::window::Icon> {
     tao::window::Icon::from_rgba(PIXELS.to_vec(), SIDE, SIDE).ok()
 }
 
+#[cfg(feature = "premium-unlocked")]
+fn window_title() -> &'static str {
+    // This warning outranks the chat/relay description when features are
+    // combined: mistaking the bypass build for public is the dangerous error,
+    // and the full marker must remain visible in a screenshot.
+    "PATANYX Browser -- UNLOCKED TEST BUILD: Premium forced on; no license checked"
+}
+
+#[cfg(not(feature = "premium-unlocked"))]
 fn window_title() -> &'static str {
     match (cfg!(feature = "chat"), cfg!(feature = "relay-client")) {
         (false, _) => "PATANYX Browser",
-        // "Premium", not "chat": the private build was renamed PATANYX-Premium
-        // (decided 2026-08-05) because chat is one of the premium
-        // features, not the whole of them. The suffix deliberately stays a
-        // DISTINCTIVE multi-word fragment -- the free build's About copy
-        // already contains the bare word "Premium" (the future-tense teaser),
-        // so a build gate grepping for "Premium" alone would fail the public
-        // binary it exists to protect. The gates in build-windows.sh and
-        // build-flatpak.sh match these exact fragments; change them together.
-        (true, false) => "PATANYX Browser — Premium (LAN chat only)",
-        (true, true) => "PATANYX Browser — Premium + relay",
+        // The chat build is its own product: PATANYX Nabu-X (decided
+        // 2026-08-27). It was PATANYX-Premium from 2026-08-05 and
+        // PATANYX-chat before that. The reason for leaving "Premium" behind
+        // is that the plain browser now carries Premium features too, so the
+        // word no longer told the two builds apart -- which is the entire job
+        // of this title.
+        //
+        // NO "+ relay" SUFFIX, and that is the point of the name. Nabu-X IS
+        // the build with chat and the relay in it, so appending "+ relay"
+        // both restated the definition and invented a product name nobody
+        // chose. The previous scheme ("Premium + relay") needed the suffix
+        // because "Premium" did not imply either one; this name does.
+        //
+        // The LAN-only arm keeps a suffix for the opposite reason: that build
+        // is NOT a complete Nabu-X, it reaches the local network only, and a
+        // title claiming otherwise is the one dishonest thing this function
+        // could do.
+        //
+        // The gates match on "PATANYX Nabu-X", which is why the public About
+        // copy says "a separate Nabu-X build" and never the full phrase --
+        // otherwise the marker would appear in the very binary the gate
+        // exists to clear. The gates in build-windows.sh and
+        // build-flatpak.sh match this exact fragment; change them together.
+        (true, false) => "PATANYX Nabu-X (LAN chat only)",
+        (true, true) => "PATANYX Nabu-X",
     }
 }
 
@@ -520,15 +933,37 @@ fn window_title() -> &'static str {
 /// assets are served without access logging, so a launch does not write the
 /// person's address anywhere; the privacy policy (Part A s2.1, Part B B.2)
 /// says so and this constant is what has to stay true for it to be right.
-const HOME_URL: &str = "https://patanyx.com/";
+pub(crate) const HOME_URL: &str = "https://patanyx.com/";
 
 /// What the first tab opens. A URL or search handed on the command line
 /// wins outright. With none, the smoke run stays on `about:blank` because
 /// its blocking probe has to be the ONLY page load of the run (see the
 /// `probe_url` comment in `main`); every other launch opens `HOME_URL`.
+///
+/// THE COMMAND LINE IS AN UNTRUSTED INPUT and it is checked here, because the
+/// first tab is built with `new_tab`, which passes the URL straight to the
+/// webview's initial `with_url` -- and an initial load is not a navigation, so
+/// it never reaches the navigation handler that guards every later one. Every
+/// OTHER way a URL becomes a tab (the `tab_new` IPC command, the new-window
+/// handler, a chat-sent tab) already asks `is_allowed_content_url` first; this
+/// path did not, so `PATANYX "http://rbchrome.localhost/"` put the trusted
+/// chrome document in a content tab, and `file:///…` opened local files the
+/// same way (security assessment 2026-08-28, R5).
+///
+/// A refused argument falls back to the home page rather than failing to start:
+/// the user asked for a browser, and the safe page is a better answer than no
+/// window. `normalize_input` has already turned bare words into a search, so
+/// what arrives here is either a URL or `about:blank`.
 fn choose_start_url(positional: Option<String>, smoke_mode: bool) -> String {
     match positional {
-        Some(url) => url,
+        Some(url) if state::is_allowed_content_url(&url) => url,
+        Some(refused) => {
+            eprintln!(
+                "patanyx: refusing to open {refused:?} from the command line; \
+                 opening the home page instead"
+            );
+            HOME_URL.to_string()
+        }
         None if smoke_mode => "about:blank".to_string(),
         None => HOME_URL.to_string(),
     }
@@ -557,6 +992,56 @@ mod start_url_tests {
     fn the_smoke_run_keeps_the_first_tab_blank() {
         assert_eq!(choose_start_url(None, true), "about:blank");
     }
+
+    /// A shortcut, a file association or any local launcher chooses this
+    /// string, and the first tab's initial load skips the navigation handler.
+    /// So the chrome origin and local files must not survive the trip, in any
+    /// spelling the predicate knows -- including the trailing-dot one that
+    /// defeated it before (security assessment 2026-08-28, R1/R5).
+    #[test]
+    fn the_command_line_cannot_open_the_chrome_origin_or_local_files() {
+        for refused in [
+            "http://rbchrome.localhost/",
+            "http://rbchrome.localhost./",
+            "http://rbchrome.localhost:80/index.html",
+            "http://RBCHROME.LOCALHOST/",
+            "rbchrome://localhost/index.html",
+            "file:///etc/passwd",
+            "file:///C:/Users/victim/secret.txt",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+        ] {
+            assert_eq!(
+                choose_start_url(Some(refused.to_string()), false),
+                HOME_URL,
+                "a refused command-line argument still opened: {refused:?}"
+            );
+            // Smoke mode takes the same path; it must not be a way around it.
+            assert_eq!(
+                choose_start_url(Some(refused.to_string()), true),
+                HOME_URL,
+                "smoke mode opened a refused argument: {refused:?}"
+            );
+        }
+    }
+
+    /// And the guard must not have cost the feature: opening a page from the
+    /// command line is why the argument exists.
+    #[test]
+    fn ordinary_pages_on_the_command_line_still_open() {
+        for allowed in [
+            "https://example.com/x",
+            "http://example.com/",
+            "https://start.duckduckgo.com/?q=what+is+a+browser",
+            "about:blank",
+        ] {
+            assert_eq!(
+                choose_start_url(Some(allowed.to_string()), false),
+                allowed,
+                "an ordinary command-line page was refused: {allowed:?}"
+            );
+        }
+    }
 }
 
 fn main() {
@@ -567,6 +1052,24 @@ fn main() {
     // Emitting it from the binary itself makes that identity structural rather
     // than a step someone has to remember -- there is no second code path that
     // could drift. See docs/update-channel.md.
+    //
+    // DEBUG BUILDS ONLY, and the shipped browser is the reason. This takes a
+    // destination path from the command line and writes to it with no validation:
+    // it truncates, it follows symlinks, it says nothing (the release build is
+    // `windows_subsystem = "windows"`), and it returns before any window exists.
+    // In a consumer binary that is an arbitrary-file-write primitive for anyone
+    // who can choose PATANYX's arguments -- a crafted shortcut clobbers a chosen
+    // file, and a UNC destination makes Windows authenticate to an attacker's SMB
+    // server and leak the user's NetNTLMv2 hash (security assessment 2026-08-28,
+    // R6). The attacker does not control the bytes, only the path, which is
+    // already enough.
+    //
+    // Nothing is lost by gating it: the publisher builds with a
+    // plain `cargo build -q -p patanyx` and runs `$CARGO_TARGET_DIR/debug/patanyx
+    // --emit-blocklist`, so the publisher keeps the flag it actually uses, and the
+    // byte-identity argument above is untouched because the SAME compiled list is
+    // still what emits it.
+    #[cfg(debug_assertions)]
     if let Some(dest) = std::env::args()
         .skip_while(|a| a != "--emit-blocklist")
         .nth(1)
@@ -578,6 +1081,33 @@ fn main() {
             }
             Err(e) => {
                 eprintln!("patanyx: --emit-blocklist: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // THE ENGINE GATE. Asks the WebKit we are about to ship against whether the
+    // shipped ad and tracker rules actually compile, and exits non-zero if not.
+    //
+    // Not gated on debug_assertions, unlike --emit-blocklist above: that flag
+    // WRITES a caller-named path, which is why it is restricted. This one only
+    // reads, compiles into a temporary directory it creates itself, and
+    // prints a verdict, so it is safe in a release binary -- and it has to be,
+    // because the thing worth gating is the RELEASE build's rules against the
+    // release image's engine.
+    //
+    // Unix only. On Windows the rules are answered by a HostSet membership
+    // check in our own code rather than compiled by the engine, so there is no
+    // engine verdict to ask for.
+    #[cfg(unix)]
+    if std::env::args().any(|arg| arg == "--verify-content-filter") {
+        match platform::verify_content_filters() {
+            Ok(()) => {
+                println!("CONTENT FILTER OK");
+                return;
+            }
+            Err(why) => {
+                eprintln!("CONTENT FILTER FAIL: {why}");
                 std::process::exit(1);
             }
         }
@@ -614,6 +1144,17 @@ fn main() {
         None
     };
 
+    // A pending, verified update may install itself HERE, before any window,
+    // webview or vault exists -- the cheapest possible moment to swap the
+    // binary. When it does, the replacement is already spawned and this
+    // process's only remaining job is to not exist. Feature releases wait for
+    // consent or their grace period; the signed manifest decides which is
+    // which (updater::apply_pending_at_startup, and the policy table in
+    // patanyx-update's Manifest::installs_silently).
+    if updater::apply_pending_at_startup() {
+        return;
+    }
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
     let window = WindowBuilder::new()
@@ -638,7 +1179,19 @@ fn main() {
         // Windows this is the webview that exists first and would otherwise
         // be the one that creates the folder beside the exe.
         platform::new_webview_builder()
-            .with_url(platform::CHROME_URL)
+            // THE PRIVILEGED DOCUMENT NEEDS THE REVISION TOO, and it was the
+            // one left behind. The translator's entry point was versioned
+            // after a stale script cost four builds; this one stayed constant,
+            // so a profile holding the old index.html keeps requesting its old
+            // unversioned chrome.js -- the privileged UI, including its IPC
+            // and security-sensitive rendering. Revisioning the scripts inside
+            // the document cannot help when the document itself never
+            // reloads. Found by an independent audit, 2026-09-01.
+            .with_url(&format!(
+                "{}?v={}",
+                platform::CHROME_URL,
+                asset_revision()
+            ))
             .with_custom_protocol(
                 "rbchrome".to_string(),
                 move |_id, request: http::Request<Vec<u8>>| serve_chrome(&request),
@@ -650,9 +1203,7 @@ fn main() {
             // and platform-specific; it must NOT be loosened into "any http
             // URL" to accommodate the WebView2 form, or the trusted chrome
             // webview could navigate onto the open web.
-            .with_navigation_handler(|url: String| {
-                url.starts_with(platform::CHROME_ORIGIN_PREFIX)
-            })
+            .with_navigation_handler(|url: String| url.starts_with(platform::CHROME_ORIGIN_PREFIX))
             // The privileged UI opens no windows. wry's default when no handler
             // is set falls through to the engine, and this is the one surface
             // where an unguarded default is unacceptable.
@@ -661,10 +1212,23 @@ fn main() {
             // every download, which would also bypass the sanitized,
             // collision-safe destination that content downloads go through.
             .with_download_started_handler(|_url, _destination| false)
-            // Block OS drop handling here. The chrome UI has no file inputs, so
-            // unlike the content webviews (where blocking would break
-            // drag-to-upload) there is nothing to lose and a door to close.
-            .with_drag_drop_handler(|_event| true)
+            // NO drag-drop handler here, and the absence is load-bearing.
+            //
+            // This used to set one, to block file drops onto the chrome. The
+            // comment said "there is nothing to lose", and that was wrong.
+            // Setting ANY handler makes wry, on Windows, walk the WebView2
+            // child windows calling RevokeDragDrop -- tearing out the
+            // ENGINE'S OWN drop target -- and register a CF_HDROP-only
+            // listener in its place. In-page HTML5 drag and drop is delivered
+            // by that engine target, so this silently killed tab reordering.
+            //
+            // Nothing replaces it, deliberately: SetAllowExternalDrop(false)
+            // was tried as a narrower substitute and measured on hardware to
+            // break the drag just as thoroughly (see the block comment in
+            // platform/windows.rs::harden_privacy). What refuses a dropped
+            // file is the navigation handler above -- the chrome may only
+            // ever navigate to CHROME_ORIGIN_PREFIX -- plus the fact that the
+            // chrome has no file inputs and denies new windows outright.
             // Devtools on the PRIVILEGED webview is a console with vault-adjacent
             // reach, so it needs an explicit opt-in rather than riding along with
             // any debug build. Content webviews keep plain debug-only devtools.
@@ -672,6 +1236,22 @@ fn main() {
         &proxy,
     )
     .expect("failed to build chrome webview");
+
+    // The isolation battery, measured against THIS webview rather than a
+    // stand-in. Diverges, so nothing below runs when it is armed. Absent from
+    // release binaries entirely -- the module, the platform helpers and this
+    // call site are all `#[cfg(debug_assertions)]`.
+    #[cfg(debug_assertions)]
+    if isolation_probe::enabled() {
+        isolation_probe::run(event_loop, &hosts, &chrome);
+    }
+
+    // The translation reply channel's proof, same discipline: diverges, and
+    // absent from release binaries entirely.
+    #[cfg(all(debug_assertions, unix))]
+    if translate_channel_probe::enabled() {
+        translate_channel_probe::run(event_loop, &hosts);
+    }
 
     // Ask the OS to tell us when the workstation locks or the machine sleeps,
     // so the vault can close on the one signal that most clearly means the
@@ -699,6 +1279,19 @@ fn main() {
     // measured from startup, not from the first event to arrive.
     let mut schedule = schedule::Schedule::new(std::time::Instant::now());
     let mut app = AppState::new(chrome, hosts, proxy.clone(), smoke_mode);
+    // The full-loop self-test needs its own heartbeat: the translation poller
+    // only runs while a translation is in flight, and the first click has not
+    // happened yet. Debug builds only, and only when explicitly armed.
+    #[cfg(all(debug_assertions, unix))]
+    if translate_channel_probe::selftest_enabled() {
+        let p = proxy.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            if p.send_event(UserEvent::TranslateSelfTest).is_err() {
+                break;
+            }
+        });
+    }
     // Was this launch handed a page to open? The chrome uses it to decide
     // whether opening the vault would be welcome or an interruption. It is
     // whether an ARGUMENT was given, not whether the first tab has a URL: a
@@ -859,6 +1452,8 @@ fn main() {
                     let result = ipc::smoke_vault_sequence(&mut app)
                         .and_then(|()| ipc::smoke_licence_sequence(&mut app))
                         .and_then(|()| ipc::smoke_tab_sequence(&mut app))
+                        .and_then(|()| ipc::smoke_partner_sequence(&mut app))
+                        .and_then(|()| ipc::smoke_sponsorship_sequence(&mut app))
                         .and_then(|()| ipc::smoke_readout_sequence(&mut app));
                     match result {
                         Ok(()) => {
@@ -891,8 +1486,35 @@ fn main() {
             Event::UserEvent(UserEvent::ZoomFactorChanged(id, factor)) => {
                 app.on_zoom_factor_changed(id, factor)
             }
+            Event::UserEvent(UserEvent::SessionWipeFinished) => {
+                app.finish_session_wipe()
+            }
             Event::UserEvent(UserEvent::UrlChanged(id, url)) => app.on_url_changed(id, url),
             Event::UserEvent(UserEvent::LoadState(id, loading)) => app.on_load_state(id, loading),
+            // Text a CONTENT page's extractor posted up. UNTRUSTED, and
+            // handled in exactly one place so there is one schema check
+            // rather than several. It arrives tagged with the tab id the HOST
+            // recorded at construction, never one the page supplied.
+            Event::UserEvent(UserEvent::ContentTranslate(id, raw)) => {
+                app.on_content_translate(id, &raw);
+            }
+            Event::UserEvent(UserEvent::TranslateTick) => app.on_translate_tick(),
+            #[cfg(all(debug_assertions, unix))]
+            Event::UserEvent(UserEvent::TranslateSelfTest) => {
+                translate_channel_probe::selftest_step(&mut app);
+            }
+            Event::UserEvent(UserEvent::PackInstalled(pair, failure)) => {
+                app.on_pack_installed(pair, failure);
+            }
+            Event::UserEvent(UserEvent::PackProgress(pair, got, total)) => {
+                app.on_pack_progress(pair, got, total);
+            }
+            Event::UserEvent(UserEvent::TranslateEngine(json)) => {
+                app.on_translate_engine(&json);
+            }
+            Event::UserEvent(UserEvent::TranslateResult(job, json)) => {
+                app.on_translate_result(job, &json);
+            }
             Event::UserEvent(UserEvent::TitleChanged(id, title)) => {
                 app.on_title_changed(id, title)
             }
@@ -983,14 +1605,48 @@ fn main() {
             Event::UserEvent(UserEvent::Capture(event)) => {
                 app.on_capture_done(event);
             }
+            Event::UserEvent(UserEvent::RegionCapturePrepared { result, scope }) => {
+                app.on_region_capture_prepared(result, scope);
+            }
+            Event::UserEvent(UserEvent::SnapshotPicturePrepared { result, scope }) => {
+                page_integrity::finish_snapshot_picture(&mut app, result, scope);
+            }
             Event::UserEvent(UserEvent::NavigationBlocked { tab_id, host, rule }) => {
+                let pending_id = app.note_navigation_blocked(tab_id, &host);
                 // The refusal already happened, in the navigation handler.
                 // This only tells the user, and it must, or a blocked page is
                 // indistinguishable from a broken browser.
+                // The sentence is composed HERE, in the locale, with the
+                // host and rule crossing as Fluent arguments -- never
+                // concatenated into catalog text. The chrome renders the
+                // body verbatim; host and rule still ride along for the
+                // machine-readable state the gate asserts.
+                let rulenote = if !rule.is_empty() && rule != host {
+                    let mut args = crate::i18n::Args::default();
+                    args.set("rule", rule.as_str());
+                    app.i18n
+                        .resolve(crate::i18n::keys::CHROME_BLOCKED_RULE_CLAUSE, &args)
+                } else {
+                    String::new()
+                };
+                let mut args = crate::i18n::Args::default();
+                args.set("host", host.as_str());
+                args.set("rulenote", rulenote);
+                let body = app
+                    .i18n
+                    .resolve(crate::i18n::keys::CHROME_BLOCKED_BODY, &args);
                 app.emit(
                     "navigation_blocked",
-                    json!({ "tab_id": tab_id, "host": host, "rule": rule }),
+                    json!({ "tab_id": tab_id, "pending_id": pending_id, "host": host, "rule": rule, "body": body }),
                 );
+            }
+            Event::UserEvent(UserEvent::AdlistBlocked { tab_id, url, host, method }) => {
+                // The refusal already happened in the engine; this records it
+                // on the tab so the chrome can explain and, where the backend
+                // allows it, ask. tab_status carries the pending from here.
+                if app.adlist_hold(tab_id, &url, &host, &method).is_some() {
+                    app.emit_tab_status();
+                }
             }
             Event::UserEvent(UserEvent::InsecureNavigation { tab_id, url }) => {
                 // Same shape as NavigationBlocked: the refusal already
@@ -1006,6 +1662,9 @@ fn main() {
                 password,
             }) => {
                 app.note_login_submitted(tab_id, source_url, username, password);
+            }
+            Event::UserEvent(UserEvent::FingerprintProbes { tab_id, counts }) => {
+                app.note_fingerprint_probes(tab_id, &counts);
             }
             Event::UserEvent(UserEvent::BlocklistRefreshed(outcome)) => {
                 // Reported to the chrome either way. A refresh that keeps
@@ -1025,14 +1684,28 @@ fn main() {
                 // update is a UI decision, and nothing downloads until the
                 // user says so.
                 app.emit("update_checked", status);
+                // A verified manifest may have raised the engine floor just
+                // now (updater::remember_engine_floors). The boot-time
+                // engine_status reply already happened, so re-ask and push:
+                // a floor that rises mid-session must not wait for a
+                // restart to be seen, when seeing it is its entire purpose.
+                if let Ok(state) = platform::engine_ipc_status(&app.i18n) {
+                    if state["below_floor"] == serde_json::Value::Bool(true) {
+                        app.emit("engine_state", state);
+                    }
+                }
             }
             Event::UserEvent(UserEvent::ResolverProbe(reachable)) => {
                 resolver_probe::on_probe_result(reachable, &probe_result_proxy);
             }
             Event::UserEvent(UserEvent::ResolverBanner { visible, mode }) => {
+                // Composed once, in the locale, for the same reason the
+                // blocked banner is: the words a fail-closed claim uses are
+                // catalog property, and the chrome renders them verbatim.
+                let body = resolver_probe::banner_body(&app.i18n, &mode);
                 app.emit(
                     "resolver_state",
-                    serde_json::json!({ "unreachable": visible, "mode": mode }),
+                    serde_json::json!({ "unreachable": visible, "mode": mode, "body": body }),
                 );
             }
             Event::UserEvent(UserEvent::Shortcut(action)) => {
@@ -1073,6 +1746,7 @@ fn main() {
                     Shortcut::LockVault => app.lock_vault(),
                     Shortcut::OpenCommandPalette => app.open_command_palette(),
                     Shortcut::Print => app.print_active_tab(),
+                    Shortcut::OpenDeveloperTools => app.open_active_devtools(),
                     // The chrome owns the bar; the key asks it to open AND
                     // takes keyboard focus off the page first, or the bar
                     // opens with a caret in it that receives nothing.
@@ -1243,4 +1917,188 @@ fn main() {
             _ => {}
         }
     });
+}
+
+#[cfg(test)]
+mod info_tab_tests {
+    //! Pins that the certificate ISSUER string is DISPLAY ONLY. The security
+    //! verdict comes from `classify_issuer`; the issuer text is shown in the
+    //! Info tab and must never steer a decision, or a hostile-issuer string
+    //! could influence behaviour instead of merely being labelled.
+
+    /// The issuer string is never read into a control-flow branch. Source-level
+    /// pin: `tls_issuer` may be ASSIGNED and EMITTED, never matched or tested.
+    #[test]
+    fn tls_issuer_is_display_only() {
+        for src in [
+            include_str!("state.rs"),
+            include_str!("platform/unix.rs"),
+            include_str!("platform/windows.rs"),
+        ] {
+            for line in src.lines() {
+                let t = line.trim_start();
+                if t.starts_with("//") {
+                    continue;
+                }
+                // A decision would look like `if ... tls_issuer` or
+                // `match ... tls_issuer` or `tls_issuer ==`. None may exist.
+                let mentions = line.contains("tls_issuer");
+                if !mentions {
+                    continue;
+                }
+                assert!(
+                    !(t.starts_with("if ") || t.starts_with("match ")),
+                    "tls_issuer must not appear in a branch: {line}"
+                );
+                assert!(
+                    !line.contains("tls_issuer ==") && !line.contains("tls_issuer.eq"),
+                    "tls_issuer must not be compared: {line}"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod translator_origin_tests {
+    //! Pins the phase-0 fix. Every assertion here corresponds to something
+    //! that was MEASURED to leak when the translator shared the chrome
+    //! origin (`docs/page-translation-spike.md`), so a future change that
+    //! quietly undoes one of them fails here rather than in a browser.
+
+    use super::*;
+
+    /// The whole fix in one line. If these ever match, a view that holds text
+    /// scraped from hostile pages is back on the privileged UI's origin, and
+    /// the storage leak returns with it.
+    #[test]
+    fn the_translator_does_not_share_the_chrome_origin() {
+        assert_ne!(
+            platform::TRANSLATE_ORIGIN_PREFIX,
+            platform::CHROME_ORIGIN_PREFIX,
+            "the translator webview must not share the chrome origin"
+        );
+        assert!(!platform::TRANSLATE_URL.starts_with(platform::CHROME_ORIGIN_PREFIX));
+        assert!(!platform::CHROME_URL.starts_with(platform::TRANSLATE_ORIGIN_PREFIX));
+    }
+
+    /// The endpoints that make sharing a handler dangerous. serve_chrome
+    /// answers /region-capture/ with a screen capture and /archive-picture/
+    /// with a DECRYPTED page from the encrypted archive; phase 0 confirmed a
+    /// fetch from a second webview reaches its handler. The translator's
+    /// handler must answer neither, and must not answer chrome's assets
+    /// either.
+    #[test]
+    fn the_translator_handler_serves_nothing_the_chrome_handler_serves() {
+        for path in [
+            "/region-capture/1.png",
+            "/archive-picture/1.png",
+            "/index.html",
+            "/chrome.js",
+            "/chrome.css",
+            "/integrity.js",
+            "/update.js",
+        ] {
+            let req = http::Request::builder()
+                .uri(format!("rbtranslate://localhost{path}"))
+                .body(Vec::new())
+                .expect("request");
+            let res = serve_translator(&req);
+            assert_eq!(
+                res.status(),
+                404,
+                "the translator origin must not serve {path}"
+            );
+        }
+    }
+
+    /// A wry protocol handler runs across an extern "C" boundary, so a panic
+    /// inside it ABORTS the process rather than unwinding. Phase 0 lost three
+    /// hardware runs to exactly that, because WebView2 asks a custom scheme
+    /// for /favicon.ico unprompted.
+    #[test]
+    fn the_translator_handler_answers_hostile_paths_without_panicking() {
+        for path in [
+            "/",
+            "/favicon.ico",
+            "/../../etc/passwd",
+            "/%2e%2e/%2e%2e/etc/passwd",
+            "//",
+            "/translator.html?x=1",
+            "/\u{202e}rewrite",
+        ] {
+            let req = http::Request::builder()
+                .uri(format!("rbtranslate://localhost{path}"))
+                .body(Vec::new())
+                .expect("request");
+            let res = serve_translator(&req);
+            assert!(res.status() == 200 || res.status() == 404, "{path}");
+        }
+    }
+
+    /// Every response carries the policy, including the 404 -- the same rule
+    /// serve_chrome follows.
+    #[test]
+    fn every_translator_response_carries_its_policy() {
+        for path in ["/translator.html", "/nope"] {
+            let req = http::Request::builder()
+                .uri(format!("rbtranslate://localhost{path}"))
+                .body(Vec::new())
+                .expect("request");
+            let res = serve_translator(&req);
+            assert_eq!(
+                res.headers()
+                    .get("Content-Security-Policy")
+                    .and_then(|v| v.to_str().ok()),
+                Some(TRANSLATE_CSP),
+                "{path} must carry the translator policy"
+            );
+        }
+    }
+
+    /// The translator policy is the chrome policy plus EXACTLY the two
+    /// directives phase 0 measured as necessary, and nothing else. Written as
+    /// a test because "two directives looser" is the claim the separate origin
+    /// is justified by: if this drifts, the justification drifts with it.
+    #[test]
+    fn the_translator_policy_is_looser_by_exactly_two_directives() {
+        assert!(
+            TRANSLATE_CSP.contains("connect-src 'self'"),
+            "without it the engine cannot fetch its own .wasm"
+        );
+        assert!(
+            TRANSLATE_CSP.contains("'wasm-unsafe-eval'"),
+            "without it WebAssembly refuses to compile"
+        );
+        // The chrome policy must NOT have acquired either of them. That is
+        // what moving the translator off the shared origin bought.
+        assert!(CSP.contains("connect-src 'none'"), "chrome must stay closed");
+        assert!(!CSP.contains("wasm-unsafe-eval"), "chrome must stay closed");
+        // Everything else stays identical, so the delta is auditable.
+        for directive in [
+            "default-src 'none'",
+            "style-src 'self'",
+            "img-src 'self'",
+            "form-action 'none'",
+            "base-uri 'none'",
+        ] {
+            assert!(TRANSLATE_CSP.contains(directive), "missing {directive}");
+            assert!(CSP.contains(directive), "missing {directive}");
+        }
+    }
+
+    /// The translator's data directory sits BESIDE the browsing profile, not
+    /// inside it: a future "clear browsing data" that empties the profile must
+    /// not silently take downloaded language packs with it.
+    #[test]
+    fn the_translator_data_directory_is_not_inside_the_browsing_profile() {
+        let vault = std::path::Path::new("/tmp/x/vault.db");
+        let browsing = platform::browsing_profile_dir(vault);
+        let translator = platform::translator_profile_dir_for(vault);
+        assert_ne!(browsing, translator);
+        assert!(
+            !translator.starts_with(&browsing),
+            "{translator:?} must not sit inside {browsing:?}"
+        );
+    }
 }

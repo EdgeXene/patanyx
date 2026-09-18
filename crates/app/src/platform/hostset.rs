@@ -133,7 +133,37 @@ impl HostSet {
         // Trailing dot is legal in a URL and means the same host.
         let host = host.strip_suffix('.').unwrap_or(host);
 
+        // ANCHOR THE WALK AT THE RIGHT END, not the left.
+        //
+        // The walk tries at most MAX_RULE_LABELS candidates, which is correct
+        // -- `acceptable` caps a RULE at that many labels, so a longer
+        // candidate cannot be in the set. Starting that budget at the host's
+        // leftmost label was not: for a host with more labels than the cap,
+        // the sixteen candidates tried were the sixteen LONGEST ones, every
+        // one of them too long to be a rule, and the walk returned None
+        // before ever reaching the parent domain that was actually listed.
+        //
+        // An attacker padding subdomains therefore evaded the list outright:
+        // `a0.a1.….a15.tracker.example` is 68 bytes, far inside MAX_HOST_LEN,
+        // and did not match a listed `tracker.example`. This set backs the
+        // MALICIOUS navigation blocklist as well as the ad rules, so the
+        // consequence was a phishing host going unblocked, and it was live in
+        // shipped 0.9.66. Found by the red-team pass of 2026-09-01 and
+        // reproduced by `redteam_probe_deep_nesting_reaches_the_rule`.
+        //
+        // Skipping the leading labels that cannot start a rule costs one pass
+        // over the host and keeps the lookup bounded by the rule cap, so the
+        // "work is bounded by the HOST, not the list" property in the module
+        // header still holds.
+        let label_count = host.split('.').count();
         let mut start = 0usize;
+        for _ in 0..label_count.saturating_sub(MAX_RULE_LABELS) {
+            match host[start..].find('.') {
+                Some(dot) => start += dot + 1,
+                None => break,
+            }
+        }
+
         for _ in 0..MAX_RULE_LABELS {
             let candidate = &host[start..];
             // Returns the CANDIDATE, not something read back from storage --
@@ -309,6 +339,26 @@ mod tests {
         // Over the length bound: rejected outright.
         let long = "a".repeat(300) + ".test";
         assert_eq!(s.matched_rule(&long), None);
+    }
+
+    #[test]
+    fn redteam_probe_deep_nesting_reaches_the_rule() {
+        // The reproduction for the evasion fixed above. Sixteen padding
+        // labels is the smallest case that defeated the old left-anchored
+        // walk; it is a legal, ordinary-length host, so nothing but the walk
+        // stood between an attacker and an unblocked phishing page.
+        let s = set("tracker.example\n");
+        let deep: String =
+            (0..16).map(|i| format!("a{i}.")).collect::<String>() + "tracker.example";
+        assert!(
+            deep.len() < MAX_HOST_LEN,
+            "probe host must be a legal length"
+        );
+        assert_eq!(
+            s.matched_rule(&deep),
+            Some("tracker.example"),
+            "padding subdomains evaded the blocklist: {deep}"
+        );
     }
 
     #[test]

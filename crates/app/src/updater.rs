@@ -156,6 +156,32 @@ const PUBLISHER_KEYS: &[&str] = &[
 /// Note what that costs while it is here: a release key can still sign a
 /// blocklist. That was already true before this change, so nothing is worse in
 /// the meantime -- but the improvement is not real until the entry is gone.
+/// Keys that may sign a LANGUAGE PACK manifest. A THIRD list, and the reason
+/// is the decision of 2026-08-31: the model feed's key authorises
+/// model-feed artifacts ONLY, and a valid model-feed signature must never be
+/// interpreted as authority to sign a blocklist or a release.
+///
+/// TWO MECHANISMS, AND BOTH ARE NEEDED. Domain separation
+/// (`SIGNING_DOMAIN_MODELS`) stops a model signature being REPLAYED against
+/// another verifier. It does nothing about forgery: a key the verifier trusts
+/// can always sign a fresh message in another domain. Only a separate key SET
+/// stops that, which is this list.
+///
+/// NO TRANSITIONAL ENTRY, deliberately, and note the contrast with
+/// `BLOCKLIST_KEYS` above. That list still carries the release working key so
+/// installs already in the field keep refreshing, and its own comment is
+/// honest that "a release key can still sign a blocklist" until the entry
+/// goes. Nothing in the field verifies a model manifest yet, so there is no
+/// compatibility debt to pay here and this list starts clean. It must stay
+/// that way: adding a second key for convenience would give away the property
+/// on the day it was added.
+///
+/// The private half lives at /root/.patanyx-keys/models.key on the publishing
+/// server, like the blocklist key and for the same reason -- packs are
+/// republished by automation, and nobody signs by hand on a schedule.
+const MODEL_KEYS: &[&str] =
+    &["acb24fc2688ae44ad771e764c824053a1c0ebcbbf4cbd8bd18fe9bb8b21873bd"];
+
 const BLOCKLIST_KEYS: &[&str] = &[
     // The automated publisher's key. Lives on the server, used by cron.
     "1e0225c3731b06a55400ee0cb0bac1b25d8afe36971c5e38bcb5f2cef7b5b216",
@@ -163,6 +189,49 @@ const BLOCKLIST_KEYS: &[&str] = &[
     // BLOCKLIST_KEYS keep refreshing. Delete this line one release after the
     // build carrying it has propagated.
     "49ecd13929f38f8961e52b284bf55d725c38e990fddf4e7ea949729584cc0a09",
+];
+
+/// Keys that may sign an ENGINE ADVISORY: the warning-only WebView2
+/// threshold (`patanyx_update::verify_advisory_manifest`, and the client half
+/// in `engine_advisory.rs`). A FOURTH list, and the fourth class.
+///
+/// EMPTY ON PURPOSE, AND THIS IS NOT A PLACEHOLDER KEY. The other lists once
+/// shipped an all-zeros placeholder that parsed and looked configured;
+/// `TrustedKeys::new` refuses that shape now. An EMPTY list is refused too
+/// (`NoTrustedKeys`), and `engine_advisory::check` turns that refusal into
+/// the `unconfigured` state: nothing is fetched, nothing is persisted, and
+/// the status snapshot says the channel is not active. That is the truthful
+/// state of every build until the production key exists, and it cannot be
+/// mistaken for delivery.
+///
+/// PROVISIONING IS A ONE-TIME LANDING STEP, not part of this change:
+///
+///   1. `patanyx-sign keygen /root/.patanyx-keys/advisory.key advisory` on
+///      the publishing server (0600, beside blocklist.key -- same terms, same
+///      reasoning: an unattended hourly signer cannot use an offline key).
+///   2. Paste the printed verifying key here. `advisory_keys_are_provisioned`
+///      below flips from pinning EMPTY to pinning ONE key in that same change.
+///   3. Ship a release. Only builds carrying the key can receive advisories;
+///      builds already in the field keep the release-manifest floor path.
+///
+/// WHAT A STOLEN ADVISORY KEY BUYS: a false banner on Windows, until the key
+/// is dropped from this list in a release. The client keeps advisory floors
+/// UNDER THE KEY THAT SIGNED THEM and re-verifies them against this list on
+/// every read, so revocation removes them; nothing signed becomes permanent.
+/// It cannot lower a floor, refuse startup, name a URL or reach Linux.
+///
+/// It must never appear in `PUBLISHER_KEYS`, `BLOCKLIST_KEYS` or
+/// `MODEL_KEYS`; `advisory_key_tests` asserts disjointness and pins exactly
+/// one key.
+///
+/// PROVISIONED 2026-09-11 on the publishing server with
+/// `patanyx-sign keygen /root/.patanyx-keys/advisory.key advisory` (0600,
+/// beside blocklist.key). Only the verifying half is here; the signing half
+/// has never left that file.
+const ADVISORY_KEYS: &[&str] = &[
+    // The hourly engine-advisory monitor's key. Lives on the server, used by
+    // the timer.
+    "e16998e637f88c04a57c7093aec5711e14cfd0811b157f67872896f14e4ea768",
 ];
 
 /// The distribution host, shared with the blocklist channel.
@@ -284,6 +353,22 @@ pub(crate) fn blocklist_trusted_keys() -> Result<TrustedKeys, UpdateError> {
     TrustedKeys::from_hex(BLOCKLIST_KEYS)
 }
 
+/// Keys the LANGUAGE PACK channel verifies against. See `MODEL_KEYS`.
+///
+/// Separate function rather than a parameter, exactly as
+/// `blocklist_trusted_keys` is: choosing the wrong set must be a visibly wrong
+/// call at the call site, not an argument nobody reads.
+pub(crate) fn model_trusted_keys() -> Result<TrustedKeys, UpdateError> {
+    TrustedKeys::from_hex(MODEL_KEYS)
+}
+
+/// Keys the ENGINE ADVISORY channel verifies against. See `ADVISORY_KEYS`.
+/// `Err(NoTrustedKeys)` until the list is provisioned, which the advisory
+/// check reports as `unconfigured` rather than as a fetch failure.
+pub(crate) fn advisory_trusted_keys() -> Result<TrustedKeys, UpdateError> {
+    TrustedKeys::from_hex(ADVISORY_KEYS)
+}
+
 /// Whether this build can fetch at all. Everything else — status, refusal
 /// display, the panel — works regardless.
 pub fn available() -> bool {
@@ -324,6 +409,12 @@ enum Phase {
     Idle,
     Checking,
     UpToDate,
+    /// This machine runs a NEWER version than the server offers. Not a
+    /// refusal in the user's sense: nothing is wrong, nothing is withheld,
+    /// the server is simply behind (a test build ahead of the feed, or the
+    /// feed not yet carrying a release). Shown as up to date with the two
+    /// versions named, never as "Update refused" in red (decided 2026-09-16).
+    Ahead { offered: Version },
     /// Authentic, newer, at/above floor, for this platform. The prompt is
     /// showing; nothing has been downloaded yet.
     Offered { manifest: Manifest },
@@ -354,11 +445,26 @@ enum Phase {
 struct Updater {
     phase: Phase,
     last_check_started: Option<Instant>,
+    /// The last engine-advisory outcome, reported beside the release phase.
+    /// `None` until a check has run. Independent of `phase`: a failed or
+    /// refused release check does not cost the user the advisory, and the
+    /// snapshot shows both so neither can hide behind the other.
+    advisory: Option<crate::engine_advisory::AdvisoryOutcome>,
+    /// The raw signed envelope of the last successful check, kept so that a
+    /// download reaching `Ready` can be made durable (remember_pending) no
+    /// matter WHICH chain staged it. The background chain and the user's
+    /// install click share download_and_stage precisely so they cannot
+    /// drift; persisting from only one of them was exactly such a drift --
+    /// a manually downloaded Ready evaporated on quit and could never
+    /// self-install, while the copy promised it would.
+    envelope: Option<Vec<u8>>,
 }
 
 static UPDATER: Mutex<Updater> = Mutex::new(Updater {
     phase: Phase::Idle,
     last_check_started: None,
+    advisory: None,
+    envelope: None,
 });
 
 fn lock() -> MutexGuard<'static, Updater> {
@@ -452,9 +558,37 @@ pub fn check_now() -> Value {
         .name("patanyx-update-check".to_string())
         .spawn(move || {
             let url = manifest_url(platform, crate::prefs::load().update_channel);
-            let phase = run_check_with(&keys, &FLOOR, current, platform, || {
-                net::get(&url, MAX_MANIFEST_FETCH_BYTES, net::MANIFEST_TIMEOUT)
-            });
+            // The envelope bytes outlive the check: if this offer background-
+            // downloads all the way to Ready, they are what makes Ready
+            // durable across a restart (remember_pending re-verifies nothing
+            // here -- the startup reader does that against the compiled keys).
+            let mut envelope_bytes: Option<Vec<u8>> = None;
+            let phase = run_check_observed(
+                &keys,
+                &FLOOR,
+                current,
+                platform,
+                || {
+                    let fetched =
+                        net::get(&url, MAX_MANIFEST_FETCH_BYTES, net::MANIFEST_TIMEOUT);
+                    if let Ok(bytes) = &fetched {
+                        envelope_bytes = Some(bytes.clone());
+                    }
+                    fetched
+                },
+                |manifest| {
+                    if let Err(e) = remember_engine_floors(&data_dir(), manifest) {
+                        // Observable, not swallowed: the compiled floor stays
+                        // in force, and the log says why the raise did not
+                        // persist.
+                        eprintln!("PATANYX: engine floor register not written: {e}");
+                    }
+                },
+            );
+            // THE ENGINE ADVISORY, after the release manifest and WHATEVER
+            // it concluded. Same schedule, same host, one more fixed URL;
+            // its own key set and its own verifier. See engine_advisory.rs.
+            let advisory = observe_advisory_after(&phase, crate::engine_advisory::check);
             // Background download, the mainstream shape MINUS the silent apply:
             // when a verified offer lands and the pref allows it, fetch and
             // stage NOW so the user's consent click is an instant restart
@@ -471,7 +605,12 @@ pub fn check_now() -> Value {
                 }
                 _ => None,
             };
-            lock().phase = phase;
+            {
+                let mut u = lock();
+                u.envelope = envelope_bytes.clone();
+                u.phase = phase;
+                u.advisory = Some(advisory);
+            }
             if let Some(manifest) = manifest {
                 {
                     let mut u = lock();
@@ -484,7 +623,13 @@ pub fn check_now() -> Value {
                         manifest: manifest.clone(),
                     };
                 }
-                lock().phase = download_and_stage(&manifest);
+                let phase = download_and_stage(&manifest);
+                if let (Phase::Ready { staged, manifest }, Some(envelope)) =
+                    (&phase, &envelope_bytes)
+                {
+                    remember_pending(&data_dir(), envelope, staged, manifest);
+                }
+                lock().phase = phase;
             }
         });
     if let Err(e) = spawned {
@@ -496,6 +641,19 @@ pub fn check_now() -> Value {
         return status_json(&u);
     }
     status()
+}
+
+/// The advisory check runs AFTER the release check and REGARDLESS of how the
+/// release check ended. A function rather than a line in the worker so the
+/// independence is a tested property: every `Phase`, including `Failed` and
+/// `Refused`, still runs `advisory`. The phase is read only to make that
+/// promise explicit at the type level; nothing about it changes the call.
+fn observe_advisory_after(
+    phase: &Phase,
+    advisory: impl FnOnce() -> crate::engine_advisory::AdvisoryOutcome,
+) -> crate::engine_advisory::AdvisoryOutcome {
+    let _ = phase;
+    advisory()
 }
 
 /// True when this process is running inside a Flatpak sandbox.
@@ -583,7 +741,14 @@ pub fn install() -> Result<Value, &'static str> {
     let spawned = std::thread::Builder::new()
         .name("patanyx-update-download".to_string())
         .spawn(move || {
-            lock().phase = download_and_stage(&worker);
+            let phase = download_and_stage(&worker);
+            let mut u = lock();
+            if let (Phase::Ready { staged, manifest }, Some(envelope)) =
+                (&phase, &u.envelope)
+            {
+                remember_pending(&data_dir(), envelope, staged, manifest);
+            }
+            u.phase = phase;
         });
     if let Err(e) = spawned {
         let mut u = lock();
@@ -608,11 +773,290 @@ fn download_and_stage(manifest: &Manifest) -> Phase {
     )
 }
 
+// ─────────────── A staged update that survives a restart ───────────────
+//
+// `Phase::Ready` used to live only in memory: quit without clicking and the
+// verified download was forgotten, re-fetched next session, and the consent
+// click never became the instant restart it was built to be. These few files
+// make Ready durable, and `apply_pending_at_startup` is what turns a durable
+// Ready into the mainstream behavior: maintenance and security releases
+// install themselves at the next launch; a pure feature release waits for the
+// user or for `GRACE_SECONDS`, whichever comes first.
+//
+// TRUST MODEL, stated once: the envelope on disk is VERIFIED AGAIN at startup
+// against the compiled-in keys, and the staged bytes are re-hashed against the
+// signed manifest inside `installer::apply`. Nothing on disk is believed for
+// its location. The one unsigned file is the meta (staged filename +
+// first-seen clock): tampering with the filename changes which bytes get
+// re-hashed (they must still match the signed sha256, so substitution fails),
+// and backdating first-seen can ripen a feature release early -- an actor with
+// local write access could do strictly worse things to an unsandboxed browser,
+// so the clock does not pretend to be tamper-proof.
+
+/// How long an announced feature release waits before it stops waiting.
+/// Seven days: long enough that nobody's UI changes mid-week without warning,
+/// short enough that "ignored the banner" does not become "never patched".
+const GRACE_SECONDS: u64 = 7 * 24 * 60 * 60;
+
+fn pending_envelope_path(dir: &Path) -> PathBuf {
+    dir.join("pending-envelope.json")
+}
+
+fn pending_meta_path(dir: &Path) -> PathBuf {
+    dir.join("pending-meta.json")
+}
+
+/// Where the highest engine floors ever seen in a signed manifest live:
+/// `{"webview2":[152,0,4191,62],"webkitgtk":[2,52,5]}`.
+fn engine_floor_path(dir: &Path) -> PathBuf {
+    dir.join("engine-floor.json")
+}
+
+/// The persisted floors, merged with what a freshly VERIFIED manifest
+/// asserts. Monotonic: an engine's floor only ever rises, so a replayed
+/// older manifest (which `decide` may still accept as "up to date") cannot
+/// lower it. Returns the document to write, or `None` when nothing rose.
+/// Pure, so the monotonicity is tested without a disk.
+fn raise_engine_floors(existing: &Value, floors: &patanyx_update::EngineFloors) -> Option<Value> {
+    let mut out = match existing {
+        Value::Object(map) => map.clone(),
+        _ => serde_json::Map::new(),
+    };
+    let mut rose = false;
+    for (key, asserted) in [("webview2", floors.webview2()), ("webkitgtk", floors.webkitgtk())] {
+        let Some(asserted) = asserted else { continue };
+        // STRICT conversion of the stored fields. This was `x as u32`, which
+        // truncates: a stored field of 2^32 + 5 read back as 5, so a corrupt
+        // or hand-edited register could compare as LOWER than a signed value
+        // and be "raised" to it -- or, with a field near u32::MAX, compare as
+        // higher than any honest floor and pin the register forever. A field
+        // that does not fit is now a stored value that does not exist, and
+        // the signed value wins.
+        let current = out.get(key).and_then(|v| v.as_array()).and_then(|a| {
+            a.iter()
+                .map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok()))
+                .collect::<Option<Vec<u32>>>()
+        });
+        let higher = match &current {
+            Some(cur) if cur.len() == asserted.len() => asserted > cur.as_slice(),
+            // Nothing stored, or stored at a precision the manifest no longer
+            // uses: the signed value wins.
+            _ => true,
+        };
+        if higher {
+            out.insert(key.to_string(), json!(asserted));
+            rose = true;
+        }
+    }
+    rose.then_some(Value::Object(out))
+}
+
+/// Records the engine floors a verified manifest carries. Called on EVERY
+/// verified manifest, not only on an offered update: the whole point is that
+/// a floor can rise while the browser is already at the newest version.
+///
+/// A failed write leaves the compiled floor in force, which is what every
+/// build before this had -- but the failure is RETURNED now rather than
+/// discarded, so the caller can say so. The write is atomic (temp file and
+/// rename, `engine_advisory::write_atomic`) and the read-merge-replace runs
+/// under the same process-wide lock the advisory register uses: two checks
+/// racing produce a whole file holding the higher floor, and a crash mid-
+/// write leaves the previous bytes exactly as they were. `Ok(true)` when the
+/// register rose.
+fn remember_engine_floors(dir: &Path, manifest: &Manifest) -> std::io::Result<bool> {
+    let floors = manifest.engine_floors();
+    if floors.is_empty() {
+        return Ok(false);
+    }
+    // Same two locks as the advisory register (thread mutex plus the OS
+    // file lock), so a second browser process sharing the directory cannot
+    // rename a stale, lower document over this one.
+    let _guard = crate::engine_advisory::register_guard(dir)?;
+    let existing = std::fs::read_to_string(engine_floor_path(dir))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+        .unwrap_or(Value::Null);
+    match raise_engine_floors(&existing, floors) {
+        Some(doc) => {
+            crate::engine_advisory::write_atomic(&engine_floor_path(dir), doc.to_string().as_bytes())?;
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// The highest floor a signed manifest has asserted for `engine`
+/// ("WebView2" or "WebKitGTK", the names the browser reports), if any.
+/// The platform layer compares it against the compiled constant and takes
+/// the higher; a stored value can only ever raise, never lower.
+pub(crate) fn persisted_engine_floor(engine: &str) -> Option<Vec<u32>> {
+    let key = match engine {
+        "WebView2" => "webview2",
+        "WebKitGTK" => "webkitgtk",
+        _ => return None,
+    };
+    let raw = std::fs::read_to_string(engine_floor_path(&data_dir())).ok()?;
+    let doc: Value = serde_json::from_str(&raw).ok()?;
+    let fields: Vec<u32> = doc
+        .get(key)?
+        .as_array()?
+        .iter()
+        .map(|x| x.as_u64().and_then(|x| u32::try_from(x).ok()))
+        .collect::<Option<Vec<u32>>>()?;
+    (!fields.is_empty()).then_some(fields)
+}
+
+pub(crate) fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Record a staged update so the next launch can act on it. Called the
+/// moment the background chain lands `Ready`, with the same envelope bytes
+/// the check verified.
+///
+/// The first-seen clock is preserved across re-checks OF THE SAME VERSION:
+/// every scheduled check re-stages, and a grace period that reset on each
+/// one would never elapse.
+fn remember_pending(dir: &Path, envelope: &[u8], staged: &Path, manifest: &Manifest) {
+    let version = manifest.version().to_string();
+    let first_seen = read_pending_meta(dir)
+        .filter(|m| m.version == version)
+        .map(|m| m.first_seen_unix)
+        .unwrap_or_else(unix_now);
+    // Filename only, never a path: the reader joins it back onto its own
+    // data dir, so the meta cannot point the startup apply at foreign bytes
+    // elsewhere on disk (which would still fail the hash, but why offer it).
+    let Some(name) = staged.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    let meta = json!({
+        "version": version,
+        "staged": name,
+        "first_seen_unix": first_seen,
+    });
+    // Best effort, deliberately: failing to persist leaves exactly the
+    // behavior every build before this had.
+    let _ = std::fs::write(pending_envelope_path(dir), envelope);
+    let _ = std::fs::write(pending_meta_path(dir), meta.to_string());
+}
+
+struct PendingMeta {
+    version: String,
+    staged: String,
+    first_seen_unix: u64,
+}
+
+fn read_pending_meta(dir: &Path) -> Option<PendingMeta> {
+    let raw = std::fs::read_to_string(pending_meta_path(dir)).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    // The writer stores a bare filename, and the READER is where that
+    // property has to hold: `dir.join` follows `..`, and an absolute
+    // component makes it discard `dir` entirely. A traversing value cannot
+    // stage wrong bytes (the hash decides), but it could aim the startup
+    // read at an arbitrary path, and the containment claim belongs to this
+    // function, not to a comment about the writer.
+    let staged = v["staged"].as_str()?;
+    if Path::new(staged).file_name() != Some(std::ffi::OsStr::new(staged)) {
+        return None;
+    }
+    Some(PendingMeta {
+        version: v["version"].as_str()?.to_string(),
+        staged: staged.to_string(),
+        first_seen_unix: v["first_seen_unix"].as_u64()?,
+    })
+}
+
+fn clean_pending(dir: &Path) {
+    let _ = std::fs::remove_file(pending_envelope_path(dir));
+    let _ = std::fs::remove_file(pending_meta_path(dir));
+}
+
+/// Is this pending release allowed to install itself RIGHT NOW?
+///
+/// The signed manifest speaks first (`installs_silently`: maintenance and
+/// security releases qualify); an announced feature release ripens when its
+/// grace period lapses. Pure, so the timing table is testable.
+fn pending_is_ripe(manifest: &Manifest, first_seen_unix: u64, now_unix: u64) -> bool {
+    manifest.installs_silently()
+        || now_unix >= first_seen_unix.saturating_add(GRACE_SECONDS)
+}
+
+/// Apply a pending update at launch, before any window or vault exists.
+/// Returns true when the replacement process has been spawned and THIS
+/// process must exit without building a UI.
+///
+/// Every early return leaves the browser starting normally on its current
+/// version -- this function must never be the reason PATANYX fails to open.
+pub fn apply_pending_at_startup() -> bool {
+    // A Flatpak cannot self-replace, and a smoke run must not: a gate that
+    // swapped the binary under the test would invalidate the run.
+    if in_flatpak() || std::env::args().any(|a| a == "--smoke-test") {
+        return false;
+    }
+    let dir = data_dir();
+    let Ok(envelope) = std::fs::read(pending_envelope_path(&dir)) else {
+        return false;
+    };
+    let Ok(keys) = trusted_keys() else {
+        return false;
+    };
+    // Not authentic = not ours. Remove it so a corrupt file is not re-parsed
+    // at every launch forever.
+    let Ok(manifest) = verify_manifest(&envelope, &keys) else {
+        clean_pending(&dir);
+        return false;
+    };
+    let Some(meta) = read_pending_meta(&dir) else {
+        clean_pending(&dir);
+        return false;
+    };
+    let (Some(current), Some(platform)) = (current_version(), running_platform()) else {
+        return false;
+    };
+    // The normal end of the story: the relaunched (updated) process runs this,
+    // finds the pending release is no longer newer than itself, and tidies up.
+    let Decision::Update(_) = decide(&current, &FLOOR, platform, &manifest) else {
+        clean_pending(&dir);
+        return false;
+    };
+    if !crate::prefs::load().update_auto_apply {
+        return false;
+    }
+    if !pending_is_ripe(&manifest, meta.first_seen_unix, unix_now()) {
+        return false;
+    }
+    let staged = dir.join(&meta.staged);
+    // `apply` re-reads and re-hashes the staged bytes against the signed
+    // manifest before touching the running binary; a failure leaves both the
+    // browser and the staged file in place.
+    match installer::apply(&staged, &manifest) {
+        Ok(()) => {
+            clean_pending(&dir);
+            let _ = std::fs::remove_file(&staged);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// The `kind` word the JS renders. One place, so the string contract with
+/// update.js cannot fork.
+fn release_kind_word(manifest: &Manifest) -> &'static str {
+    match manifest.release_kind() {
+        patanyx_update::ReleaseKind::Feature => "feature",
+        patanyx_update::ReleaseKind::Maintenance => "maintenance",
+    }
+}
+
 /// The one snapshot shape every command returns and update.js renders. The
 /// `state` strings are a contract with the JS — the tests pin them.
 fn status_json(u: &Updater) -> Value {
     let mut out = json!({
         "available": available(),
+        "auto_apply": crate::prefs::load().update_auto_apply,
         "running": current_version().map(|v| v.to_string()),
         "platform": running_platform().map(|p| p.as_str()),
         "state": "idle",
@@ -625,15 +1069,27 @@ fn status_json(u: &Updater) -> Value {
         "intercepted": net::LAST_FETCH_WAS_INTERCEPTED
             .load(std::sync::atomic::Ordering::Relaxed),
     });
+    // The engine advisory's own outcome, beside the release phase and never
+    // folded into it. Absent until a check has run; `unconfigured` while no
+    // advisory key is compiled in, which is every build until provisioning.
+    if let Some(advisory) = &u.advisory {
+        out["advisory"] = advisory.to_json();
+    }
     match &u.phase {
         Phase::Idle => {}
         Phase::Checking => out["state"] = json!("checking"),
         Phase::UpToDate => out["state"] = json!("uptodate"),
+        Phase::Ahead { offered } => {
+            out["state"] = json!("ahead");
+            out["offered"] = json!(offered.to_string());
+        }
         Phase::Offered { manifest } => {
             out["state"] = json!("offered");
             out["offered"] = json!(manifest.version().to_string());
             out["size"] = json!(manifest.size());
             out["published_at"] = json!(manifest.published_at());
+            out["kind"] = json!(release_kind_word(manifest));
+            out["security"] = json!(manifest.security());
             // Publisher-signed release blurb, shown beside the install
             // decision -- which is why only the SIGNED field is ever the
             // source, never anything fetched separately. Absent stays
@@ -667,6 +1123,8 @@ fn status_json(u: &Updater) -> Value {
             }
         }
         Phase::Ready { manifest, staged } => {
+            out["kind"] = json!(release_kind_word(manifest));
+            out["security"] = json!(manifest.security());
             out["state"] = json!("ready");
             out["offered"] = json!(manifest.version().to_string());
             out["staged"] = json!(staged.to_string_lossy());
@@ -696,6 +1154,21 @@ fn run_check_with(
     platform: Platform,
     fetch_manifest: impl FnOnce() -> Result<Vec<u8>, FetchError>,
 ) -> Phase {
+    run_check_observed(keys, floor, current, platform, fetch_manifest, |_| {})
+}
+
+/// `run_check_with`, plus a look at every manifest that VERIFIES, before
+/// `decide` has its say. The engine floor rides on this: a manifest that is
+/// "up to date" for the browser version still carries the newest floor, and
+/// the browser must learn it. Nothing unverified ever reaches `on_verified`.
+fn run_check_observed(
+    keys: &TrustedKeys,
+    floor: &Version,
+    current: Version,
+    platform: Platform,
+    fetch_manifest: impl FnOnce() -> Result<Vec<u8>, FetchError>,
+    on_verified: impl FnOnce(&Manifest),
+) -> Phase {
     let bytes = match fetch_manifest() {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -716,9 +1189,11 @@ fn run_check_with(
             }
         }
     };
+    on_verified(&manifest);
     match decide(&current, floor, platform, &manifest) {
         Decision::UpToDate => Phase::UpToDate,
         Decision::Update(manifest) => Phase::Offered { manifest },
+        Decision::Refused(patanyx_update::RefusalReason::NotNewer { offered, .. }) => Phase::Ahead { offered },
         Decision::Refused(why) => Phase::Refused {
             // The Display impls on RefusalReason were written for users.
             reason: why.to_string(),
@@ -952,13 +1427,37 @@ fn fetch_detail(error: &FetchError) -> String {
 // build only the tests exercise it.
 #[cfg_attr(not(feature = "updater-net"), allow(dead_code))]
 pub(crate) fn read_capped(reader: impl Read, cap: u64) -> Result<Vec<u8>, FetchError> {
+    read_capped_progress(reader, cap, |_| {})
+}
+
+/// Read a capped body, calling `on_progress(bytes_so_far)` as chunks arrive.
+///
+/// SAME CAP ENFORCEMENT as `read_capped` -- the `take(cap+1)` and the
+/// post-check are identical, so progress reporting cannot become a way to read
+/// past the limit. The callback is advisory: it drives a UI and is never
+/// allowed to change what bytes are accepted. Chunked at 64 KiB so a 36 MB
+/// pack reports ~570 times, often enough to feel live and rare enough not to
+/// flood the event loop.
+pub(crate) fn read_capped_progress(
+    mut reader: impl Read,
+    cap: u64,
+    mut on_progress: impl FnMut(u64),
+) -> Result<Vec<u8>, FetchError> {
+    let mut limited = reader.by_ref().take(cap.saturating_add(1));
     let mut body = Vec::new();
-    reader
-        .take(cap.saturating_add(1))
-        .read_to_end(&mut body)
-        .map_err(|e| FetchError::Network(e.to_string()))?;
-    if body.len() as u64 > cap {
-        return Err(FetchError::TooLarge);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = limited
+            .read(&mut chunk)
+            .map_err(|e| FetchError::Network(e.to_string()))?;
+        if n == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..n]);
+        if body.len() as u64 > cap {
+            return Err(FetchError::TooLarge);
+        }
+        on_progress(body.len() as u64);
     }
     Ok(body)
 }
@@ -1139,42 +1638,49 @@ pub(crate) mod net {
     pub static LAST_FETCH_WAS_INTERCEPTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
-    pub fn get(url: &str, cap: u64, timeout: Duration) -> Result<Vec<u8>, FetchError> {
-        // The agent comes from crate::net, the ONE place that knows the
-        // tunnel rule (proxy when the engine says so, fail closed when it
-        // cannot be expressed, no redirects). It used to be built here;
-        // extracted when the activation call needed the same rule, so the
-        // hole the tunnel design flagged cannot reopen as a second copy.
-        let agent = crate::net::agent(timeout)
-            .map_err(|e| FetchError::Network(e.to_string()))?;
-        let first = agent.get(url).call();
-
-        // A TRANSPORT FAILURE MAY BE AN INTERCEPTING PROXY, AND THE RETRY IS
-        // THE TEST (security audit 2026-08-18, F21).
-        //
-        // On a corporate network every connection is terminated and re-signed
-        // by a CA in the OS store and in no public root list, so the strict
-        // agent above reports UnknownIssuer and the user receives no updates
-        // at all -- silently, while the rest of the browser works, because the
-        // engine consults the OS store and this does not.
-        //
-        // Rather than match on an error string, which is brittle across ureq
-        // and rustls versions, the retry IS the diagnosis: if the same request
-        // succeeds once the OS roots are accepted, then something the machine
-        // trusts and Mozilla does not is in the path. If it fails too, the
-        // original error is what the user sees, so a genuine outage still
-        // reads as an outage.
-        //
-        // Safe HERE and nowhere else: this function fetches manifests and
-        // payloads, whose integrity rests on the compiled-in Ed25519 key and
-        // a sha256 from the signed manifest, not on TLS. The activation call
-        // carries a licence token and keeps using `crate::net::agent` only.
-        let response = match first {
+    /// One GET: compiled-in roots first, the OS store only as the retry.
+    ///
+    /// SHARED BY BOTH FETCHERS, DELIBERATELY. This retry was added to `get`
+    /// alone (security audit 2026-08-18, F21) and `get_with_progress` never
+    /// grew it. On an intercepting corporate network the two therefore
+    /// disagreed about the SAME feed: the signed manifest downloaded through
+    /// the relaxed retry, and the pack body -- fifty megabytes later, same
+    /// host, same integrity argument -- failed on the strict agent with no
+    /// second attempt. The user was told "could not reach the language pack
+    /// server" about a server that was answering perfectly. Neither function
+    /// was wrong when read on its own, which is exactly why this is now one
+    /// function and not two.
+    ///
+    /// A TRANSPORT FAILURE MAY BE AN INTERCEPTING PROXY, AND THE RETRY IS THE
+    /// TEST. On such a network every connection is terminated and re-signed by
+    /// a CA in the OS store and in no public root list, so the strict agent
+    /// reports UnknownIssuer while the rest of the browser works, because the
+    /// engine consults the OS store and this does not. Rather than match on an
+    /// error string, which is brittle across ureq and rustls versions, the
+    /// retry IS the diagnosis: if the same request succeeds once OS roots are
+    /// accepted, something the machine trusts and Mozilla does not is in the
+    /// path. If it fails too, the STRICT error is what the user sees, so a
+    /// genuine outage still reads as an outage.
+    ///
+    /// SAFE FOR THIS FEED AND NO OTHER: manifests and payloads rest on the
+    /// compiled-in Ed25519 key and a sha256 and length from the signed
+    /// manifest, not on TLS -- a proxy that can read this connection still
+    /// cannot forge a pack that verifies. The activation call carries a licence
+    /// token, has no such signature, and keeps using `crate::net::agent` only.
+    fn call_strict_then_os_roots(
+        url: &str,
+        timeout: Duration,
+    ) -> Result<ureq::Response, FetchError> {
+        // The agent comes from crate::net, the ONE place that knows the tunnel
+        // rule (proxy when the engine says so, fail closed when it cannot be
+        // expressed, no redirects).
+        let agent = crate::net::agent(timeout).map_err(|e| FetchError::Network(e.to_string()))?;
+        match agent.get(url).call() {
             Ok(response) => {
                 LAST_FETCH_WAS_INTERCEPTED.store(false, std::sync::atomic::Ordering::Relaxed);
-                response
+                Ok(response)
             }
-            Err(ureq::Error::Status(code, _)) => return Err(FetchError::Http(code)),
+            Err(ureq::Error::Status(code, _)) => Err(FetchError::Http(code)),
             Err(ureq::Error::Transport(strict_error)) => {
                 let relaxed = crate::net::agent_accepting_os_roots(timeout)
                     .map_err(|e| FetchError::Network(e.to_string()))?;
@@ -1182,17 +1688,21 @@ pub(crate) mod net {
                     Ok(response) => {
                         LAST_FETCH_WAS_INTERCEPTED
                             .store(true, std::sync::atomic::Ordering::Relaxed);
-                        response
+                        Ok(response)
                     }
-                    Err(ureq::Error::Status(code, _)) => return Err(FetchError::Http(code)),
+                    Err(ureq::Error::Status(code, _)) => Err(FetchError::Http(code)),
                     // Report the STRICT error, not the retry's: the retry is a
                     // diagnostic, and its failure says nothing the first did not.
                     Err(ureq::Error::Transport(_)) => {
-                        return Err(FetchError::Network(strict_error.to_string()))
+                        Err(FetchError::Network(strict_error.to_string()))
                     }
                 }
             }
-        };
+        }
+    }
+
+    pub fn get(url: &str, cap: u64, timeout: Duration) -> Result<Vec<u8>, FetchError> {
+        let response = call_strict_then_os_roots(url, timeout)?;
         // Fail fast when the server announces more than the cap; the capped
         // read below stays the enforcement of record.
         if let Some(len) = response
@@ -1204,6 +1714,31 @@ pub(crate) mod net {
             }
         }
         read_capped(response.into_reader(), cap)
+    }
+
+    /// Like `get`, but reports download progress against `cap`.
+    ///
+    /// The header content-length is passed to `on_progress` first as the
+    /// denominator when the server offers one; it is advisory (the signed
+    /// manifest size is the number that actually matters and is checked later),
+    /// but it lets the UI show "12 of 36 MB" instead of a bare byte count.
+    pub fn get_with_progress(
+        url: &str,
+        cap: u64,
+        timeout: Duration,
+        mut on_progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, FetchError> {
+        let response = call_strict_then_os_roots(url, timeout)?;
+        let announced = response
+            .header("content-length")
+            .and_then(|h| h.parse::<u64>().ok());
+        if let Some(len) = announced {
+            if len > cap {
+                return Err(FetchError::TooLarge);
+            }
+        }
+        on_progress(0, announced);
+        super::read_capped_progress(response.into_reader(), cap, |n| on_progress(n, announced))
     }
 }
 
@@ -1223,6 +1758,15 @@ pub(crate) mod net {
     /// Present so `status_json` compiles one way in both builds.
     pub static LAST_FETCH_WAS_INTERCEPTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
+
+    pub fn get_with_progress(
+        _url: &str,
+        _cap: u64,
+        _timeout: Duration,
+        _on_progress: impl FnMut(u64, Option<u64>),
+    ) -> Result<Vec<u8>, FetchError> {
+        Err(FetchError::Network("no TLS stack in this build".to_string()))
+    }
 
     pub fn get(_url: &str, _cap: u64, _timeout: Duration) -> Result<Vec<u8>, FetchError> {
         Err(FetchError::Network(
@@ -1412,11 +1956,11 @@ mod tests {
         assert!(!in_flight(&json!({})));
     }
 
-    fn dev_signing_key() -> ed25519_dalek::SigningKey {
+    pub(super) fn dev_signing_key() -> ed25519_dalek::SigningKey {
         ed25519_dalek::SigningKey::from_bytes(&DEV_SIGNING_SEED)
     }
 
-    fn dev_trusted_keys() -> TrustedKeys {
+    pub(super) fn dev_trusted_keys() -> TrustedKeys {
         TrustedKeys::new(vec![dev_signing_key().verifying_key()])
             .expect("one key is a valid set")
     }
@@ -1437,7 +1981,7 @@ mod tests {
     }
 
     /// Same construction as patanyx-update's testutil::payload_json.
-    fn payload_json(version: &str, platform: &str, size: u64) -> String {
+    pub(super) fn payload_json(version: &str, platform: &str, size: u64) -> String {
         // The size argument stays in the signature because callers pass a
         // deliberately WRONG one in the length-mismatch tests; the bytes
         // hashed are always TEST_BINARY.
@@ -1496,7 +2040,7 @@ mod tests {
 
     /// Same construction as patanyx-update's testutil::sign: Ed25519 over
     /// SIGNING_DOMAIN || payload-bytes, payload embedded as a JSON string.
-    fn sign_with(payload: &str, key: &ed25519_dalek::SigningKey) -> String {
+    pub(super) fn sign_with(payload: &str, key: &ed25519_dalek::SigningKey) -> String {
         use ed25519_dalek::Signer;
         let mut message = Vec::with_capacity(SIGNING_DOMAIN.len() + payload.len());
         message.extend_from_slice(SIGNING_DOMAIN);
@@ -1730,6 +2274,103 @@ mod tests {
         }
     }
 
+    /// The startup-apply timing table. `pending_is_ripe` is the only gate
+    /// between "a verified update is on disk" and "the binary replaces
+    /// itself with no click", so every row is pinned: quiet kinds install at
+    /// once, an announced feature release waits out its full grace period to
+    /// the second, and a security fix inside a feature release does not wait.
+    #[test]
+    fn a_pending_release_ripens_by_kind_grace_and_security() {
+        let manifest_with = |extra: &str| {
+            let payload = payload_json("9.9.9", "linux-x86_64", TEST_BINARY.len() as u64)
+                .replace(",\"size\":", &format!(",{extra}\"size\":"));
+            verify_manifest(
+                sign_with(&payload, &dev_signing_key()).as_bytes(),
+                &dev_trusted_keys(),
+            )
+            .expect("test manifest must verify")
+        };
+        let t0 = 1_000_000;
+
+        // Maintenance (explicit or defaulted): ripe the moment it is staged.
+        assert!(pending_is_ripe(&manifest_with(""), t0, t0));
+        assert!(pending_is_ripe(
+            &manifest_with("\"kind\":\"maintenance\","),
+            t0,
+            t0
+        ));
+
+        // A feature release waits the WHOLE grace period...
+        let feature = manifest_with("\"kind\":\"feature\",");
+        assert!(!pending_is_ripe(&feature, t0, t0));
+        assert!(!pending_is_ripe(&feature, t0, t0 + GRACE_SECONDS - 1));
+        // ...and then stops waiting.
+        assert!(pending_is_ripe(&feature, t0, t0 + GRACE_SECONDS));
+
+        // A security fix never waits, even inside a feature release.
+        assert!(pending_is_ripe(
+            &manifest_with("\"kind\":\"feature\",\"security\":true,"),
+            t0,
+            t0
+        ));
+    }
+
+    /// The durable half of Ready. The meta round-trips, and re-staging the
+    /// SAME version keeps the original first-seen clock -- a grace period
+    /// that reset on every scheduled re-check would never elapse, and the
+    /// feature banner would quietly become "wait forever".
+    #[test]
+    fn pending_meta_round_trips_and_the_grace_clock_survives_a_recheck() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = verify_manifest(
+            signed_manifest_for(Version::new(9, 9, 9), Platform::LinuxX86_64).as_bytes(),
+            &dev_trusted_keys(),
+        )
+        .expect("must verify");
+        let staged = dir.path().join("patanyx-9.9.9-linux-x86_64.bin");
+
+        remember_pending(dir.path(), b"envelope-bytes", &staged, &manifest);
+        let first = read_pending_meta(dir.path()).expect("meta must round-trip");
+        assert_eq!(first.version, "9.9.9");
+        assert_eq!(first.staged, "patanyx-9.9.9-linux-x86_64.bin");
+        assert!(first.first_seen_unix > 0);
+
+        // A re-check of the same version must NOT reset the clock.
+        remember_pending(dir.path(), b"envelope-bytes", &staged, &manifest);
+        let again = read_pending_meta(dir.path()).expect("meta must still parse");
+        assert_eq!(again.first_seen_unix, first.first_seen_unix);
+
+        // The envelope landed verbatim, and cleaning removes both files.
+        assert_eq!(
+            std::fs::read(pending_envelope_path(dir.path())).expect("envelope on disk"),
+            b"envelope-bytes"
+        );
+        clean_pending(dir.path());
+        assert!(read_pending_meta(dir.path()).is_none());
+        assert!(!pending_envelope_path(dir.path()).exists());
+    }
+
+    /// The reader refuses a `staged` value that is anything but a bare
+    /// filename. Traversal cannot install wrong bytes (the hash decides),
+    /// but the startup read must not be aimable at arbitrary paths.
+    #[test]
+    fn a_pending_meta_naming_a_path_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for evil in ["../../etc/hostname", "/etc/hostname", "a/b.bin"] {
+            std::fs::write(
+                pending_meta_path(dir.path()),
+                format!(
+                    "{{\"version\":\"9.9.9\",\"staged\":\"{evil}\",\"first_seen_unix\":1}}"
+                ),
+            )
+            .expect("write meta");
+            assert!(
+                read_pending_meta(dir.path()).is_none(),
+                "meta with staged={evil} was accepted"
+            );
+        }
+    }
+
     #[test]
     fn manifest_url_is_tls_and_per_platform() {
         // The debug-build env override would invalidate this test, so clear
@@ -1803,6 +2444,8 @@ mod tests {
         let idle = Updater {
             phase: Phase::Idle,
             last_check_started: None,
+            advisory: None,
+            envelope: None,
         };
         let snap = status_json(&idle);
         assert_eq!(snap["state"], json!("idle"));
@@ -1816,6 +2459,8 @@ mod tests {
                 offered: None,
             },
             last_check_started: None,
+            advisory: None,
+            envelope: None,
         };
         let snap = status_json(&refused);
         assert_eq!(snap["state"], json!("refused"));
@@ -1832,6 +2477,8 @@ mod tests {
                 manifest: manifest.clone(),
             },
             last_check_started: None,
+            advisory: None,
+            envelope: None,
         };
         let snap = status_json(&offered_state);
         assert_eq!(snap["state"], json!("offered"));
@@ -1862,6 +2509,8 @@ mod tests {
                 staged: PathBuf::from("/nonexistent-staged-path"),
             },
             last_check_started: None,
+            advisory: None,
+            envelope: None,
         });
         assert_eq!(snap["notes"], json!("Adds fingerprint noise."));
     }
@@ -1915,20 +2564,12 @@ mod tests {
         let phase = run_check_with(&dev_trusted_keys(), &FLOOR, current, platform, || {
             Ok(envelope.into_bytes())
         });
-        let expected = RefusalReason::NotNewer {
-            offered: older,
-            running: current,
-        }
-        .to_string();
+        // An older offer is not a refusal the user must read: the machine is
+        // AHEAD of the server, and the panel says so calmly, naming the
+        // offered version (decided 2026-09-16).
         match phase {
-            Phase::Refused {
-                reason,
-                offered: Some(v),
-            } => {
-                assert_eq!(v, older);
-                assert_eq!(reason, expected, "the UI must get RefusalReason verbatim");
-            }
-            other => panic!("expected NotNewer refusal, got {other:?}"),
+            Phase::Ahead { offered } => assert_eq!(offered, older),
+            other => panic!("expected Ahead, got {other:?}"),
         }
     }
 
@@ -2402,5 +3043,392 @@ mod data_dir_tests {
             PathBuf::from("/tmp/blocklist"),
             "the blocklist must not sit directly in a shared temp directory"
         );
+    }
+}
+
+#[cfg(test)]
+mod key_class_separation_tests {
+    //! The decision of 2026-08-31 made mechanical at the KEY level.
+    //!
+    //! `manifest.rs` proves the other half -- that a signature in one domain
+    //! cannot be replayed against another verifier. That is replay protection,
+    //! and it is not the same property: a key a verifier TRUSTS can always
+    //! sign a fresh message in any domain it likes. So the classes are only
+    //! genuinely separated if the key SETS are disjoint, and until this module
+    //! existed nothing checked that. I planted the defect -- pasted the
+    //! release key into MODEL_KEYS -- and the whole suite stayed green.
+
+    use super::{BLOCKLIST_KEYS, MODEL_KEYS, PUBLISHER_KEYS};
+
+    /// The model feed's key authorises model-feed artifacts ONLY.
+    ///
+    /// Disjoint from both other classes, with no exception and no transitional
+    /// entry: nothing in the field verifies a model manifest yet, so there is
+    /// no compatibility debt that could justify one. If this ever fails, the
+    /// separation the ruling asked for has been given away.
+    #[test]
+    fn the_model_key_set_is_disjoint_from_every_other_class() {
+        for key in MODEL_KEYS {
+            assert!(
+                !PUBLISHER_KEYS.contains(key),
+                "a model key must never also be a release key: {key}"
+            );
+            assert!(
+                !BLOCKLIST_KEYS.contains(key),
+                "a model key must never also be a blocklist key: {key}"
+            );
+        }
+    }
+
+    /// The ONE overlap that exists, pinned so it cannot grow quietly.
+    ///
+    /// `BLOCKLIST_KEYS` still carries the release working key, deliberately:
+    /// installs already in the field verify blocklists against
+    /// `PUBLISHER_KEYS`, and dropping it would silently end their refreshes.
+    /// Its own comment is honest that "a release key can still sign a
+    /// blocklist" until the entry goes.
+    ///
+    /// This test does not object to that. It objects to a SECOND one
+    /// appearing, and it will fail the moment the transitional entry is
+    /// removed -- which is the reminder to tighten this assertion to zero
+    /// rather than a licence to leave it at one. 1.0.0 is when the field
+    /// catches up and that removal becomes safe.
+    #[test]
+    fn the_only_cross_class_overlap_is_the_documented_transitional_key() {
+        let overlap: Vec<&&str> = BLOCKLIST_KEYS
+            .iter()
+            .filter(|k| PUBLISHER_KEYS.contains(k))
+            .collect();
+        assert_eq!(
+            overlap.len(),
+            1,
+            "expected exactly the one transitional release key in BLOCKLIST_KEYS, found {overlap:?}. \
+             If this is now ZERO, delete the transitional entry's comment and change this \
+             assertion to 0 -- the improvement is finally real. If it is more than one, \
+             a key was shared that should not have been."
+        );
+    }
+    /// The feed must build its strict agent in exactly ONE place.
+    ///
+    /// It did not. `get` grew the intercepting-proxy retry (F21) and
+    /// `get_with_progress` never did, so on a corporate network the signed
+    /// manifest arrived through the relaxed retry and the pack body -- same
+    /// host, same feed, same integrity argument -- died on the strict agent
+    /// with no second attempt. Users behind Zscaler were told the language
+    /// pack server was unreachable while it answered every request.
+    ///
+    /// Nothing caught it because each function was correct read on its own;
+    /// only the PAIR was wrong. So the invariant is now structural: one
+    /// construction site, and a second one fails here.
+    ///
+    /// The needle is built at run time so this scan cannot match its own
+    /// source. `agent_accepting_os_roots` does not match: the open paren is
+    /// part of the needle.
+    #[test]
+    fn the_feed_builds_its_strict_agent_in_exactly_one_place() {
+        const UPDATER_RS: &str = include_str!("updater.rs");
+        let needle = format!("crate::net::{}(", "agent");
+        let sites = UPDATER_RS.matches(needle.as_str()).count();
+        assert_eq!(
+            sites, 1,
+            "the strict agent is constructed at {sites} sites in updater.rs. \
+             Every feed fetch must go through call_strict_then_os_roots, or \
+             one path silently loses the intercepting-proxy retry the other \
+             has -- which is exactly how the pack body broke for corporate \
+             users while the manifest kept working."
+        );
+    }
+
+}
+
+#[cfg(test)]
+mod engine_floor_tests {
+    use super::tests::{dev_signing_key, dev_trusted_keys, payload_json, sign_with};
+    use super::{
+        raise_engine_floors, remember_engine_floors, run_check_observed, FetchError, Phase, FLOOR,
+    };
+    use patanyx_update::{verify_manifest, Platform, Version};
+    use serde_json::json;
+
+    const V: &str = "2.10.0";
+
+    fn manifest_with(floor: &str) -> patanyx_update::Manifest {
+        let base = payload_json(V, "linux-x86_64", 47);
+        let payload = base.replace(
+            ",\"published_at\"",
+            &format!(",\"engine_floor\":{floor},\"published_at\""),
+        );
+        assert_ne!(payload, base, "payload_json changed shape; the splice missed");
+        let envelope = sign_with(&payload, &dev_signing_key());
+        verify_manifest(envelope.as_bytes(), &dev_trusted_keys()).expect("must verify")
+    }
+
+    /// A signed floor only ever rises. The manifest `decide` accepts as
+    /// "up to date" may be older than one already seen, and it must not
+    /// drag the floor back down with it.
+    #[test]
+    fn a_signed_floor_rises_and_never_falls() {
+        let m = manifest_with("{\"webview2\":\"152.0.4191.62\",\"webkitgtk\":\"2.52.5\"}");
+        let first = raise_engine_floors(&json!(null), m.engine_floors()).expect("rose");
+        assert_eq!(first["webview2"], json!([152, 0, 4191, 62]));
+        assert_eq!(first["webkitgtk"], json!([2, 52, 5]));
+
+        let older = manifest_with("{\"webview2\":\"152.0.4191.53\"}");
+        assert!(raise_engine_floors(&first, older.engine_floors()).is_none());
+        let same = manifest_with("{\"webview2\":\"152.0.4191.62\"}");
+        assert!(raise_engine_floors(&first, same.engine_floors()).is_none());
+
+        let newer = manifest_with("{\"webview2\":\"153.0.4234.6\"}");
+        let second = raise_engine_floors(&first, newer.engine_floors()).expect("rose");
+        assert_eq!(second["webview2"], json!([153, 0, 4234, 6]));
+        // The engine the newer manifest said nothing about keeps its floor.
+        assert_eq!(second["webkitgtk"], json!([2, 52, 5]));
+
+        let none = manifest_with("{}");
+        assert!(raise_engine_floors(&second, none.engine_floors()).is_none());
+    }
+
+    /// The observed check hands EVERY verified manifest to the observer, and
+    /// nothing that fails verification. Pinned through the real pipeline.
+    #[test]
+    fn only_verified_manifests_reach_the_floor_observer() {
+        let current = Version::new(2, 10, 0);
+        let mut seen = 0;
+        let good = sign_with(&payload_json(V, "linux-x86_64", 47), &dev_signing_key());
+        // Same version as current: decide says UpToDate, and the observer
+        // must still have been called -- that is the whole point.
+        let _ = run_check_observed(
+            &dev_trusted_keys(),
+            &FLOOR,
+            current,
+            Platform::LinuxX86_64,
+            || Ok(good.into_bytes()),
+            |_| seen += 1,
+        );
+        assert_eq!(seen, 1);
+
+        let forged = payload_json(V, "linux-x86_64", 47);
+        let mut seen_forged = 0;
+        let _ = run_check_observed(
+            &dev_trusted_keys(),
+            &FLOOR,
+            current,
+            Platform::LinuxX86_64,
+            || {
+                Ok(format!(
+                    "{{\"v\":1,\"payload\":{},\"sig\":\"00\"}}",
+                    serde_json::to_string(&forged).unwrap()
+                )
+                .into_bytes())
+            },
+            |_| seen_forged += 1,
+        );
+        assert_eq!(seen_forged, 0, "an unverified manifest reached the observer");
+    }
+
+    #[test]
+    fn remembering_writes_the_file_and_a_manifest_without_floors_writes_nothing() {
+        let dir = std::env::temp_dir().join(format!("patanyx-engine-floor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(remember_engine_floors(&dir, &manifest_with("{}")).unwrap(), false);
+        assert!(!super::engine_floor_path(&dir).exists());
+        assert_eq!(
+            remember_engine_floors(&dir, &manifest_with("{\"webview2\":\"152.0.4191.62\"}")).unwrap(),
+            true
+        );
+        let raw = std::fs::read_to_string(super::engine_floor_path(&dir)).expect("written");
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["webview2"], json!([152, 0, 4191, 62]));
+        // A replay does not rewrite; a write that cannot happen is reported
+        // and leaves the file exactly as it was.
+        assert_eq!(
+            remember_engine_floors(&dir, &manifest_with("{\"webview2\":\"152.0.4191.62\"}")).unwrap(),
+            false
+        );
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, b"a file where a directory is needed").unwrap();
+        let err = remember_engine_floors(&blocked, &manifest_with("{\"webview2\":\"152.0.4191.66\"}"));
+        assert!(err.is_err(), "a failed register write must be observable");
+        assert_eq!(
+            std::fs::read_to_string(super::engine_floor_path(&dir)).unwrap(),
+            raw,
+            "last-good bytes intact"
+        );
+        // No temp file survives.
+        assert!(std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .all(|e| !e.file_name().to_string_lossy().ends_with(".tmp")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// STRICT LEGACY CONVERSION. A stored field that does not fit u32 is not
+    /// truncated into a small number the signed floor then "beats": it is
+    /// treated as absent, and the signed value replaces it. Before this the
+    /// conversion was `as u32`.
+    #[test]
+    fn a_stored_field_that_does_not_fit_is_absent_not_truncated() {
+        let m = manifest_with("{\"webview2\":\"152.0.4191.66\"}");
+        // 4294967302 as u32 would be 6, which is below 66 -- a truncating
+        // reader would "raise" a register that actually holds an absurd
+        // value; a strict reader replaces it.
+        let absurd = json!({"webview2": [152u64, 0, 4191, 4_294_967_302u64]});
+        let doc = raise_engine_floors(&absurd, m.engine_floors()).expect("replaced");
+        assert_eq!(doc["webview2"], json!([152, 0, 4191, 66]));
+        // And a genuinely higher stored value is kept.
+        let higher = json!({"webview2": [152, 0, 4191, 70]});
+        assert!(raise_engine_floors(&higher, m.engine_floors()).is_none());
+    }
+
+    /// THE ADVISORY RIDES ON THE SAME CHECK, INDEPENDENTLY. Whatever the
+    /// release check concluded -- up to date with no app release, refused,
+    /// failed at the network -- the advisory observer still runs. Pinned
+    /// through the function the worker thread calls.
+    #[test]
+    fn the_advisory_check_runs_after_every_release_outcome() {
+        use super::{observe_advisory_after, Phase};
+        use crate::engine_advisory::AdvisoryOutcome;
+        let phases = [
+            Phase::UpToDate,
+            Phase::Failed { detail: "unreachable".into(), resume: None },
+            Phase::Refused { reason: "forged".into(), offered: None },
+            Phase::Idle,
+            Phase::Checking,
+        ];
+        for phase in &phases {
+            let mut ran = false;
+            let out = observe_advisory_after(phase, || {
+                ran = true;
+                AdvisoryOutcome::Raised { floor: [152, 0, 4191, 66] }
+            });
+            assert!(ran, "the advisory must run after {phase:?}");
+            assert_eq!(out, AdvisoryOutcome::Raised { floor: [152, 0, 4191, 66] });
+        }
+    }
+
+    /// SAME-VERSION APP CHECK and FAILED APP CHECK, end to end through the
+    /// real verifiers: the release manifest is up to date (no app release)
+    /// or unreachable, and the advisory still lands in its own register and
+    /// raises the effective floor above the compiled one.
+    #[test]
+    fn a_same_version_or_failed_app_check_still_delivers_the_advisory() {
+        use crate::engine_advisory::testkit::{signed, trusted, SEED_ADVISORY_A};
+        use crate::engine_advisory::{persisted_floor_with, run_advisory_check, AdvisoryOutcome};
+        let dir = std::env::temp_dir().join(format!("patanyx-advisory-pair-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let compiled = [152u32, 0, 4191, 62];
+        let now = 1_757_600_000;
+
+        // Same version: the release check says up to date and observes no floor.
+        let current = Version::new(2, 10, 0);
+        let good = sign_with(&payload_json(V, "linux-x86_64", 47), &dev_signing_key());
+        let phase = run_check_observed(
+            &dev_trusted_keys(),
+            &FLOOR,
+            current,
+            Platform::LinuxX86_64,
+            || Ok(good.into_bytes()),
+            |m| assert!(m.engine_floors().is_empty()),
+        );
+        assert!(matches!(phase, Phase::UpToDate));
+        let advisory = super::observe_advisory_after(&phase, || {
+            run_advisory_check(
+                Ok(trusted(&[&SEED_ADVISORY_A])),
+                || Ok(signed("152.0.4191.66", now - 1000, &SEED_ADVISORY_A)),
+                &dir,
+                &compiled,
+                now,
+            )
+        });
+        assert_eq!(advisory, AdvisoryOutcome::Raised { floor: [152, 0, 4191, 66] });
+
+        // Failed app check: the release fetch is unreachable; the advisory
+        // fetch is a separate closure and still succeeds with a higher floor.
+        let phase = run_check_observed(
+            &dev_trusted_keys(),
+            &FLOOR,
+            current,
+            Platform::LinuxX86_64,
+            || Err(FetchError::Network("unreachable".into())),
+            |_| panic!("nothing verified"),
+        );
+        assert!(matches!(phase, Phase::Failed { .. }));
+        let advisory = super::observe_advisory_after(&phase, || {
+            run_advisory_check(
+                Ok(trusted(&[&SEED_ADVISORY_A])),
+                || Ok(signed("152.0.4191.70", now - 500, &SEED_ADVISORY_A)),
+                &dir,
+                &compiled,
+                now,
+            )
+        });
+        assert_eq!(advisory, AdvisoryOutcome::Raised { floor: [152, 0, 4191, 70] });
+
+        // The effective floor now rests on the advisory register alone: no
+        // release floor was ever persisted here.
+        let advisory_floor = persisted_floor_with(&dir, &trusted(&[&SEED_ADVISORY_A]), &compiled, now);
+        assert_eq!(advisory_floor, Some([152, 0, 4191, 70]));
+        assert!(!super::engine_floor_path(&dir).exists());
+        let effective = crate::platform::effective_floor_from(
+            &compiled,
+            None,
+            advisory_floor.map(|f| f.to_vec()),
+        );
+        assert_eq!(effective, vec![152, 0, 4191, 70]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod advisory_key_tests {
+    //! The advisory key list, pinned in BOTH directions: disjoint from every
+    //! other class, and EMPTY until the lander provisions it -- so nothing in
+    //! this tree can be read as an active advisory channel.
+    use super::{ADVISORY_KEYS, BLOCKLIST_KEYS, MODEL_KEYS, PUBLISHER_KEYS};
+
+    /// A stolen advisory key must not be a key any other verifier trusts.
+    /// Domain separation stops replay; only disjoint key SETS stop forgery.
+    #[test]
+    fn the_advisory_key_set_is_disjoint_from_every_other_class() {
+        for key in ADVISORY_KEYS {
+            assert!(!PUBLISHER_KEYS.contains(key), "advisory key is a release key: {key}");
+            assert!(!BLOCKLIST_KEYS.contains(key), "advisory key is a blocklist key: {key}");
+            assert!(!MODEL_KEYS.contains(key), "advisory key is a model key: {key}");
+        }
+    }
+
+    /// PROVISIONED: exactly one real key, and the channel is configured.
+    ///
+    /// This test was the visible marker of the missing production
+    /// configuration while `ADVISORY_KEYS` was empty; it flipped in the
+    /// provisioning commit. It now pins that the list holds exactly ONE
+    /// entry, that the entry is a well-formed, non-weak Ed25519 key the
+    /// verifier constructs from, and that it is the production key rather
+    /// than any test seed's verifying key. A second entry is a rotation and
+    /// must be added deliberately here as well.
+    #[test]
+    fn advisory_keys_hold_exactly_one_real_provisioned_key() {
+        assert_eq!(ADVISORY_KEYS.len(), 1, "one advisory key; rotation adds a second deliberately");
+        let key = ADVISORY_KEYS[0];
+        assert_eq!(key.len(), 64);
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()));
+        assert!(!key.chars().all(|c| c == '0'), "the all-zeros placeholder is not a key");
+        let keys = super::advisory_trusted_keys().expect("the compiled advisory key must construct");
+        assert_eq!(keys.len(), 1);
+        // Not the verifying key of any test seed used in this crate.
+        for seed in [
+            crate::engine_advisory::testkit::SEED_ADVISORY_A,
+            crate::engine_advisory::testkit::SEED_ADVISORY_B,
+            crate::engine_advisory::testkit::SEED_ATTACKER,
+            super::DEV_SIGNING_SEED,
+        ] {
+            let test_key = ed25519_dalek::SigningKey::from_bytes(&seed).verifying_key();
+            assert_ne!(
+                patanyx_update::hex::encode(test_key.as_bytes()),
+                key,
+                "a TEST key must never be the production advisory key"
+            );
+        }
+        // And the placeholder shape is refused if someone pastes it.
+        assert!(patanyx_update::TrustedKeys::from_hex(&[&"0".repeat(64)]).is_err());
     }
 }

@@ -138,6 +138,64 @@ pub fn public_suffix(host: &str) -> &str {
     &host[*starts.last().unwrap()..]
 }
 
+/// Whether `host` cannot be a domain name, and so must match only itself.
+///
+/// THIS EXISTS BECAUSE OF A CREDENTIAL DEFECT. IPv4 literals went through
+/// domain-suffix matching like any hostname, and the default rule took their
+/// rightmost label as the public suffix -- so `192.168.1.1` and `1.1.1.1`
+/// both reduced to registrable domain `1.1`, and `same_site` called them the
+/// same site. A password saved for a home router was offered on a public
+/// address; `127.0.0.1` and `10.0.0.1` both reduced to `0.1`. Measured, not
+/// reasoned: registrable_domain("192.168.0.1") returned Some("0.1").
+///
+/// THE TEST IS "FINAL LABEL IS ALL DIGITS", not "parses as an IPv4 address",
+/// and the difference is the whole point. The narrow version leaves the other
+/// spellings behind: `127.1` and `2130706433` are both routable ways to write
+/// localhost and neither is four octets, so a four-octet parser would send
+/// them straight back down the suffix path this guard exists to close.
+///
+/// It cannot refuse a real domain. No public suffix ends in an all-numeric
+/// label -- checked against the compiled-in list rather than assumed, and the
+/// count is zero -- because a numeric TLD has never been delegated.
+///
+/// A single-label host (`localhost`, `2130706433`) never reached here anyway:
+/// `public_suffix` returns the whole string, `suffix.len() == host.len()`, and
+/// `registrable_domain` already answers None. This adds the DOTTED forms.
+fn not_a_domain(host: &str) -> bool {
+    // IPv6 arrives from `host_of` with its brackets already stripped, so a
+    // v6 host is `::1` or `2001:db8::1`. A colon cannot occur in a domain
+    // name, which makes this both cheap and total.
+    if host.contains(':') {
+        return true;
+    }
+    match host.rsplit('.').next() {
+        Some(last) => {
+            if last.is_empty() {
+                return false;
+            }
+            // An `0x` prefix is only ever an alternative IP spelling. Measured
+            // gap in the first version of this guard, which tested digits
+            // alone: `0x7f.0x0.0x0.0x1` gave Some("0x0.0x1") and
+            // `0xc0.0xa8.0x1.0x1` gave Some("0x1.0x1"), so two hex-dotted
+            // hosts sharing their last two labels were the same site -- the
+            // original defect in a different spelling. `host_of` does not
+            // normalize these; it lowercases and strips a trailing dot and
+            // nothing else.
+            //
+            // THE OBVIOUS GENERALISATION IS WRONG AND WOULD BREAK REAL SITES.
+            // "final label is all hex digits" looks like the complete rule and
+            // rejects a long list of delegated suffixes, because a-f are hex
+            // digits: .ad .ae .af .ba .bb .bd .be .abc .aaa .bbc all match it.
+            // Checked against the compiled-in list rather than guessed. The
+            // PREFIX is what is unambiguous, and no public suffix starts with
+            // `0x` -- also checked, count zero.
+            let lower_hex_prefix = last.starts_with("0x") || last.starts_with("0X");
+            lower_hex_prefix || last.bytes().all(|b| b.is_ascii_digit())
+        }
+        None => false,
+    }
+}
+
 /// The registrable domain of `host` -- its public suffix plus one label.
 ///
 /// `None` when the host is itself a public suffix and therefore belongs to
@@ -151,6 +209,14 @@ pub fn registrable_domain(host: &str) -> Option<&str> {
     // upstream test vectors specifically pin `.com` and `.example.com` to
     // "no registrable domain" rather than to something plausible-looking.
     if host.is_empty() || host.split('.').any(str::is_empty) {
+        return None;
+    }
+    // An IP literal belongs to nobody, exactly like a bare public suffix, and
+    // the caller contract above already says what None means: fall back to
+    // exact-host comparison, never "matches anything". `same_site` implements
+    // that, so this one line makes every credential path compare IPs byte for
+    // byte. See `not_a_domain`.
+    if not_a_domain(host) {
         return None;
     }
     let suffix = public_suffix(host);
@@ -184,6 +250,120 @@ pub fn same_site(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The spellings the FIRST version of this guard missed.
+    ///
+    /// Found by following up a question a red-team seat tried to research and
+    /// could not: whether alternative IPv4 notations reach this matcher
+    /// unnormalized. They do.
+    #[test]
+    fn hex_dotted_ip_spellings_are_not_domains() {
+        // Each of these returned a registrable domain before the prefix test.
+        assert_eq!(registrable_domain("0x7f.0x0.0x0.0x1"), None);
+        assert_eq!(registrable_domain("0xc0.0xa8.0x1.0x1"), None);
+        assert_eq!(registrable_domain("0XFF.0XFF.0X1.0X1"), None);
+        // The collision the gap allowed: same last two labels, so the old
+        // rule made two unrelated addresses one site.
+        assert!(!same_site("0x7f.0x0.0x0.0x1", "0xaa.0xbb.0x0.0x1"));
+        assert!(!same_site("0xc0.0xa8.0x1.0x1", "0x0a.0x00.0x1.0x1"));
+        // Already caught by the all-digits arm; pinned so a future edit of
+        // one arm cannot quietly drop the other.
+        assert_eq!(registrable_domain("0177.0.0.1"), None);
+        assert_eq!(registrable_domain("0x7f.1"), None);
+        assert_eq!(registrable_domain("0x7f000001"), None);
+    }
+
+    /// The prefix rule must not cost a single delegated suffix made of a-f.
+    ///
+    /// This is the test that stops someone "completing" the rule above into
+    /// "all hex digits", which rejects every one of these.
+    #[test]
+    fn hex_letter_suffixes_are_still_real_domains() {
+        for host in [
+            "example.ad", "example.ae", "example.af", "example.ba",
+            "example.bb", "example.bd", "example.be", "example.abc",
+        ] {
+            assert!(
+                registrable_domain(host).is_some(),
+                "{host} lost its registrable domain; the prefix rule must not \
+                 reject a suffix merely because a-f are hex digits"
+            );
+        }
+        assert!(same_site("a.example.be", "b.example.be"));
+        assert!(!same_site("example.be", "example.ad"));
+    }
+
+    /// F-001. Each pair was OFFERED EACH OTHER'S PASSWORDS before the guard.
+    #[test]
+    fn ip_literals_match_only_themselves() {
+        // The pair that makes this urgent rather than theoretical: a home
+        // router and a public address, both reduced to "1.1".
+        assert!(!same_site("192.168.1.1", "1.1.1.1"));
+        assert!(!same_site("192.168.1.1", "10.0.1.1"));
+        assert!(!same_site("192.168.1.1", "172.16.1.1"));
+        // localhost, where dev servers and local admin panels live.
+        assert!(!same_site("127.0.0.1", "10.0.0.1"));
+        assert!(!same_site("192.168.0.1", "10.0.0.1"));
+        // Exact equality still holds: an IP is a site, just only itself.
+        assert!(same_site("192.168.1.1", "192.168.1.1"));
+        assert!(same_site("127.0.0.1", "127.0.0.1"));
+        // No site-level identity to hand out.
+        assert_eq!(registrable_domain("192.168.1.1"), None);
+        assert_eq!(registrable_domain("1.1.1.1"), None);
+        assert_eq!(registrable_domain("127.0.0.1"), None);
+    }
+
+    /// The spellings a four-octet parser would have missed.
+    #[test]
+    fn short_and_numeric_ip_forms_are_not_domains() {
+        assert_eq!(registrable_domain("127.1"), None);
+        assert_eq!(registrable_domain("10.0.1"), None);
+        assert!(!same_site("127.1", "10.1"));
+        // IPv6, brackets already stripped by `host_of`. THESE THREE PASS
+        // WITH THE COLON ARM DELETED: a plain v6 address carries no dots, so
+        // `public_suffix` returns the whole string and `registrable_domain`
+        // answers None by the single-label path. They document behaviour.
+        // The test below is what makes the arm load-bearing, and a mutation
+        // run is how the difference was found rather than assumed.
+        assert_eq!(registrable_domain("2001:db8::1"), None);
+        assert!(!same_site("2001:db8::1", "2001:db8::2"));
+        assert!(same_site("::1", "::1"));
+    }
+
+    /// WHY `not_a_domain` TESTS FOR A COLON AT ALL.
+    ///
+    /// A colon-bearing string that also carries dots and ends in a real
+    /// suffix defeats every other arm of the guard: its final label is not
+    /// numeric, and it is not a single label, so without the colon test
+    /// `public_suffix` finds `com` and `registrable_domain` hands back
+    /// `example.com`. The credential decision then treats it as that site.
+    ///
+    /// Whether `host_of` can emit such a string today is deliberately not
+    /// the argument. This is the one place the credential decision is made,
+    /// and it should not depend on an upstream normalizer staying exactly as
+    /// it is now -- the original defect reached here the same way, through a
+    /// shape nobody had considered.
+    #[test]
+    fn a_colon_bearing_host_cannot_borrow_a_real_domain() {
+        assert_eq!(registrable_domain("2001:db8::ffff:a.example.com"), None);
+        assert!(!same_site("2001:db8::ffff:a.example.com", "b.example.com"));
+        assert!(!same_site("::1:evil.example.com", "login.example.com"));
+    }
+
+    /// The guard must not cost a single real domain.
+    #[test]
+    fn the_ip_guard_does_not_touch_domains() {
+        assert_eq!(registrable_domain("example.com"), Some("example.com"));
+        assert_eq!(registrable_domain("a.example.com"), Some("example.com"));
+        assert!(same_site("login.example.com", "www.example.com"));
+        assert!(!same_site("example.com", "example.org"));
+        // Numerals INSIDE a domain are ordinary; only the final label decides.
+        assert_eq!(registrable_domain("1.example.com"), Some("example.com"));
+        assert_eq!(registrable_domain("192.168.example.com"), Some("example.com"));
+        assert!(same_site("7.cloud.example.co.uk", "8.cloud.example.co.uk"));
+        // A public suffix still belongs to nobody.
+        assert_eq!(registrable_domain("co.uk"), None);
+    }
 
     #[test]
     fn the_list_actually_compiled_in() {

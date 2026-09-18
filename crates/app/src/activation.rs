@@ -151,10 +151,18 @@ pub fn decode_hex_16(hex: &str) -> Option<[u8; 16]> {
 /// exactly like `PATANYX_UPDATE_MANIFEST_URL` does for the updater; a
 /// shipped build never sets it.
 fn licence_origin() -> String {
-    std::env::var("PATANYX_LICENCE_ORIGIN")
+    // DEBUG BUILDS ONLY. The loopback filter was the only guard in a shipped
+    // binary, and a local process that controls the launch environment and a
+    // loopback port would receive the full bearer token on the next unlock
+    // (pentest F-009). The end-to-end gate runs a debug binary.
+    #[cfg(debug_assertions)]
+    if let Some(v) = std::env::var("PATANYX_LICENCE_ORIGIN")
         .ok()
         .filter(|v| is_loopback_origin(v))
-        .unwrap_or_else(|| crate::updater::base_url().to_string())
+    {
+        return v;
+    }
+    crate::updater::base_url().to_string()
 }
 
 /// Is this override a real loopback origin, by the HOST rather than by how
@@ -195,44 +203,298 @@ pub enum ActivateOutcome {
     Refused(String),
     /// The server could not be reached, or refused to talk (proxy not
     /// expressible, TLS, timeout, non-JSON answer, 5xx). Retryable.
-    Offline(String),
+    Offline(CallFailure),
 }
 
-/// Blocking: call the server. Runs on a worker thread, never on the event
-/// loop. Compiled without a network client, it answers `Offline` honestly.
+/// What is known about a failed call without guessing from display text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureKind {
+    Offline,
+    TunnelCarried,
+    OtherCertificate,
+    Intercepted,
+}
+
+/// A printable diagnostic plus the typed class used to choose user copy.
+/// ureq preserves rustls below its transport error, so classification happens
+/// before that source chain is flattened for a log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallFailure {
+    detail: String,
+    kind: FailureKind,
+}
+
+impl CallFailure {
+    fn offline(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+            kind: FailureKind::Offline,
+        }
+    }
+
+    #[cfg(feature = "updater-net")]
+    fn from_net_error(error: crate::net::NetError) -> Self {
+        Self::from_net_error_with_carrier(error, tunnel_in_force_after_failure())
+    }
+
+    #[cfg(feature = "updater-net")]
+    fn from_net_error_with_carrier(error: crate::net::NetError, tunnel_in_force: bool) -> Self {
+        Self::classified_transport(error.to_string(), None, tunnel_in_force)
+    }
+
+    #[cfg(feature = "updater-net")]
+    fn from_transport(transport: ureq::Transport) -> Self {
+        let certificate_kind = transport_certificate_kind(&transport);
+        Self::classified_transport(
+            transport.to_string(),
+            certificate_kind,
+            tunnel_in_force_after_failure(),
+        )
+    }
+
+    #[cfg(feature = "updater-net")]
+    fn from_response_io(error: std::io::Error) -> Self {
+        Self::classified_transport(error.to_string(), None, tunnel_in_force_after_failure())
+    }
+
+    #[cfg(all(test, feature = "updater-net"))]
+    fn from_transport_with_carrier(transport: ureq::Transport, tunnel_in_force: bool) -> Self {
+        let certificate_kind = transport_certificate_kind(&transport);
+        Self::classified_transport(transport.to_string(), certificate_kind, tunnel_in_force)
+    }
+
+    #[cfg(feature = "updater-net")]
+    fn classified_transport(
+        detail: impl Into<String>,
+        certificate_kind: Option<FailureKind>,
+        tunnel_in_force: bool,
+    ) -> Self {
+        Self {
+            detail: detail.into(),
+            kind: classify_transport_failure(certificate_kind, tunnel_in_force),
+        }
+    }
+
+    #[cfg(all(test, feature = "updater-net"))]
+    fn from_certificate(error: rustls::CertificateError) -> Self {
+        Self::from_certificate_with_carrier(error, false)
+    }
+
+    #[cfg(all(test, feature = "updater-net"))]
+    fn from_certificate_with_carrier(
+        error: rustls::CertificateError,
+        tunnel_in_force: bool,
+    ) -> Self {
+        let error = rustls::Error::InvalidCertificate(error);
+        Self::classified_transport(
+            error.to_string(),
+            Some(certificate_failure_kind(&error)),
+            tunnel_in_force,
+        )
+    }
+}
+
 #[cfg(feature = "updater-net")]
-fn post_json_blocking(route: &str, body: &Value) -> Result<(u16, Value), String> {
-    use std::time::Duration;
-    let agent = crate::net::agent(Duration::from_secs(20)).map_err(|e| e.to_string())?;
-    let url = format!("{}/premium/{route}", licence_origin());
+fn transport_certificate_kind(transport: &ureq::Transport) -> Option<FailureKind> {
+    let mut certificate_kind = None;
+    let mut source = std::error::Error::source(transport);
+    while let Some(error) = source {
+        if let Some(error) = error.downcast_ref::<rustls::Error>() {
+            certificate_kind = Some(certificate_failure_kind(error));
+            break;
+        }
+        source = error.source();
+    }
+    certificate_kind
+}
+
+/// Read the request carrier at the last useful point: after ureq has reported
+/// the failure and immediately before we classify it for user-visible copy.
+/// This is deliberately an after-the-fact read rather than state captured with
+/// the request. If the tunnel is switched off between request setup/send and
+/// classification, that race can classify a request that did use it as plain
+/// offline.
+#[cfg(feature = "updater-net")]
+fn tunnel_in_force_after_failure() -> bool {
+    crate::tunnel_control::engine_proxy_port().is_some()
+}
+
+/// Certificate evidence wins because it gives the reader a more actionable
+/// explanation. Otherwise the carrier decides: every non-certificate failure
+/// is tunnel-carried when PATANYX's own tunnel was in force, irrespective of
+/// whether it arose while constructing the proxy, connecting to its loopback
+/// port, completing SOCKS, waiting for an answer, or reaching EdgeXene.
+#[cfg(feature = "updater-net")]
+fn classify_transport_failure(
+    certificate_kind: Option<FailureKind>,
+    tunnel_in_force: bool,
+) -> FailureKind {
+    match certificate_kind {
+        Some(FailureKind::Intercepted) => FailureKind::Intercepted,
+        Some(FailureKind::OtherCertificate) => FailureKind::OtherCertificate,
+        _ if tunnel_in_force => FailureKind::TunnelCarried,
+        _ => FailureKind::Offline,
+    }
+}
+
+impl std::fmt::Display for CallFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+#[cfg(feature = "updater-net")]
+fn certificate_failure_kind(error: &rustls::Error) -> FailureKind {
+    match error {
+        rustls::Error::InvalidCertificate(
+            rustls::CertificateError::UnknownIssuer | rustls::CertificateError::BadSignature,
+        ) => FailureKind::Intercepted,
+        rustls::Error::InvalidCertificate(_) => FailureKind::OtherCertificate,
+        _ => FailureKind::Offline,
+    }
+}
+
+/// One POST attempt with a given agent: send, and turn the answer into a
+/// `(status, json)` pair or a typed `CallFailure`. Factored out so the caller
+/// can try one agent, read the FAILURE KIND, and decide whether a second agent
+/// is worth trying.
+#[cfg(feature = "updater-net")]
+fn send_once(
+    agent: &ureq::Agent,
+    url: &str,
+    body: &Value,
+) -> Result<(u16, Value), CallFailure> {
     let sent = agent
-        .post(&url)
+        .post(url)
         .set("Content-Type", "application/json")
         .send_string(&body.to_string());
     let (status, response) = match sent {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(code, response)) => (code, response),
-        Err(ureq::Error::Transport(t)) => return Err(t.to_string()),
+        Err(ureq::Error::Transport(t)) => return Err(CallFailure::from_transport(t)),
     };
-    let text = response.into_string().map_err(|e| e.to_string())?;
-    let value: Value = serde_json::from_str(&text).map_err(|_| "non-JSON answer".to_string())?;
+    let text = response
+        .into_string()
+        .map_err(CallFailure::from_response_io)?;
+    let value: Value =
+        serde_json::from_str(&text).map_err(|_| CallFailure::offline("non-JSON answer"))?;
     Ok((status, value))
 }
 
+/// Blocking: call the server. Runs on a worker thread, never on the event loop.
+/// Compiled without a network client, it answers `Offline` honestly.
+///
+/// REACHABILITY, WITH THE PROXY DECISION MADE BY WHAT ACTUALLY HAPPENS. When
+/// there is no user tunnel, the first attempt goes through the machine's own
+/// proxy (if it has one -- corporate egress like Zscaler). If that attempt
+/// fails to CONNECT, the proxy is unreachable -- most often a stale registry
+/// entry that outlived the network it belonged to (the laptop is now on a
+/// hotspot where the corporate proxy is switched off) -- so the SAME request is
+/// retried DIRECT, which is what would have worked all along.
+///
+/// The fallback fires ONLY on a connect-level failure (`Offline`). A CERTIFICATE
+/// refusal (`Intercepted`/`OtherCertificate`) means the connection reached a
+/// proxy that re-signs TLS: retrying direct cannot help on that network, and
+/// more importantly the honest "something is inspecting this connection" answer
+/// must stand rather than being buried under a second failure. The token is
+/// never sent to such a proxy -- `Roots::Bundled` refused it -- and it is not
+/// sent direct either, because we stop.
+///
+/// The user-tunnel path takes no fallback at all: the tunnel is the chosen
+/// egress and bypassing it would defeat the privacy the user asked for.
+#[cfg(feature = "updater-net")]
+fn post_json_blocking(route: &str, body: &Value) -> Result<(u16, Value), CallFailure> {
+    use std::time::Duration;
+    let url = format!("{}/premium/{route}", licence_origin());
+    let timeout = Duration::from_secs(20);
+
+    if crate::tunnel_control::engine_proxy_port().is_some() {
+        let agent = crate::net::agent(timeout).map_err(CallFailure::from_net_error)?;
+        return send_once(&agent, &url, body);
+    }
+
+    let agent = crate::net::agent(timeout).map_err(CallFailure::from_net_error)?;
+    match send_once(&agent, &url, body) {
+        Err(why) if retry_direct_after(why.kind) => {
+            // The first attempt could not connect. If a proxy was in play it may
+            // be stale/unreachable; retry with the proxy deliberately skipped.
+            // (When no proxy was configured this simply reattempts direct, which
+            // is harmless -- it only happens on an already-failing call.)
+            let direct = crate::net::agent_direct(timeout).map_err(CallFailure::from_net_error)?;
+            send_once(&direct, &url, body)
+        }
+        other => other,
+    }
+}
+
+/// Whether a first-attempt failure of this kind is worth retrying DIRECT
+/// (proxy skipped). Only a connect-level `Offline` is: a stale/unreachable
+/// proxy is the case direct rescues. A CERTIFICATE refusal must NOT retry
+/// direct -- it means a proxy re-signed the TLS, the token was correctly
+/// withheld, and the honest "inspected" answer has to stand rather than be
+/// replaced by whatever a second, direct attempt happens to hit. Retrying it
+/// direct would also be pointless: the interceptor sits on the network, not on
+/// the proxy hop.
+fn retry_direct_after(kind: FailureKind) -> bool {
+    matches!(kind, FailureKind::Offline)
+}
+
 #[cfg(not(feature = "updater-net"))]
-fn post_json_blocking(_route: &str, _body: &Value) -> Result<(u16, Value), String> {
-    Err("this build has no network client".to_string())
+fn post_json_blocking(_route: &str, _body: &Value) -> Result<(u16, Value), CallFailure> {
+    Err(CallFailure::offline("this build has no network client"))
+}
+
+/// Which failed-call copy applies: the request's carrier could not reach the
+/// service, or TLS refused the peer certificate.
+///
+/// The activation call accepts only the compiled-in roots (`net::agent`,
+/// `Roots::Bundled`) and deliberately never falls back to the operating
+/// system's store the way the signature-protected updater may. On a network
+/// that re-signs TLS with a private root -- an ordinary corporate proxy --
+/// the handshake therefore fails, and the old copy told the user PATANYX
+/// "could not reach EdgeXene" and would try again. Both halves were wrong:
+/// EdgeXene was reachable, and retrying can never succeed, because nothing
+/// about a retry changes the trust decision. The user retries forever.
+///
+/// ureq retains rustls as a typed source. Unknown issuer and bad certificate
+/// signature fit interception; every other certificate refusal gets neutral
+/// copy that makes no claim about its cause.
+fn offline_reason(why: &CallFailure) -> &'static str {
+    match why.kind {
+        FailureKind::Intercepted => "intercepted",
+        FailureKind::OtherCertificate => "certificate",
+        FailureKind::TunnelCarried => "tunnel_carried",
+        FailureKind::Offline => "offline",
+    }
+}
+
+/// The same typed split for RELEASE. Releasing needs the server -- there is no
+/// local-only release, because dropping the receipt here while the server
+/// still counts the slot would strand a slot the user believes is free -- so
+/// the advice differs from activation's: try elsewhere, rather than "this is
+/// one time".
+///
+/// `release_blocking` collapses a server refusal and a failed call into the
+/// same `Err`, so this must use only the typed failure kind and never infer a
+/// cause from its printable detail.
+fn release_reason(why: &CallFailure) -> &'static str {
+    match why.kind {
+        FailureKind::Intercepted => "release_intercepted",
+        FailureKind::OtherCertificate => "release_certificate",
+        FailureKind::TunnelCarried => "release_tunnel_carried",
+        FailureKind::Offline => "release_offline",
+    }
 }
 
 /// Turn the server's answer into an outcome. Pure, so the mapping is
 /// table-tested below without a server.
-pub fn outcome_from_reply(reply: Result<(u16, Value), String>) -> ActivateOutcome {
+pub fn outcome_from_reply(reply: Result<(u16, Value), CallFailure>) -> ActivateOutcome {
     match reply {
         Ok((200, value)) => match value.get("receipt").and_then(Value::as_str) {
             Some(receipt) if receipt.starts_with("prx1-") => ActivateOutcome::Activated {
                 receipt_text: receipt.to_string(),
             },
-            _ => ActivateOutcome::Offline("200 without a receipt".to_string()),
+            _ => ActivateOutcome::Offline(CallFailure::offline("200 without a receipt")),
         },
         Ok((code, value)) if (400..500).contains(&code) => {
             let error = value
@@ -242,7 +504,7 @@ pub fn outcome_from_reply(reply: Result<(u16, Value), String>) -> ActivateOutcom
                 .to_string();
             ActivateOutcome::Refused(error)
         }
-        Ok((code, _)) => ActivateOutcome::Offline(format!("HTTP {code}")),
+        Ok((code, _)) => ActivateOutcome::Offline(CallFailure::offline(format!("HTTP {code}"))),
         Err(why) => ActivateOutcome::Offline(why),
     }
 }
@@ -256,18 +518,20 @@ pub fn activate_blocking(token_text: &str, device_id: &[u8; 16]) -> ActivateOutc
 /// not be reached (the local receipt is then KEPT: releasing locally while
 /// the server still counts the slot would strand a slot the user thinks is
 /// free).
-pub fn release_blocking(token_text: &str, device_id: &[u8; 16]) -> Result<bool, String> {
+pub fn release_blocking(token_text: &str, device_id: &[u8; 16]) -> Result<bool, CallFailure> {
     let body = json!({ "token": token_text, "device_id": hex_encode_16(device_id) });
     match post_json_blocking("release", &body) {
         Ok((200, value)) => Ok(value
             .get("released")
             .and_then(Value::as_bool)
             .unwrap_or(false)),
-        Ok((code, value)) => Err(value
-            .get("error")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| format!("HTTP {code}"))),
+        Ok((code, value)) => Err(CallFailure::offline(
+            value
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("HTTP {code}")),
+        )),
         Err(why) => Err(why),
     }
 }
@@ -290,7 +554,41 @@ pub struct ActivationEvent {
     pub license_id_hex: String,
     pub device_id_hex: String,
     pub activate: Option<ActivateOutcome>,
-    pub release: Option<Result<bool, String>>,
+    pub release: Option<Result<bool, CallFailure>>,
+}
+
+/// Deliver a result that arrived while the vault was locked. Called right
+/// after the unlock-time evaluation, so the licence check inside
+/// `handle_event` sees the session the result belongs to.
+pub fn replay_pending(state: &mut AppState) {
+    if let Some(event) = state.pending_activation_event.take() {
+        handle_event_from(state, event, false);
+    }
+}
+
+/// Finish a release this device started and never resolved. Called from the
+/// unlock arms, right after the unlock-time evaluation: at that moment the
+/// vault is open, nothing else is claiming the slot, and the user is
+/// present. Bounded by the in-flight flag, and free to repeat because
+/// releasing the same device twice is what the server calls idempotent.
+pub fn finish_pending_release(state: &mut AppState) -> bool {
+    if !release_is_pending_here(state) {
+        return false;
+    }
+    start_release_call(state)
+}
+
+/// Whether this device has a release recorded but not yet answered.
+pub fn release_is_pending_here(state: &AppState) -> bool {
+    let Ok(Some(device_id)) = device_id_if_present(&state.vault_path) else {
+        return false;
+    };
+    let here = hex_encode_16(&device_id);
+    state
+        .vault
+        .as_ref()
+        .and_then(|vault| vault.release_pending())
+        .is_some_and(|pending| pending == here)
 }
 
 /// Start ONE activation attempt for the stored token, if the session says
@@ -332,7 +630,7 @@ pub fn start_activation(state: &AppState) -> bool {
     };
     crate::licence_control::mark_activation_in_flight();
     let proxy = state.proxy();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let outcome = activate_blocking(&record.token_text, &device_id);
         record.token_text.zeroize();
         let _ = proxy.send_event(crate::UserEvent::Activation(ActivationEvent {
@@ -343,12 +641,66 @@ pub fn start_activation(state: &AppState) -> bool {
             release: None,
         }));
     });
+    remember_worker(handle);
     true
+}
+
+/// The most recent worker thread, so a caller that must know the network
+/// side is finished (the smoke, before it asserts on the busy flag) can
+/// JOIN it instead of polling a flag that a synthetic result can clear.
+static WORKER: std::sync::Mutex<Option<std::thread::JoinHandle<()>>> =
+    std::sync::Mutex::new(None);
+
+fn remember_worker(handle: std::thread::JoinHandle<()>) {
+    let previous = WORKER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .replace(handle);
+    if let Some(previous) = previous {
+        // At most one is in flight (mark_activation_in_flight gates the
+        // start), so a previous handle is a finished thread; reap it.
+        let _ = previous.join();
+    }
+}
+
+/// Block until the last started worker has finished its network call and
+/// posted its result. The result itself still arrives through the event
+/// loop; this only guarantees the thread is done.
+pub fn join_worker() {
+    let handle = WORKER
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .take();
+    if let Some(handle) = handle {
+        let _ = handle.join();
+    }
 }
 
 /// Start a release of THIS device's slot. Only meaningful while activated;
 /// the IPC arm checks that. Returns whether a worker was started.
-pub fn start_release(state: &AppState) -> bool {
+pub fn start_release(state: &mut AppState) -> bool {
+    // THE INTENT GOES TO DISK BEFORE THE REQUEST LEAVES. Everything that
+    // used to make a release lossy -- a lock while the worker ran, a failed
+    // write afterwards, an ordinary exit -- is answered here: the next
+    // unlock finds this record and asks the server again. Releasing the
+    // same device twice is free, so the retry costs nothing.
+    let Ok(Some(device_id)) = device_id_if_present(&state.vault_path) else {
+        return false;
+    };
+    let here = hex_encode_16(&device_id);
+    let Some(vault) = state.vault.as_mut() else {
+        return false;
+    };
+    if vault.begin_release(&here).is_err() {
+        crate::licence_control::set_activation_result("vault_io");
+        return false;
+    }
+    start_release_call(state)
+}
+
+/// The network half, without recording the intent: the unlock-time RETRY of
+/// a release already recorded in the vault comes through here.
+pub fn start_release_call(state: &AppState) -> bool {
     let vault_path = state.vault_path.clone();
     let Ok(Some(device_id)) = device_id_if_present(&vault_path) else {
         return false;
@@ -362,7 +714,7 @@ pub fn start_release(state: &AppState) -> bool {
     };
     crate::licence_control::mark_activation_in_flight();
     let proxy = state.proxy();
-    std::thread::spawn(move || {
+    let handle = std::thread::spawn(move || {
         let result = release_blocking(&record.token_text, &device_id);
         record.token_text.zeroize();
         let _ = proxy.send_event(crate::UserEvent::Activation(ActivationEvent {
@@ -373,6 +725,7 @@ pub fn start_release(state: &AppState) -> bool {
             release: Some(result),
         }));
     });
+    remember_worker(handle);
     true
 }
 
@@ -381,15 +734,39 @@ pub fn start_release(state: &AppState) -> bool {
 /// the worker ran, the result is dropped: it belongs to a state that no
 /// longer exists.
 pub fn handle_event(state: &mut AppState, event: ActivationEvent) {
-    crate::licence_control::clear_activation_in_flight();
+    handle_event_from(state, event, true);
+}
+
+/// `from_worker`: true when a worker thread just finished (its busy flag is
+/// cleared here); false for a REPLAY of a parked result, which must not
+/// clear the flag of whatever worker may be running now.
+fn handle_event_from(state: &mut AppState, event: ActivationEvent, from_worker: bool) {
+    if from_worker {
+        crate::licence_control::clear_activation_in_flight();
+    }
+    // Vault locked meanwhile: KEEP the result for the next unlock rather
+    // than drop it. The licence check below cannot run now (the session is
+    // gone with the lock) and runs at replay instead.
+    if state.vault.is_none() {
+        // ACTIVATION results only. A release result needs no in-memory
+        // parking: the vault already records that this device is being
+        // released, so the next unlock retries the call whatever happens
+        // to this answer. (It used to be parked here, and every way that
+        // parking could be lost or overwritten was a way for a released
+        // device to come back to life.)
+        if event.kind == CallKind::Activate {
+            state.pending_activation_event = Some(event);
+        }
+        return;
+    }
     let still_same_licence =
         crate::licence_control::current_license_id_hex().as_deref() == Some(&*event.license_id_hex);
-    let Some(vault) = state.vault.as_mut() else {
-        return;
-    };
     if !still_same_licence {
         return;
     }
+    let Some(vault) = state.vault.as_mut() else {
+        return;
+    };
     match event.kind {
         CallKind::Activate => match event.activate {
             Some(ActivateOutcome::Activated { receipt_text }) => {
@@ -414,7 +791,15 @@ pub fn handle_event(state: &mut AppState, event: ActivationEvent) {
                 while records.len() > 5 {
                     records.remove(0);
                 }
-                if vault.set_activation_records(records).is_err() {
+                // A successful activation supersedes an earlier release OF
+                // THIS DEVICE: the marker that suppresses silent
+                // re-activation must not outlive the receipt it guards. Only
+                // this device's marker: a vault that travelled from a device
+                // that released must keep saying so for that device.
+                if vault.set_activation_records(records).is_err()
+                    || vault.clear_released_device_if(&event.device_id_hex).is_err()
+                    || vault.clear_release_pending_if(&event.device_id_hex).is_err()
+                {
                     crate::licence_control::set_activation_result("vault_io");
                 } else {
                     // Re-run the unlock-time evaluation from the vault: the
@@ -428,7 +813,7 @@ pub fn handle_event(state: &mut AppState, event: ActivationEvent) {
             }
             Some(ActivateOutcome::Offline(why)) => {
                 eprintln!("patanyx activation: could not reach the licence server ({why})");
-                crate::licence_control::set_activation_result("offline");
+                crate::licence_control::set_activation_result(offline_reason(&why));
             }
             None => {}
         },
@@ -437,27 +822,132 @@ pub fn handle_event(state: &mut AppState, event: ActivationEvent) {
                 // Released on the server (or it never held a slot there):
                 // either way this device's receipt is dead. Remove it, then
                 // re-evaluate: Premium goes off on THIS machine, in front of
-                // the user, which is what release means.
-                let records: Vec<patanyx_vault::ActivationRecord> = vault
-                    .activation_records()
-                    .into_iter()
-                    .filter(|r| r.device_id_hex != event.device_id_hex)
-                    .collect();
-                if vault.set_activation_records(records).is_err() {
-                    crate::licence_control::set_activation_result("vault_io");
+                // the user, which is what release means. No app-side copy of
+                // the receipts here: the vault filters its own rows and wipes
+                // the old ones, and a clone would be plaintext left behind.
+                //
+                // ONE durable write drops the receipt, records the release
+                // and answers the started-release record together. If it
+                // fails, the started-release record is still on disk: the
+                // next unlock asks the server again and writes again. So a
+                // failed write costs a retry, never the user's decision.
+                if vault.release_device(&event.device_id_hex).is_ok() {
+                    crate::licence_control::set_activation_result("released");
+                    crate::licence_control::on_vault_unlocked(state);
                 } else {
                     crate::licence_control::on_vault_unlocked(state);
-                    crate::licence_control::set_activation_result("released");
+                    crate::licence_control::set_activation_result("vault_io");
                 }
             }
             Some(Err(why)) => {
                 eprintln!("patanyx activation: release did not reach the licence server ({why})");
-                crate::licence_control::set_activation_result("release_offline");
+                crate::licence_control::set_activation_result(release_reason(&why));
             }
             None => {}
         },
     }
     state.emit("licence_changed", json!({}));
+}
+
+/// OFFLINE ACTIVATION. Import a receipt minted elsewhere, for a machine that
+/// cannot reach EdgeXene at all -- a corporate network (Zscaler and the like)
+/// that blocks the licence host outright, where no proxy setting can help.
+///
+/// The receipt is the SAME artifact `/premium/activate` returns. It is stored
+/// and then judged by the SAME unlock-time evaluation every activation goes
+/// through (`on_vault_unlocked` -> `activation_state` -> `Receipt::parse` +
+/// `binds`). So this adds NO new trust path: a forged receipt, or a genuine one
+/// minted for another device or another licence, fails to bind exactly as it
+/// would after a normal unlock, and is rolled back. The only thing that reaches
+/// Premium is a receipt whose signature verifies against the compiled-in ring
+/// AND whose device id is this machine's AND whose licence is the one held.
+///
+/// Needs no network, so it is not behind `updater-net`: a locked-down machine
+/// is exactly the one that may be built or run without the network client.
+///
+/// Returns a code for the chrome: "activated"; "receipt_malformed" (not a
+/// prx1- receipt); "receipt_rejected" (parsed but did not verify or bind here);
+/// "no_licence" (paste the token first); "locked"; "device_id"; "vault_io".
+pub fn import_receipt(state: &mut AppState, receipt_text: &str) -> &'static str {
+    let receipt_text = receipt_text.trim();
+    if !receipt_text.starts_with("prx1-") {
+        // `ptx1-` (the licence TOKEN) and `prx1-` (this device's activation
+        // receipt) differ by one character and both are pasted from the same
+        // panel, so pasting the token here is the predictable mistake rather
+        // than an exotic one. Name it: a generic "malformed" sends the reader
+        // hunting for a typo in a string that was never the right string.
+        if receipt_text.starts_with("ptx1-") {
+            return "looks_like_token";
+        }
+        return "receipt_malformed";
+    }
+    let device_id = match device_id_or_mint(&state.vault_path) {
+        Ok(id) => id,
+        Err(_) => return "device_id",
+    };
+    let Some(license_id_hex) = crate::licence_control::current_license_id_hex() else {
+        return "no_licence";
+    };
+    let device_id_hex = hex_encode_16(&device_id);
+
+    // Snapshot the records so a receipt that does not verify at evaluation can
+    // be rolled back cleanly -- the vault must not keep a receipt Premium won't
+    // honour.
+    let previous = match state.vault.as_mut() {
+        Some(vault) => vault.activation_records(),
+        None => return "locked",
+    };
+    let mut records: Vec<patanyx_vault::ActivationRecord> = previous
+        .iter()
+        .cloned()
+        // Same rule as the network path: one row per device, current licence.
+        .filter(|r| r.license_id_hex == license_id_hex && r.device_id_hex != device_id_hex)
+        .collect();
+    records.push(patanyx_vault::ActivationRecord {
+        license_id_hex: license_id_hex.clone(),
+        device_id_hex: device_id_hex.clone(),
+        receipt_text: receipt_text.to_string(),
+    });
+    while records.len() > 5 {
+        records.remove(0);
+    }
+    match state.vault.as_mut() {
+        Some(vault) => {
+            if vault.set_activation_records(records).is_err() {
+                return "vault_io";
+            }
+        }
+        None => return "locked",
+    }
+
+    // The one and only judge: the unlock-time evaluation, run from the vault.
+    crate::licence_control::on_vault_unlocked(state);
+    let activated = crate::licence_control::current()
+        .map(|s| s.activation == crate::licence_control::ActivationState::Activated)
+        .unwrap_or(false);
+    if activated {
+        // An imported receipt is the user activating this device on purpose:
+        // an earlier release of it is over, like every other activation --
+        // including one still parked for retry, which would otherwise delete
+        // this receipt at the next unlock.
+        if let Some(vault) = state.vault.as_mut() {
+            if vault.clear_released_device_if(&device_id_hex).is_err()
+                || vault.clear_release_pending_if(&device_id_hex).is_err()
+            {
+                return "vault_io";
+            }
+        }
+        state.emit("licence_changed", json!({}));
+        return "activated";
+    }
+
+    // Rejected: restore what was there and re-evaluate, so a bad paste leaves
+    // no trace and cannot displace a receipt that was already valid.
+    if let Some(vault) = state.vault.as_mut() {
+        let _ = vault.set_activation_records(previous);
+    }
+    crate::licence_control::on_vault_unlocked(state);
+    "receipt_rejected"
 }
 
 /// The server's refusal codes, narrowed to the ones the copy knows; any
@@ -475,6 +965,20 @@ fn refusal_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The token-safety line of the reachability fallback: a connect failure
+    /// retries direct (that is how a stale corporate proxy on a home network is
+    /// rescued), but a CERTIFICATE refusal never does. If this ever flipped for
+    /// `Intercepted`, activation would answer a re-signing proxy by trying the
+    /// same call direct and burying the "this network is inspecting you"
+    /// warning -- and the whole reason the token is withheld there.
+    #[test]
+    fn only_a_connect_failure_retries_direct_never_a_certificate_one() {
+        assert!(retry_direct_after(FailureKind::Offline), "a dead proxy must fall back to direct");
+        assert!(!retry_direct_after(FailureKind::Intercepted), "a re-signing proxy must NOT retry direct");
+        assert!(!retry_direct_after(FailureKind::OtherCertificate));
+        assert!(!retry_direct_after(FailureKind::TunnelCarried));
+    }
 
     #[test]
     fn a_missing_device_id_is_minted_once_and_then_stable() {
@@ -555,14 +1059,13 @@ mod tests {
             ActivateOutcome::Offline(_)
         ));
         assert!(matches!(
-            outcome_from_reply(Err("timeout".to_string())),
+            outcome_from_reply(Err(CallFailure::offline("timeout"))),
             ActivateOutcome::Offline(_)
         ));
         assert_eq!(refusal_code("slots_full"), "slots_full");
         assert_eq!(refusal_code("something_new"), "refused");
     }
 
-    #[test]
     /// ACTIVATION MUST NEVER ACCEPT AN INTERCEPTED CONNECTION.
     ///
     /// The update and blocklist channels may fall back to the OS trust store,
@@ -605,6 +1108,259 @@ mod tests {
         );
     }
 
+    /// Only certificate failures that fit re-signing may accuse the network.
+    #[test]
+    fn activation_only_calls_unknown_issuer_or_bad_signature_interception() {
+        for cert in [
+            rustls::CertificateError::UnknownIssuer,
+            rustls::CertificateError::BadSignature,
+        ] {
+            let failure = CallFailure::from_certificate(cert);
+            assert_eq!(
+                offline_reason(&failure),
+                "intercepted",
+                "a re-signing-shaped trust failure lost its warning: {failure}"
+            );
+        }
+        assert_eq!(
+            offline_reason(&CallFailure::offline(
+                "invalid peer certificate: UnknownIssuer",
+            )),
+            "offline",
+            "display text must not decide the user's accusation"
+        );
+    }
+
+    #[test]
+    fn activation_gives_other_certificate_failures_neutral_copy() {
+        for cert in [
+            rustls::CertificateError::Expired,
+            rustls::CertificateError::NotValidYet,
+            rustls::CertificateError::Revoked,
+            rustls::CertificateError::NotValidForName,
+        ] {
+            let failure = CallFailure::from_certificate(cert);
+            let reason = offline_reason(&failure);
+            assert_eq!(reason, "certificate", "{failure}");
+            let copy = crate::licence_control::activation_copy(reason);
+            assert!(!copy.contains("inspecting"), "{copy}");
+            assert!(!copy.contains("this network"), "{copy}");
+        }
+    }
+
+    #[test]
+    fn activation_classifies_transport_failures_by_carrier() {
+        assert_activation_carrier_split(
+            "proxy construction",
+            CallFailure::from_net_error_with_carrier(proxy_construction_failure(), true),
+            CallFailure::from_net_error_with_carrier(proxy_construction_failure(), false),
+        );
+        assert_activation_carrier_split(
+            "connect refused",
+            CallFailure::from_transport_with_carrier(connect_refused_transport(), true),
+            CallFailure::from_transport_with_carrier(connect_refused_transport(), false),
+        );
+        assert_activation_carrier_split(
+            "timeout",
+            CallFailure::from_transport_with_carrier(timeout_transport(), true),
+            CallFailure::from_transport_with_carrier(timeout_transport(), false),
+        );
+    }
+
+    /// Release has the same two failures and must tell them apart the same
+    /// way -- and must NOT start blaming interception for a server refusal,
+    /// which arrives through the same `Err` on this path.
+    #[test]
+    fn release_gives_other_certificate_failures_neutral_copy() {
+        for cert in [
+            rustls::CertificateError::Expired,
+            rustls::CertificateError::NotValidYet,
+            rustls::CertificateError::Revoked,
+            rustls::CertificateError::NotValidForName,
+        ] {
+            let failure = CallFailure::from_certificate(cert);
+            let reason = release_reason(&failure);
+            assert_eq!(reason, "release_certificate", "{failure}");
+            let copy = crate::licence_control::activation_copy(reason);
+            assert!(!copy.contains("inspecting"), "{copy}");
+            assert!(!copy.contains("this network"), "{copy}");
+        }
+        assert_eq!(
+            release_reason(&CallFailure::from_certificate(
+                rustls::CertificateError::UnknownIssuer,
+            )),
+            "release_intercepted"
+        );
+        assert_eq!(
+            release_reason(&CallFailure::from_certificate(
+                rustls::CertificateError::BadSignature,
+            )),
+            "release_intercepted"
+        );
+    }
+
+    #[test]
+    fn release_classifies_transport_failures_by_carrier() {
+        assert_release_carrier_split(
+            "proxy construction",
+            CallFailure::from_net_error_with_carrier(proxy_construction_failure(), true),
+            CallFailure::from_net_error_with_carrier(proxy_construction_failure(), false),
+        );
+        assert_release_carrier_split(
+            "connect refused",
+            CallFailure::from_transport_with_carrier(connect_refused_transport(), true),
+            CallFailure::from_transport_with_carrier(connect_refused_transport(), false),
+        );
+        assert_release_carrier_split(
+            "timeout",
+            CallFailure::from_transport_with_carrier(timeout_transport(), true),
+            CallFailure::from_transport_with_carrier(timeout_transport(), false),
+        );
+    }
+
+    fn proxy_construction_failure() -> crate::net::NetError {
+        crate::net::NetError::ProxyUnavailable("proxy could not be built".to_string())
+    }
+
+    fn connect_refused_transport() -> ureq::Transport {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let transport = transport_from(ureq::get(&format!("http://{address}/")).call());
+        assert!(
+            transport
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("refused"),
+            "the refused-connection fixture produced a different failure: {transport}"
+        );
+        transport
+    }
+
+    fn timeout_transport() -> ureq::Transport {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let _connection = listener.accept().unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let agent = ureq::AgentBuilder::new()
+            .timeout(std::time::Duration::from_millis(20))
+            .build();
+        let transport = transport_from(agent.get(&format!("http://{address}/")).call());
+        server.join().unwrap();
+        let detail = transport.to_string().to_ascii_lowercase();
+        assert!(
+            detail.contains("timed out") || detail.contains("timeout"),
+            "the silent-server fixture produced a different failure: {transport}"
+        );
+        transport
+    }
+
+    fn transport_from(result: Result<ureq::Response, ureq::Error>) -> ureq::Transport {
+        match result.expect_err("the test endpoint unexpectedly answered") {
+            ureq::Error::Transport(transport) => transport,
+            ureq::Error::Status(code, _) => panic!("test endpoint answered HTTP {code}"),
+        }
+    }
+
+    fn assert_activation_carrier_split(shape: &str, tunnel: CallFailure, direct: CallFailure) {
+        assert_eq!(
+            offline_reason(&tunnel),
+            "tunnel_carried",
+            "{shape} through PATANYX's tunnel lost its carrier"
+        );
+        assert_eq!(
+            offline_reason(&direct),
+            "offline",
+            "{shape} without a tunnel named one"
+        );
+    }
+
+    fn assert_release_carrier_split(shape: &str, tunnel: CallFailure, direct: CallFailure) {
+        assert_eq!(
+            release_reason(&tunnel),
+            "release_tunnel_carried",
+            "{shape} through PATANYX's tunnel lost its carrier"
+        );
+        assert_eq!(
+            release_reason(&direct),
+            "release_offline",
+            "{shape} without a tunnel named one"
+        );
+    }
+
+    #[test]
+    fn certificate_evidence_takes_precedence_inside_the_tunnel() {
+        for (certificate, activation, release) in [
+            (
+                rustls::CertificateError::UnknownIssuer,
+                "intercepted",
+                "release_intercepted",
+            ),
+            (
+                rustls::CertificateError::Expired,
+                "certificate",
+                "release_certificate",
+            ),
+        ] {
+            let failure = CallFailure::from_certificate_with_carrier(certificate, true);
+            assert_eq!(offline_reason(&failure), activation, "{failure}");
+            assert_eq!(release_reason(&failure), release, "{failure}");
+        }
+    }
+
+    #[test]
+    fn tunnel_carried_copy_names_the_carrier_and_keeps_the_network_remedy() {
+        for reason in ["tunnel_carried", "release_tunnel_carried"] {
+            let copy = crate::licence_control::activation_copy(reason);
+            let lower = copy.to_ascii_lowercase();
+            assert!(!lower.contains("vpn"), "{reason}: {copy}");
+            assert!(copy.contains("PATANYX sent"), "{reason}: {copy}");
+            assert!(copy.contains("through its own tunnel"), "{reason}: {copy}");
+            assert!(
+                copy.contains("could not reach EdgeXene"),
+                "{reason}: {copy}"
+            );
+            assert!(
+                lower.contains("another network"),
+                "{reason} lost the alternative-network remedy: {copy}"
+            );
+        }
+    }
+
+    /// The release copy must not promise the one-time workaround activation
+    /// can offer: a release has to reach the server or the slot stays counted.
+    #[test]
+    fn the_release_copy_offers_no_one_time_workaround() {
+        let copy = crate::licence_control::activation_copy("release_intercepted");
+        assert_ne!(copy, crate::licence_control::activation_copy("no_such_reason"));
+        assert!(copy.contains("inspecting"), "{copy}");
+        assert!(
+            !copy.contains("stays activated"),
+            "release borrowed activation's one-time promise, which is not true here: {copy}"
+        );
+    }
+
+    /// Every reason the activation path can produce must have a sentence.
+    #[test]
+    fn the_new_reason_has_copy_and_it_is_not_the_fallback() {
+        let copy = crate::licence_control::activation_copy("intercepted");
+        assert_ne!(
+            copy,
+            crate::licence_control::activation_copy("no_such_reason"),
+            "`intercepted` fell through to the generic refusal sentence"
+        );
+        assert!(
+            copy.contains("inspecting"),
+            "the copy must say what actually happened: {copy}"
+        );
+        assert!(
+            !copy.contains("try again"),
+            "the copy must not invite a retry that cannot succeed: {copy}"
+        );
+    }
+
     #[test]
     fn the_origin_override_only_accepts_loopback() {
         // USERINFO IS NOT A HOST (security audit 2026-08-18, F5). The last
@@ -633,12 +1389,21 @@ mod tests {
         // The genuine article still works, or the end-to-end gate cannot run.
         for good in ["http://127.0.0.1:18788", "http://localhost:18788"] {
             std::env::set_var("PATANYX_LICENCE_ORIGIN", good);
-            assert_eq!(licence_origin(), good, "loopback override refused: {good}");
+            if cfg!(debug_assertions) {
+                assert_eq!(licence_origin(), good, "loopback override refused: {good}");
+            } else {
+                // Release builds carry no override at all (pentest F-009).
+                assert_eq!(licence_origin(), crate::updater::base_url(), "a release build honoured the override");
+            }
         }
         std::env::set_var("PATANYX_LICENCE_ORIGIN", "http://evil.example");
         assert_eq!(licence_origin(), crate::updater::base_url());
         std::env::set_var("PATANYX_LICENCE_ORIGIN", "http://127.0.0.1:18788");
-        assert_eq!(licence_origin(), "http://127.0.0.1:18788");
+        if cfg!(debug_assertions) {
+            assert_eq!(licence_origin(), "http://127.0.0.1:18788");
+        } else {
+            assert_eq!(licence_origin(), crate::updater::base_url());
+        }
         std::env::remove_var("PATANYX_LICENCE_ORIGIN");
         assert_eq!(licence_origin(), crate::updater::base_url());
     }

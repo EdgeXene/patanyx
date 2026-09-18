@@ -1,0 +1,24 @@
+# GitHub Linguist. Every rule here is a statement of fact about what the file
+# IS, not a nudge toward a nicer language bar. First-party code stays counted,
+# including the test gates under scripts/, which are this project's own work
+# even though they never reach a build.
+
+# One third-party crate, carried in-tree with a documented one-line patch per
+# engine so the fix is auditable rather than hidden behind a fork. It is not
+# this project's code and must not count toward its language statistics.
+# The patch and its rationale: vendor/wry/PATANYX-PATCH.md
+vendor/** linguist-vendored
+
+# Brand artwork, not source. SVG is a language to Linguist and a drawing to
+# everyone else.
+packaging/brand/** linguist-vendored
+
+# Generated from Cargo.lock by packaging/flatpak/flatpak-cargo-generator.py.
+# Regenerating it is a build step; reading it as authored code is not useful.
+packaging/flatpak/cargo-sources.json linguist-generated
+
+# The hashed data sets the binary compiles in. These are lists, not source:
+# a malicious-host list and the Mozilla Public Suffix List, kept in plaintext
+# in the repository so additions are reviewable in a diff.
+crates/app/src/blocklist.txt linguist-generated
+crates/app/src/public_suffix_list.txt linguist-generated

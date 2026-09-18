@@ -5,9 +5,9 @@
 //! settings the browser needs at process start, when there is no passphrase
 //! yet and nothing is decrypted.
 //!
-//! Today that set has exactly one member: which DNS resolver the engine should
-//! use. It has to be here because the WebView2 environment -- where the setting
-//! is applied -- is created before any window exists, let alone a vault prompt.
+//! This includes choices the engine needs before the vault opens: the DNS
+//! resolver used to create WebView2's environment and the engine tracking-
+//! prevention level applied as each profile becomes live.
 //!
 //! # Why plaintext is acceptable here, and where the line is
 //!
@@ -25,6 +25,38 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+/// WebView2's own tracking-prevention level.
+///
+/// This is separate from PATANYX's host list and request interception. Changing
+/// it must never rewrite or disable either of those primary blocking layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrackingPreventionLevel {
+    /// The existing posture and the absent-field meaning for every prefs file
+    /// written before this choice existed.
+    #[default]
+    Strict,
+    /// WebView2's default, offered for sites Strict breaks.
+    Balanced,
+}
+
+impl TrackingPreventionLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Balanced => "balanced",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "balanced" => Some(Self::Balanced),
+            _ => None,
+        }
+    }
+}
+
 /// Which resolver the engine should send DNS queries to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -33,49 +65,52 @@ pub enum DnsMode {
     /// running a VPN, is their VPN's resolver.
     ///
     /// THE DEFAULT, and this is a CHOICE THE BROWSER DECLINES TO MAKE rather
-    /// than a recommendation of the system resolver. Every alternative here
-    /// hands a specific company every domain the user looks up. That can be a
-    /// good trade, and the panel argues it, but it is the user's trade to make:
+    /// than a recommendation of the system resolver. The encrypted option
+    /// hands one company every domain the user looks up. That can be a good
+    /// trade, and the panel argues it, but it is the user's trade to make:
     /// a browser that quietly redirected DNS to a party of its own choosing
     /// would be doing a smaller version of the thing this product exists to
     /// refuse. It also has a concrete cost -- overriding a VPN's resolver
-    /// splits that user's traffic across two companies neither of them chose.
+    /// splits that user's traffic across two companies neither of them chose,
+    /// and names private to a corporate VPN stop resolving.
     ///
     /// This is also the only setting that WORKS ON CAPTIVE-PORTAL WIFI, because
     /// it carries no DoH mode and so does not fail closed. See
     /// [`Self::doh_mode`]. That is a happy accident rather than the reason, but
     /// it does mean a first-run user is never stranded on hotel WiFi.
+    ///
+    /// HISTORY, because the tests and docs around this were rewritten twice
+    /// in two days: on 2026-09-04 Quad9 became the default for the
+    /// first stable release, and on 2026-09-05 reversed it -- System default,
+    /// Quad9 an option. The hardening that came out of reviewing the Quad9
+    /// default stayed: the applied-resolver record, the probe's tunnel and
+    /// redirect guards, the chosen marker, the lenient marker parsing.
     #[default]
     System,
-    /// Mullvad's FILTERING resolver. Free, no account, Swedish jurisdiction,
-    /// no-logging policy.
-    ///
-    /// OPT-IN, like every other resolver here. What choosing it buys is not
-    /// anonymity -- Mullvad sees every domain, and that is stated wherever the
-    /// choice is offered -- it is moving the observer from a party with a
-    /// commercial interest in the data to one with a published no-logging
-    /// policy and no such interest.
-    ///
-    /// The `base` endpoint, not the bare one: it blocks known malware and
-    /// phishing domains as well as ads and trackers. That is deliberate and it
-    /// corrects an asymmetry -- Quad9's default endpoint filters threats, so
-    /// shipping Mullvad's unfiltered endpoint alongside it meant choosing
-    /// Mullvad silently bought LESS protection than choosing Quad9.
-    ///
-    /// The filtering is also the only automatically-updating malicious-domain
-    /// defence this browser has while its own signed blocklist is unbuilt, and
-    /// SmartScreen is off. The cost is real and belongs in the UI, not just
-    /// here: Mullvad decides what is on that list, and a false positive looks
-    /// to the user like a site being down.
-    ///
-    /// Mullvad-the-resolver and Mullvad-the-VPN are separate services and
-    /// choosing this assumes neither. A user on a different VPN who picks this
-    /// is splitting their DNS away from the provider carrying their traffic,
-    /// which is usually not what they want; the panel says so.
-    Mullvad,
     /// Quad9. Swiss non-profit, no-logging policy, malware filtering on by
     /// default, DNSSEC validated, and EDNS Client Subnet not sent -- all four
     /// stated in Quad9's published feature table.
+    ///
+    /// OPT-IN, like every encrypted resolver this browser has offered. What
+    /// choosing it buys is not anonymity -- Quad9 sees every domain, and that
+    /// is stated wherever the choice is offered -- it is moving the observer
+    /// from a party with a commercial interest in the data to a non-profit
+    /// with a published no-logging policy, and refusing known malicious
+    /// domains at the resolver on every request.
+    ///
+    /// The ONLY encrypted choice since Mullvad left: it announced on
+    /// 2026-09-03 that its public encrypted DNS servers shut down on
+    /// 2026-11-02 and that it sponsors Quad9 instead. The `Mullvad` variant
+    /// this enum carried went in the same change. A stored file that still
+    /// says `mullvad` deserialises to Quad9 through the serde alias below,
+    /// so the file stays readable and the user stays on an encrypted,
+    /// filtering resolver; what they lose is Mullvad's ad and tracker
+    /// blocking at the resolver, which the browser's own blocker covers.
+    ///
+    /// FAIL-CLOSED ([`Self::doh_mode`]): a user who chose this and walks into
+    /// a hotel cannot load the sign-in page until they switch to `System`
+    /// and restart. `resolver_probe` notices and says so.
+    #[serde(alias = "mullvad")]
     Quad9,
 }
 
@@ -158,6 +193,47 @@ pub enum PageTheme {
     Dark,
     /// Ask every site for its light theme.
     Light,
+}
+
+/// How much of a page Text Capture and Deep Recall ask the engine to render.
+///
+/// This is one preference for both features because both start with the same
+/// page picture and virtualized pages fail in the same way in either flow.
+/// The actual scope is still carried on `capture::CaptureEvent`: an old
+/// WebView2 runtime may fall back from a requested full page to the viewport,
+/// and a preference must never overwrite that fact in the result or archive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapturePreference {
+    /// The behavior every build before this choice shipped used.
+    #[default]
+    FullPage,
+    /// Only the pixels currently visible in the page view.
+    Viewport,
+}
+
+impl CapturePreference {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::FullPage => "full_page",
+            Self::Viewport => "viewport",
+        }
+    }
+
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "full_page" => Some(Self::FullPage),
+            "viewport" => Some(Self::Viewport),
+            _ => None,
+        }
+    }
+
+    pub fn capture_scope(self) -> crate::capture::CaptureScope {
+        match self {
+            Self::FullPage => crate::capture::CaptureScope::FullPage,
+            Self::Viewport => crate::capture::CaptureScope::VisibleArea,
+        }
+    }
 }
 
 impl PageTheme {
@@ -329,13 +405,14 @@ impl ToolbarLabels {
     }
 }
 
-/// Where the feature buttons live: along the top, or down the left edge.
+/// Where the feature buttons live: at either end of the top row, or down
+/// either side of the page.
 ///
-/// `Top` is the shape every build has shipped and stays the default. `Left`
-/// moves the SECOND toolbar row -- the browser's standing state, everything
-/// after `.toolbar-break` -- into a vertical strip, and leaves the tab strip,
-/// the navigation buttons and the address bar where they are. An address bar
-/// wants width; a column of pills does not.
+/// `TopLeft` is the stored meaning of the old `"top"` value and stays the
+/// default. `Left` and `Right` move the SECOND toolbar row -- the browser's
+/// standing state, everything after `.toolbar-break` -- into a vertical
+/// strip, and leave the tab strip, the navigation buttons and the address bar
+/// where they are. An address bar wants width; a column of pills does not.
 ///
 /// This is a layout choice, so it is worn the same way the accent and the
 /// scheme are: a data attribute on the chrome's root element, with the CSS
@@ -344,32 +421,44 @@ impl ToolbarLabels {
 /// how much of the window it is now using on each axis -- see
 /// `AppState::set_chrome_insets`.
 ///
-/// Left is ICON-ONLY by construction, and [`ToolbarLabels`] therefore applies
-/// only while this is `Top`. That is stated in the panel rather than left to
-/// be discovered: a setting that silently does nothing is the thing this
-/// browser's rule about inert controls exists to prevent.
+/// The side strips are ICON-ONLY by construction, and [`ToolbarLabels`]
+/// therefore applies only to the two top placements. That is stated in the
+/// panel rather than left to be discovered: a setting that silently does
+/// nothing is the thing this browser's rule about inert controls exists to
+/// prevent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ToolbarPlacement {
-    /// Two rows above the page, the shape every build has shipped.
+    /// Two rows above the page, feature buttons aligned left. The serde alias
+    /// is the compatibility contract with prefs written before four-way
+    /// placement existed.
     #[default]
-    Top,
+    #[serde(alias = "top")]
+    TopLeft,
+    /// Two rows above the page, feature buttons aligned right.
+    TopRight,
     /// Feature buttons in a strip down the left; everything else stays put.
     Left,
+    /// Feature buttons in a strip down the right; everything else stays put.
+    Right,
 }
 
 impl ToolbarPlacement {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Top => "top",
+            Self::TopLeft => "top_left",
+            Self::TopRight => "top_right",
             Self::Left => "left",
+            Self::Right => "right",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "top" => Some(Self::Top),
+            "top_left" => Some(Self::TopLeft),
+            "top_right" => Some(Self::TopRight),
             "left" => Some(Self::Left),
+            "right" => Some(Self::Right),
             _ => None,
         }
     }
@@ -395,31 +484,32 @@ impl UpdateChannel {
 impl DnsMode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::System => "system",
-            Self::Mullvad => "mullvad",
             Self::Quad9 => "quad9",
+            Self::System => "system",
         }
     }
 
+    /// Wire names only. `"mullvad"` is deliberately NOT accepted: the
+    /// service is retired, and an IPC caller naming it gets `bad_args`
+    /// rather than a silent substitution. A stored file that still says it
+    /// is handled by the serde alias on `Quad9`, not here.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
-            "system" => Some(Self::System),
-            "mullvad" => Some(Self::Mullvad),
             "quad9" => Some(Self::Quad9),
+            "system" => Some(Self::System),
             _ => None,
         }
     }
 
     /// The DoH template, or `None` for the system resolver.
     ///
-    /// Verified against each resolver's published documentation rather than
+    /// Verified against the resolver's published documentation rather than
     /// recalled. A wrong template does not degrade -- it means DNS fails, so
-    /// these are not values to guess at.
+    /// this is not a value to guess at.
     pub fn doh_template(self) -> Option<&'static str> {
         match self {
-            Self::System => None,
-            Self::Mullvad => Some("https://base.dns.mullvad.net/dns-query"),
             Self::Quad9 => Some("https://dns.quad9.net/dns-query"),
+            Self::System => None,
         }
     }
 
@@ -428,9 +518,9 @@ impl DnsMode {
     /// `secure` FAILS CLOSED: if the chosen resolver cannot be reached, the
     /// browser does not resolve at all rather than falling back to whatever
     /// the network offers. That is the point. A user who deliberately picked
-    /// Mullvad and got silently downgraded to an airport's plaintext resolver
-    /// has the leak they chose this setting to close, and no way to find out --
-    /// WebView2 exposes no signal that a downgrade happened.
+    /// Quad9 and got silently downgraded to an airport's plaintext resolver
+    /// has the leak they chose this setting to close, and no way to find out
+    /// -- WebView2 exposes no signal that a downgrade happened.
     ///
     /// THE COST IS CAPTIVE PORTALS. Hotel, airport and cafe login pages work
     /// BY hijacking DNS, so fail-closed means the browser cannot reach them at
@@ -445,45 +535,41 @@ impl DnsMode {
     /// the user never asked for.
     pub fn doh_mode(self) -> Option<&'static str> {
         match self {
+            Self::Quad9 => Some("secure"),
             Self::System => None,
-            Self::Mullvad | Self::Quad9 => Some("secure"),
         }
     }
 
-    /// One sentence for the UI. Says what the choice COSTS as well as what it
-    /// buys -- picking a resolver moves who sees your lookups, it does not
-    /// remove them.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::System => {
-                "The default. Your machine keeps using whatever it uses now: your \
-                 VPN's resolver if you have one, otherwise your internet \
-                 provider, who can log and sell what you look up. The lookup \
-                 is not encrypted, so a network can also strip the key that \
-                 hides the site name inside the connection and put it back in \
-                 the open. This is the only setting that works on public WiFi \
-                 that asks you to log in."
-            }
-            Self::Mullvad => {
-                "Encrypted, and sent to Mullvad, who also block malware, \
-                 phishing, ad and tracker domains. They see every domain you \
-                 look up instead of your provider, under a no-logging policy. \
-                 It also protects the key that hides the site name inside the \
-                 connection, which a network can strip over unencrypted DNS. \
-                 This overrides your VPN's resolver, and never falls back to \
-                 the network's DNS, so public WiFi login pages will not load \
-                 until you switch back to System."
-            }
-            Self::Quad9 => {
-                "Encrypted, and sent to Quad9, a Swiss non-profit who also \
-                 block known malicious domains. They see every domain you look \
-                 up. It also protects the key that hides the site name inside \
-                 the connection, which a network can strip over unencrypted \
-                 DNS. This overrides your VPN's resolver, and never falls back \
-                 to the network's DNS, so public WiFi login pages will not \
-                 load until you switch back to System."
-            }
-        }
+    /// The engine switches for this choice, or `None` for System: exactly
+    /// the text `platform::windows::desired_browser_args` appends.
+    ///
+    /// Lives HERE, platform-independent, so a test that runs on Linux (where
+    /// CI runs) can pin that the DEFAULT produces the switches. The Windows
+    /// function that consumes this cannot be exercised there, and a refactor
+    /// that dropped the arguments inside it would otherwise leave every test
+    /// green while every install ran plaintext under a green chip.
+    pub fn doh_args(self) -> Option<String> {
+        let mode = self.doh_mode()?;
+        let template = self.doh_template()?;
+        Some(format!(
+            " --dns-over-https-mode={mode} --dns-over-https-templates={template}"
+        ))
+    }
+
+    /// One sentence for the UI, resolved from the compiled catalog. Says
+    /// what the choice COSTS as well as what it buys -- being on a resolver
+    /// moves who sees your lookups, it does not remove them.
+    ///
+    /// Owned `String`, resolved on EVERY call: the text must follow a live
+    /// locale change, so nothing may cache it (i18n.rs has the ruling). The
+    /// English words themselves now live in chrome/i18n/locales/en.ftl,
+    /// still exactly once -- the single-source contract moved files, it did
+    /// not weaken -- and the claims manifest pins their content.
+    pub fn describe(self, i18n: &crate::i18n::I18n) -> String {
+        i18n.text(match self {
+            Self::System => crate::i18n::keys::PREFS_DNS_SYSTEM_DESCRIPTION,
+            Self::Quad9 => crate::i18n::keys::PREFS_DNS_QUAD9_DESCRIPTION,
+        })
     }
 }
 
@@ -508,31 +594,18 @@ impl TunnelMode {
         }
     }
 
-    /// The user-facing description of this choice, and the ONLY source of
-    /// it: every surface that explains the tunnel takes its text from here,
-    /// so two UIs can never word the same choice differently. In the same
-    /// spirit as [`DnsMode::describe`], the text says what the choice COSTS
-    /// as well as what it buys -- the server at the far end sees the
-    /// traffic, and a tunnel that is down fails closed rather than falling
-    /// back.
-    pub fn describe(self) -> &'static str {
-        match self {
-            Self::Off => {
-                "The default. Your browsing goes straight out, the same as \
-                 any other browser."
-            }
-            Self::Imported => {
-                "Sends only this browser's traffic through the WireGuard \
-                 server you imported, not your other apps and not the rest of \
-                 the system. You picked that server, and it can see your \
-                 traffic, so this is not an anonymity feature. If the tunnel \
-                 goes down, pages fail to load. PATANYX never falls back to a \
-                 direct connection. Switching this on or off takes effect the \
-                 next time you start the browser; Apply and restart, in the \
-                 Private Tunnel panel, does that for you and reopens your \
-                 tabs."
-            }
-        }
+    /// The user-facing description of this choice, and still the ONLY
+    /// source of it: every surface that explains the tunnel resolves the
+    /// same catalog message, so two UIs can never word the same choice
+    /// differently. The words live in chrome/i18n/locales/en.ftl under the
+    /// claims manifest; in the same spirit as [`DnsMode::describe`], they
+    /// say what the choice COSTS as well as what it buys. Resolved per call
+    /// -- no cache -- so a live locale change repaints it (i18n.rs).
+    pub fn describe(self, i18n: &crate::i18n::I18n) -> String {
+        i18n.text(match self {
+            Self::Off => crate::i18n::keys::PREFS_TUNNEL_OFF_DESCRIPTION,
+            Self::Imported => crate::i18n::keys::PREFS_TUNNEL_IMPORTED_DESCRIPTION,
+        })
     }
 }
 
@@ -577,10 +650,81 @@ fn fingerprint_noise_default() -> bool {
 }
 
 
+/// "en" and never anything cleverer: guessing from the OS would make the
+/// first launch differ per machine, and the stored value must survive a
+/// downgrade to a build that has never heard of the tag it names.
+fn ui_locale_default() -> String {
+    "en".to_string()
+}
+
+/// `true` only for a JSON `true`; anything else -- `null`, a number, a
+/// string, a missing value -- is `false`. Used for markers whose failure
+/// mode must be "treated as unset", never "the file is unreadable".
+fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(matches!(v, serde_json::Value::Bool(true)))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    /// Who resolves the sites the user visits, from the NEXT start: the
+    /// engine takes this only at environment creation. The resolver the
+    /// engine is running right now is [`applied_dns`], and the two differ
+    /// after a choice until the restart, which is why every surface that
+    /// claims a resolver is in force reads the applied one.
     pub dns: DnsMode,
+    /// Whether `dns` was set through the picker, as opposed to written by
+    /// `save` as a side effect of some other preference changing.
+    ///
+    /// `save` writes the whole struct, so a file carrying the default value
+    /// says nothing about whether the user ever opened the panel; a file
+    /// carrying a NON-default value can only have got it from the picker,
+    /// because nothing else writes one. [`parse_stored`] therefore marks a
+    /// stored non-default value as chosen even in a pre-1.0 file that never
+    /// carried this field. What the marker buys is the future: if the default
+    /// ever changes, a recorded choice can be honoured and an unrecorded
+    /// default can move, without the guesswork that made the one-day Quad9
+    /// default (2026-09-04) so hard to migrate honestly.
+    ///
+    /// The `dns` key is the same one every earlier build reads, so a
+    /// downgrade runs the resolver this build last wrote. A downgrade drops
+    /// this marker, which 0.9.x does not know; the value itself survives.
+    ///
+    /// Lenient on the wire: a marker that is not a boolean reads as `false`
+    /// instead of making the WHOLE file unreadable, which would discard every
+    /// other preference in it and let the next save write defaults over them.
+    /// The review pointed at exactly that: one malformed field must not take
+    /// the tunnel mode or the auto-lock down with it.
+    #[serde(default, deserialize_with = "lenient_bool")]
+    pub resolver_chosen: bool,
+    /// The chrome's own language, and ONLY the chrome's: this value must
+    /// never reach navigator.language, Accept-Language, or any per-site
+    /// surface -- the divergence non-goals carry the reasoning, and a
+    /// pinned test holds the door. Lives in the unlocked prefs file
+    /// because the chrome needs it before any unlock, and it discloses
+    /// nothing but a language choice.
+    #[serde(default = "ui_locale_default")]
+    pub ui_locale: String,
+    /// The language a page was last translated INTO, pre-filled next time.
+    ///
+    /// A familiar convenience: the target dropdown remembers your choice so
+    /// translating is usually one click. Empty means "never chosen", and the
+    /// UI then pre-fills from the chrome's own locale as a first guess.
+    ///
+    /// Same file and same reasoning as `ui_locale`: it lives in the UNLOCKED
+    /// prefs, because the chooser is drawn before any vault unlock, and it
+    /// discloses nothing but a language preference. It must NEVER reach
+    /// navigator.language / Accept-Language / any per-site surface -- it is a
+    /// UI default, not a signal a page may read, exactly like ui_locale.
+    /// `#[serde(default)]` at the struct level gives an old prefs.json the
+    /// empty string, which is the correct "never chosen" meaning.
+    #[serde(default)]
+    pub translate_target: String,
+    /// WebView2's profile-level tracker blocking. Strict is deliberately the
+    /// default, including when an older additive prefs file lacks this field.
+    /// WebKitGTK has only an ITP on/off switch and does not consume this value.
+    pub tracking_prevention: TrackingPreventionLevel,
     /// Seconds of inactivity before the vault locks; 0 disables it.
     #[serde(default = "autolock_default")]
     pub vault_autolock_secs: u64,
@@ -590,6 +734,17 @@ pub struct Prefs {
     /// there is no wrong-numeric-default trap here, so no field-level
     /// override function is needed.
     pub update_channel: UpdateChannel,
+    /// Whether the ONE-TIME 1.0.0 channel reset has run on this install.
+    ///
+    /// Through 0.9.x the Updates panel drew a single "Beta" button and moved
+    /// every install it opened on from Stable to Beta, with a comment saying
+    /// that was safe "only today" because both channels served the identical
+    /// manifest. So no stored Beta from that era is a choice anyone made. The
+    /// first 1.0.0 load puts such an install back on Stable ONCE and sets
+    /// this, after which a Beta the user picks from the restored two-button
+    /// row is respected forever.
+    #[serde(default)]
+    pub channel_reset_1_0: bool,
     /// Which tunnel, if any, carries this browser's traffic.
     /// `#[serde(default)]` at the struct level already gives an old
     /// prefs.json missing this field `TunnelMode`'s own `#[default]`, which
@@ -599,10 +754,10 @@ pub struct Prefs {
     /// wrong-default trap here, so no field-level override function is
     /// needed.
     pub tunnel: TunnelMode,
-    /// A shelf id set aside by "Apply and restart", to be reopened once the
+    /// A shelf id created by "Apply and restart", to be reopened once the
     /// vault is unlocked in the replacement process.
     ///
-    /// THE ID, NOT THE NAME: shelf names repeat (every "Set aside 3 tabs"
+    /// THE ID, NOT THE NAME: shelf names repeat (every "Shelf with 3 tabs"
     /// looks alike), and restoring the wrong one would reopen a session the
     /// user shelved deliberately weeks ago. `Shelf::id` is unique.
     ///
@@ -625,6 +780,10 @@ pub struct Prefs {
     /// level gives an old prefs.json `Auto`, which IS the correct
     /// absent-field meaning: a user who never touched this follows the OS.
     pub page_theme: PageTheme,
+    /// Text Capture and Deep Recall capture scope. The struct-level serde
+    /// default gives every older prefs.json `FullPage`, preserving today's
+    /// behavior until the user explicitly chooses the viewport.
+    pub capture_scope: CapturePreference,
     /// Chrome accent theme. Absent field reads Default, which renders
     /// byte-identically to every build before theming existed.
     pub chrome_theme: ChromeTheme,
@@ -637,6 +796,19 @@ pub struct Prefs {
     /// touches that. Default ON, the shape mainstream browsers settled on;
     /// the update panel carries the switch for metered or minimal setups.
     pub update_background_download: bool,
+    /// Apply a staged, verified update BY ITSELF at the next launch, with no
+    /// click -- the shape other browsers use. The signed manifest still decides WHICH
+    /// releases may do that (`Manifest::installs_silently`): maintenance and
+    /// security releases qualify; a pure feature release is announced and
+    /// waits for consent or the grace period.
+    ///
+    /// Default OFF, and STILL OFF in 1.0.0 by decision: this is the one code
+    /// path that replaces the running binary, it has never run in the field,
+    /// and `swap_and_relaunch` restores the old binary on a failed write but
+    /// not on a failed relaunch. It becomes ON only after a real
+    /// replace-and-relaunch test on hardware -- a one-line change HERE plus a
+    /// field-level serde default (absent must then read true, not false).
+    pub update_auto_apply: bool,
     /// Lock the vault when the workstation locks or the machine suspends.
     ///
     /// Separate from `vault_autolock_secs` because the two watch different
@@ -671,10 +843,11 @@ pub struct Prefs {
     /// Same shape as `page_theme` and unlike `vault_lock_on_session_lock`,
     /// where the derived default is the weaker posture.
     pub toolbar_labels: ToolbarLabels,
-    /// Where the feature buttons live: along the top, or down the left edge.
+    /// Where the feature buttons live: at either end of the top, or down
+    /// either edge.
     ///
     /// Same absent-field reasoning as `toolbar_labels`: the derived default
-    /// is `Top`, which is the layout every prefs.json written before this
+    /// is `TopLeft`, which is the layout every prefs.json written before this
     /// field existed was describing. Moving somebody's toolbar on upgrade is
     /// the one wrong answer here.
     pub toolbar_placement: ToolbarPlacement,
@@ -701,14 +874,21 @@ impl Default for Prefs {
     fn default() -> Self {
         Self {
             dns: DnsMode::default(),
+            resolver_chosen: false,
+            ui_locale: ui_locale_default(),
+            translate_target: String::new(),
+            tracking_prevention: TrackingPreventionLevel::default(),
             vault_autolock_secs: AUTOLOCK_DEFAULT_SECS,
             update_channel: UpdateChannel::default(),
+            channel_reset_1_0: false,
             tunnel: TunnelMode::default(),
             tunnel_restore_shelf: None,
             page_theme: PageTheme::default(),
+            capture_scope: CapturePreference::default(),
             chrome_theme: ChromeTheme::default(),
             chrome_scheme: ChromeScheme::default(),
             update_background_download: true,
+            update_auto_apply: false,
             vault_lock_on_session_lock: lock_on_session_lock_default(),
             fingerprint_noise: fingerprint_noise_default(),
             toolbar_labels: ToolbarLabels::default(),
@@ -818,12 +998,13 @@ fn write_onboarding_marker() -> std::io::Result<()> {
 /// ABSENT AND CORRUPT ARE NOT THE SAME EVENT, and collapsing them is what this
 /// distinction exists to undo. A missing file means a user who has never
 /// chosen a resolver: defaults are exactly right and there is nothing to say.
-/// An unreadable one means a user who may well have chosen Mullvad or Quad9
-/// and is now silently on the network's plaintext resolver, because
+/// An unreadable one means a user who may well have chosen Quad9 and whose
+/// NEXT start is on the network's plaintext resolver, because
 /// `DnsMode::System` carries `doh_mode() == None`. The old doc called that
 /// fallback "the conservative direction" -- true for availability, false for
 /// the one property the setting exists to provide, and the user saw nothing
-/// either way.
+/// either way. (The engine already running keeps what it started with; see
+/// [`applied_dns`].)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefsOrigin {
     /// Read and parsed. What is returned is what the user chose.
@@ -850,20 +1031,102 @@ pub fn load() -> Prefs {
 /// a dozen places that genuinely do not care, and making all of them
 /// destructure a tuple to ignore half of it would bury the one call that does.
 pub fn load_with_origin() -> (Prefs, PrefsOrigin) {
-    let raw = match std::fs::read_to_string(prefs_path()) {
+    let (prefs, origin) = from_read(std::fs::read_to_string(prefs_path()).map_err(|e| e.kind()));
+    let (prefs, reset) = reset_forced_beta_once(prefs);
+    if reset {
+        // Persist so the reset is genuinely once. A failed save leaves the
+        // in-memory value correct for this run and tries again next start,
+        // which is the same outcome as never having run; nothing to report.
+        let _ = save(&prefs);
+    }
+    (prefs, origin)
+}
+
+/// The one-time 1.0.0 channel reset, pure so it is table-testable.
+///
+/// Returns the prefs and whether anything changed. A stored Beta with the
+/// marker unset is the 0.9.x forced migration and goes back to Stable; a
+/// Beta with the marker set is a real choice and stays. Stable with the marker
+/// unset just gets the marker, so the check never runs again.
+pub fn reset_forced_beta_once(mut prefs: Prefs) -> (Prefs, bool) {
+    if prefs.channel_reset_1_0 {
+        return (prefs, false);
+    }
+    prefs.channel_reset_1_0 = true;
+    if prefs.update_channel == UpdateChannel::Beta {
+        prefs.update_channel = UpdateChannel::Stable;
+    }
+    (prefs, true)
+}
+
+/// The classifier behind [`load_with_origin`], pure so the test that pins
+/// "absent is not the same as corrupt" exercises THIS function rather than
+/// a copy of its logic that could drift from it.
+pub fn from_read(read: Result<String, std::io::ErrorKind>) -> (Prefs, PrefsOrigin) {
+    let raw = match read {
         Ok(raw) => raw,
         // Not found is the ordinary first-run case. Any OTHER read error
         // (permissions, a directory in the way, I/O) is a file that exists in
         // some form and could not be used, which is the reportable case.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return (Prefs::default(), PrefsOrigin::Absent)
-        }
+        Err(std::io::ErrorKind::NotFound) => return (Prefs::default(), PrefsOrigin::Absent),
         Err(_) => return (Prefs::default(), PrefsOrigin::Unreadable),
     };
-    match serde_json::from_str(&raw) {
+    match parse_stored(&raw) {
         Ok(prefs) => (prefs, PrefsOrigin::Stored),
         Err(_) => (Prefs::default(), PrefsOrigin::Unreadable),
     }
+}
+
+/// Parses a stored file and applies the one rule serde cannot express: a
+/// stored value that differs from the default can only have come from the
+/// picker, so it counts as CHOSEN even when the file predates the marker.
+/// A stored default without the marker is just the default. EVERY
+/// deserialisation of a stored file goes through here, so the marker is
+/// always consistent with the value beside it.
+pub fn parse_stored(raw: &str) -> Result<Prefs, serde_json::Error> {
+    let mut prefs: Prefs = serde_json::from_str(raw)?;
+    if prefs.dns != DnsMode::default() {
+        prefs.resolver_chosen = true;
+    }
+    Ok(prefs)
+}
+
+/// The resolver the ENGINE was given at startup.
+///
+/// FROZEN at the first environment argument build and handed back to every
+/// later one: the shared environment, wry's fallback path, and the
+/// translator webview, which is created later and would otherwise re-read
+/// a file the user may have changed since boot and run a different resolver
+/// from the browser it sits beside. One process, one resolver, and this is
+/// it. Never recorded where no engine takes it: WebKitGTK has no encrypted
+/// DNS, so on Linux this stays unset and reads as `System`, which is the
+/// truth there. Unset on Windows -- the chrome asking before any
+/// environment exists, which does not happen -- also reads as `System`:
+/// grey is the safe wrong.
+///
+/// WHY THIS EXISTS. `load()` re-reads the file on every `dns_get`, and the
+/// file can change under a running engine: a choice (restart pending), or
+/// the file becoming unreadable, which yields the DEFAULT. A chrome that
+/// coloured its chip by the file would claim, after a Quad9 choice, an
+/// encryption not yet running, and after the file broke under a Quad9
+/// engine, a plaintext state the engine is not in. So the chip, the
+/// reachability probe and the diagnostics all read THIS, and the file is
+/// what the next start gets.
+///
+/// What this records is what the process ASKED for. Whether the engine
+/// honoured the switches is not observable from here; the release checklist
+/// carries a hardware check for that, and the copy says "sends", not
+/// "confirmed".
+static APPLIED_DNS: std::sync::OnceLock<DnsMode> = std::sync::OnceLock::new();
+
+/// The frozen resolver, recording `mode` if nothing is frozen yet. Every
+/// engine argument build goes through this, so the first one decides.
+pub fn applied_dns_or_record(mode: DnsMode) -> DnsMode {
+    *APPLIED_DNS.get_or_init(|| mode)
+}
+
+pub fn applied_dns() -> DnsMode {
+    APPLIED_DNS.get().copied().unwrap_or(DnsMode::System)
 }
 
 /// Writes preferences, creating the directory if needed.
@@ -875,9 +1138,9 @@ pub fn save(prefs: &Prefs) -> Result<(), &'static str> {
     let body = serde_json::to_string_pretty(prefs).map_err(|_| "io")?;
     // WRITE-THEN-RENAME. This used to be a plain write, argued as "a torn
     // write loses a resolver preference and `load` falls back to the default"
-    // -- which was accurate about the mechanism and wrong about the cost. The
-    // default is `System`: no encrypted DNS and no fail-closed behaviour. So a
-    // torn write did not lose a preference, it silently turned off the
+    // -- which was accurate about the mechanism and wrong about the cost.
+    // The default is `System`: no encrypted DNS and no fail-closed behaviour.
+    // So a torn write did not lose a preference, it silently turned off the
     // protection the user had switched on, and nothing said so.
     //
     // A rename over the same directory is atomic on both platforms, and the
@@ -896,7 +1159,93 @@ pub fn save(prefs: &Prefs) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn translate_target_round_trips_and_defaults_empty() {
+        // A prefs.json written before this field existed reads back empty,
+        // which is the correct "never chosen" meaning.
+        let json = r#"{"dns":"system"}"#;
+        let p: Prefs = serde_json::from_str(json).expect("old prefs parse");
+        assert_eq!(p.translate_target, "");
+
+        // Round-trips through serialization.
+        let mut p2 = Prefs::default();
+        p2.translate_target = "es".to_string();
+        let out = serde_json::to_string(&p2).unwrap();
+        let back: Prefs = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.translate_target, "es");
+    }
+    fn english() -> crate::i18n::I18n {
+        crate::i18n::I18n::bootstrap("en").expect("the embedded English catalog is valid")
+    }
+
     use super::*;
+
+    #[test]
+    fn capture_scope_defaults_full_page_and_viewport_round_trips() {
+        // Load compatibility is the feature contract: every prefs file from
+        // before this field existed keeps the old full-page behavior.
+        let old: Prefs = serde_json::from_str(r#"{"dns":"system"}"#)
+            .expect("pre-capture-scope prefs must still load");
+        assert_eq!(old.capture_scope, CapturePreference::FullPage);
+        assert_eq!(Prefs::default().capture_scope, CapturePreference::FullPage);
+
+        let mut prefs = Prefs::default();
+        prefs.capture_scope = CapturePreference::Viewport;
+        let text = serde_json::to_string(&prefs).expect("prefs serialize");
+        let back: Prefs = serde_json::from_str(&text).expect("prefs round trip");
+        assert_eq!(back.capture_scope, CapturePreference::Viewport);
+        assert!(text.contains(r#""capture_scope":"viewport""#));
+
+        assert_eq!(
+            CapturePreference::parse("full_page"),
+            Some(CapturePreference::FullPage)
+        );
+        assert_eq!(
+            CapturePreference::parse("viewport"),
+            Some(CapturePreference::Viewport)
+        );
+        assert_eq!(CapturePreference::parse("visible_area"), None);
+        assert_eq!(CapturePreference::parse("Viewport"), None);
+        assert_eq!(
+            CapturePreference::Viewport.capture_scope(),
+            crate::capture::CaptureScope::VisibleArea
+        );
+    }
+
+    #[test]
+    fn tracking_prevention_is_strict_when_absent_and_balanced_round_trips() {
+        // Additive-field compatibility: this is the exact shape of a prefs
+        // file written before the choice existed. An upgrade must preserve
+        // the old STRICT posture rather than inherit WebView2's Balanced
+        // default merely because the JSON has no new key.
+        let old: Prefs = serde_json::from_str(r#"{"dns":"system"}"#)
+            .expect("pre-tracking-level prefs must still load");
+        assert_eq!(old.tracking_prevention, TrackingPreventionLevel::Strict);
+        assert_eq!(
+            Prefs::default().tracking_prevention,
+            TrackingPreventionLevel::Strict
+        );
+
+        let mut prefs = Prefs::default();
+        prefs.tracking_prevention = TrackingPreventionLevel::Balanced;
+        let text = serde_json::to_string(&prefs).expect("prefs serialize");
+        let back: Prefs = serde_json::from_str(&text).expect("prefs round trip");
+        assert_eq!(
+            back.tracking_prevention,
+            TrackingPreventionLevel::Balanced
+        );
+        assert!(text.contains(r#""tracking_prevention":"balanced""#));
+
+        for level in [
+            TrackingPreventionLevel::Strict,
+            TrackingPreventionLevel::Balanced,
+        ] {
+            assert_eq!(TrackingPreventionLevel::parse(level.as_str()), Some(level));
+        }
+        assert_eq!(TrackingPreventionLevel::parse("basic"), None);
+        assert_eq!(TrackingPreventionLevel::parse("Strict"), None);
+    }
 
     /// The marker "Apply and restart" leaves for the next boot. It is the
     /// only thing that tells the replacement process a session is waiting,
@@ -1047,6 +1396,32 @@ mod tests {
         );
     }
 
+    /// The 0.9.x panel forced every install onto Beta; 1.0.0 undoes that
+    /// exactly once and then respects whatever the user picks.
+    #[test]
+    fn a_forced_beta_is_reset_to_stable_once_and_a_chosen_beta_is_kept() {
+        use super::{reset_forced_beta_once, UpdateChannel};
+        let mut forced = Prefs::default();
+        forced.update_channel = UpdateChannel::Beta;
+        let (p, changed) = reset_forced_beta_once(forced);
+        assert!(changed);
+        assert_eq!(p.update_channel, UpdateChannel::Stable, "a forced Beta must go back to Stable");
+        assert!(p.channel_reset_1_0, "the reset must mark itself done");
+
+        // Picked AFTER the reset: a real choice, untouched.
+        let mut chosen = p.clone();
+        chosen.update_channel = UpdateChannel::Beta;
+        let (q, changed) = reset_forced_beta_once(chosen);
+        assert!(!changed);
+        assert_eq!(q.update_channel, UpdateChannel::Beta, "a chosen Beta must be respected");
+
+        // A fresh Stable install just gets the marker, once.
+        let (r, changed) = reset_forced_beta_once(Prefs::default());
+        assert!(changed && r.channel_reset_1_0 && r.update_channel == UpdateChannel::Stable);
+        let (_, again) = reset_forced_beta_once(r);
+        assert!(!again, "the marker must stop the check from running twice");
+    }
+
     #[test]
     fn old_prefs_json_without_toolbar_labels_reads_show() {
         // The absent-field meaning has to be the shape every earlier build
@@ -1074,7 +1449,7 @@ mod tests {
     }
 
     #[test]
-    fn old_prefs_json_without_toolbar_placement_reads_top() {
+    fn old_prefs_json_without_toolbar_placement_reads_top_left() {
         // Nobody's toolbar moves on upgrade. A prefs.json written before
         // this setting existed describes a browser with two rows above the
         // page, and that is what it must read back as -- including one that
@@ -1082,9 +1457,27 @@ mod tests {
         // realistic shape of an existing install's file.
         for old in [r#"{"dns":"system"}"#, r#"{"toolbar_labels":"hide"}"#] {
             let prefs: Prefs = serde_json::from_str(old).expect("old prefs must parse");
-            assert_eq!(prefs.toolbar_placement, ToolbarPlacement::Top);
+            assert_eq!(prefs.toolbar_placement, ToolbarPlacement::TopLeft);
         }
-        assert_eq!(Prefs::default().toolbar_placement, ToolbarPlacement::Top);
+        assert_eq!(Prefs::default().toolbar_placement, ToolbarPlacement::TopLeft);
+    }
+
+    #[test]
+    fn old_top_toolbar_value_reads_top_left_and_left_stays_left() {
+        // `top` was the only horizontal spelling before the choice gained an
+        // alignment. It must keep loading as Top Left; `left` was already a
+        // stored value and must keep its exact meaning.
+        let old_top: Prefs = serde_json::from_str(
+            r#"{"toolbar_labels":"hide","toolbar_placement":"top"}"#,
+        )
+        .expect("old top prefs must parse");
+        assert_eq!(old_top.toolbar_placement, ToolbarPlacement::TopLeft);
+        assert_eq!(old_top.toolbar_labels, ToolbarLabels::Hide);
+
+        let old_left: Prefs =
+            serde_json::from_str(r#"{"toolbar_placement":"left"}"#)
+                .expect("old left prefs must parse");
+        assert_eq!(old_left.toolbar_placement, ToolbarPlacement::Left);
     }
 
     #[test]
@@ -1099,7 +1492,18 @@ mod tests {
         // value either -- "side" and "sidebar" are the two words a reader
         // would guess, and both must be refused rather than assumed.
         assert_eq!(ToolbarPlacement::parse("left"), Some(ToolbarPlacement::Left));
-        assert_eq!(ToolbarPlacement::parse("top"), Some(ToolbarPlacement::Top));
+        assert_eq!(
+            ToolbarPlacement::parse("top_left"),
+            Some(ToolbarPlacement::TopLeft)
+        );
+        assert_eq!(
+            ToolbarPlacement::parse("top_right"),
+            Some(ToolbarPlacement::TopRight)
+        );
+        assert_eq!(ToolbarPlacement::parse("right"), Some(ToolbarPlacement::Right));
+        // `top` is a stored-prefs compatibility alias, not a current IPC wire
+        // spelling. New saves and live messages use the four unambiguous names.
+        assert_eq!(ToolbarPlacement::parse("top"), None);
         assert_eq!(ToolbarPlacement::parse("side"), None);
         assert_eq!(ToolbarPlacement::parse("sidebar"), None);
         assert_eq!(ToolbarPlacement::parse("Left"), None);
@@ -1113,14 +1517,20 @@ mod tests {
         // Labels apply only while the toolbar is on top, and that is a UI
         // rule, not a storage one: choosing Left must not quietly discard a
         // label preference the user set earlier and would get back by
-        // choosing Top again.
+        // choosing a top placement again.
         let mut prefs = Prefs::default();
         prefs.toolbar_labels = ToolbarLabels::Hide;
-        prefs.toolbar_placement = ToolbarPlacement::Left;
+        prefs.toolbar_placement = ToolbarPlacement::Right;
         let text = serde_json::to_string(&prefs).unwrap();
         let back: Prefs = serde_json::from_str(&text).unwrap();
         assert_eq!(back.toolbar_labels, ToolbarLabels::Hide);
-        assert_eq!(back.toolbar_placement, ToolbarPlacement::Left);
+        assert_eq!(back.toolbar_placement, ToolbarPlacement::Right);
+
+        // Placement changes never rewrite the neighbouring pref. Returning to
+        // Top Left restores the exact label choice that preceded the strip.
+        let mut returned = back;
+        returned.toolbar_placement = ToolbarPlacement::TopLeft;
+        assert_eq!(returned.toolbar_labels, ToolbarLabels::Hide);
     }
 
     #[test]
@@ -1201,24 +1611,16 @@ mod tests {
     /// A corrupt settings file must be distinguishable from a missing one.
     ///
     /// Both yield defaults, and `DnsMode::System` means plaintext DNS with no
-    /// fail-closed behaviour -- so for a user who had chosen Mullvad or Quad9,
-    /// "corrupt" is a silently disabled protection while "missing" is just a
-    /// first run. The panel can only say so if these two are told apart, and
-    /// for the entire life of this file they were not.
+    /// fail-closed behaviour -- so for a user who had chosen Quad9, "corrupt"
+    /// is a silently disabled protection (from the next start) while
+    /// "missing" is just a first run. The panel can only say so if these two
+    /// are told apart, and for most of the life of this file they were not.
     #[test]
     fn a_corrupt_settings_file_is_not_the_same_as_no_settings_file() {
-        // Exercises the classifier directly rather than through the real path,
-        // which reads a fixed location this test must not touch.
-        fn classify(read: Result<String, std::io::ErrorKind>) -> PrefsOrigin {
-            match read {
-                Ok(raw) => match serde_json::from_str::<Prefs>(&raw) {
-                    Ok(_) => PrefsOrigin::Stored,
-                    Err(_) => PrefsOrigin::Unreadable,
-                },
-                Err(std::io::ErrorKind::NotFound) => PrefsOrigin::Absent,
-                Err(_) => PrefsOrigin::Unreadable,
-            }
-        }
+        // Exercises the REAL classifier, `from_read`, fed the read result
+        // directly, so a regression in load_with_origin's own logic fails
+        // here rather than in a copy of it.
+        let classify = |read: Result<String, std::io::ErrorKind>| from_read(read).1;
 
         assert_eq!(
             classify(Err(std::io::ErrorKind::NotFound)),
@@ -1235,12 +1637,10 @@ mod tests {
             PrefsOrigin::Unreadable,
             "a truncated or torn file is the case that silently downgraded DNS"
         );
-        assert_eq!(
-            classify(Ok(r#"{"dns":"mullvad"}"#.to_string())),
-            PrefsOrigin::Stored
-        );
+        assert_eq!(classify(Ok(r#"{"dns":"quad9"}"#.to_string())), PrefsOrigin::Stored);
 
         // And the reason any of this matters: the fallback carries no DoH.
+        assert_eq!(Prefs::default().dns, DnsMode::System);
         assert_eq!(Prefs::default().dns.doh_mode(), None);
     }
 
@@ -1250,44 +1650,121 @@ mod tests {
         // looks up. That can be a good trade and the panel argues it, but the
         // browser must not make it on the user's behalf -- quietly redirecting
         // DNS to a party of our choosing is a smaller version of the thing this
-        // product exists to refuse.
+        // product exists to refuse. Decided 2026-09-05, reversing a
+        // one-day Quad9 default.
+        assert_eq!(DnsMode::default(), DnsMode::System);
         assert_eq!(Prefs::default().dns, DnsMode::System);
         assert_eq!(DnsMode::default().doh_template(), None);
         // An EMPTY preferences file must land in the same place as a missing
         // one: a user who never opened the picker has not opted in to anything.
-        let untouched: Prefs = serde_json::from_str("{}").expect("empty prefs must parse");
+        let untouched = parse_stored("{}").expect("empty prefs must parse");
         assert_eq!(untouched.dns, DnsMode::System);
+        assert!(!untouched.resolver_chosen);
     }
 
     #[test]
-    fn the_default_never_fails_closed() {
-        // Picking a resolver fails closed, which makes captive-portal WiFi
-        // unusable until the user switches back. That is an acceptable cost of
-        // a deliberate choice and an unacceptable one for a first run, so the
-        // DEFAULT must carry no DoH mode. If this ever gains one, a user who
-        // installed the browser and changed nothing is stranded on hotel WiFi
-        // with no route online and no idea why.
+    fn a_stored_choice_survives_upgrade_and_the_retired_name_maps_to_quad9() {
+        // No 0.9.x build wrote the chosen marker, and the default was System
+        // there too -- so a stored non-default value can only have come from
+        // the picker. It is honoured and marked chosen, so a later default
+        // change cannot take it away. A stored `mullvad` reads as Quad9:
+        // encrypted stays encrypted, never plaintext, never "unreadable".
+        let p = parse_stored(r#"{"dns":"quad9","vault_autolock_secs":900}"#).unwrap();
+        assert_eq!(p.dns, DnsMode::Quad9);
+        assert!(p.resolver_chosen, "a non-default value is a choice by definition");
+        assert_eq!(p.vault_autolock_secs, 900, "the rest of the file survives");
+        let p = parse_stored(r#"{"dns":"mullvad"}"#).unwrap();
+        assert_eq!(p.dns, DnsMode::Quad9, "the retired resolver becomes Quad9");
+        assert!(p.resolver_chosen);
+        let p = parse_stored(r#"{"dns":"system"}"#).unwrap();
+        assert_eq!(p.dns, DnsMode::System);
+        assert!(!p.resolver_chosen, "a stored default without the marker is just the default");
+        // A file that recorded a System choice keeps it as a choice.
+        let p = parse_stored(r#"{"dns":"system","resolver_chosen":true}"#).unwrap();
+        assert!(p.resolver_chosen);
+        // What this build writes: the same `dns` key every earlier build
+        // reads, plus the marker.
+        let written = serde_json::to_string(&Prefs::default()).unwrap();
+        assert!(written.contains(r#""dns":"system""#), "{written}");
+        assert!(written.contains(r#""resolver_chosen":false"#), "{written}");
+    }
+
+    #[test]
+    fn the_default_never_fails_closed_and_quad9_does() {
+        // Picking Quad9 fails closed, which makes captive-portal WiFi
+        // unusable until the user switches back. That is an acceptable cost
+        // of a deliberate choice and an unacceptable one for a first run, so
+        // the DEFAULT must carry no DoH mode. If this ever gains one, a user
+        // who installed the browser and changed nothing is stranded on hotel
+        // WiFi with no route online and no idea why.
         assert_eq!(DnsMode::default().doh_mode(), None);
+        assert_eq!(DnsMode::default().doh_args(), None);
         assert_eq!(DnsMode::System.doh_mode(), None);
         assert_eq!(DnsMode::System.doh_template(), None);
+        assert_eq!(DnsMode::Quad9.doh_mode(), Some("secure"));
+        // The switches the engine is handed for the encrypted choice, pinned
+        // as text, because the Windows function that appends them is out of
+        // reach of a Linux-run test.
+        assert_eq!(
+            DnsMode::Quad9.doh_args().as_deref(),
+            Some(" --dns-over-https-mode=secure --dns-over-https-templates=https://dns.quad9.net/dns-query")
+        );
+    }
+
+    #[test]
+    fn a_malformed_marker_does_not_take_the_whole_file_down() {
+        // The marker must fail SMALL. A file whose marker is null (or
+        // anything but a boolean) still yields every other preference in it
+        // -- here the tunnel mode -- and the resolver beside it. The
+        // alternative was "unreadable", which discards the file and lets the
+        // next save write defaults over it.
+        for bad in [r#"null"#, r#"1"#, r#""yes""#, r#"[]"#] {
+            let raw = format!(r#"{{"resolver_chosen":{bad},"tunnel":"imported","dns":"quad9"}}"#);
+            let prefs = parse_stored(&raw)
+                .unwrap_or_else(|e| panic!("marker {bad} must not make the file unreadable: {e}"));
+            assert_eq!(prefs.tunnel, TunnelMode::Imported, "the tunnel mode must survive");
+            assert_eq!(prefs.dns, DnsMode::Quad9, "a stored choice survives a broken marker");
+            assert!(prefs.resolver_chosen, "and is marked chosen from the value itself");
+        }
+        // And beside the DEFAULT value a malformed marker must read as FALSE:
+        // `parse_stored` only ever sets the marker for a non-default value,
+        // so this is the case that catches a deserializer regression that
+        // read garbage as `true` and turned a side-effect System into a
+        // recorded choice.
+        for bad in [r#"null"#, r#"1"#, r#""yes""#, r#"[]"#] {
+            let raw = format!(r#"{{"resolver_chosen":{bad},"dns":"system"}}"#);
+            let prefs = parse_stored(&raw).unwrap();
+            assert_eq!(prefs.dns, DnsMode::System);
+            assert!(!prefs.resolver_chosen, "marker {bad} beside the default must read as unset");
+        }
+        let (prefs, origin) = from_read(Ok(r#"{"resolver_chosen":null,"tunnel":"imported"}"#.into()));
+        assert_eq!(origin, PrefsOrigin::Stored);
+        assert_eq!(prefs.tunnel, TunnelMode::Imported);
+        assert_eq!(prefs.dns, DnsMode::System);
+        assert!(!prefs.resolver_chosen);
     }
 
     #[test]
     fn modes_round_trip_through_their_wire_names() {
-        for mode in [DnsMode::System, DnsMode::Mullvad, DnsMode::Quad9] {
+        for mode in [DnsMode::System, DnsMode::Quad9] {
             assert_eq!(DnsMode::parse(mode.as_str()), Some(mode));
         }
         assert_eq!(DnsMode::parse("nonsense"), None);
         assert_eq!(DnsMode::parse("System"), None, "wire names are lowercase");
+        // Retired with Mullvad's public resolvers (shutdown 2026-11-02). An
+        // IPC caller that still names it gets bad_args, not a substitution.
+        assert_eq!(DnsMode::parse("mullvad"), None);
     }
 
     #[test]
-    fn every_non_system_mode_has_a_template() {
+    fn the_encrypted_mode_has_an_https_template() {
         // A mode that claims to encrypt but resolves to no template would
         // silently leave DNS in plaintext while the UI said otherwise.
-        for mode in [DnsMode::Mullvad, DnsMode::Quad9] {
-            let t = mode.doh_template().expect("must have a DoH template");
-            assert!(t.starts_with("https://"), "{mode:?} template must be https");
+        let t = DnsMode::Quad9.doh_template().expect("must have a DoH template");
+        assert!(t.starts_with("https://"), "template must be https");
+        // And nothing in this enum still points at the retired service.
+        for mode in [DnsMode::System, DnsMode::Quad9] {
+            assert!(!mode.doh_template().unwrap_or("").contains("mullvad"));
         }
     }
 
@@ -1296,9 +1773,7 @@ mod tests {
         // The whole reason to pick a resolver is not to use the network's. A
         // mode that fell back would hand a hostile or merely cheap network the
         // plaintext lookups this setting exists to prevent, silently.
-        for mode in [DnsMode::Mullvad, DnsMode::Quad9] {
-            assert_eq!(mode.doh_mode(), Some("secure"), "{mode:?} must fail closed");
-        }
+        assert_eq!(DnsMode::Quad9.doh_mode(), Some("secure"), "Quad9 must fail closed");
         // System must carry NO mode: with no template there is nothing to be
         // secure about, and a mode without a template configures a fallback
         // the user never asked for.
@@ -1307,28 +1782,42 @@ mod tests {
     }
 
     #[test]
-    fn a_resolver_choice_is_never_less_protective_than_another() {
-        // Quad9's default endpoint filters malicious domains. Shipping
-        // Mullvad's UNFILTERED endpoint beside it meant picking Mullvad
-        // silently bought less protection than picking Quad9 -- an asymmetry
-        // no user could have seen. `base.` is the filtering endpoint.
-        assert!(
-            DnsMode::Mullvad.doh_template().unwrap().contains("base."),
-            "Mullvad must use the filtering endpoint, not the bare one"
+    fn the_applied_resolver_is_system_until_an_engine_records_one() {
+        // Only the Windows engine takes the DoH setting, and it records what
+        // it took. Before that -- and forever on Linux, where nothing records
+        // -- the answer is System, which is the truth there. The first build
+        // freezes it, and every later build (fallback path, translator
+        // webview) is handed the frozen value, not the file's current one.
+        //
+        // This is the ONLY test that records; the static is process-wide.
+        assert_eq!(applied_dns(), DnsMode::System);
+        assert_eq!(applied_dns_or_record(DnsMode::Quad9), DnsMode::Quad9);
+        assert_eq!(applied_dns(), DnsMode::Quad9);
+        assert_eq!(
+            applied_dns_or_record(DnsMode::System),
+            DnsMode::Quad9,
+            "a later build must get the frozen resolver, not the file's"
         );
-        for mode in [DnsMode::Mullvad, DnsMode::Quad9] {
-            let d = mode.describe();
-            assert!(
-                d.contains("malware") || d.contains("malicious"),
-                "{mode:?} filters threats, and the UI text must say so: {d}"
-            );
-            // Fail-closed is the part a user discovers at an airport. It has
-            // to be in the sentence they read BEFORE choosing, not afterwards.
-            assert!(
-                d.contains("WiFi"),
-                "{mode:?} must warn that public WiFi logins break: {d}"
-            );
-        }
+        assert_eq!(applied_dns(), DnsMode::Quad9, "the first record must win");
+    }
+
+    #[test]
+    fn each_description_says_what_the_choice_costs() {
+        // Quad9 filters threats, and the UI text must say so -- and the
+        // fail-closed cost is the part a user discovers at an airport. It has
+        // to be in the sentence they read BEFORE choosing, not afterwards.
+        let d = DnsMode::Quad9.describe(&english());
+        assert!(
+            d.contains("malware") || d.contains("malicious"),
+            "Quad9 filters threats, and the UI text must say so: {d}"
+        );
+        assert!(d.contains("WiFi"), "must warn that public WiFi logins break: {d}");
+        // And the default must say what IT costs: plaintext.
+        let s = DnsMode::System.describe(&english());
+        assert!(
+            s.contains("not encrypted") || s.contains("unencrypted"),
+            "System must say lookups are unencrypted: {s}"
+        );
     }
 
     #[test]
@@ -1337,9 +1826,15 @@ mod tests {
         // does not depend on a real data directory.
         let broken: Result<Prefs, _> = serde_json::from_str("{ not json");
         assert!(broken.is_err());
-        let unknown: Prefs = serde_json::from_str(r#"{"dns":"system","future":1}"#)
+        // A field from a newer build must not break an older one -- and a
+        // System value that was CHOSEN is honoured through the same path.
+        let unknown = parse_stored(r#"{"dns":"system","future":1}"#)
             .expect("an unknown field must not break an older build");
         assert_eq!(unknown.dns, DnsMode::System);
+        // And a stored choice beside an unknown field is still a choice.
+        let chosen = parse_stored(r#"{"dns":"quad9","future":1}"#).unwrap();
+        assert_eq!(chosen.dns, DnsMode::Quad9);
+        assert!(chosen.resolver_chosen);
     }
 
     #[test]
@@ -1429,8 +1924,9 @@ mod tests {
         // choice, which only protects the user from mixed wording if the
         // two texts actually differ -- and an empty string is how "same
         // wording" would sneak in.
-        let off = TunnelMode::Off.describe();
-        let imported = TunnelMode::Imported.describe();
+        let l10n = english();
+        let off = TunnelMode::Off.describe(&l10n);
+        let imported = TunnelMode::Imported.describe(&l10n);
         assert!(!off.is_empty(), "Off must still say something to the user");
         assert!(
             !imported.is_empty(),
@@ -1450,7 +1946,7 @@ mod tests {
         // the far end sees the traffic; switching needs a restart on
         // Windows; and a down tunnel fails CLOSED -- pages fail to load,
         // never a silent fallback to direct.
-        let d = TunnelMode::Imported.describe();
+        let d = TunnelMode::Imported.describe(&english());
         assert!(
             d.contains("this browser"),
             "must say the tunnel covers this browser only: {d}"

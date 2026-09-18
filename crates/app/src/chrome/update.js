@@ -25,6 +25,10 @@
  */
 (function () {
   "use strict";
+  // The catalog helpers, shared through the same bridge object every
+  // cross-script capability rides (__rb.request, __rb.askConfirm...).
+  const { i18nText, i18nResolve, i18nSet, rebuildOnLocaleFill } =
+    window.__rb || {};
 
   var POLL_MS = 1000;
   var pollTimer = null;
@@ -51,40 +55,33 @@
   //
   // Keep both halves true or delete them. The frequencies here are the
   // constants in schedule.rs; if those change, this changes with them.
-  var NOTE_SCHEDULED =
-    "A check is one plain request to the update server: no account, no ID, " +
-    "no version number -- the address names only the platform this build " +
-    "targets. The server still sees an IP address and a time; that is " +
-    "unavoidable, and it is all it sees.\n\n" +
-    "PATANYX also checks on its own, on a deliberately irregular schedule: " +
-    "roughly every six hours for updates, about once an hour for the " +
-    "malicious-site list, the first shortly after launch. Each one is the " +
-    "same identifier-free request, so the server sees an IP address and a time on " +
-    "that schedule too, not only when you press the button. When a check " +
-    "finds a signed update and the background switch above is on, the " +
-    "download and its verification happen then too, on the same terms. " +
-    "With a tunnel imported, all of this goes through the tunnel or fails; " +
-    "it never falls back to a direct connection. Nothing is ever INSTALLED " +
-    "without your explicit accept.";
-
-  // A build compiled without `updater-net` has no HTTP stack at all: the
-  // scheduled tasks still come due, but the fetch behind both of them is a
-  // stub that returns an error without touching the network (updater.rs).
-  // So the paragraph above would be false here -- it promises contact that
-  // never happens, which is the same defect in the opposite direction.
-  var NOTE_NO_NETWORK =
-    "This build has no update networking compiled into it, so it contacts " +
-    "no server at all -- not on a schedule, and not when you press the " +
-    "button.";
+  // SHORTENED 2026-08-27 because: 150 words nobody read.
+  // The three facts kept are the three the long version was written to fix,
+  // in the order a reader cares about: it checks WITHOUT being asked, the
+  // server sees an IP and a time, and nothing installs without an accept.
+  // The tunnel clause stays because it is a fail-closed guarantee.
+  //
+  // The frequencies are the constants in schedule.rs. If those change this
+  // changes with them: a note that understates contact is worse than none.
+  var NOTE_SCHEDULED, NOTE_NO_NETWORK;
+  rebuildOnLocaleFill(function () {
+    NOTE_SCHEDULED = i18nText("chrome-js-update-note-scheduled", "PATANYX checks for updates about every six hours, and the malicious-site list about once an hour, whether or not you press the button. Update checks request release information and, when configured, engine advisories. They do not send your account, an installation ID, your engine version, or browsing activity. The update server can see your IP address, when you check, which update files you request, and a generic PATANYX user-agent label. With a tunnel imported, checks go through the tunnel or fail.\n\nWith automatic updates off, nothing installs without your accept. With them on, fixes install themselves at the next launch; a release that adds new features asks first and installs on its own only after seven days, unless it also carries a security fix, which installs at the next launch.");
+    // A build compiled without `updater-net` has no HTTP stack at all, so the
+    // paragraph above would promise contact that never happens.
+    NOTE_NO_NETWORK = i18nText("chrome-js-update-note-no-network", "This build has no update networking compiled into it, so it contacts no server at all -- not on a schedule, and not when you press the button.");
+  });
 
   // Two fixed manifest URLs, not a per-install one -- see UpdateChannel's own
   // doc in prefs.rs. Switching takes effect on the NEXT check; nothing here
   // restarts anything.
-  var CHANNEL_NOTE_STABLE = "Fetches the regular release manifest.";
-  var CHANNEL_NOTE_BETA =
-    "Fetches a second, separate manifest carrying the next release before " +
-    "it reaches Stable. Every Beta subscriber requests the same address " +
-    "as every other one -- nothing here is specific to this install.";
+  var CHANNEL_NOTE_STABLE, CHANNEL_NOTE_BETA;
+  rebuildOnLocaleFill(function () {
+    CHANNEL_NOTE_STABLE = i18nText("chrome-js-update-channel-stable", "The regular release.");
+    // The second sentence stays: it is the one that says Beta does not make
+    // this install identifiable, which is the question a privacy-minded
+    // reader actually has about opting into a smaller group.
+    CHANNEL_NOTE_BETA = i18nText("chrome-js-update-channel-beta", "This install was on the Beta channel from the pre-release line. There is no Beta in 1.0.0; it follows Stable from now on.");
+  });
 
   function make(tag, text) {
     var node = document.createElement(tag);
@@ -121,7 +118,7 @@
     var button = make("button");
     button.id = "btn-update";
     button.type = "button";
-    button.title = "Updates";
+    button.title = i18nText("chrome-js-update-button", "Updates");
     button.setAttribute("aria-pressed", "false");
 
     // Inline SVG stroked in currentColor; the CSP forbids external assets.
@@ -166,8 +163,14 @@
     // and the grey/green convention finally reach it.
     var label = document.createElement("span");
     label.className = "feature-label";
-    label.textContent = "Updates";
+    label.textContent = i18nText("chrome-js-update-button", "Updates");
     button.appendChild(label);
+    // Built once; label and tooltip follow a live locale switch.
+    rebuildOnLocaleFill(function () {
+      var text = i18nText("chrome-js-update-button", "Updates");
+      button.title = text;
+      label.textContent = text;
+    });
     // Feature controls live in the menu sheet now; the toolbar keeps only the
     // shield, the freeze chip and the menu button itself. `menu-item` supplies
     // the row geometry, `feature-btn` keeps the state classes -- is-active,
@@ -207,6 +210,10 @@
     panel.appendChild(els.version);
 
     var channelRow = make("div");
+    // An id so the gate can assert the buttons are IN the row, not merely
+    // created: the DOM harness registers an element by id the moment it is
+    // made, so "the button exists" was true even when nothing appended it.
+    channelRow.id = "update-channel-row";
     setStyles(channelRow, {
       display: "flex",
       gap: "8px",
@@ -215,25 +222,28 @@
     });
     var channelLabel = make("span", "Updates:");
     setStyles(channelLabel, { color: "#8f909a" });
-    // NO STABLE BUTTON WHILE THE WHOLE BROWSER IS PRE-RELEASE.
-    //
-    // Offering "Stable" alongside "Beta" says the two are different kinds of
-    // build. They are not yet: every release so far is a pre-release, both
-    // channels are served the same signed manifest, and a user choosing
-    // "Stable" would be picking a maturity that does not exist. One button
-    // that names what this actually is beats two that imply a choice.
-    //
-    // The pref, the IPC pair and the second manifest URL are all untouched,
-    // so restoring the row is re-adding a button when there IS a stable line
-    // to point at. `migrateToBeta` below is what keeps the shown state
-    // truthful in the meantime.
-    els.channelBeta = makeButton("Beta");
-    els.channelBeta.id = "update-channel-beta";
+    // BOTH CHANNELS, because 1.0.0 is a stable line. Through the 0.9.x
+    // pre-releases this row showed one "Beta" button: every release was a
+    // pre-release, both channel URLs served the identical signed manifest,
+    // and a "Stable" button would have offered a maturity that did not
+    // exist. That reasoning ended with the first stable release. Stable is
+    // the regular release; Beta is the next one before it reaches Stable.
+    // ONE CHANNEL IN 1.0.0. The Beta button is not built (decided
+    // 2026-09-16: "There shouldn't be a Beta button"); Stable is shown as the
+    // channel this install follows, not as a choice. The backend keeps its
+    // channel preference and arm; an install still stored on Beta from the
+    // pre-release line is moved to Stable once, with a note, in
+    // setChannelButtons.
+    els.channelStable = makeButton("Stable");
+    els.channelStable.id = "update-channel-stable";
+    els.channelStable.disabled = true;
+    els.channelStable.style.cursor = "default";
     channelRow.appendChild(channelLabel);
-    channelRow.appendChild(els.channelBeta);
+    channelRow.appendChild(els.channelStable);
     panel.appendChild(channelRow);
 
     els.channelNote = make("div", CHANNEL_NOTE_STABLE);
+    els.channelNote.id = "update-channel-note";
     setStyles(els.channelNote, {
       color: "#8f909a",
       fontSize: "12px",
@@ -254,6 +264,13 @@
     els.check = makeButton("Check now");
     els.install = makeButton("Download and install");
     els.restart = makeButton("Restart and update now");
+    // Built once; the labels follow the locale through the same rebuild
+    // hook the chrome's own tables use.
+    rebuildOnLocaleFill(function () {
+      els.check.textContent = i18nText("chrome-js-update-check-label", "Check now");
+      els.install.textContent = i18nText("chrome-js-update-install-label", "Download and install");
+      els.restart.textContent = i18nText("chrome-js-update-restart-label", "Restart and update now");
+    });
     row.appendChild(els.check);
     row.appendChild(els.install);
     row.appendChild(els.restart);
@@ -286,13 +303,14 @@
     });
     var bgText = make(
       "span",
-      "Download updates in the background (installing still asks first)",
+      "Download updates in the background (installing is a separate switch, below)",
     );
     setStyles(bgText, { color: "#8f909a", fontSize: "12px" });
     bgRow.appendChild(els.bg);
     bgRow.appendChild(bgText);
     panel.appendChild(bgRow);
     els.bg.addEventListener("change", function () {
+      clearErrorAndShowStatus();
       window.__rb
         .request("update_background_set", { enabled: !!els.bg.checked })
         .then(function (data) {
@@ -304,6 +322,57 @@
       .request("update_background_get", {})
       .then(function (data) {
         els.bg.checked = !!(data && data.enabled);
+      })
+      .catch(function () {});
+
+    // The auto-apply switch. What it turns on is decided per release by the
+    // SIGNED manifest (maintenance and security releases install themselves
+    // at the next launch; feature releases ask first and wait out a 7-day
+    // grace) -- this checkbox only says whether this install participates.
+    // Ships OFF in 1.0.0 by decision: self-replacement has never run in the
+    // field, and the recovery path covers a failed write but not a failed
+    // relaunch, so it stays opt-in until a real replace-and-relaunch test
+    // has been run on hardware.
+    var autoRow = make("label");
+    setStyles(autoRow, {
+      display: "flex",
+      gap: "8px",
+      alignItems: "center",
+      marginBottom: "10px",
+      cursor: "pointer",
+    });
+    els.auto = document.createElement("input");
+    els.auto.type = "checkbox";
+    els.auto.id = "update-auto-apply";
+    setStyles(els.auto, {
+      width: "13px",
+      height: "13px",
+      flex: "none",
+      margin: "0",
+      accentColor: "#4d8f5e",
+    });
+    var autoText = make(
+      "span",
+      "Install updates automatically at the next launch (releases that " +
+        "add new features ask first, unless they carry a security fix)",
+    );
+    setStyles(autoText, { color: "#8f909a", fontSize: "12px" });
+    autoRow.appendChild(els.auto);
+    autoRow.appendChild(autoText);
+    panel.appendChild(autoRow);
+    els.auto.addEventListener("change", function () {
+      clearErrorAndShowStatus();
+      window.__rb
+        .request("update_auto_apply_set", { enabled: !!els.auto.checked })
+        .then(function (data) {
+          els.auto.checked = !!(data && data.enabled);
+        })
+        .catch(showError);
+    });
+    window.__rb
+      .request("update_auto_apply_get", {})
+      .then(function (data) {
+        els.auto.checked = !!(data && data.enabled);
       })
       .catch(function () {});
 
@@ -323,22 +392,50 @@
     els.check.addEventListener("click", onCheck);
     els.install.addEventListener("click", onInstall);
     els.restart.addEventListener("click", onRestartClick);
-    els.channelBeta.addEventListener("click", function () {
-      setChannel("beta");
-    });
 
     return button;
   }
 
   // Visual state only; `render()` separately disables both when this build
   // has no update networking at all, same as the Check button.
+  var channelMoved = false;
+  // Separate from `channelMoved` on purpose. `channelMoved` means the
+  // preference IS stored as Stable; this one means a write is in the air.
+  // Two callers ask the channel today -- once at init, once when the panel
+  // opens -- and they are far enough apart that each settles before the next
+  // begins, so the retry works without this. It is here so that a third
+  // caller, or a reply that lands slower than a microtask, cannot turn one
+  // migration into two writes racing to set the same value.
+  var channelMoving = false;
   function setChannelButtons(active) {
-    var beta = active === "beta";
-    els.channelBeta.style.borderColor = beta ? "#4f8cff" : "#3a3b43";
-    els.channelBeta.style.fontWeight = beta ? "700" : "400";
-    els.channelNote.textContent = beta
-      ? CHANNEL_NOTE_BETA
-      : CHANNEL_NOTE_STABLE;
+    els.channelStable.style.borderColor = "#4f8cff";
+    els.channelStable.style.fontWeight = "700";
+    if (active === "beta" && !channelMoved && !channelMoving) {
+      // A pre-release install still stored on Beta. There is no Beta in
+      // 1.0.0, so it follows Stable from here; said once, done once.
+      //
+      // MARKED DONE ONLY ONCE IT IS STORED. Setting the flag before the
+      // write and swallowing the rejection meant a failed preference save
+      // left the install fetching the Beta manifest while this panel said it
+      // now follows Stable, and no later open ever retried, so such an
+      // install quietly stopped receiving updates (review R-005).
+      els.channelNote.textContent = CHANNEL_NOTE_BETA;
+      channelMoving = true;
+      window.__rb
+        .request("update_channel_set", { channel: "stable" })
+        .then(function () {
+          channelMoving = false;
+          channelMoved = true;
+        })
+        .catch(function () {
+          // Nothing moved, so withdraw the sentence that says it did and
+          // leave the migration unmarked for the next time the panel opens.
+          channelMoving = false;
+          els.channelNote.textContent = CHANNEL_NOTE_STABLE;
+        });
+      return;
+    }
+    els.channelNote.textContent = CHANNEL_NOTE_STABLE;
   }
 
   function refreshChannel() {
@@ -346,20 +443,11 @@
       .request("update_channel_get", {})
       .then(function (data) {
         var channel = data && data.channel;
-        // Stable is still the stored default, and with its button gone a
-        // user left on it would see one unlit button describing a channel
-        // they are not on -- the panel misreporting its own state, which is
-        // the shape of defect this project keeps paying for. Move them once.
-        //
-        // Safe to do silently TODAY, and only today: both channels are
-        // served the identical signed manifest, so nothing about what this
-        // install fetches changes. The moment a real beta line exists ahead
-        // of stable, this migration stops being a no-op and has to become a
-        // deliberate choice with the user told about it.
-        if (channel !== "beta") {
-          setChannel("beta");
-          return;
-        }
+        // The 0.9.x panel moved a stored Stable to Beta here, because the
+        // Beta button was the only one drawn. That migration is gone with
+        // the single-button row; the one-time reset of installs it moved
+        // lives in Rust (prefs::load), where a stored value is actually
+        // decided, not in a renderer that runs only when the panel opens.
         setChannelButtons(channel);
       })
       .catch(function () {});
@@ -374,9 +462,12 @@
       .catch(showError);
   }
 
-  function approxSize(size) {
-    if (!size || size < 1024 * 1024) return "under 1 MB";
-    return "about " + Math.round(size / (1024 * 1024)) + " MB";
+  async function approxSize(size) {
+    if (!size || size < 1024 * 1024) {
+      return i18nResolve("chrome-js-update-size-small", {}, "under 1 MB");
+    }
+    var mb = Math.round(size / (1024 * 1024));
+    return i18nResolve("chrome-js-update-size-mb", { mb }, "about " + mb + " MB");
   }
 
   // ONE CLICK -- but only THEIR click. The user pressed "Download and
@@ -404,19 +495,41 @@
   function onRestartClick() {
     if (applying) return;
     applying = true;
-    window.__rb.request("update_apply").catch(function () {
+    clearError();
+    window.__rb.request("update_apply").catch(function (e) {
+      // Rust refuses BEFORE the phase moves (not_ready, install_failed), so
+      // "the phase reports it" was never true for this path: the click did
+      // nothing visible (launch sweep F-003).
+      //
+      // AND THEN THE FIX RE-ADDED THE SILENCE. It showed the code and called
+      // refresh(), whose async render overwrote the explanation with the
+      // ordinary ready text a moment later, leaving the panel identical
+      // before and after a failed install (review R-004). There is nothing to
+      // re-read: the phase did not move, which is exactly why this path
+      // exists. The error stands until the person asks for something new.
       applying = false;
+      showError(e);
     });
   }
 
-  function render(st) {
+  var renderGen = 0;
+  async function render(st) {
     if (!panel) return;
+    // Successive status events race their awaits; only the newest render
+    // may touch the sinks -- the same strictly-newest rule the locale fill
+    // itself uses.
+    var gen = ++renderGen;
     maybeApply(st);
-    els.version.textContent =
+    var versionPlain =
       "This PATANYX is version " +
       (st.running || "?") +
       (st.platform ? " (" + st.platform + ")" : "") +
       ".";
+    var versionText = await i18nResolve(
+      "chrome-js-update-version-line",
+      { version: st.running || "?", platform: st.platform || "" },
+      versionPlain,
+    );
 
     var busy = st.state === "checking" || st.state === "downloading";
     var stateText = "";
@@ -424,53 +537,80 @@
     var detailColor = "#8f909a";
 
     if (!st.available) {
-      stateText = "Update checking is not built into this PATANYX.";
-      detailText =
+      stateText = i18nText("chrome-js-update-not-built", "Update checking is not built into this PATANYX.");
+      detailText = i18nText("chrome-js-update-not-built-detail",
         "This build contains no update networking at all, so it never " +
-        "contacts an update server -- there is nothing here to switch off.";
+          "contacts an update server -- there is nothing here to switch off.");
     } else if (st.state === "idle") {
-      stateText = "No check has run yet.";
+      stateText = i18nText("chrome-js-update-idle", "No check has run yet.");
     } else if (st.state === "checking") {
-      stateText = "Checking for updates…";
+      stateText = i18nText("chrome-js-update-checking", "Checking for updates…");
     } else if (st.state === "uptodate") {
-      stateText = "PATANYX is up to date.";
+      stateText = i18nText("chrome-js-update-uptodate", "PATANYX is up to date.");
       detailColor = "#9fd6ac";
-      detailText =
-        "The update server offers the version this machine already runs.";
+      detailText = i18nText("chrome-js-update-uptodate-detail",
+        "The update server offers the version this machine already runs.");
+    } else if (st.state === "ahead") {
+      stateText = i18nText("chrome-js-update-uptodate", "PATANYX is up to date.");
+      detailColor = "#9fd6ac";
+      detailText = await i18nResolve("chrome-js-update-ahead-detail",
+        { running: st.running || "", offered: st.offered || "" },
+        "This machine runs " + (st.running || "") + ", newer than the " + (st.offered || "") + " the update server offers.");
     } else if (st.state === "offered") {
-      stateText = "Version " + st.offered + " is available.";
-      detailText =
-        "You run " +
-        st.running +
-        ". The download is " +
-        approxSize(st.size) +
-        ". The publisher's signature is verified before anything is installed.";
+      stateText = await i18nResolve("chrome-js-update-offered-state",
+        { version: st.offered },
+        "Version " + st.offered + " is available.");
+      detailText = await i18nResolve("chrome-js-update-offered-detail",
+        { running: st.running, size: await approxSize(st.size) },
+        "You run " + st.running + ". The download is " + await approxSize(st.size) +
+          ". The publisher's signature is verified before anything is installed.");
     } else if (st.state === "downloading") {
-      stateText = "Downloading version " + st.offered + "…";
-      detailText =
-        "The download is verified against the signed manifest before it is kept.";
+      stateText = await i18nResolve("chrome-js-update-downloading",
+        { version: st.offered },
+        "Downloading version " + st.offered + "…");
+      detailText = i18nText("chrome-js-update-downloading-detail",
+        "The download is verified against the signed manifest before it is kept.");
     } else if (st.state === "refused") {
-      stateText = "Update refused.";
+      stateText = i18nText("chrome-js-update-refused", "Update refused.");
       detailColor = "#e2a1a1";
       // The reason string comes from patanyx-update verbatim. Do not
       // paraphrase a security event.
-      detailText = st.reason + "\n\nNothing was installed.";
+      detailText =
+        st.reason +
+        (await i18nResolve("chrome-js-update-nothing-installed", {},
+          "\n\nNothing was installed."));
     } else if (st.state === "failed") {
       stateText = st.retry
-        ? "The download failed."
-        : "The update check failed.";
+        ? i18nText("chrome-js-update-download-failed", "The download failed.")
+        : i18nText("chrome-js-update-check-failed", "The update check failed.");
       detailColor = "#d8b46a";
-      detailText = (st.detail || "") + "\n\nNothing was installed.";
+      detailText =
+        (st.detail || "") +
+        (await i18nResolve("chrome-js-update-nothing-installed", {},
+          "\n\nNothing was installed."));
     } else if (st.state === "ready") {
-      stateText = "Version " + st.offered + " is downloaded and verified.";
+      stateText = await i18nResolve("chrome-js-update-ready-state",
+        { version: st.offered },
+        "Version " + st.offered + " is downloaded and verified.");
       detailColor = "#9fd6ac";
       detailText = !st.wired
-        ? "Installed. Restart PATANYX to finish \u2014 the new version is already running in a new window.\n" +
+        ? i18nText("chrome-js-update-restart-finish",
+            "Installed. Restart PATANYX to finish. The new version is already running in a new window.\n") +
           (st.staged || "")
         : userInstalled
-          ? "Ready to install."
-          : "Downloaded in the background and verified. Nothing is installed " +
-            "until you choose to restart, whenever suits you.";
+          ? i18nText("chrome-js-update-ready-install", "Ready to install.")
+          // Quiet releases self-install at the next launch; an announced
+          // feature release waits out its grace period first. Say the one
+          // that is true of THIS release, from the same signed fields the
+          // policy reads.
+          : st.auto_apply && (st.kind !== "feature" || st.security)
+            ? i18nText("chrome-js-update-bg-ready-next-launch",
+                "Downloaded in the background and verified. It installs at the next launch, or restart now to take it immediately.")
+            : st.auto_apply
+              ? i18nText("chrome-js-update-bg-ready-week",
+                  "Downloaded in the background and verified. Restart to take it now; otherwise it installs on its own in about a week.")
+              : i18nText("chrome-js-update-bg-ready",
+                  "Downloaded in the background and verified. Nothing is installed until you choose to restart, whenever suits you.");
     }
 
     // The publisher-signed release blurb, when the manifest carries one.
@@ -483,7 +623,9 @@
         st.state === "downloading" ||
         st.state === "ready")
     ) {
-      detailText += "\n\nWhat is new in " + st.offered + ":\n" + st.notes;
+      detailText += await i18nResolve("chrome-js-update-whats-new",
+        { version: st.offered, notes: st.notes },
+        "\n\nWhat is new in " + st.offered + ":\n" + st.notes);
     }
 
     // YOUR NETWORK IS READING THIS CONNECTION, AND SAYING SO IS THE POINT.
@@ -510,18 +652,26 @@
     // request actually reveals -- that a check happened -- because the
     // manifest URL is identical for every install and carries no version.
     if (st.intercepted) {
-      detailText +=
-        "\n\nSomething on your network is inspecting encrypted traffic, so " +
-        "the last signed fetch from the update server was accepted against " +
-        "the certificates your computer trusts. Updates are verified against " +
-        "the publisher's signature, " +
-        "which does not depend on the connection. Whoever runs that equipment " +
-        "can see that this browser checked for an update.";
+      detailText += i18nText("chrome-js-update-intercepted",
+        "\n\nSomething on this computer or its network is inspecting " +
+          "encrypted traffic, so " +
+          "the last signed fetch from the update server was accepted against " +
+          "the certificates your computer trusts. Updates are verified against " +
+          "the publisher's signature, " +
+          "which does not depend on the connection. Whoever runs that equipment " +
+          "can see that this browser checked for an update.");
     }
 
-    els.status.textContent = stateText;
-    els.detail.textContent = detailText;
-    els.detail.style.color = detailColor;
+    if (gen !== renderGen) return; // a newer status event superseded this one
+    els.version.textContent = versionText;
+    // The version line and the controls below always follow the status. The
+    // status and detail do not, while a failure is on screen waiting to be
+    // read: a poll landing a moment later must not erase it (review R-004).
+    if (!errorShown) {
+      els.status.textContent = stateText;
+      els.detail.textContent = detailText;
+      els.detail.style.color = detailColor;
+    }
 
     // The disclosure follows the build, not the default. `available` is the
     // `updater-net` feature as the running binary reports it.
@@ -532,8 +682,6 @@
     els.check.style.cursor = els.check.disabled ? "default" : "pointer";
 
     // Choosing a channel this build can never fetch from is not a choice.
-    els.channelBeta.disabled = !st.available;
-    els.channelBeta.style.opacity = st.available ? "1" : "0.5";
 
     var canInstall =
       st.available &&
@@ -541,7 +689,9 @@
       (st.state === "offered" || (st.state === "failed" && st.retry));
     els.install.style.display = canInstall ? "" : "none";
     els.install.textContent =
-      st.state === "failed" ? "Try downloading again" : "Download and install";
+      st.state === "failed"
+        ? i18nText("chrome-js-update-retry-label", "Try downloading again")
+        : i18nText("chrome-js-update-install-label", "Download and install");
 
     // The background-ready case: verified bytes are waiting and no click
     // consented yet, so the consent IS this button.
@@ -552,8 +702,53 @@
     if (!busy) stopPolling();
   }
 
+  // While this is set, the status sinks belong to the explanation and a
+  // status render may not touch them. Cleared when the person asks for
+  // something new, which is the only moment an old failure stops being the
+  // most recent thing that happened to them.
+  var errorShown = false;
+
+  // Two clears, and the difference is load-bearing.
+  //
+  // Dropping the flag does NOT repaint: while it was set every render skipped
+  // the status and detail lines, so the words of the old failure are still on
+  // screen. Somebody has to ask the panel what is true now. But making the
+  // clear itself do that broke a different thing (review round 3): a status
+  // read carrying the state from BEFORE the action can land after the action
+  // started, and `render` ends with `if (!busy) stopPolling()` -- so clicking
+  // Download and install while an old settings error was showing cancelled
+  // the polling that the download it had just started depended on, and the
+  // panel sat on "Downloading" forever.
+  //
+  // So: callers that render on their own take `clearError`, and only the ones
+  // that would otherwise leave stale words on screen pay for a refresh.
+  function clearError() {
+    errorShown = false;
+  }
+
+  // Any render still suspended on its localization is holding a status from
+  // BEFORE this action, and `render` ends by stopping the poll timer when the
+  // state it is carrying is not busy. So an old `offered` render resuming
+  // after a click started a download stopped that download's polling, and the
+  // panel sat on "Downloading" with nothing left to notice it had finished
+  // (review round 4). A non-English locale makes that await a real gap rather
+  // than a theoretical one. Bumping the generation retires those renders: the
+  // check they already perform on the way out does the rest.
+  function supersedeRenders() {
+    renderGen++;
+  }
+
+  function clearErrorAndShowStatus() {
+    if (!errorShown) return;
+    errorShown = false;
+    // If this answer arrives after a fresh failure, the guard is already back
+    // up and the render will leave the new explanation alone.
+    refresh();
+  }
+
   function showError(err) {
-    els.status.textContent = "Something went wrong.";
+    errorShown = true;
+    els.status.textContent = i18nText("chrome-js-update-wrong", "Something went wrong.");
     els.detail.style.color = "#d8b46a";
     els.detail.textContent = window.__rb.friendly
       ? window.__rb.friendly(err)
@@ -561,14 +756,18 @@
   }
 
   function onCheck() {
+    clearError();
     window.__rb.request("update_check", {}).then(render).catch(showError);
+    supersedeRenders();
     startPolling();
   }
 
   function onInstall() {
     // Consent for the auto-apply when THIS download completes.
     userInstalled = true;
+    clearError();
     window.__rb.request("update_install", {}).then(render).catch(showError);
+    supersedeRenders();
     startPolling();
   }
 
@@ -613,6 +812,12 @@
       // width; a narrower window wraps it further.
       heightPx: 500,
       onOpen: function () {
+        // Opening the panel is the person asking what the state is NOW. An
+        // error from a previous visit must not outlive that question: it
+        // suppressed the status lines while the version line above kept
+        // updating, so the panel showed a stale failure beside fresh facts
+        // (review R-004).
+        clearError();
         refresh();
         refreshChannel();
       },

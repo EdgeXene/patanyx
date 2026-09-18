@@ -24,7 +24,11 @@ mod crypto;
 mod error;
 mod format;
 mod backup;
-mod lock;
+/// The one-live-process file lock. Public because the Library replacement in
+/// the app crate needs the same primitive on a DIFFERENT file: an import is a
+/// multi-step transaction across two encrypted stores, and serialising it is
+/// the only thing that actually makes it one.
+pub mod lock;
 mod recovery;
 mod model;
 
@@ -35,7 +39,7 @@ pub use lock::{LockError, VaultLock};
 pub use model::{
     ActivationRecord, Contact, ContactBook, CredentialEntry, CredentialMeta, LicenceRecord,
     NoteMeta, RelaySettings, SecretNote, TunnelSettings, VaultData, MAX_LABEL_CHARS,
-    MAX_PEER_HASH_CHARS,
+    MAX_PEER_HASH_CHARS, ReleasedDevice, MAX_RELEASED_DEVICES,
 };
 
 use std::fs;
@@ -71,6 +75,12 @@ pub struct Vault {
     /// save still happened; this exists so the UI can be honest about the
     /// backups not working instead of silently implying they are.
     last_backup_error: Option<String>,
+    /// SMOKE-ONLY fault injection: make the next `save` fail without
+    /// touching the disk, so the app's recovery from a failed write can be
+    /// exercised in the e2e gate. Debug builds only; a release binary has
+    /// neither the field nor the method.
+    #[cfg(any(debug_assertions, test))]
+    fail_next_save: bool,
     /// Encrypts the contents. Random, never derived from a passphrase: that
     /// indirection is what allows more than one unlock method.
     master: Zeroizing<[u8; crypto::KEY_LEN]>,
@@ -216,6 +226,8 @@ impl Vault {
         let master = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
         let mut vault = Vault {
             last_backup_error: None,
+            #[cfg(any(debug_assertions, test))]
+            fail_next_save: false,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -355,6 +367,8 @@ impl Vault {
         let guard = lock::acquire(path).map_err(VaultError::from)?;
         Ok(Vault {
             last_backup_error: None,
+            #[cfg(any(debug_assertions, test))]
+            fail_next_save: false,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -398,6 +412,8 @@ impl Vault {
         let master = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
         let mut vault = Vault {
             last_backup_error: None,
+            #[cfg(any(debug_assertions, test))]
+            fail_next_save: false,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -442,11 +458,24 @@ impl Vault {
         // outright: reading it partially and re-saving would silently drop
         // fields this build does not know about, which is exactly how `relay`
         // and the contact `note` were lost before SCHEMA_VERSION was bumped.
-        if envelope.schema == 0 || envelope.schema > model::SCHEMA_VERSION {
-            return Err(VaultError::BadFormat(format!(
-                "unsupported payload schema {}",
-                envelope.schema
-            )));
+        if envelope.schema > model::SCHEMA_VERSION {
+            // ITS OWN ERROR, not BadFormat. A vault written by a NEWER build is
+            // not damaged -- it decrypted perfectly, and every byte of it is
+            // intact. It is simply from the future, and this build refuses it
+            // to avoid dropping fields it does not understand.
+            //
+            // Reported as "damaged or unreadable" until 2026-08-31, which sent
+            // someone looking for a corrupt file that did not exist. The
+            // distinction is free: the code already knows both numbers.
+            return Err(VaultError::NewerVault {
+                found: envelope.schema,
+                supported: model::SCHEMA_VERSION,
+            });
+        }
+        if envelope.schema == 0 {
+            return Err(VaultError::BadFormat(
+                "payload declares no schema".to_string(),
+            ));
         }
         let mut data: VaultData = serde_json::from_slice(plaintext).map_err(|e| {
             VaultError::BadFormat(format!("decrypted payload is not valid json: {e}"))
@@ -474,6 +503,8 @@ impl Vault {
         let guard = lock::acquire(&path).map_err(VaultError::from)?;
         Ok(Self {
             last_backup_error: None,
+            #[cfg(any(debug_assertions, test))]
+            fail_next_save: false,
             _lock: guard,
             path,
             master,
@@ -540,6 +571,24 @@ impl Vault {
     }
 
     pub fn save(&mut self) -> Result<(), VaultError> {
+        self.save_inner(true)
+    }
+
+    /// Arms the injected save failure (debug builds and tests only).
+    #[cfg(any(debug_assertions, test))]
+    pub fn fail_next_save_for_test(&mut self) {
+        self.fail_next_save = true;
+    }
+
+    /// `backup == false` only for a passphrase rotation, which must not leave
+    /// a copy of the old-passphrase file behind (see change_passphrase).
+    pub(crate) fn save_inner(&mut self, backup: bool) -> Result<(), VaultError> {
+        #[cfg(any(debug_assertions, test))]
+        if std::mem::take(&mut self.fail_next_save) {
+            return Err(VaultError::Io(std::io::Error::other(
+                "injected save failure (smoke)",
+            )));
+        }
         // Keep a bounded history of previous ciphertexts before overwriting.
         //
         // `rotate_backups` documented "call this BEFORE overwriting the
@@ -562,10 +611,12 @@ impl Vault {
         // turn a full disk into data loss, which is the opposite of the
         // point. It is recorded instead, so the UI can say backups are not
         // working rather than implying they are.
-        self.last_backup_error = match backup::rotate_backups(&self.path, backup::DEFAULT_MAX_BACKUPS) {
-            Ok(_) => None,
-            Err(e) => Some(e.to_string()),
-        };
+        if backup {
+            self.last_backup_error = match backup::rotate_backups(&self.path, backup::DEFAULT_MAX_BACKUPS) {
+                Ok(_) => None,
+                Err(e) => Some(e.to_string()),
+            };
+        }
         // A fresh nonce on every save: reusing an XChaCha20-Poly1305 nonce
         // with the same key would break AEAD security.
         let nonce: [u8; crypto::NONCE_LEN] = crypto::random_bytes();
@@ -670,6 +721,40 @@ impl Vault {
                 origin: e.origin.clone(),
             })
             .collect()
+    }
+
+    /// Whether this exact credential is ALREADY STORED for a matching origin.
+    ///
+    /// The save offer's question is "do you want me to remember this", and
+    /// after an autofill the answer is that it already does. Without this, a
+    /// user filled a saved password, signed in, and was immediately asked to
+    /// save the password the browser had just typed for them. Reported from
+    /// hardware, not found here.
+    ///
+    /// THE COMPARISON HAPPENS INSIDE THE VAULT on purpose. Answering it
+    /// outside would mean handing a stored plaintext password to the caller
+    /// so it could compare, which is a worse boundary for a strictly worse
+    /// reason; a bool is all anyone needs.
+    ///
+    /// `matches` is the same shape `credentials_matching` takes and must be
+    /// the SAME rule the fill offer used. An exact-origin test here would miss
+    /// the case this exists for: a credential saved on `accounts.example.com`
+    /// is offered on `mail.example.com`, so a submission there must recognize
+    /// it as already stored rather than saving a second copy.
+    ///
+    /// A same username with a DIFFERENT password is deliberately not a match.
+    /// That is a password change, and offering to record it is correct.
+    pub fn has_matching_credential(
+        &self,
+        username: &str,
+        password: &str,
+        matches: impl Fn(&str) -> bool,
+    ) -> bool {
+        self.data.credentials.iter().any(|e| {
+            e.origin.as_deref().is_some_and(&matches)
+                && e.username == username
+                && e.password == password
+        })
     }
 
     /// Exact-origin lookup, kept for callers that genuinely mean one host.
@@ -941,6 +1026,104 @@ impl Vault {
         self.save()
     }
 
+    /// Arm one injected save failure. See `fail_next_save`.
+    #[cfg(debug_assertions)]
+    pub fn inject_save_failure_once(&mut self) {
+        self.fail_next_save = true;
+    }
+
+    /// Whether this device was released and has not activated again since.
+    /// See `VaultData::released_devices`.
+    pub fn is_released(&self, device_id_hex: &str) -> bool {
+        self.data
+            .released_devices
+            .iter()
+            .any(|d| d.0 == device_id_hex)
+    }
+
+    /// Every released device, for tests and diagnostics.
+    pub fn released_devices(&self) -> Vec<String> {
+        self.data.released_devices.iter().map(|d| d.0.clone()).collect()
+    }
+
+    /// The device whose release is started but not yet resolved, if any.
+    /// See `VaultData::release_pending`.
+    pub fn release_pending(&self) -> Option<String> {
+        self.data.release_pending.as_ref().map(|d| d.0.clone())
+    }
+
+    /// Record, BEFORE the request leaves, that this device is being
+    /// released. Idempotent: re-recording the same device does not write.
+    pub fn begin_release(&mut self, device_id_hex: &str) -> Result<(), VaultError> {
+        if self.release_pending().as_deref() == Some(device_id_hex) {
+            return Ok(());
+        }
+        self.data.release_pending = Some(ReleasedDevice(device_id_hex.to_string()));
+        self.save()
+    }
+
+    /// Abandon a started release of THIS device, because this device is
+    /// activating again on purpose. No-op, and no write, otherwise.
+    pub fn clear_release_pending_if(&mut self, device_id_hex: &str) -> Result<(), VaultError> {
+        if self.release_pending().as_deref() != Some(device_id_hex) {
+            return Ok(());
+        }
+        self.data.release_pending = None;
+        self.save()
+    }
+
+    /// Forget THIS device's release, and only this device's. A vault can
+    /// travel between installs (receipts are per device for that reason),
+    /// and device B activating must not erase the fact that device A
+    /// released. No-op, and no write, when this device is not listed.
+    pub fn clear_released_device_if(&mut self, device_id_hex: &str) -> Result<(), VaultError> {
+        if !self.is_released(device_id_hex) {
+            return Ok(());
+        }
+        self.data.released_devices.retain(|d| d.0 != device_id_hex);
+        self.save()
+    }
+
+    /// RELEASE, as one durable write: drop this device's receipt AND record
+    /// the release together. Two separate saves left a window (first
+    /// succeeded, second failed or the process died) in which the file held
+    /// neither receipt nor marker, which is exactly the state the next
+    /// unlock reads as "activate silently". The rows are wiped first, as in
+    /// `set_activation_records`. Releasing again is idempotent.
+    pub fn release_device(&mut self, device_id_hex: &str) -> Result<(), VaultError> {
+        let kept: Vec<ActivationRecord> = self
+            .data
+            .activation
+            .iter()
+            .filter(|r| r.device_id_hex != device_id_hex)
+            .cloned()
+            .collect();
+        for old in &mut self.data.activation {
+            old.receipt_text.zeroize();
+        }
+        self.data.activation = kept;
+        // The started-release record is answered by this write, whichever
+        // way the list below goes; it must not outlive it.
+        if self.release_pending().as_deref() == Some(device_id_hex) {
+            self.data.release_pending = None;
+        }
+        if !self.is_released(device_id_hex) {
+            if self.data.released_devices.len() >= MAX_RELEASED_DEVICES {
+                // Refuse rather than forget: see MAX_RELEASED_DEVICES. The
+                // receipt rows above were already dropped in memory, which
+                // is the safe direction (Premium off here), and the caller
+                // retries the whole release at the next unlock.
+                return Err(VaultError::Io(std::io::Error::other(
+                    "released-device list is full",
+                )));
+            }
+            self.data
+                .released_devices
+                .push(ReleasedDevice(device_id_hex.to_string()));
+        }
+        self.save()
+    }
+
     /// Sets a contact's free-text note, replacing whatever was there.
     ///
     /// A hash number is unmemorable by design, so this is where the user
@@ -1192,6 +1375,164 @@ mod tests {
             .0
     }
 
+    /// A RELEASED DEVICE STAYS RELEASED. The marker has to survive the
+    /// vault being closed and reopened, because the unlock-time evaluation
+    /// is exactly what used to re-activate a released device.
+    #[test]
+    fn released_device_marker_persists_and_clears() {
+        let path = temp_path("released");
+        let mut vault = create_test_vault(&path);
+        assert!(vault.released_devices().is_empty(), "a fresh vault has released nothing");
+        vault.release_device(&"ab".repeat(16)).unwrap();
+        vault.release_device(&"ab".repeat(16)).unwrap();
+        assert_eq!(vault.released_devices().len(), 1, "releasing twice lists the device once");
+        drop(vault);
+        let mut reopened = Vault::unlock(&path, "test passphrase").unwrap();
+        assert!(
+            reopened.is_released(&"ab".repeat(16)),
+            "the marker must be read back from disk, not from memory"
+        );
+        reopened.clear_released_device_if(&"ab".repeat(16)).unwrap();
+        drop(reopened);
+        let mut many = Vault::unlock(&path, "test passphrase").unwrap();
+        assert!(many.released_devices().is_empty(), "clearing must persist too");
+        // Bounded WITHOUT eviction: past the cap the write is refused and
+        // every earlier release is still remembered.
+        // Filled in memory (same crate, private field): thousands of real
+        // saves would make this test minutes long for no extra proof.
+        many.data.released_devices = (0..MAX_RELEASED_DEVICES)
+            .map(|i| ReleasedDevice(format!("{i:032x}")))
+            .collect();
+        assert_eq!(many.released_devices().len(), MAX_RELEASED_DEVICES);
+        assert!(many.release_device(&"ff".repeat(16)).is_err(), "a full list refuses, never evicts");
+        assert!(many.is_released(&format!("{:032x}", 0)), "the oldest entry is still there");
+        assert!(!many.is_released(&"ff".repeat(16)));
+        // Releasing a device already listed is still fine when full.
+        many.release_device(&format!("{:032x}", 3)).unwrap();
+        let _ = fs::remove_file(&path);
+    }
+
+    /// THE STARTED RELEASE IS DURABLE, and answered by the release landing.
+    /// This is what makes a release survive a lock, a crash or an exit: the
+    /// intent is on disk before the request leaves.
+    #[test]
+    fn a_started_release_survives_reopen_and_is_cleared_by_the_release() {
+        let path = temp_path("begin-release");
+        let dev = "cd".repeat(16);
+        let mut vault = create_test_vault(&path);
+        vault
+            .set_activation_records(vec![ActivationRecord {
+                license_id_hex: "11".repeat(16),
+                device_id_hex: dev.clone(),
+                receipt_text: "prx1-a".into(),
+            }])
+            .unwrap();
+        vault.begin_release(&dev).unwrap();
+        drop(vault);
+        let mut reopened = Vault::unlock(&path, "test passphrase").unwrap();
+        assert_eq!(
+            reopened.release_pending().as_deref(),
+            Some(dev.as_str()),
+            "the started release must be read back from disk"
+        );
+        assert!(
+            !reopened.activation_records().is_empty(),
+            "the receipt is still there until the release lands"
+        );
+        // A different device activating must not answer this device's release.
+        reopened.clear_release_pending_if(&"ee".repeat(16)).unwrap();
+        assert_eq!(reopened.release_pending().as_deref(), Some(dev.as_str()));
+        reopened.release_device(&dev).unwrap();
+        drop(reopened);
+        let again = Vault::unlock(&path, "test passphrase").unwrap();
+        assert_eq!(again.release_pending(), None, "the release answered it");
+        assert!(again.is_released(&dev) && again.activation_records().is_empty());
+        let _ = fs::remove_file(&path);
+    }
+
+    /// RELEASE IS ONE WRITE: after `release_device` a reopened vault has the
+    /// marker and not the receipt, together; and the device-scoped clear
+    /// leaves another device's marker alone.
+    #[test]
+    fn release_device_drops_the_receipt_and_records_the_marker_together() {
+        let path = temp_path("release-one-write");
+        let mut vault = create_test_vault(&path);
+        let dev_a = "aa".repeat(16);
+        let dev_b = "bb".repeat(16);
+        vault
+            .set_activation_records(vec![
+                ActivationRecord { license_id_hex: "11".repeat(16), device_id_hex: dev_a.clone(), receipt_text: "prx1-a".into() },
+                ActivationRecord { license_id_hex: "11".repeat(16), device_id_hex: dev_b.clone(), receipt_text: "prx1-b".into() },
+            ])
+            .unwrap();
+        vault.release_device(&dev_a).unwrap();
+        drop(vault);
+        let mut reopened = Vault::unlock(&path, "test passphrase").unwrap();
+        let ids: Vec<String> = reopened.activation_records().into_iter().map(|r| r.device_id_hex).collect();
+        assert_eq!(ids, vec![dev_b.clone()], "only device A's receipt is gone");
+        assert!(reopened.is_released(&dev_a));
+        reopened.clear_released_device_if(&dev_b).unwrap();
+        assert!(reopened.is_released(&dev_a), "device B must not clear device A's release");
+        // A travelled vault: B releases too, and A's release is still there.
+        reopened.release_device(&dev_b).unwrap();
+        assert!(reopened.is_released(&dev_a) && reopened.is_released(&dev_b), "both releases remembered");
+        assert!(reopened.activation_records().is_empty());
+        reopened.clear_released_device_if(&dev_a).unwrap();
+        assert!(!reopened.is_released(&dev_a) && reopened.is_released(&dev_b));
+        let _ = fs::remove_file(&path);
+    }
+
+    /// THE AUTOFILL LOOP. Fill a saved password, sign in, and the browser
+    /// asked whether to save the password it had just typed for you. Reported
+    /// from Windows hardware after four other checks passed.
+    #[test]
+    fn a_credential_already_stored_is_recognised_as_stored() {
+        let dir = std::env::temp_dir().join(format!("patanyx-already-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault.json");
+        let mut vault = create_test_vault(&path);
+        vault
+            .add_credential(
+                "accounts.example.com",
+                Some("accounts.example.com"),
+                "dora",
+                "hunter2",
+                "",
+            )
+            .unwrap();
+
+        let exact = |stored: &str| stored == "accounts.example.com";
+        assert!(
+            vault.has_matching_credential("dora", "hunter2", exact),
+            "the credential just added is not recognised as stored"
+        );
+
+        // A DIFFERENT PASSWORD IS NOT A MATCH. That is a password change, and
+        // offering to record it is the right behaviour -- suppressing it would
+        // silently lose the new password.
+        assert!(
+            !vault.has_matching_credential("dora", "hunter3", exact),
+            "a changed password must still be offered for saving"
+        );
+        // A different account on the same site is its own credential.
+        assert!(!vault.has_matching_credential("someone-else", "hunter2", exact));
+        // And the origin rule is the caller's: a predicate that does not match
+        // must not find it, or one site could suppress another's save offer.
+        assert!(!vault.has_matching_credential("dora", "hunter2", |stored| stored
+            == "evil.example.net"));
+
+        // The case the exact-origin version would have missed: saved on one
+        // subdomain, submitted on another, which is exactly when the fill
+        // offer crosses subdomains too.
+        let same_site = |stored: &str| stored.ends_with("example.com");
+        assert!(
+            vault.has_matching_credential("dora", "hunter2", same_site),
+            "a credential saved on a sibling subdomain must count as stored"
+        );
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
     fn unlock_test_vault(path: &Path) -> Vault {
         Vault::unlock(path, "test passphrase").unwrap()
     }
@@ -1316,9 +1657,12 @@ mod tests {
         rewrite_payload(&vault, &serde_json::to_vec(&future).unwrap());
         drop(vault);
 
+        // NewerVault, not BadFormat. The file is intact and decrypted; it is
+        // simply from a build ahead of this one, and a reader must be told
+        // that rather than that their vault may be lost.
         assert!(matches!(
             Vault::unlock(&path, "test passphrase"),
-            Err(VaultError::BadFormat(_))
+            Err(VaultError::NewerVault { found: 99, supported: _ })
         ));
         let _ = fs::remove_file(&path);
     }

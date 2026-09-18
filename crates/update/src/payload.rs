@@ -61,6 +61,39 @@ mod tests {
     }
 }
 
+/// The LANGUAGE PACK counterpart of [`verify_payload`].
+///
+/// A third function for the reason the second one gives: these channels carry
+/// different documents under different signing domains, and a generic over
+/// "things with a hash and a size" is an invitation to a call site that passes
+/// the wrong manifest and still compiles. Here that would mean a pack accepted
+/// on a blocklist's authority.
+///
+/// LENGTH FIRST, then hash. Not for speed -- for what a mismatch MEANS: a
+/// wrong length is a truncated or padded download and says so precisely,
+/// whereas a hash failure alone leaves a user staring at "corrupt" with no
+/// idea whether the connection dropped or the file was substituted.
+pub fn verify_model_bytes(
+    bytes: &[u8],
+    manifest: &crate::ModelManifest,
+) -> Result<(), UpdateError> {
+    let actual = bytes.len() as u64;
+    if actual != manifest.size() {
+        return Err(UpdateError::PayloadLength {
+            expected: manifest.size(),
+            actual,
+        });
+    }
+    let digest: [u8; 32] = Sha256::digest(bytes).into();
+    // Constant time, like its siblings. The comparison is against a value an
+    // attacker chose half of, and a timing oracle on a hash check is a
+    // well-trodden way to grind one out.
+    if !constant_time_eq(&digest, manifest.sha256()) {
+        return Err(UpdateError::PayloadHash);
+    }
+    Ok(())
+}
+
 /// The blocklist counterpart of [`verify_payload`]: same guarantee, different
 /// manifest type.
 ///

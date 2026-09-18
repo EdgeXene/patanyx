@@ -192,6 +192,10 @@ def main():
         ("tx-head", "sf-panel", 4.5),
         ("tx-code", "sf-code", 4.5),
         ("tx-find", "sf-find-input", 4.5),
+        # Native select popups use this explicit backstop pair. STRICT because
+        # it was added with the scheme declaration and has no shipped,
+        # unreadable baseline to grandfather.
+        ("native-option-text", "native-option-bg", 4.5, STRICT),
         ("st-ok", "sf-body", 4.5),
         ("st-warn", "sf-body", 3.0),
         ("st-err", "sf-body", 4.5),
@@ -226,6 +230,29 @@ def main():
     ]
 
     failures = []
+
+    # The numeric pair matters only if native popup options actually consume
+    # it, and the primary fix matters only if all three scheme selectors tell
+    # the engine which kind of native widget to draw.
+    for declaration, description in [
+        (r":root\s*\{[^{}]*color-scheme:\s*dark\s*;", "default Dark scheme"),
+        (
+            r':root\[data-scheme="white"\]\s*\{[^{}]*color-scheme:\s*light\s*;',
+            "White scheme",
+        ),
+        (
+            r':root\[data-scheme="black"\]\s*\{[^{}]*color-scheme:\s*dark\s*;',
+            "Black scheme",
+        ),
+    ]:
+        if not re.search(declaration, src, re.S):
+            failures.append(f"{description} does not declare its color-scheme")
+    option_rule = re.search(r"\boption\s*\{([^{}]*)\}", src, re.S)
+    if not option_rule or not all(
+        token in option_rule.group(1)
+        for token in ["var(--native-option-bg)", "var(--native-option-text)"]
+    ):
+        failures.append("option does not consume the checked native option tokens")
 
     def colour_of(name, env, where):
         """The hex a variable resolves to in one chrome, or None + a failure."""

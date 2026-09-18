@@ -50,7 +50,51 @@ const flush = async () => {
   }
 };
 
-new Function(fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8"))();
+let chromeJs = fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8");
+// Planted-defect mode: keep the renderer and every source assertion intact,
+// but rename the one listener this feature needs. The normal run never edits
+// a workspace file; running with PATANYX_TAB_REORDER_OMIT_DROP_HANDLER=1 must
+// fail the behavioral check below.
+if (process.env.PATANYX_TAB_REORDER_OMIT_DROP_HANDLER) {
+  const callSite = 'chip.addEventListener("drop", (ev) => {';
+  assert(
+    chromeJs.includes(callSite),
+    "cannot plant defect: tab drop handler spelling changed",
+  );
+  chromeJs = chromeJs.replace(
+    callSite,
+    'chip.addEventListener("drop-removed", (ev) => {',
+  );
+}
+// WP-V plant proofs. Each removes one live behavior while leaving the markup
+// and source-level contracts intact, so the behavioral assertions below must
+// be what turn red.
+if (process.env.PATANYX_TOOLBAR_OMIT_RIGHT_INSET) {
+  const callSite = "right: closedChromeRightPx(),";
+  assert(
+    chromeJs.includes(callSite),
+    "cannot plant defect: right inset call changed",
+  );
+  chromeJs = chromeJs.replace(callSite, "right: 0,");
+}
+if (process.env.PATANYX_TOOLBAR_OMIT_LABEL_GRAY) {
+  const callSite = "if (choice) choice.disabled = vertical;";
+  assert(
+    chromeJs.includes(callSite),
+    "cannot plant defect: label graying call changed",
+  );
+  chromeJs = chromeJs.replace(callSite, "if (choice) choice.disabled = false;");
+}
+if (process.env.PATANYX_RECEIPT_OMIT_CAPTION) {
+  const callSite =
+    'captionEl.textContent =\n      "Refused by the blocker since the browser was launched, counted across every tab, including tabs you have since closed.";';
+  assert(
+    chromeJs.includes(callSite),
+    "cannot plant defect: receipt caption changed",
+  );
+  chromeJs = chromeJs.replace(callSite, 'captionEl.textContent = "";');
+}
+new Function(chromeJs)();
 
 const headerAt = html.indexOf('<header id="toolbar"');
 const headerEnd = html.indexOf("</header>");
@@ -105,6 +149,146 @@ const MUST_BE_VISIBLE = [
   ["btn-library", "bookmarks and downloads"],
   ["btn-about", "version, licence and third-party notices"],
 ];
+
+const fireChrome = (event, data) => global.window.__rb_event({ event, data });
+const tabChips = () => Array.from(global.$("tabs").children || []);
+const tabChipIds = () => tabChips().map((chip) => Number(chip.dataset.tabId));
+const activeChipId = () => {
+  const chip = tabChips().find((candidate) =>
+    String(candidate.className || "")
+      .split(/\s+/)
+      .includes("active"),
+  );
+  return chip ? Number(chip.dataset.tabId) : null;
+};
+const tabItems = (ids, active) =>
+  ids.map((id) => ({
+    id,
+    url: "https://tab-" + id + ".example/",
+    title: "Tab " + id,
+    active: id === active,
+  }));
+
+check(
+  "tab chips drag one full permutation and keep the active tab by id",
+  async () => {
+    // Let the boot-time tab_list promise settle before publishing the test's
+    // authoritative event; otherwise its empty stub reply could clear the
+    // strip between dragstart and drop.
+    await flush();
+    fireChrome("tabs_changed", { items: tabItems([11, 22, 33], 22) });
+    const [first, , third] = tabChips();
+    assert(first && third, "setup did not render three tab chips");
+    assert(
+      first.getAttribute("draggable") === "true" &&
+        first._has("dragstart") &&
+        third._has("dragover") &&
+        third._has("drop"),
+      "tab chips are not draggable through dragstart/dragover/drop",
+    );
+
+    const carried = [];
+    const dataTransfer = {
+      effectAllowed: "",
+      dropEffect: "",
+      setData(type, value) {
+        carried.push([type, value]);
+      },
+    };
+    global.rbCalls.length = 0;
+    global.rbResolve.tab_reorder = {
+      ids: [22, 33, 11],
+      items: tabItems([22, 33, 11], 22),
+    };
+    first._fire("dragstart", { dataTransfer });
+    third._fire("dragover", { clientX: 1, dataTransfer });
+    assert(
+      tabChipIds().join(",") === "22,33,11",
+      "dragover did not preview the order; got " + tabChipIds().join(","),
+    );
+    third._fire("drop", { clientX: 1, dataTransfer });
+    await flush();
+
+    const calls = global.rbCalls.filter((call) => call.cmd === "tab_reorder");
+    assert(calls.length === 1, "one drop sent " + calls.length + " reorders");
+    assert(
+      calls[0].args.ids.join(",") === "22,33,11",
+      "drop did not send the full previewed permutation: " +
+        JSON.stringify(calls[0].args),
+    );
+    assert(
+      tabChipIds().join(",") === "22,33,11",
+      "the canonical reorder reply was not rendered",
+    );
+    assert(
+      activeChipId() === 22,
+      "active chip changed identity after reorder: " + activeChipId(),
+    );
+    // A drag MUST write something, and it must not be the tab id.
+    //
+    // This assertion used to demand `carried.length === 0`, and that is how a
+    // gate enforced a defect: an HTML5 drag with an empty dataTransfer is
+    // abandoned by both engines, which fall back to selecting the text under
+    // the cursor. The tab strip did exactly that on real hardware -- press,
+    // move, and the tab TITLE highlighted while the tab stayed put. The
+    // property actually worth protecting was never "carry nothing", it was
+    // "never carry an internal address", so that is what is checked now.
+    assert(
+      carried.length > 0,
+      "tab drag wrote NO dataTransfer payload, so no drag can start",
+    );
+    const ids = ["11", "22", "33"];
+    assert(
+      !carried.some(([, value]) => ids.includes(String(value))),
+      "an internal tab id rode in dataTransfer: " + JSON.stringify(carried),
+    );
+
+    // Re-rendering after a drop must not cost the two existing direct actions.
+    global.rbCalls.length = 0;
+    const inactive = tabChips().find(
+      (chip) => Number(chip.dataset.tabId) === 33,
+    );
+    inactive._fire("click");
+    inactive.querySelector(".chip-close")._fire("click");
+    const direct = global.rbCalls.filter(
+      (call) => call.cmd === "tab_switch" || call.cmd === "tab_close",
+    );
+    assert(
+      direct.length === 2 &&
+        direct[0].cmd === "tab_switch" &&
+        direct[0].args.id === 33 &&
+        direct[1].cmd === "tab_close" &&
+        direct[1].args.id === 33,
+      "click-to-switch or close lost its stable tab id after reorder: " +
+        JSON.stringify(direct),
+    );
+  },
+);
+
+check("focused tab chips reorder with Left and Right arrow keys", async () => {
+  fireChrome("tabs_changed", { items: tabItems([11, 22, 33], 22) });
+  global.rbCalls.length = 0;
+  global.rbResolve.tab_reorder = {
+    ids: [11, 33, 22],
+    items: tabItems([11, 33, 22], 22),
+  };
+  const active = tabChips().find((chip) => Number(chip.dataset.tabId) === 22);
+  assert(
+    active && active.getAttribute("tabindex") === "0" && active._has("keydown"),
+    "tab chips are not focusable with a keyboard reorder handler",
+  );
+  active._fire("keydown", { key: "ArrowRight" });
+  await flush();
+  const calls = global.rbCalls.filter((call) => call.cmd === "tab_reorder");
+  assert(
+    calls.length === 1,
+    "one arrow move sent " + calls.length + " reorders",
+  );
+  assert(
+    calls[0].args.ids.join(",") === "11,33,22" && activeChipId() === 22,
+    "ArrowRight did not persist the full order with active id 22",
+  );
+});
 
 check("the toolbar exists and breaks onto a second row", () => {
   assert(headerAt !== -1, 'no <header id="toolbar"> in index.html');
@@ -316,128 +500,126 @@ check("the sidebar exists, is empty, and starts hidden", () => {
   );
 });
 
+for (const side of ["left", "right"]) {
+  check(
+    "choosing " + side + " moves every second-row control into the sidebar",
+    async () => {
+      await wear(side);
+      const rail = global.$("sidebar");
+      const bar = global.$("toolbar");
+      assert(!rail.hidden, "the sidebar is still hidden after choosing Left");
+      for (const id of ROW_TWO) {
+        const el = global.$(id);
+        assert(
+          el.parentNode === rail,
+          "#" +
+            id +
+            " stayed in the toolbar when the toolbar moved left. In that " +
+            "layout the top strip is not where a feature button is looked for, " +
+            "and a control drawn outside the chrome's own bounds is not drawn.",
+        );
+      }
+      // The two that arrive late, appended by update.js and integrity.js after
+      // the placement may already have been worn.
+      for (const id of ["btn-integrity", "btn-update"]) {
+        const el = global.$(id);
+        if (!el || !el.parentNode) continue;
+        assert(
+          el.parentNode === rail,
+          "#" +
+            id +
+            " is appended to #toolbar at runtime and was not swept into " +
+            "the sidebar. It would render in a container the layout does not show.",
+        );
+      }
+      for (const id of ROW_ONE) {
+        assert(
+          global.$(id).parentNode === bar,
+          "#" +
+            id +
+            " moved to the sidebar. Row one acts on the page in front of " +
+            "you and stays with the address bar in both layouts.",
+        );
+      }
+    },
+  );
+}
+
 check(
-  "choosing Left moves every second-row control into the sidebar",
+  "choosing either Top placement puts them back in source order",
   async () => {
-    await wear("left");
-    const rail = global.$("sidebar");
     const bar = global.$("toolbar");
-    assert(!rail.hidden, "the sidebar is still hidden after choosing Left");
-    for (const id of ROW_TWO) {
-      const el = global.$(id);
-      assert(
-        el.parentNode === rail,
-        "#" +
-          id +
-          " stayed in the toolbar when the toolbar moved left. In that " +
-          "layout the top strip is not where a feature button is looked for, " +
-          "and a control drawn outside the chrome's own bounds is not drawn.",
+    const rail = global.$("sidebar");
+    // Snapshot from the TOP layout: the previous check left the buttons in the
+    // sidebar, and comparing a full row against a half one proves nothing.
+    await wear("top_left");
+    const before = bar.children.map((c) => c.id).join(",");
+    await wear("left");
+    // SCRAMBLE THE RAIL before coming back, and this is the part that earns
+    // the check.
+    //
+    // Restoring by appending whatever the rail currently holds gives the right
+    // answer as long as the rail's order happens to equal the markup's -- which
+    // it does on a first trip, so a gate that only went left-and-back would
+    // pass against an implementation with no notion of source order at all.
+    // update.js and integrity.js append at runtime and are swept in whenever
+    // they arrive, so "the rail's order" is not a thing that can be relied on.
+    // Moving one button to the front is the cheapest way to make the two
+    // orders genuinely disagree.
+    if (rail.children.length > 1) {
+      rail.insertBefore(
+        rail.children[rail.children.length - 1],
+        rail.children[0],
       );
     }
-    // The two that arrive late, appended by update.js and integrity.js after
-    // the placement may already have been worn.
-    for (const id of ["btn-integrity", "btn-update"]) {
-      const el = global.$(id);
-      if (!el || !el.parentNode) continue;
-      assert(
-        el.parentNode === rail,
-        "#" +
-          id +
-          " is appended to #toolbar at runtime and was not swept into " +
-          "the sidebar. It would render in a container the layout does not show.",
-      );
-    }
-    for (const id of ROW_ONE) {
-      assert(
-        global.$(id).parentNode === bar,
-        "#" +
-          id +
-          " moved to the sidebar. Row one acts on the page in front of " +
-          "you and stays with the address bar in both layouts.",
-      );
-    }
+    await wear("top_right");
+    const after = bar.children.map((c) => c.id).join(",");
+    assert(
+      global.$("sidebar").hidden,
+      "the sidebar is still showing after choosing Top Right",
+    );
+    assert(
+      global.$("sidebar").children.length === 0,
+      "the sidebar still holds controls after choosing Top: they are in a " +
+        "hidden container, which is the disclosure this whole gate exists to " +
+        "forbid.",
+    );
+    assert(
+      after === before,
+      "the row came back in a different order than it went out.\n      was: " +
+        before +
+        "\n      now: " +
+        after,
+    );
   },
 );
 
-check("choosing Top puts them back in source order", async () => {
-  const bar = global.$("toolbar");
-  const rail = global.$("sidebar");
-  // Snapshot from the TOP layout: the previous check left the buttons in the
-  // sidebar, and comparing a full row against a half one proves nothing.
-  await wear("top");
-  const before = bar.children.map((c) => c.id).join(",");
-  await wear("left");
-  // SCRAMBLE THE RAIL before coming back, and this is the part that earns
-  // the check.
-  //
-  // Restoring by appending whatever the rail currently holds gives the right
-  // answer as long as the rail's order happens to equal the markup's -- which
-  // it does on a first trip, so a gate that only went left-and-back would
-  // pass against an implementation with no notion of source order at all.
-  // update.js and integrity.js append at runtime and are swept in whenever
-  // they arrive, so "the rail's order" is not a thing that can be relied on.
-  // Moving one button to the front is the cheapest way to make the two
-  // orders genuinely disagree.
-  if (rail.children.length > 1) {
-    rail.insertBefore(
-      rail.children[rail.children.length - 1],
-      rail.children[0],
+check("all four layouts report symmetric insets to Rust", async () => {
+  for (const [placement, wantLeft, wantRight] of [
+    ["top_left", false, false],
+    ["top_right", false, false],
+    ["left", true, false],
+    ["right", false, true],
+  ]) {
+    global.rbCalls.length = 0;
+    await wear(placement);
+    const insets = global.rbCalls.filter((c) => c.cmd === "set_chrome_insets");
+    assert(insets.length > 0, placement + " reported no insets to Rust");
+    const last = insets[insets.length - 1].args;
+    assert(
+      typeof last.top === "number" &&
+        typeof last.left === "number" &&
+        typeof last.right === "number",
+      "all three insets must be numbers for " +
+        placement +
+        ": " +
+        JSON.stringify(last),
+    );
+    assert(
+      last.left > 0 === wantLeft && last.right > 0 === wantRight,
+      placement + " sent the wrong side insets: " + JSON.stringify(last),
     );
   }
-  await wear("top");
-  const after = bar.children.map((c) => c.id).join(",");
-  assert(
-    global.$("sidebar").hidden,
-    "the sidebar is still showing after choosing Top",
-  );
-  assert(
-    global.$("sidebar").children.length === 0,
-    "the sidebar still holds controls after choosing Top: they are in a " +
-      "hidden container, which is the disclosure this whole gate exists to " +
-      "forbid.",
-  );
-  assert(
-    after === before,
-    "the row came back in a different order than it went out.\n      was: " +
-      before +
-      "\n      now: " +
-      after,
-  );
-});
-
-check("the layout is reported to Rust on both axes", async () => {
-  await wear("left");
-  global.rbCalls.length = 0;
-  await wear("left");
-  const insets = global.rbCalls.filter((c) => c.cmd === "set_chrome_insets");
-  assert(insets.length > 0, "choosing a placement reported no insets to Rust");
-  const last = insets[insets.length - 1].args;
-  assert(
-    typeof last.top === "number" && typeof last.left === "number",
-    "both axes must be reported as numbers; got " + JSON.stringify(last),
-  );
-  // The page's rectangle is Rust's, and the only thing that tells it a
-  // sidebar is there is this number. Zero here means the page is laid out
-  // underneath the toolbar with nothing to show for it.
-  assert(
-    last.left > 0,
-    "the left inset is " +
-      last.left +
-      " in the sidebar layout: the page " +
-      "would be laid out under the toolbar, which does not draw an error, it " +
-      "just puts the first 56px of every page behind a strip.",
-  );
-  await wear("top");
-  const back = global.rbCalls
-    .filter((c) => c.cmd === "set_chrome_insets")
-    .pop().args;
-  assert(
-    back.left === 0,
-    "returning to Top left a " +
-      back.left +
-      "px inset: the page keeps a " +
-      "margin for a toolbar that is no longer there.",
-  );
 });
 
 check("the stylesheet is told what Rust was told", async () => {
@@ -458,12 +640,135 @@ check("the stylesheet is told what Rust was told", async () => {
       "modal card sized against the viewport extends underneath it and its " +
       "lower half is simply not on screen.",
   );
-  await wear("top");
+  await wear("right");
   assert(
-    vars.getPropertyValue("--chrome-left-px") === "0px",
-    "--chrome-left-px did not return to 0px in the top layout",
+    vars.getPropertyValue("--chrome-left-px") === "0px" &&
+      vars.getPropertyValue("--chrome-right-px") !== "0px",
+    "Right did not mirror the published sidebar inset",
+  );
+  await wear("top_left");
+  assert(
+    vars.getPropertyValue("--chrome-left-px") === "0px" &&
+      vars.getPropertyValue("--chrome-right-px") === "0px",
+    "side CSS variables did not return to 0px in the top layout",
   );
 });
+
+check("CSS gives all four placements distinct, mirrored geometry", () => {
+  const css = fs.readFileSync(path.join(chromeDir, "chrome.css"), "utf8");
+  assert(
+    /#toolbar\s*\{[\s\S]*?justify-content:\s*flex-start/.test(css) &&
+      /data-toolbar-placement="top_right"[\s\S]*?#toolbar\s*\{[\s\S]*?justify-content:\s*flex-end/.test(
+        css,
+      ),
+    "Top Left and Top Right do not align the feature row to opposite ends",
+  );
+  assert(
+    /data-toolbar-placement="left"[^}]*#sidebar[\s\S]*?left:\s*0[\s\S]*?border-right/.test(
+      css,
+    ) &&
+      /data-toolbar-placement="right"[^}]*#sidebar[\s\S]*?right:\s*0[\s\S]*?border-left/.test(
+        css,
+      ) &&
+      css.includes("margin-left: var(--chrome-left-px") &&
+      css.includes("margin-right: var(--chrome-right-px"),
+    "Left and Right do not mirror rail borders and chrome-flow margins",
+  );
+  // Whitespace-flattened: the prose is pinned by wording, not by however the
+  // formatter happens to wrap it across lines.
+  const htmlFlat = html.replace(/\s+/g, " ");
+  // THE TOP-STRIP PROMISE WAS REMOVED FROM THE PANEL, 2026-08-27, because
+  // the Theme modal now carries titles and control labels only,
+  // no prose at all. This assertion used to require the sentence "Tabs and
+  // the address bar stay at the top in every arrangement." and it is dropped
+  // rather than quietly left passing on something else.
+  //
+  // What that sentence did: the four placements move the FEATURE buttons and
+  // not the tabs or address bar, so a reader choosing Left could expect the
+  // whole strip to follow. The panel no longer says otherwise. If that turns
+  // out to confuse people on hardware, the fix is to restore the sentence and
+  // this assertion together, not to reword the buttons.
+  //
+  // The placement NAMES are still gated, because those are what the CSS
+  // assertions above are checked against.
+  assert(
+    htmlFlat.includes("Top Left") && htmlFlat.includes("Top Right"),
+    "the panel does not offer/name all four placements",
+  );
+});
+
+check(
+  "labels gray live only in side strips and keep their stored choice",
+  async () => {
+    global.rbResolve.toolbar_labels_set = { mode: "hide" };
+    global.$("labels-hide")._fire("click");
+    await flush();
+    assert(
+      global.document.documentElement.dataset.toolbarLabels === "hide",
+      "setup did not wear the hidden-label preference",
+    );
+    const setsBefore = global.rbCalls.filter(
+      (c) => c.cmd === "toolbar_labels_set",
+    ).length;
+    for (const side of ["left", "right"]) {
+      await wear(side);
+      assert(
+        global.$("labels-show").disabled && global.$("labels-hide").disabled,
+        side + " did not disable the labels choice",
+      );
+        // The reason moved from a paragraph onto the buttons themselves,
+        // 2026-08-27: the Theme modal was cut back to titles and
+        // control labels only. What must not be lost is that a DISABLED
+        // control still says WHY, so this checks the hover title rather than a
+        // note element. Dropping the assertion instead would have left two
+        // greyed-out buttons with no explanation anywhere in the product.
+        assert(
+          /id="labels-show"[\s\S]{0,240}?The left and right strips show icons only\./.test(
+            html,
+          ) &&
+            /id="labels-hide"[\s\S]{0,240}?The left and right strips show icons only\./.test(
+              html,
+            ),
+          side + " did not give the disabled choice a reason on hover",
+        );
+    }
+    for (const top of ["top_left", "top_right"]) {
+      await wear(top);
+      assert(
+        !global.$("labels-show").disabled && !global.$("labels-hide").disabled,
+        top + " did not re-enable the labels choice",
+      );
+        // The counterpart assertion is gone with the note it checked: a
+        // hover title is always present rather than shown and hidden, so
+        // there is nothing here to leave showing. The re-enable check above
+        // is what still matters for the top placements.
+    }
+    assert(
+      global.document.documentElement.dataset.toolbarLabels === "hide" &&
+        global.rbCalls.filter((c) => c.cmd === "toolbar_labels_set").length ===
+          setsBefore,
+      "a side-to-top round trip mutated the stored label choice",
+    );
+  },
+);
+
+check(
+  "the privacy receipt explains the session count including closed tabs",
+  async () => {
+    global.rbResolve.privacy_receipt = {
+      counts_blocked: true,
+      session_blocked: 7,
+      page_blocked: 2,
+    };
+    global.$("btn-tab")._fire("click");
+    await flush();
+    assert(
+      global.$("receipt-session-caption").textContent ===
+        "Refused by the blocker since the browser was launched, counted across every tab, including tabs you have since closed.",
+      "the session receipt caption is absent or changed",
+    );
+  },
+);
 
 check("nothing can hide a control behind a disclosure", () => {
   // The property that actually matters, and the reason the previous version of

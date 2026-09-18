@@ -150,6 +150,13 @@ if [ -f "$REPO_ROOT/Cargo.lock" ]; then
     cp "$REPO_ROOT/Cargo.lock" "$APPWS/Cargo.lock"
 fi
 cp -R "$REPO_ROOT/crates" "$APPWS/crates"
+# The workspace Cargo.toml patches wry to the local vendor tree (the
+# content-page window.ipc fix). A copied workspace without vendor/ leaves
+# that [patch] dangling and cargo refuses to build anything, including the
+# licence suite this gate exists to run.
+if [ -d "$REPO_ROOT/vendor" ]; then
+    cp -R "$REPO_ROOT/vendor" "$APPWS/vendor"
+fi
 # Build inputs that live OUTSIDE crates/: the OCR model weights
 # (include_bytes! from models/) and the LICENSE/NOTICE texts the About
 # panel compiles in (include_str!). This list is the output of

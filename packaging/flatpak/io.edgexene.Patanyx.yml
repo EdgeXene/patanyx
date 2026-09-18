@@ -17,10 +17,32 @@
 #   branch 49 : webkit2gtk-4.1 2.52.5 | gtk+-3.0 3.24.52 | glib 2.86.5
 #   branch 50 : webkit2gtk-4.1 2.52.5 | gtk+-3.0 3.24.52 | glib 2.88.2
 #
-# Both carry the GTK3 webkit2gtk-4.1 this app links against, at exactly the
-# 2.52.5 floor. 50 is chosen for the longer remaining support window: picking
-# a branch near end-of-life would recreate the Debian 12 problem in a nicer
-# wrapper.
+# Both carry the GTK3 webkit2gtk-4.1 this app links against. 50 is chosen for
+# the longer remaining support window: picking a branch near end-of-life would
+# recreate the Debian 12 problem in a nicer wrapper.
+#
+# BLOCKER FOR THE FLATPAK CHANNEL, 2026-09-15. Those probed figures are 2.52.5,
+# and the floor this release enforces is 2.52.6 (WSA-2026-0005). A release
+# build BELOW the compiled floor does not warn on Linux --
+# `enforce_engine_floor` prints to stderr and calls exit(2). Under Flatpak
+# nobody sees that stderr, so the symptom is a window that never opens.
+#
+# MEASURED, not inferred (peer session 45fb991a, 2026-09-15): the release
+# binary run inside org.gnome.Platform//50 under xvfb prints
+# "WebKitGTK 2.52.5 is below the security floor 2.52.6 ... Release build:
+# refusing to start" and exits 2. Operator approved the hold: this release
+# ships NO Flatpak, and the Linux channel is the native Debian 13 build.
+#
+# So before this Flatpak is built or shipped, RE-PROBE the runtime:
+#
+#   flatpak install -y org.gnome.Platform//50
+#   flatpak run --command=pkg-config org.gnome.Platform//50 \
+#     --modversion webkit2gtk-4.1
+#
+# If it reports 2.52.6 or newer, this channel is clear. If it still reports
+# 2.52.5, the Flatpak must be HELD -- do not lower MIN_WEBKITGTK to make it
+# start. The native Debian 13 package is unaffected: trixie security carries
+# 2.52.6-1~deb13u1.
 app-id: io.edgexene.Patanyx
 runtime: org.gnome.Platform
 runtime-version: "50"
@@ -61,8 +83,13 @@ modules:
       # whatever the network served that day.
       #
       # Two things used to need the network. The toolchain is now a
-      # checksummed archive source below, pinned to the same 1.96.0 that
+      # checksummed archive source below, pinned to the same 1.98.0 that
       # rust-toolchain.toml pins so published build hashes keep verifying.
+      # NOTHING INSIDE THIS SANDBOX READS rust-toolchain.toml. There is no
+      # rustup here and cargo is invoked by absolute path, so the pin is inert
+      # and this archive alone decides the compiler. That is why the two are
+      # checked mechanically by scripts/toolchain-pin-gate.sh rather than by
+      # the comment you are reading.
       # The crates come from cargo-sources.json, generated from Cargo.lock by
       # flatpak-cargo-generator.py (vendored beside it).
       # cargo shells out to `rustc` by name, so the pinned toolchain has to be
@@ -73,7 +100,7 @@ modules:
         CARGO_NET_OFFLINE: "true"
     build-commands:
       # The pinned toolchain, NOT org.freedesktop.Sdk.Extension.rust-stable:
-      # that would silently drift off 1.96.0 and break every published
+      # that would silently drift off 1.98.0 and break every published
       # reproducible-build hash with nothing in the repo to explain why.
       - ./rust-toolchain/install.sh --prefix=/run/build/patanyx/rust
         --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu
@@ -90,6 +117,7 @@ modules:
       # an error -- the feature reports itself unavailable and its controls
       # stay hidden.
       - install -Dm644 models/ocr/det.onnx /app/bin/models/ocr/det.onnx
+      - install -Dm644 models/ocr/cls.onnx /app/bin/models/ocr/cls.onnx
       - install -Dm644 models/ocr/rec.onnx /app/bin/models/ocr/rec.onnx
       - install -Dm644 models/ocr/rec_dict.txt /app/bin/models/ocr/rec_dict.txt
       - install -Dm644 packaging/flatpak/io.edgexene.Patanyx.desktop
@@ -136,7 +164,7 @@ modules:
       # rust-toolchain.toml in the same commit, and it CHANGES EVERY
       # PUBLISHED HASH.
       - type: archive
-        url: https://static.rust-lang.org/dist/rust-1.96.0-x86_64-unknown-linux-gnu.tar.gz
-        sha256: c1130e4f7976f230766ab062b105b1fb050d6a78177db2246a5878fd6a589680
+        url: https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-gnu.tar.gz
+        sha256: aa30409afa67bd1ada244cefd82c7980e6a65bc113bb978e934b2413c75e3900
         dest: rust-toolchain
         strip-components: 1

@@ -56,9 +56,11 @@ pub enum ActivationState {
     Activated,
     /// The token is ACTIVE and no receipt binds here. `reason` names why
     /// (see `activation_copy`): "pending" before the first attempt answers,
-    /// "offline", "slots_full", "grants_exhausted", "expired", "bad_token",
+    /// "offline", "tunnel_carried", "certificate", "slots_full",
+    /// "grants_exhausted", "expired", "bad_token",
     /// "device_id_unreadable", "device_id_io", "vault_io", "released",
-    /// "release_offline", "refused".
+    /// "release_offline", "release_tunnel_carried", "release_certificate",
+    /// "refused".
     Unactivated { reason: &'static str },
 }
 
@@ -309,7 +311,43 @@ pub fn on_vault_unlocked(state: &AppState) {
         // Local-only diagnostics, never the token.
         eprintln!("patanyx licence: {diagnostic}");
     }
+    // A device the user RELEASED stays released across locks: the vault
+    // carries the marker, and a token-without-receipt in that state is the
+    // user's decision, not a lost answer to retry. THIS device only: the
+    // marker names the device that released, and a vault copied from it
+    // must not stop another install's first activation.
+    let released_here = match (state.vault.as_ref(), this_device_hex(state)) {
+        (Some(vault), Some(here)) => vault.is_released(&here),
+        _ => false,
+    };
+    // A release this device STARTED and has not resolved. It outranks every
+    // other reason to touch the network here: the user asked to give the
+    // slot up, so the browser finishes that rather than taking it again.
+    let release_pending_here = crate::activation::release_is_pending_here(state);
+    if release_pending_here && matches!(session.activation, ActivationState::Unactivated { .. }) {
+        session.activation = ActivationState::Unactivated {
+            reason: "release_pending",
+        };
+        *lock(&LAST_ACTIVATION_RESULT) = Some("release_pending");
+    }
+    if released_here && matches!(session.activation, ActivationState::Unactivated { .. }) {
+        // Show the release, not "Activating this device..." forever: the
+        // in-memory result was cleared by the lock, the vault remembers.
+        session.activation = ActivationState::Unactivated { reason: "released" };
+        *lock(&LAST_ACTIVATION_RESULT) = Some("released");
+    }
+    // A result that arrived while the vault was locked is about to be
+    // replayed (`activation::replay_pending` runs right after this): it
+    // answers the question a retry would ask, and a retry started here
+    // would have its busy flag cleared by that replay while still running.
+    let replay_pending = state
+        .pending_activation_event
+        .as_ref()
+        .is_some_and(|e| Some(&e.license_id_hex) == session.license_id_hex.as_ref());
     let needs_retry = matches!(session.activation, ActivationState::Unactivated { .. })
+        && !released_here
+        && !release_pending_here
+        && !replay_pending
         && !matches!(
             *lock(&LAST_ACTIVATION_RESULT),
             Some("device_id_unreadable" | "device_id_io" | "released")
@@ -321,12 +359,21 @@ pub fn on_vault_unlocked(state: &AppState) {
     // answer costs nothing (the server is idempotent per device). Keyed by
     // licence id so the evaluation the retry's own result triggers does not
     // start a second one; a new token pasted mid-session gets its own try.
+    // NOTE: finishing an unresolved release is NOT started here. This
+    // evaluation runs from many places -- a paste, an imported receipt, an
+    // activation result -- and a release request firing inside one of those
+    // would free the slot the caller is in the middle of claiming. It is
+    // started from the unlock arms only, by `finish_pending_release`, which
+    // is where "the user just unlocked the vault" actually happens.
     if needs_retry {
         if let Some(id) = license_id_hex {
             let already = lock(&RETRIED_FOR).as_deref() == Some(id.as_str());
-            if !already {
+            // RECORD THE TRY ONLY IF ONE STARTED. A worker for a replaced
+            // licence can still be running, in which case `start_activation`
+            // refuses; marking the attempt anyway spent this licence's one
+            // retry on a call that never happened.
+            if !already && crate::activation::start_activation(state) {
                 *lock(&RETRIED_FOR) = Some(id);
-                crate::activation::start_activation(state);
             }
         }
     }
@@ -365,8 +412,33 @@ pub fn current_license_id_hex() -> Option<String> {
 
 /// The user's explicit "Activate now": forget the last result, then let the
 /// worker start. Returns whether it started.
-pub fn activate_now(state: &AppState) -> bool {
+pub fn activate_now(state: &mut AppState) -> bool {
+    // A call is already running (an unresolved release, most likely): do not
+    // clear anything for an activation that cannot start.
+    if activation_in_flight() {
+        return false;
+    }
     *lock(&LAST_ACTIVATION_RESULT) = None;
+    // An explicit Activate is the user taking the slot back on purpose --
+    // for this device; another device's release in a travelled vault stands.
+    // A release of this device parked for retry is NOT dropped here: only a
+    // durable transition (a persisted receipt, online or imported) makes
+    // replaying it obsolete. Dropping it on a click that may fail to save
+    // or to activate would leave the disk with the old receipt and nothing
+    // to correct it at the next unlock.
+    // The user is taking this device's slot back on purpose: both the
+    // recorded release and a release still waiting on the server stop
+    // applying to it. Durable, and before the request leaves, so a failure
+    // here refuses rather than leaving the two sides disagreeing.
+    let here = this_device_hex(state);
+    if let (Some(vault), Some(here)) = (state.vault.as_mut(), here) {
+        if vault.clear_released_device_if(&here).is_err()
+            || vault.clear_release_pending_if(&here).is_err()
+        {
+            set_activation_result("vault_io");
+            return false;
+        }
+    }
     if let Some(session) = lock(&SESSION).as_mut() {
         if matches!(session.activation, ActivationState::Unactivated { .. }) {
             session.activation = ActivationState::Unactivated { reason: "pending" };
@@ -375,14 +447,60 @@ pub fn activate_now(state: &AppState) -> bool {
     crate::activation::start_activation(state)
 }
 
+/// This install's device id as hex, read only (never minted: reading the
+/// vault must not create an identifier). `None` when no id exists yet or
+/// the file is unreadable; callers treat that as "not this device".
+pub fn this_device_hex(state: &AppState) -> Option<String> {
+    crate::activation::device_id_if_present(&state.vault_path)
+        .ok()
+        .flatten()
+        .map(|id| crate::activation::hex_encode_16(&id))
+}
+
+/// A pasted token is a fresh intent: forget the in-memory reasons not to
+/// try (a "released" result, the once-per-unlock guard) so the evaluation
+/// that follows the paste makes the attempt the row promises.
+pub fn forget_activation_suppression() {
+    *lock(&LAST_ACTIVATION_RESULT) = None;
+    *lock(&RETRIED_FOR) = None;
+}
+
 /// The sentence the vault row shows under an unactivated licence. Rust
 /// words it; the chrome writes it verbatim. Every reason has one.
 pub fn activation_copy(reason: &str) -> &'static str {
     match reason {
         "pending" => "Activating this device...",
         "offline" => {
-            "This device is not activated yet. PATANYX could not reach EdgeXene to \
-             activate it; it will try again at the next unlock, or use Activate now."
+            "This device is not activated yet. Your Premium license is recognized; \
+             this machine just needs to reach EdgeXene once to finish, and that has \
+             not happened yet. Try Activate now, and it will try again at the next \
+             unlock. If it keeps failing, activate once on another network -- a home \
+             connection or a phone hotspot -- and this device stays activated \
+             afterwards."
+        }
+        "tunnel_carried" => {
+            "This device is not activated yet. PATANYX sent the activation request \
+             through its own tunnel and could not reach EdgeXene. PATANYX will try \
+             again at the next unlock, or you can use Activate now. If it keeps \
+             failing, activate once on another network -- a home connection or a \
+             phone hotspot -- and this device stays activated afterwards."
+        }
+        "certificate" => {
+            "This device is not activated yet. PATANYX could not establish a secure \
+             connection to EdgeXene. PATANYX will try again at the next unlock, or you \
+             can use Activate now. If it keeps failing, activate once on another network \
+             -- a home connection or a phone hotspot -- and this device stays activated \
+             afterwards."
+        }
+        // Reachable, but something between here and EdgeXene is re-signing
+        // TLS. Retrying cannot help, so the copy must not invite it -- and it
+        // has to say the fix is ONE TIME, or this reads as "you cannot use
+        // Premium at work" when the truth is "activate once somewhere else".
+        "intercepted" => {
+            "This device is not activated yet. Something on this network is inspecting \
+             encrypted connections, and PATANYX will not send your license through it. \
+             Activate on a network that does not -- a home connection or a phone \
+             hotspot -- and this device stays activated afterwards."
         }
         "slots_full" => {
             "This license is already active on 5 devices. Release one of them from its \
@@ -407,8 +525,32 @@ pub fn activation_copy(reason: &str) -> &'static str {
             "This device released its activation. Premium is off here until you activate \
              again."
         }
+        "release_pending" => {
+            "This device is being released. PATANYX will finish it the next time it can \
+             reach EdgeXene; until then Premium stays off here."
+        }
         "release_offline" => {
-            "PATANYX could not reach EdgeXene to release this device; nothing changed."
+            "PATANYX could not reach EdgeXene to release this device yet, so it will try \
+             again each time you unlock the vault. If it keeps failing, try the release \
+             on another network -- a home connection or a phone hotspot."
+        }
+        "release_tunnel_carried" => {
+            "This device was not released. PATANYX sent the release request through \
+             its own tunnel and could not reach EdgeXene. Nothing changed. Try again \
+             later; if it keeps failing, try the release on another network -- a home \
+             connection or a phone hotspot."
+        }
+        "release_certificate" => {
+            "This device was not released. PATANYX could not establish a secure \
+             connection to EdgeXene. Nothing changed; try again later."
+        }
+        // Reachable, but inspected. Unlike activation there is no one-time
+        // workaround to offer: a release has to reach the server, or the slot
+        // stays counted and the user has stranded it.
+        "release_intercepted" => {
+            "This device was not released. Something on this network is inspecting \
+             encrypted connections, and PATANYX will not send your license through it. \
+             Nothing changed; try again on a network that does not."
         }
         _ => "EdgeXene refused to activate this device.",
     }
@@ -439,7 +581,13 @@ pub fn current() -> Option<SessionLicence> {
 /// project's rule is that copy never implies a purchase before one is
 /// possible. Flipping this to `true` is part of the launch, alongside the
 /// purchase page going live.
-pub const PREMIUM_ON_SALE: bool = false;
+pub const PREMIUM_ON_SALE: bool = true;
+
+/// The launch-only control in the Vault row. Rust owns both its visibility
+/// and its words: `None` means the chrome must expose no purchase affordance.
+pub fn purchase_copy() -> Option<&'static str> {
+    PREMIUM_ON_SALE.then_some("Open the page to buy a Premium license")
+}
 
 /// The one word the TOOLBAR needs, so the decision has a single author the
 /// way `cross_tab_gate` gives the refusal a single author.
@@ -484,19 +632,14 @@ pub fn keys_available() -> bool {
 /// never-evaluated session reads as FREE: an absence of information must
 /// never gate anything ON.
 ///
-/// First enforced by the cross-tab search: the find_tabs_search and
-/// find_tabs_goto IPC arms gate on this through tab_search::cross_tab_gate.
-/// History: the machinery landed fully tested with NO enforcement on
-/// purpose -- flipping a feature switch was reserved as a later, deliberate
-/// act, and the cross-tab search is that act. Nothing else gates yet; the
-/// features shipped unlocked as Premium seeds (the photo check) still flip
-/// only at the actual Premium launch. Theme packs left that list on
-/// 2026-08-16 and are free permanently -- there is no switch here to flip
-/// for them, and adding one would break a published promise. FINGERPRINT
-/// DIVERGENCE LEFT IT ON 2026-08-19 the same way, and so did its per-site
-/// exceptions, whose three IPC arms did genuinely refuse without a licence
-/// until that day. The reasoning
-/// is in `about.rs::PREMIUM`.
+/// Twelve IPC arms currently enforce this rule: the tab switcher and batch
+/// entry, both cross-tab-find arms, both region-OCR arms, four Deep Recall
+/// reads/writes, and the two compare requests. The image leak scan joins them
+/// in the launch-day patch; its recovery scan stays free. Theme packs became
+/// permanently free on 2026-08-16. Fingerprint Divergence and every per-site
+/// exception became permanently free on 2026-08-19, so neither may acquire a
+/// call to this function again. The reasoning is in `about.rs::PREMIUM`.
+#[cfg(not(feature = "premium-unlocked"))]
 pub fn premium_active() -> bool {
     lock(&SESSION)
         .as_ref()
@@ -506,6 +649,17 @@ pub fn premium_active() -> bool {
             session.state.premium_active() && session.activation == ActivationState::Activated
         })
         .unwrap_or(false)
+}
+
+/// DANGEROUS TEST ARTIFACT: the v1 hardware build needs every Premium path
+/// reachable without consuming a lifetime activation grant, including on a
+/// corporate network where activation may never complete. This implementation
+/// exists ONLY in a `premium-unlocked` compilation; the public binary compiles
+/// the real session-and-activation rule above and contains no runtime bypass.
+/// This feature must NEVER enter `default` or any build distributed as public.
+#[cfg(feature = "premium-unlocked")]
+pub fn premium_active() -> bool {
+    true
 }
 
 /// The row copy for the current session, with the clock read here so the
@@ -531,9 +685,10 @@ fn row_copy(state: &LicenceState, today: u32) -> (String, String) {
         LicenceState::Active { days_left: 1 } => {
             ("Premium Time Left: 1 day".to_string(), String::new())
         }
-        LicenceState::Active { days_left } => {
-            (format!("Premium Time Left: {days_left} days"), String::new())
-        }
+        LicenceState::Active { days_left } => (
+            format!("Premium Time Left: {days_left} days"),
+            String::new(),
+        ),
         // No countdown and no date: naming the state is the whole message.
         // The sub line is the same promise the Free and Lapsed rows carry,
         // because it is equally true here and a row that drops it would
@@ -782,8 +937,26 @@ mod tests {
         assert_eq!(row_copy(&lapsed, 20148).0, "Premium ended February 29, 2024.");
     }
 
+    /// The manifest pin is intentionally compiled in BOTH variants. If the
+    /// dangerous feature is ever added to `default`, this fails even though
+    /// the cfg-selected unlocked implementation would otherwise make the
+    /// real-session assertions below inapplicable.
     #[test]
-    fn premium_active_reads_the_session_state_and_locked_means_free() {
+    fn premium_unlocked_is_not_a_default_feature() {
+        let manifest = include_str!("../Cargo.toml");
+        let default = manifest
+            .lines()
+            .find(|line| line.trim_start().starts_with("default ="))
+            .expect("crates/app/Cargo.toml must declare an explicit default feature set");
+        assert!(
+            !default.contains("premium-unlocked"),
+            "premium-unlocked must never be enabled in the default/public build: {default}"
+        );
+    }
+
+    #[cfg(not(feature = "premium-unlocked"))]
+    #[test]
+    fn default_premium_active_reads_the_real_session() {
         let _serial = lock(&SERIAL);
         *lock(&SESSION) = None;
         assert!(
@@ -830,9 +1003,37 @@ mod tests {
         *lock(&SESSION) = None;
     }
 
+    #[cfg(feature = "premium-unlocked")]
+    #[test]
+    fn premium_unlocked_forces_only_the_gate_and_not_the_reported_session() {
+        let _serial = lock(&SERIAL);
+        *lock(&SESSION) = None;
+        assert!(premium_active(), "the unlocked test gate must be open");
+        assert_eq!(
+            gate_state(),
+            "locked",
+            "the test gate must not falsify the real licence/session state"
+        );
+        *lock(&SESSION) = Some(SessionLicence {
+            state: LicenceState::Free,
+            keys_available: true,
+            diagnostic: None,
+            activation: ActivationState::NotNeeded,
+            license_id_hex: None,
+        });
+        assert!(premium_active(), "the unlocked test gate must stay open");
+        assert_eq!(
+            gate_state(),
+            "free",
+            "an unlocked build with no token must still report PATANYX Free"
+        );
+        *lock(&SESSION) = None;
+    }
+
     /// The toolbar's whole reason for existing as a separate answer: a
     /// LOCKED vault must not look like a FREE one, or a paying customer is
     /// shown a prompt to buy what they already own.
+    #[cfg(not(feature = "premium-unlocked"))]
     #[test]
     fn gate_state_never_calls_a_locked_vault_free() {
         let _serial = lock(&SERIAL);
@@ -868,14 +1069,20 @@ mod tests {
         *lock(&SESSION) = None;
     }
 
-    /// Nothing is for sale until launch day, so no surface may word itself
-    /// as though a purchase were possible. Pinned rather than remembered:
-    /// this flips exactly once, deliberately, alongside the purchase page.
+    /// Premium is on sale: the page at patanyx.net/premium/ is live and the
+    /// licence server mints on real payments. Pinned in the other direction
+    /// now, so a revert cannot quietly take the toolbar back to "arriving the
+    /// day Premium launches" while the page keeps taking money.
     #[test]
-    fn premium_is_not_on_sale_yet() {
+    fn premium_is_on_sale() {
         assert!(
-            !PREMIUM_ON_SALE,
-            "flipping this is a launch act: the purchase page must exist first"
+            PREMIUM_ON_SALE,
+            "Premium launched; the toolbar's locked controls must point at the page that sells it"
+        );
+        assert_eq!(
+            purchase_copy(),
+            Some("Open the page to buy a Premium license"),
+            "the launch flag must reveal the Rust-worded purchase control"
         );
     }
 
@@ -899,8 +1106,14 @@ mod tests {
     const OTHER_DEVICE: [u8; 16] = [0xd2; 16];
 
     fn mint_receipt(seed: &[u8; 32], license_id: [u8; 16], device: [u8; 16]) -> String {
-        Receipt::mint(&SigningKey::from_bytes(seed), 0, license_id, device, EXPIRES - 10)
-            .to_text()
+        Receipt::mint(
+            &SigningKey::from_bytes(seed),
+            0,
+            license_id,
+            device,
+            EXPIRES - 10,
+        )
+        .to_text()
     }
 
     #[test]
@@ -1009,6 +1222,8 @@ mod tests {
         for reason in [
             "pending",
             "offline",
+            "tunnel_carried",
+            "certificate",
             "slots_full",
             "grants_exhausted",
             "expired",
@@ -1018,6 +1233,8 @@ mod tests {
             "vault_io",
             "released",
             "release_offline",
+            "release_tunnel_carried",
+            "release_certificate",
             "refused",
         ] {
             let copy = activation_copy(reason);
@@ -1026,5 +1243,113 @@ mod tests {
             assert!(!copy.contains("never free"), "{reason}");
             assert!(!copy.contains('\u{2014}'), "no em dashes: {reason}");
         }
+    }
+
+    #[test]
+    fn offline_copy_names_no_cause_and_offers_both_retries() {
+        let copy = activation_copy("offline");
+        let lower = copy.to_ascii_lowercase();
+        for unproved_cause in ["inspect", "block", "filter", "proxy", "vpn", "tunnel"] {
+            assert!(
+                !lower.contains(unproved_cause),
+                "offline copy asserted an unproved cause ({unproved_cause:?}): {copy}"
+            );
+        }
+        for required in [
+            "This device is not activated yet",
+            // The reworded copy leads with the remedy instead of blaming the
+            // network: no "could not reach EdgeXene" phrasing, but every retry
+            // and remedy the user needs is still here (assessment follow-up
+            // 2026-08-28 -- an honest message, not a hidden one).
+            "Premium license is recognized",
+            "next unlock",
+            "Activate now",
+            "another network",
+            "home connection",
+            "phone hotspot",
+            "stays activated afterwards",
+        ] {
+            assert!(
+                copy.contains(required),
+                "offline copy lost retry/remedy language {required:?}: {copy}"
+            );
+        }
+    }
+
+    #[test]
+    fn neutral_certificate_copy_offers_the_same_activation_remedy() {
+        let copy = activation_copy("certificate");
+        let lower = copy.to_ascii_lowercase();
+        assert!(copy.contains("This device is not activated yet"), "{copy}");
+        assert!(
+            copy.contains("could not establish a secure connection to EdgeXene"),
+            "{copy}"
+        );
+        assert!(copy.contains("next unlock"), "{copy}");
+        assert!(copy.contains("Activate now"), "{copy}");
+        assert!(copy.contains("another network"), "{copy}");
+        assert!(copy.contains("stays activated afterwards"), "{copy}");
+        for unproved_cause in ["inspect", "block", "filter", "proxy", "vpn", "tunnel"] {
+            assert!(
+                !lower.contains(unproved_cause),
+                "certificate copy asserted an unproved cause ({unproved_cause:?}): {copy}"
+            );
+        }
+    }
+
+    /// The row while a release is recorded but not finished. It must not
+    /// claim the slot is already free (the server has not said so yet) and
+    /// must not read as an error the user has to act on.
+    #[test]
+    fn release_pending_copy_says_it_will_be_finished_without_claiming_it_is_done() {
+        let copy = activation_copy("release_pending");
+        let lower = copy.to_ascii_lowercase();
+        assert!(lower.contains("being released"), "{copy}");
+        assert!(lower.contains("finish"), "{copy}");
+        assert!(
+            !lower.contains("has been released") && !lower.contains("released its activation"),
+            "the release is not done yet: {copy}"
+        );
+        for unproved_cause in ["inspect", "block", "filter", "proxy", "vpn", "tunnel"] {
+            assert!(!lower.contains(unproved_cause), "{copy}");
+        }
+    }
+
+    #[test]
+    fn release_offline_copy_offers_an_alternative_network_without_an_activation_promise() {
+        let copy = activation_copy("release_offline");
+        let lower = copy.to_ascii_lowercase();
+        assert!(
+            copy.contains("could not reach EdgeXene to release this device"),
+            "{copy}"
+        );
+        // "Nothing changed" WAS pinned here and is now false: the release is
+        // recorded in the vault before the request leaves, and every unlock
+        // tries again until it lands. Copy that told the user nothing had
+        // happened would contradict what the browser is about to do.
+        assert!(!copy.contains("Nothing changed"), "{copy}");
+        assert!(
+            lower.contains("try again") && copy.contains("unlock the vault"),
+            "the copy must say the release is retried at each unlock: {copy}"
+        );
+        assert!(copy.contains("another network"), "{copy}");
+        assert!(!copy.contains("stays activated"), "{copy}");
+        for unproved_cause in ["inspect", "block", "filter", "proxy", "vpn", "tunnel"] {
+            assert!(
+                !lower.contains(unproved_cause),
+                "release_offline copy asserted an unproved cause ({unproved_cause:?}): {copy}"
+            );
+        }
+    }
+
+    #[test]
+    fn intercepted_copy_is_pinned_byte_for_byte() {
+        assert_eq!(
+            activation_copy("intercepted"),
+            "This device is not activated yet. Something on this network is inspecting \
+             encrypted connections, and PATANYX will not send your license through it. \
+             Activate on a network that does not -- a home connection or a phone \
+             hotspot -- and this device stays activated afterwards."
+        );
     }
 }

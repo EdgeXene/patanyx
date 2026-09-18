@@ -40,6 +40,32 @@ use crate::UserEvent;
 /// large is not a photograph of a recovery key under any circumstances.
 const MAX_IMAGE_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Extra capture pixels supplied to OCR around a user-drawn selection.
+/// Ten source pixels covers anti-aliased edges and ordinary page glyph widths
+/// at the observed zoom without pulling a neighbouring line into the crop.
+const REGION_OCR_PAD: u32 = 10;
+
+fn padded_ocr_rect(
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    image_w: u32,
+    image_h: u32,
+) -> (u32, u32, u32, u32) {
+    let x0 = x.saturating_sub(REGION_OCR_PAD);
+    let y0 = y.saturating_sub(REGION_OCR_PAD);
+    let x1 = x
+        .saturating_add(w)
+        .saturating_add(REGION_OCR_PAD)
+        .min(image_w);
+    let y1 = y
+        .saturating_add(h)
+        .saturating_add(REGION_OCR_PAD)
+        .min(image_h);
+    (x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0))
+}
+
 /// What a completed scan is for. The engine does the same work either way;
 /// this decides how the text is interpreted and what the UI is told.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,16 +109,44 @@ static ENGINE: OnceLock<Result<Mutex<OcrEngine>, OcrError>> = OnceLock::new();
 /// Short stable codes, exactly like every other IPC failure. Every one of
 /// these MUST have an `ERROR_TEXT` entry in chrome.js or the user is shown a
 /// raw identifier.
-fn error_code(e: &OcrError) -> &'static str {
+fn file_error_code(e: &OcrError) -> &'static str {
     match e {
         OcrError::ModelsMissing(_) => "ocr_unavailable",
-        OcrError::ImageDecode => "bad_image",
+        // This is the only OCR path that handles a user-picked file, so both
+        // an unreadable format and the existing file-size/pixel refusals keep
+        // the file-specific `bad_image` contract.
+        OcrError::ImageDecode | OcrError::ImageTooLarge => "bad_image",
         // The rect was validated against held dimensions before the worker
         // started, so BadRegion surfacing here is a bug; it still gets an
         // honest generic failure rather than a panic or a misleading
         // "bad image".
         OcrError::BadRegion => "ocr_failed",
         OcrError::ModelsInvalid(_) | OcrError::Inference(_) => "ocr_failed",
+    }
+}
+
+fn region_error_code(e: &OcrError) -> &'static str {
+    match e {
+        OcrError::ModelsMissing(_) => "ocr_unavailable",
+        OcrError::ImageTooLarge => "region_too_large",
+        // Region bytes came from our capture engine, not a file picker. A
+        // malformed capture is a generic OCR/capture failure and must never
+        // tell the user to choose another file format.
+        OcrError::ImageDecode
+        | OcrError::BadRegion
+        | OcrError::ModelsInvalid(_)
+        | OcrError::Inference(_) => "ocr_failed",
+    }
+}
+
+fn archive_error_code(e: &OcrError) -> &'static str {
+    match e {
+        OcrError::ModelsMissing(_) => "ocr_unavailable",
+        OcrError::ImageDecode
+        | OcrError::ImageTooLarge
+        | OcrError::BadRegion
+        | OcrError::ModelsInvalid(_)
+        | OcrError::Inference(_) => "ocr_failed",
     }
 }
 
@@ -148,6 +202,46 @@ pub fn ipc_status() -> Result<Value, &'static str> {
     }))
 }
 
+/// OCR health for the diagnostics snapshot. This never initializes the
+/// models: before first use it says `not_loaded`; after first use it preserves
+/// the optional classifier's degraded reason without making OCR itself fail.
+pub fn diagnostics() -> Value {
+    match ENGINE.get() {
+        None => json!({
+            "engine": "not_loaded",
+            "angle_classifier": "not_loaded",
+        }),
+        Some(Err(e)) => json!({
+            "engine": "unavailable",
+            "angle_classifier": "unavailable",
+            "detail": e.to_string(),
+        }),
+        Some(Ok(engine)) => match engine.try_lock() {
+            Ok(engine) => {
+                let degraded = engine.classifier_diagnostic();
+                json!({
+                    "engine": "ready",
+                    "angle_classifier": if engine.classifier_available() {
+                        "ready"
+                    } else {
+                        "degraded"
+                    },
+                    "detail": degraded,
+                })
+            }
+            Err(std::sync::TryLockError::WouldBlock) => json!({
+                "engine": "busy",
+                "angle_classifier": "unknown_while_busy",
+            }),
+            Err(std::sync::TryLockError::Poisoned(_)) => json!({
+                "engine": "unavailable",
+                "angle_classifier": "unavailable",
+                "detail": "OCR engine lock poisoned",
+            }),
+        },
+    }
+}
+
 /// `ocr_scan` -- starts a scan and returns immediately.
 ///
 /// The reply carries only the token. The RESULT arrives later as an
@@ -171,6 +265,14 @@ pub fn ipc_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static st
         .and_then(Value::as_str)
         .and_then(ScanKind::parse)
         .ok_or("bad_args")?;
+    // PREMIUM SINCE LAUNCH, for the leak check only. The recovery-key scan
+    // (`Recovery`) stays free on purpose: it exists to get someone INTO a
+    // locked vault, and Premium state lives inside that vault, so a locked-
+    // out user can never be Premium. Gating it would put a recovery aid
+    // behind a paywall for exactly the person who needs it.
+    if kind == ScanKind::Leaks {
+        crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
+    }
     if !available() {
         return Err("ocr_unavailable");
     }
@@ -220,7 +322,7 @@ pub fn ipc_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static st
 pub fn ipc_region_scan(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
     let capture = args
         .get("capture")
-        .and_then(Value::as_u64)
+        .and_then(crate::capture::token_from_wire)
         .ok_or("bad_args")?;
     let rect = ["x", "y", "w", "h"]
         .map(|k| args.get(k).and_then(Value::as_u64));
@@ -245,10 +347,15 @@ pub fn ipc_region_scan(state: &mut AppState, args: &Value) -> Result<Value, &'st
     let token = next_result_token();
     let proxy: EventLoopProxy<UserEvent> = state.proxy();
     // Truncations are safe: the bounds check above proved every value fits
-    // inside a u32 image dimension.
-    let (x, y, w, h) = (x as u32, y as u32, w as u32, h as u32);
+    // inside a u32 image dimension. Pad ONLY the OCR crop: the chrome keeps
+    // rendering the exact rectangle the user drew. Detection boxes expand
+    // around ink, but that cannot recover a leading glyph already cut out of
+    // the source crop; ten clamped source pixels can.
+    let (x, y, w, h) = padded_ocr_rect(x as u32, y as u32, w as u32, h as u32, img_w, img_h);
     std::thread::spawn(move || {
-        let result = with_engine(|engine| engine.recognize_region(&png, x, y, w, h));
+        let result = with_engine(region_error_code, |engine| {
+            engine.recognize_region(&png, x, y, w, h)
+        });
         let _ = proxy.send_event(UserEvent::Ocr(OcrEvent {
             token,
             kind: ScanKind::Region,
@@ -280,7 +387,7 @@ pub fn read_for_archive(
 ) {
     let proxy: EventLoopProxy<UserEvent> = state.proxy();
     std::thread::spawn(move || {
-        let text = with_engine(|engine| engine.recognize(&png))
+        let text = with_engine(archive_error_code, |engine| engine.recognize(&png))
             .map(|regions| {
                 regions
                     .iter()
@@ -310,6 +417,7 @@ fn next_result_token() -> u64 {
 /// Runs `f` against the cached engine, initialising it on first use. Returns
 /// codes, not errors, so the event arm has nothing left to decide.
 fn with_engine(
+    error_code: fn(&OcrError) -> &'static str,
     f: impl FnOnce(&OcrEngine) -> Result<Vec<TextRegion>, OcrError>,
 ) -> Result<Vec<TextRegion>, &'static str> {
     match ENGINE.get_or_init(|| {
@@ -332,7 +440,7 @@ fn with_engine(
 /// The actual work, on the worker thread.
 fn scan_blocking(path: &str) -> Result<Vec<TextRegion>, &'static str> {
     let bytes = std::fs::read(path).map_err(|_| "bad_image")?;
-    with_engine(|engine| engine.recognize(&bytes))
+    with_engine(file_error_code, |engine| engine.recognize(&bytes))
 }
 
 /// Called on the event loop when a worker finishes. Emits exactly one
@@ -454,5 +562,44 @@ mod tests {
         assert_eq!(ScanKind::parse("leaks"), Some(ScanKind::Leaks));
         assert_eq!(ScanKind::parse(""), None);
         assert_eq!(ScanKind::parse("Recovery"), None);
+    }
+
+    #[test]
+    fn only_the_file_picker_uses_bad_image_and_region_size_has_its_own_code() {
+        assert_eq!(file_error_code(&OcrError::ImageDecode), "bad_image");
+        assert_eq!(file_error_code(&OcrError::ImageTooLarge), "bad_image");
+        assert_eq!(
+            region_error_code(&OcrError::ImageDecode),
+            "ocr_failed",
+            "an in-memory capture must not mention a bad file format"
+        );
+        assert_eq!(
+            region_error_code(&OcrError::ImageTooLarge),
+            "region_too_large"
+        );
+    }
+
+    #[test]
+    fn diagnostics_always_state_the_angle_classifier_status() {
+        let d = diagnostics();
+        assert!(d.get("engine").is_some());
+        assert!(d.get("angle_classifier").is_some());
+    }
+
+    #[test]
+    fn a_rect_starting_mid_character_pads_the_ocr_crop_to_the_full_first_word() {
+        // Synthetic source geometry: "App Details" begins at x=20, the user
+        // starts at x=25 through the first A, and the word ends at x=50. OCR
+        // must receive the whole word even though the displayed rect remains
+        // the user's (25, 12, 80, 24).
+        let displayed = (25, 12, 80, 24);
+        let crop = padded_ocr_rect(displayed.0, displayed.1, displayed.2, displayed.3, 120, 60);
+        assert_eq!(crop, (15, 2, 100, 44));
+        let app_word = 20..50;
+        assert!(crop.0 <= app_word.start && crop.0 + crop.2 >= app_word.end);
+        assert_eq!(displayed, (25, 12, 80, 24), "display geometry changed");
+
+        // The same rule clamps rather than underflowing at the capture edge.
+        assert_eq!(padded_ocr_rect(3, 4, 20, 10, 30, 20), (0, 0, 30, 20));
     }
 }

@@ -274,7 +274,7 @@ def main() -> int:
         warnings.append("could not read the version from Cargo.toml; version check skipped")
     else:
         # A VERSION CLAIM, not every dotted triple on the page. The download
-        # page also states "Needs WebKitGTK 2.52.5 or newer", which is a
+        # page also states "Needs WebKitGTK 2.52.6 or newer", which is a
         # dependency and nothing to do with what PATANYX is at. A claim about
         # our version is introduced by "Version" or carries a `v` prefix; a
         # dependency requirement does neither.

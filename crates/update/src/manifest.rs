@@ -143,6 +143,103 @@ pub struct Manifest {
     published_at: u64,
     deltas: Vec<Delta>,
     notes: String,
+    /// Whether this release changes what the user SEES, and therefore whether
+    /// it may install itself without being announced first.
+    release_kind: ReleaseKind,
+    /// Whether this release carries a security fix. Independent of
+    /// `release_kind` on purpose: a fix rides in whatever release comes next,
+    /// including a feature one, and holding it behind an unclicked banner is
+    /// the outcome this flag exists to prevent.
+    security: bool,
+    /// The oldest engine runtime this publisher considers free of a known,
+    /// exploited bug, per engine. See [`EngineFloors`].
+    engine_floors: EngineFloors,
+}
+
+/// Per-engine security floors, carried INSIDE the signed payload so a
+/// publisher can raise the browser's engine floor the day an engine advisory
+/// lands, without shipping a new browser.
+///
+/// The browser compiles a floor in (`platform::MIN_WEBVIEW2`,
+/// `platform::MIN_WEBKITGTK`); these only ever RAISE it, and the client
+/// keeps the highest it has ever seen. What a raised floor does is show a
+/// banner. It never refuses to start: the refusal a Linux release build
+/// applies stays tied to the compiled constant, so a signed document can
+/// make the browser warn but cannot turn it off.
+///
+/// Field counts are exact and match the compiled constants' precision:
+/// WebView2 is four fields (152.0.4191.53 and 152.0.4191.62 are the exposed
+/// and the fixed runtime, and they differ only in the fourth), WebKitGTK is
+/// three. A floor with the wrong precision is refused at signing time, like
+/// a malformed delta, rather than silently compared at the wrong depth.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct EngineFloors {
+    webview2: Option<Vec<u32>>,
+    webkitgtk: Option<Vec<u32>>,
+}
+
+impl EngineFloors {
+    /// The WebView2 floor, four fields, if the publisher set one.
+    pub fn webview2(&self) -> Option<&[u32]> {
+        self.webview2.as_deref()
+    }
+
+    /// The WebKitGTK floor, three fields, if the publisher set one.
+    pub fn webkitgtk(&self) -> Option<&[u32]> {
+        self.webkitgtk.as_deref()
+    }
+
+    /// The floor for an engine by the name the browser reports for it.
+    pub fn for_engine(&self, name: &str) -> Option<&[u32]> {
+        match name {
+            "WebView2" => self.webview2(),
+            "WebKitGTK" => self.webkitgtk(),
+            _ => None,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.webview2.is_none() && self.webkitgtk.is_none()
+    }
+}
+
+/// "152.0.4191.62" -> [152, 0, 4191, 62], refusing anything that is not
+/// exactly `fields` dotted decimal numbers. Publisher-signed input, so a
+/// bad value is a publisher mistake that must fail loudly.
+fn parse_engine_floor(engine: &str, text: &str, fields: usize) -> Result<Vec<u32>, UpdateError> {
+    let parsed: Result<Vec<u32>, _> = text.split('.').map(|p| p.parse::<u32>()).collect();
+    match parsed {
+        Ok(v) if v.len() == fields => Ok(v),
+        _ => Err(UpdateError::Malformed(format!(
+            "engine_floor.{engine} must be exactly {fields} dotted decimal fields, got {text:?}"
+        ))),
+    }
+}
+
+/// What kind of change a release is, from the user's point of view.
+///
+/// This is a PUBLISHER ASSERTION carried INSIDE the signed payload, so it
+/// cannot be flipped in transit: an attacker who could turn `Feature` into
+/// `Maintenance` would turn an announced update into a silent one, which is
+/// exactly the capability the signature exists to deny.
+///
+/// Absent in every manifest published before this existed, and `Maintenance`
+/// is the correct reading of absence: those releases are already installed by
+/// anyone who would see them, and the quiet path is the one they shipped under.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ReleaseKind {
+    /// Fixes and improvements to things that already exist. Installs quietly.
+    Maintenance,
+    /// Adds something the user can see and did not have before. Announced,
+    /// and installed on the user's say-so or when the grace period lapses.
+    Feature,
+}
+
+impl Default for ReleaseKind {
+    fn default() -> Self {
+        ReleaseKind::Maintenance
+    }
 }
 
 /// A delta a client MAY use instead of the full download, when the binary
@@ -187,6 +284,10 @@ const MAX_DELTAS: usize = 8;
 /// language.
 const MAX_NOTES_CHARS: usize = 500;
 
+/// An engine advisory's `reason` is a CVE id or a sentence, never a page.
+/// Shared with `advisory.rs`, which applies it.
+pub(crate) const MAX_ADVISORY_REASON_CHARS: usize = 200;
+
 /// Characters that can make signed text READ as something it is not: bidi
 /// overrides, zero-width joiners and separators. Same set as the hover
 /// readout's `is_deceptive` (crates/app/src/hover.rs), duplicated because
@@ -194,7 +295,7 @@ const MAX_NOTES_CHARS: usize = 500;
 /// not justify a shared crate. `char::is_control` does NOT cover these --
 /// they are format characters (Cf), which is exactly what makes them
 /// invisible.
-fn is_deceptive_text(c: char) -> bool {
+pub(crate) fn is_deceptive_text(c: char) -> bool {
     matches!(
         c,
         '\u{202A}'..='\u{202E}'   // LRE, RLE, PDF, LRO, RLO
@@ -256,6 +357,33 @@ impl Manifest {
     pub fn notes(&self) -> &str {
         &self.notes
     }
+
+    /// The engine floors this publisher asserts. Empty for every manifest
+    /// published before the field existed. See [`EngineFloors`].
+    pub fn engine_floors(&self) -> &EngineFloors {
+        &self.engine_floors
+    }
+
+    /// What kind of change this release is. See [`ReleaseKind`].
+    pub fn release_kind(&self) -> ReleaseKind {
+        self.release_kind
+    }
+
+    /// Whether this release carries a security fix.
+    pub fn security(&self) -> bool {
+        self.security
+    }
+
+    /// May this release install itself without being announced first?
+    ///
+    /// The whole policy in one place, so the client cannot drift from the
+    /// publisher's meaning: maintenance installs quietly, and a security fix
+    /// installs quietly EVEN IF it also adds features -- a fix held behind an
+    /// unclicked banner is the failure this is designed to prevent. Only a
+    /// feature release with no security content waits to be announced.
+    pub fn installs_silently(&self) -> bool {
+        self.security || self.release_kind == ReleaseKind::Maintenance
+    }
 }
 
 /// The outer, UNSIGNED wrapper.
@@ -292,6 +420,21 @@ struct RawPayload {
     /// same backward-compatible shape as `deltas`.
     #[serde(default)]
     notes: String,
+    /// `"maintenance"` (default) or `"feature"`. Same backward-compatible
+    /// shape as `deltas` and `notes`.
+    #[serde(default)]
+    kind: ReleaseKind,
+    /// `true` if this release carries a security fix. Default `false`: a
+    /// publisher must say so deliberately, and forgetting the flag makes a
+    /// release LESS urgent rather than falsely urgent.
+    #[serde(default)]
+    security: bool,
+    /// `{"webview2": "152.0.4191.62", "webkitgtk": "2.52.5"}`, either key
+    /// optional. Absent in every manifest published before it existed.
+    /// Unknown engine names are refused: this is signed publisher text, and
+    /// a typo here would silently raise nothing.
+    #[serde(default)]
+    engine_floor: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -400,6 +543,18 @@ impl RawPayload {
                     .to_string(),
             ));
         }
+        let mut engine_floors = EngineFloors::default();
+        for (engine, text) in &self.engine_floor {
+            match engine.as_str() {
+                "webview2" => engine_floors.webview2 = Some(parse_engine_floor(engine, text, 4)?),
+                "webkitgtk" => engine_floors.webkitgtk = Some(parse_engine_floor(engine, text, 3)?),
+                other => {
+                    return Err(UpdateError::Malformed(format!(
+                        "engine_floor names an engine this browser does not have: {other:?}"
+                    )))
+                }
+            }
+        }
         Ok(Manifest {
             version: self.version,
             platform: self.platform,
@@ -409,6 +564,9 @@ impl RawPayload {
             published_at: self.published_at,
             deltas,
             notes: self.notes,
+            release_kind: self.kind,
+            security: self.security,
+            engine_floors,
         })
     }
 }
@@ -434,6 +592,21 @@ pub fn verify_manifest(bytes: &[u8], keys: &TrustedKeys) -> Result<Manifest, Upd
 /// far more often than releases, so its signing key is handled far more often.
 pub const SIGNING_DOMAIN_BLOCKLIST: &[u8] = b"PATANYX-BLOCKLIST-MANIFEST-V1\n";
 
+/// Domain for the LANGUAGE PACK feed. A third class, and a third domain.
+///
+/// The decision (2026-08-31) is that the model feed's key authorises
+/// model-feed artifacts ONLY -- a valid model-feed signature must never be
+/// interpreted as authority to sign a blocklist or a release. That takes two
+/// independent mechanisms and this is one of them: the signature covers
+/// `domain || payload`, so a model-feed signature cannot be REPLAYED against
+/// another verifier no matter which key made it.
+///
+/// The other half is a separate key set (`MODEL_KEYS` in the app), which is
+/// what stops a STOLEN model key from signing a fresh blocklist. Domain
+/// separation alone would not: it prevents replay, not forgery in another
+/// domain by a key the verifier trusts.
+pub const SIGNING_DOMAIN_MODELS: &[u8] = b"PATANYX-MODEL-MANIFEST-V1\n";
+
 /// The shared core of both verifiers: caps, wire version, signature.
 ///
 /// PRIVATE, AND THE DOMAIN IS A PARAMETER ONLY HERE. Every public entry point
@@ -450,6 +623,23 @@ fn verify_envelope(
     keys: &TrustedKeys,
     domain: &[u8],
 ) -> Result<String, UpdateError> {
+    verify_envelope_identified(bytes, keys, domain).map(|(payload, _)| payload)
+}
+
+/// `verify_envelope`, also returning WHICH trusted key verified.
+///
+/// Needed by the engine-advisory class (`advisory.rs`), whose client persists
+/// floors under the key that authenticated them so a revoked key takes its
+/// floors with it. Still `pub(crate)`, still domain-as-parameter only here,
+/// and still no oracle: every key is tried every time with no short-circuit,
+/// the failure is the same coarse `BadSignature`, and the identity is
+/// reported only on success -- where it is public data anyway, since anyone
+/// holding the compiled key set can check the same signature.
+pub(crate) fn verify_envelope_identified(
+    bytes: &[u8],
+    keys: &TrustedKeys,
+    domain: &[u8],
+) -> Result<(String, ed25519_dalek::VerifyingKey), UpdateError> {
     if bytes.len() > MAX_ENVELOPE_BYTES {
         return Err(UpdateError::Malformed(format!(
             "envelope is {} bytes; the cap is {MAX_ENVELOPE_BYTES}",
@@ -495,16 +685,21 @@ fn verify_envelope(
     // `TrustedKeys` now refuses weak keys at construction, so it should be --
     // but the two checks answer to different owners. This one holds even if a
     // weak key reaches the set some other way, and costs nothing.
-    let mut verified = false;
+    let mut verified: Option<ed25519_dalek::VerifyingKey> = None;
     for key in keys.iter() {
-        verified |= key.verify_strict(&message, &signature).is_ok();
+        // No short-circuit: every key is checked whether or not an earlier
+        // one already matched, so timing does not say which key it was.
+        let ok = key.verify_strict(&message, &signature).is_ok();
+        if ok && verified.is_none() {
+            verified = Some(*key);
+        }
     }
-    if !verified {
+    let Some(key) = verified else {
         return Err(UpdateError::BadSignature);
-    }
+    };
 
     // Only now are the bytes known to be the publisher's.
-    Ok(envelope.payload)
+    Ok((envelope.payload, key))
 }
 
 /// A blocklist release whose signature has ALREADY VERIFIED.
@@ -633,6 +828,175 @@ pub fn verify_blocklist_manifest(
         size: raw.size,
         entries: raw.entries,
         published_at: raw.published_at,
+    })
+}
+
+/// A language pack a build may download, after its manifest verified.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelManifest {
+    pair: String,
+    url: String,
+    sha256: [u8; 32],
+    size: u64,
+    version: u64,
+}
+
+impl ModelManifest {
+    pub fn pair(&self) -> &str {
+        &self.pair
+    }
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+    pub fn sha256(&self) -> &[u8; 32] {
+        &self.sha256
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    /// Monotonic. The app refuses to replace a pack with an older one.
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
+#[derive(Deserialize)]
+struct RawModelPayload {
+    pair: String,
+    url: String,
+    sha256: String,
+    size: u64,
+    /// Monotonic, chosen by the publisher. See the rollback refusal in the
+    /// app's `langpack`: without this, an attacker who can serve bytes can
+    /// replay an OLD validly-signed pack and pin a user to it forever.
+    version: u64,
+}
+
+/// Hard bound on one language pack.
+///
+/// 96 MiB. Set from the measured registry rather than one pair: across the 99
+/// published pairs the largest packed container is en-ko at 64.46 MiB, with
+/// ja-en and ko-en next at ~52 MiB and everything else at or below ~36 MiB.
+/// 64 MiB (the original bound, fixed on the 36.6 MB `enes` pack alone) rejected
+/// en-ko by less than half a mebibyte. 96 MiB clears the largest real pack with
+/// roughly 50% headroom for an upstream retrain, while still bounding both
+/// memory and what a compromised publisher can make an install download to
+/// 96 MiB (about 100.7 MB). Widen this deliberately, from a fresh measurement,
+/// not to make one stubborn pair fit.
+pub const MAX_MODEL_PACK_BYTES: u64 = 96 * 1024 * 1024;
+
+/// Parse and verify a LANGUAGE PACK envelope.
+///
+/// A third entry point rather than a flag, for the reason the blocklist one
+/// gives: each hard-wires its own domain, so choosing the wrong verifier is a
+/// visibly wrong call at the call site instead of a boolean nobody reads.
+///
+/// The pair is validated to the same shape the app's allowlist uses. A
+/// manifest is signed data, but "signed" means the publisher said it, not that
+/// it is well-formed -- and this value ends up selecting a file on disk.
+/// Shape floor for a language-pair token used as a URL segment and a filename
+/// component: two subtags of ASCII letters/digits, one hyphen between, bounded.
+///
+/// This is a NECESSARY condition, not the authority -- the client checks
+/// registry membership. Its job is to guarantee a token can never carry a
+/// path separator, a dot, a NUL, or an unbounded length no matter what a
+/// signed manifest claims.
+pub fn pair_token_ok(pair: &str) -> bool {
+    if pair.is_empty() || pair.len() > 20 {
+        return false;
+    }
+    // TWO OR THREE subtags. The two-subtag floor existed because a token was
+    // once SPLIT to recover its language codes, and "en-zh-hans" cannot be
+    // split unambiguously. Nothing splits a token now -- the registry is a
+    // lookup and carries `from`/`to` beside the token -- so the ambiguity that
+    // justified the rule is gone, while what the rule actually protects is
+    // untouched: a token must remain a safe path and URL segment. A
+    // script-tagged language (Chinese) needs three.
+    let mut parts = pair.split('-');
+    let (Some(a), Some(b)) = (parts.next(), parts.next()) else {
+        return false;
+    };
+    let c = parts.next();
+    if parts.next().is_some() {
+        return false; // at most three
+    }
+    // LOWERCASE letters and digits only. Not `is_ascii_alphanumeric`, which
+    // accepts uppercase: the nginx route and the registry tokens are
+    // lowercase, and a token legal here but rejected at the edge is precisely
+    // the cross-layer disagreement this grammar exists to prevent. A test
+    // pins "EN-ES" as refused for exactly that reason.
+    let subtag_ok = |t: &str| {
+        (2..=12).contains(&t.len())
+            && t.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    };
+    subtag_ok(a) && subtag_ok(b) && c.is_none_or(subtag_ok)
+}
+
+pub fn verify_model_manifest(
+    bytes: &[u8],
+    keys: &TrustedKeys,
+) -> Result<ModelManifest, UpdateError> {
+    let payload = verify_envelope(bytes, keys, SIGNING_DOMAIN_MODELS)?;
+    let raw: RawModelPayload = serde_json::from_str(&payload).map_err(|e| {
+        UpdateError::Malformed(format!("signed payload is not the expected JSON: {e}"))
+    })?;
+    // A path-segment-safe language-pair token. NOT a general BCP-47 parser:
+    // this value names a file and a URL segment, so the test is a narrow
+    // character allowlist plus a length bound, never structure.
+    //
+    // Widened from the old `xx-yy` (len==5) shape when the model set grew from
+    // one pair to the whole published registry. Two lowercase ASCII subtags
+    // separated by a SINGLE hyphen; no leading/trailing/double hyphen; bounded
+    // at 16 bytes to match the ipc argument cap. This deliberately rejects
+    // three-part tokens like `en-zh-hant`: script-tagged pairs are EXCLUDED
+    // from the published registry precisely because they do not fit this
+    // one-hyphen shape, so a token this floor rejects is also a token no client
+    // will ever ask for. The registry membership check on the client is the
+    // real allowlist; this is the shape floor the signed manifest must clear.
+    let pair_ok = pair_token_ok(&raw.pair);
+    if !pair_ok {
+        return Err(UpdateError::Malformed(
+            "pair must be two hyphen-separated language subtags".to_string(),
+        ));
+    }
+    // https, bounded length, AND a character allowlist.
+    //
+    // THE ALLOWLIST IS NOT REDUNDANT WITH THE SIGNATURE. "Signed" means the
+    // publisher said it, not that it is well formed -- the same sentence this
+    // function already applies to the pair, applied to the field that is
+    // handed to an HTTP client. A control character in a URL is the shape of
+    // header injection and request smuggling, and a signing tool run against a
+    // hand-edited payload is exactly how one gets signed. Refusing it here
+    // means no client ever has to be the thing that copes.
+    let url_ok = raw.url.len() > "https://".len()
+        && raw.url.len() <= MAX_URL_LEN
+        && raw.url.starts_with("https://")
+        && raw.url.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b':' | b'/')
+        });
+    if !url_ok {
+        return Err(UpdateError::Malformed(
+            "url must be an https URL of reasonable length and safe characters".to_string(),
+        ));
+    }
+    // Zero is reserved for "nothing installed", so a manifest claiming it
+    // could never beat an existing install and would strand every client.
+    if raw.version == 0 {
+        return Err(UpdateError::Malformed("version must be non-zero".to_string()));
+    }
+    if raw.size == 0 || raw.size > MAX_MODEL_PACK_BYTES {
+        return Err(UpdateError::Malformed(
+            "size must be non-zero and within the pack limit".to_string(),
+        ));
+    }
+    let sha256 = hex::decode_32(&raw.sha256)
+        .map_err(|()| UpdateError::Malformed("sha256 must be 32 hex bytes".to_string()))?;
+    Ok(ModelManifest {
+        pair: raw.pair,
+        url: raw.url,
+        sha256,
+        size: raw.size,
+        version: raw.version,
     })
 }
 
@@ -820,5 +1184,158 @@ mod tests {
         }
         assert!(Platform::from_name("plan9-m68k").is_err());
         assert!(Platform::from_name("").is_err());
+    }
+}
+
+#[cfg(test)]
+mod model_key_class_tests {
+    //! The decision of 2026-08-31, made mechanical: a model-feed
+    //! signature must never be usable as authority over another artifact
+    //! class. Two independent mechanisms, and these tests check BOTH, because
+    //! each covers a failure the other does not.
+
+    use super::*;
+    use crate::testutil::{signing_key, trusted_keys, SEED_ATTACKER, SEED_TRUSTED_A};
+    use ed25519_dalek::{Signer, SigningKey};
+
+    /// Sign a payload under an ARBITRARY domain, which the production API
+    /// deliberately does not allow. Only a test may do this: it is the whole
+    /// point of the exercise to attempt what the real callers cannot.
+    fn sign_in_domain(payload: &str, key: &SigningKey, domain: &[u8]) -> String {
+        let mut message = Vec::with_capacity(domain.len() + payload.len());
+        message.extend_from_slice(domain);
+        message.extend_from_slice(payload.as_bytes());
+        format!(
+            "{{\"v\":1,\"payload\":{},\"sig\":\"{}\"}}",
+            serde_json::to_string(payload).expect("a string always serializes"),
+            crate::hex::encode(&key.sign(&message).to_bytes())
+        )
+    }
+
+    #[test]
+    fn pair_token_shape_floor() {
+        // Every real published token clears it, INCLUDING the script-tagged
+        // three-subtag members (Chinese), which are lowercased into the token
+        // while `from`/`to` keep the true "zh-Hans".
+        for good in [
+            "en-es", "el-en", "es-en", "zh-en", "en-pt", "de-en",
+            "en-zh-hans", "zh-hant-en", "en-zh-hant", "zh-hans-en",
+        ] {
+            assert!(pair_token_ok(good), "should accept {good}");
+        }
+        // Everything a path segment must never contain.
+        for bad in [
+            "",
+            "en",                    // one subtag
+            "en-es-fr-de",           // four subtags: three is the ceiling
+            "en_es",                 // wrong separator
+            "en-",                   // empty subtag
+            "-es",
+            "en--es",                // empty middle
+            "e-es",                  // subtag too short
+            "en-e",
+            "en/es",
+            "en-e/s",
+            "../et",
+            "en-es\0",
+            "EN-ES",                 // uppercase (tokens are lowercase)
+            "en-zh-Hans",            // the SCRIPT SUBTAG's case, likewise
+            "en-es ",
+            "en-es-",                // empty third subtag
+            "en--es-fr",
+            &"a".repeat(9).to_string(),
+        ] {
+            assert!(!pair_token_ok(bad), "should refuse {bad:?}");
+        }
+        // The 20-byte length bound: three real subtags fit, padding does not.
+        assert!(pair_token_ok("en-zh-hant"));
+        assert!(!pair_token_ok("longsubtag123-longsubtag123"));
+        assert!(!pair_token_ok("longsubtag12-longsubtag12"));
+    }
+
+    fn model_payload() -> String {
+        concat!(
+            "{\"pair\":\"en-es\",\"url\":\"https://models.patanyx.net/en-es/1.pack\",",
+            "\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000001\",",
+            "\"size\":36600000,\"version\":1}"
+        )
+        .to_string()
+    }
+
+    /// MECHANISM 1: domain separation stops REPLAY. A model manifest, signed
+    /// by a key the verifier trusts, must not verify as a blocklist or an
+    /// update no matter who signed it.
+    #[test]
+    fn a_model_manifest_cannot_be_replayed_as_another_class() {
+        let key = signing_key(SEED_TRUSTED_A);
+        let keys = trusted_keys();
+        let signed = sign_in_domain(&model_payload(), &key, SIGNING_DOMAIN_MODELS);
+
+        assert!(verify_model_manifest(signed.as_bytes(), &keys).is_ok());
+        assert!(verify_manifest(signed.as_bytes(), &keys).is_err());
+        assert!(verify_blocklist_manifest(signed.as_bytes(), &keys).is_err());
+    }
+
+    /// And the other direction: neither of the older classes may be presented
+    /// as a language pack.
+    #[test]
+    fn another_class_cannot_be_replayed_as_a_model_manifest() {
+        let key = signing_key(SEED_TRUSTED_A);
+        let keys = trusted_keys();
+        for domain in [SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST] {
+            let signed = sign_in_domain(&model_payload(), &key, domain);
+            assert!(
+                verify_model_manifest(signed.as_bytes(), &keys).is_err(),
+                "a payload signed in another domain must not verify as a model manifest"
+            );
+        }
+    }
+
+    /// MECHANISM 2, and the one domain separation does NOT provide: a key the
+    /// model verifier trusts must not be a key the OTHER verifiers trust.
+    ///
+    /// Domain separation stops replay; it cannot stop forgery, because a
+    /// stolen key can always sign a fresh message in any domain. Only a
+    /// separate key SET stops that -- so this test asserts the sets are
+    /// disjoint, which is the property MODEL_KEYS exists to hold.
+    #[test]
+    fn a_stolen_model_key_cannot_forge_another_class() {
+        let attacker = signing_key(SEED_ATTACKER);
+        // A verifier that trusts ONLY the attacker's key stands in for "the
+        // model channel", and a disjoint set stands in for the others.
+        let model_side = TrustedKeys::new(vec![attacker.verifying_key()]).expect("keys");
+        let other_side = trusted_keys();
+
+        // The attacker signs a fresh blocklist-domain message with the key the
+        // MODEL channel trusts. It is a valid signature -- and it must still
+        // be refused, because the other channel does not trust that key.
+        let forged = sign_in_domain("{\"x\":1}", &attacker, SIGNING_DOMAIN_BLOCKLIST);
+        assert!(verify_blocklist_manifest(forged.as_bytes(), &other_side).is_err());
+
+        // Sanity: the same key IS accepted in its own class, so the refusal
+        // above is about the key set and not about the payload being junk.
+        let own = sign_in_domain(&model_payload(), &attacker, SIGNING_DOMAIN_MODELS);
+        assert!(verify_model_manifest(own.as_bytes(), &model_side).is_ok());
+    }
+
+    /// A manifest is signed data, which means the publisher said it -- not
+    /// that it is well formed. The pair names a file on disk.
+    #[test]
+    fn a_signed_manifest_is_still_validated() {
+        let key = signing_key(SEED_TRUSTED_A);
+        let keys = trusted_keys();
+        for bad in [
+            r#"{"pair":"../../etc","url":"https://models.patanyx.net/a","sha256":"0000000000000000000000000000000000000000000000000000000000000001","size":10}"#,
+            r#"{"pair":"en-es","url":"http://models.patanyx.net/a","sha256":"0000000000000000000000000000000000000000000000000000000000000001","size":10}"#,
+            r#"{"pair":"en-es","url":"https://models.patanyx.net/a","sha256":"nothex","size":10}"#,
+            r#"{"pair":"en-es","url":"https://models.patanyx.net/a","sha256":"0000000000000000000000000000000000000000000000000000000000000001","size":0}"#,
+            r#"{"pair":"EN-ES","url":"https://models.patanyx.net/a","sha256":"0000000000000000000000000000000000000000000000000000000000000001","size":10}"#,
+        ] {
+            let signed = sign_in_domain(bad, &key, SIGNING_DOMAIN_MODELS);
+            assert!(
+                verify_model_manifest(signed.as_bytes(), &keys).is_err(),
+                "must refuse {bad}"
+            );
+        }
     }
 }

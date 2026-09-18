@@ -314,7 +314,6 @@ pub fn observable_counts(
     }
 }
 
-
 /// Serialize is the IPC wire format; the always-visible toolbar chip and
 /// the per-tab panel both match on these snake_case names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -399,6 +398,30 @@ pub enum SettingState {
     /// The engine refused it, or could not be reached to ask. The user's
     /// intent stands in `TabPolicy`; this says it is not in force.
     Failed,
+}
+
+/// The engine-confirmed tracking-prevention level.
+///
+/// A generic `Applied` loses the fact field diagnostics need most: whether the
+/// profile was running Strict or Balanced. This type keeps the accepted level
+/// in the wire value and reserves `Failed` for an unconfirmed setter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrackingPreventionState {
+    Strict,
+    Balanced,
+    Failed,
+    NotAttempted,
+}
+
+impl TrackingPreventionState {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Strict => "strict",
+            Self::Balanced => "balanced",
+            Self::Failed => "failed",
+            Self::NotAttempted => "not_attempted",
+        }
+    }
 }
 
 /// What the ENGINE confirmed, per tab, for the panel that reports it.
@@ -858,13 +881,13 @@ fn parse_ipv4(host: &str) -> Option<[u8; 4]> {
 
 fn is_private_ipv4(o: [u8; 4]) -> bool {
     match o {
-        [127, ..] => true,                              // loopback
-        [10, ..] => true,                               // RFC1918
-        [172, b, ..] if (16..=31).contains(&b) => true, // RFC1918
-        [192, 168, ..] => true,                         // RFC1918
-        [169, 254, ..] => true,                         // link-local, incl. 169.254.169.254
+        [127, ..] => true,                               // loopback
+        [10, ..] => true,                                // RFC1918
+        [172, b, ..] if (16..=31).contains(&b) => true,  // RFC1918
+        [192, 168, ..] => true,                          // RFC1918
+        [169, 254, ..] => true,                          // link-local, incl. 169.254.169.254
         [100, b, ..] if (64..=127).contains(&b) => true, // CGNAT
-        [0, ..] => true,                                // "this network"
+        [0, ..] => true,                                 // "this network"
         _ => false,
     }
 }
@@ -897,6 +920,28 @@ pub struct TabState {
     pub policy: TabPolicy,
     pub ledger: Ledger,
     pub freeze: FreezeController,
+    /// The one host this tab may reach despite the ad/tracker list, after the
+    /// user answered the held-page banner.
+    ///
+    /// `Option`, never a set. A set would accumulate hosts for the life of the
+    /// tab from one banner each, which is the shape the malicious-host
+    /// override has and deliberately not this one: the user consents to a
+    /// page, not to a growing list.
+    ///
+    /// Not persisted and not shared. It dies with the tab, and it is dropped
+    /// when the tab's committed top-level host changes, which is the sentence
+    /// the banner puts in front of the user.
+    adlist_override: Option<String>,
+    /// Which intercepted request is the top-level document. Windows-only in
+    /// use, platform-neutral in shape: the rule is pure and tested everywhere
+    /// (see `toplevel_request`), and it lives here so the navigation events
+    /// and the request handler reach it through the one `state` Rc they
+    /// already hold rather than a second one threaded through every closure.
+    pub toplevel: crate::toplevel_request::TopLevelRequests,
+    /// The method of the most recent top-level navigation, "GET" or "POST".
+    /// Read when a held page is raised, because a held form submission cannot
+    /// be replayed and the banner must say so before the click.
+    pub last_top_level_method: String,
     /// Whether the DOCUMENT in this tab was loaded over plain HTTP.
     ///
     /// Drives the local-network boundary below. Set on every navigation, and
@@ -908,6 +953,12 @@ pub struct TabState {
     /// certificate can no longer be read after the load failed. Cleared on
     /// every navigation so an http page never shows a stale https verdict.
     pub tls_error_verdict: Option<TlsState>,
+    /// The serving certificate's issuer name, for DISPLAY ONLY -- the Info tab
+    /// shows "Issued by X". It is NEVER an input to any decision: the verdict
+    /// (`classify_issuer`) is, and a pinned test holds that line. Stored on the
+    /// failure path because a failed cert's issuer is otherwise lost; the live
+    /// path re-reads it from the current certificate.
+    pub tls_issuer: Option<String>,
     /// JSON of the currently installed freeze content-filter. Lives here
     /// (not in `TabView`) because the unix auto-freeze timer fires with
     /// access to `TabState` only. Pure data; engine handles stay out.
@@ -926,9 +977,9 @@ pub struct TabState {
     /// and SmartScreen stays ON, sending every URL the user visits to
     /// Microsoft -- in a browser sold on privacy. That has to be visible.
     pub smartscreen_off: SettingState,
-    /// Whether STRICT tracking prevention was actually accepted. Needs
-    /// Runtime 111+; an older one silently keeps BALANCED.
-    pub tracking_prevention: SettingState,
+    /// Which tracking-prevention level was actually accepted. Needs Runtime
+    /// 111+; `Failed` means the requested level was not confirmed.
+    pub tracking_prevention: TrackingPreventionState,
     /// Whether the navigation handlers registered.
     ///
     /// Without `NavigationCompleted` a quarantine tab NEVER auto-freezes,
@@ -964,6 +1015,22 @@ pub struct TabState {
     /// in `tab_status`. Distinct from `autofill_off` above, which is the
     /// ENGINE's own form-fill/password store, not this browser's vault.
     pub content_script_registered: SettingState,
+    /// Whether a document in this tab has announced that it is listening for
+    /// translation commands.
+    ///
+    /// WINDOWS ONLY. WebKitGTK carries the same news differently -- a parked
+    /// poll IS the announcement there, so the unix backend reads its outbox
+    /// instead of this field and never sets it. Both are reached through
+    /// `platform::translate_page_ready`, so callers see one signal.
+    ///
+    /// Reset on every navigation, because the document that announced itself
+    /// is gone and the next one has not spoken yet. A stale true would offer
+    /// the user a control whose command lands nowhere.
+    pub translate_page_ready: bool,
+    /// Whether the one-way channel used by Fingerprint Divergence to push
+    /// batched count deltas registered for this tab. This says only that the
+    /// channel exists; the counts themselves remain untrusted page claims.
+    pub fingerprint_probe_reporting: SettingState,
     /// See `EngineSettings::permissions_registered`.
     pub permissions_registered: SettingState,
     /// WebView2's id for this tab's registered page-scrollbar script
@@ -1052,18 +1119,24 @@ impl TabState {
             policy: policy.clone(),
             ledger: Ledger::default(),
             freeze: FreezeController::new(policy.freeze_after_load),
+            adlist_override: None,
+            toplevel: crate::toplevel_request::TopLevelRequests::default(),
+            last_top_level_method: "GET".to_string(),
             page_insecure: false,
             tls_error_verdict: None,
+            tls_issuer: None,
             freeze_json: None,
             interception: InterceptionState::NotAttempted,
             script_setting: SettingState::NotAttempted,
             smartscreen_off: SettingState::NotAttempted,
-            tracking_prevention: SettingState::NotAttempted,
+            tracking_prevention: TrackingPreventionState::NotAttempted,
             navigation_tracking: SettingState::NotAttempted,
             autofill_off: SettingState::NotAttempted,
             ephemeral_confirmed: SettingState::NotAttempted,
             handler_events: 0,
             content_script_registered: SettingState::NotAttempted,
+            translate_page_ready: false,
+            fingerprint_probe_reporting: SettingState::NotAttempted,
             permissions_registered: SettingState::NotAttempted,
             scrollbar_script_id: None,
         }
@@ -1091,8 +1164,13 @@ impl TabState {
     /// `url` is the document being navigated to, or None when the engine
     /// could not report it.
     pub fn on_load_started(&mut self, url: Option<&str>) {
+        // The document that announced itself is gone. The next one has not
+        // spoken yet, and until it does there is nothing listening for a
+        // translation command. (Windows only; see the field.)
+        self.translate_page_ready = false;
         self.freeze.on_load_started();
         self.tls_error_verdict = None;
+        self.tls_issuer = None;
         // Unknown counts as secure, deliberately: see `page_insecure`.
         self.page_insecure = url.is_some_and(is_insecure_page_url);
     }
@@ -1110,6 +1188,22 @@ impl TabState {
     /// `websocket` is what the engine reported; the caller maps a FAILED
     /// context read to `false`, because an unclassifiable request must
     /// stay eligible for blocking rather than inherit the socket path.
+    ///
+    /// `override_host` is the tab's ad-list override, set when the user
+    /// answered "Open anyway" on the blocked-navigation banner: "this tab may
+    /// reach THIS host despite the ad/tracker list". It is an INPUT rather
+    /// than state on the tab so that the decision stays a function of its
+    /// arguments, which is what makes every rule here provable on a box with
+    /// no WebView2.
+    ///
+    /// It exempts the AdRule predicate and nothing else. Freeze, the reserved
+    /// chrome origin, and the malicious list (checked by the caller, above
+    /// this function) are all unaffected, and the request is still ledgered --
+    /// as ALLOWED, because it is about to be sent. EXACT host equality, never
+    /// a suffix match: `sub.tracker.example` is a different host from
+    /// `tracker.example` and the user consented to one of them. The WebKitGTK
+    /// side anchors its exception rule to the exact host for the same reason,
+    /// so the two engines agree about what was consented to.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn decide_request(
         &mut self,
@@ -1117,6 +1211,7 @@ impl TabState {
         websocket: bool,
         rules: &RuleSet,
         now: Instant,
+        override_host: Option<&str>,
     ) -> RequestDecision {
         // Every call proves the engine pipeline delivered an event. The
         // freeze diagnostic prints this; it is NOT an enforcement gate
@@ -1145,7 +1240,7 @@ impl TabState {
                 }
             }
         }
-        let decision = self.decide_inner(class, websocket, rules, now);
+        let decision = self.decide_inner(class, websocket, rules, now, override_host);
         // An AUTO-freeze transitions lazily inside should_block, so it never
         // passes through freeze_with_interception and would otherwise sit at
         // Pending forever on a tab whose interception cannot enforce — the
@@ -1171,8 +1266,8 @@ impl TabState {
         websocket: bool,
         rules: &RuleSet,
         now: Instant,
+        override_host: Option<&str>,
     ) -> RequestDecision {
-
         if websocket {
             // Seeing a socket inhibits AUTO-freeze until the next
             // navigation (its close is not observable through the request
@@ -1241,7 +1336,12 @@ impl TabState {
                     self.ledger.record(&host, true);
                     return RequestDecision::Block(BlockReason::ReservedOrigin);
                 }
-                let ads = self.policy.block_ads && rules.blocks_host(&host);
+                // The override lifts the ad rule for ONE host. Written as
+                // an equality against the whole host, not a suffix test: a
+                // suffix test would make consent to `tracker.example` also
+                // consent to `evil.tracker.example`, which the user never saw.
+                let overridden = override_host.is_some_and(|allowed| allowed == host);
+                let ads = self.policy.block_ads && !overridden && rules.blocks_host(&host);
                 let frozen = self.freeze.should_block(&host, now);
                 let blocked = ads || frozen;
                 self.ledger.record(&host, blocked);
@@ -1254,6 +1354,24 @@ impl TabState {
                 }
             }
         }
+    }
+
+    /// This tab's ad-list override, if the user consented to one.
+    ///
+    /// Owned by TabState so the engine adapter has somewhere to read it from
+    /// without reaching into the consent machine, and returned by value
+    /// because the caller holds a RefCell borrow it must release before any
+    /// COM call (see the borrow comment at the Windows request handler).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn adlist_override_host(&self) -> Option<String> {
+        self.adlist_override.clone()
+    }
+
+    /// Set or clear the override. Clearing is not an afterthought here: it is
+    /// the same call, so the revocation cannot be the path nobody wrote.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn set_adlist_override(&mut self, host: Option<String>) {
+        self.adlist_override = host;
     }
 
     /// The ONE entry point through which a successful engine block may
@@ -1371,7 +1489,14 @@ const INTERCEPTOR_ISSUER_HINTS: &[&str] = &[
     "eset",
     "bitdefender",
     "norton",
-    "symantec",
+    // The inspection products Symantec shipped after acquiring Blue Coat,
+    // named specifically. The bare "symantec" token used to stand in for
+    // these and swept up Managed PKI for SSL and the Class 3 public roots
+    // with them -- issuance, not interception. `bluecoat` still catches the
+    // ProxySG-branded deployments; these two are the WSS-branded ones it
+    // does not.
+    "symantec web security",
+    "symantec ssl visibility",
     "mcafee",
     "trend micro",
     "fiddler",
@@ -1406,10 +1531,69 @@ const PUBLIC_CA_ISSUER_HINTS: &[&str] = &[
     "ssl.com",
 ];
 
-/// Classifies a certificate issuer string. Interceptor hints win over
-/// public-CA hints (a false "intercepted" warning is cheaper than a false
-/// "normal" one). Anything unrecognized — including no issuer at all — is
-/// `Unknown`, never a guess.
+/// Whether `needle` appears in `haystack` STARTING at a word boundary.
+///
+/// A bare `contains` fired from inside unrelated words, and the banner it
+/// raises states a fact in the flat indicative, so a collision is the browser
+/// telling a user something false about their connection. Two real ones:
+/// `eset` inside "G**eset**zliche Krankenversicherung" (a German health
+/// insurer's internal CA) and inside "Pr**eset** Analytics". Both classified
+/// as interception.
+///
+/// THE START ONLY, and that asymmetry is the whole design. Requiring a
+/// boundary at BOTH ends looked tidier and silently broke real detection:
+/// Fiddler's root is `CN=DO_NOT_TRUST_FiddlerRoot, ... OU=Created by
+/// http://www.fiddler2.com`, where `fiddler` is followed by `R` and by `2`.
+/// Both occurrences were rejected and a live interception proxy classified as
+/// Unknown.
+///
+/// Vendor names appear as the PREFIX of a compound certificate name --
+/// FiddlerRoot, fiddler2, ZscalerRoot -- so what follows carries no
+/// information. The false positives all went the other way, with the hint
+/// starting inside another word: `eset` in "G(eset)zliche Krankenversicherung"
+/// and in "Pr(eset) Analytics". Testing the leading edge rejects those and
+/// keeps the compounds.
+///
+/// A boundary is anything non-alphanumeric, which is what separates tokens in
+/// a distinguished name: `CN=`, `, O=`, spaces, underscores, dots. Multi-word
+/// hints such as "blue coat" work unchanged, since only the leading edge is
+/// tested.
+///
+/// This does NOT fix every false positive and is not meant to read as if it
+/// does. "Norton Rose Fulbright" still matches `norton`, and a word that
+/// merely BEGINS with a hint still matches. Narrowing either needs to know
+/// which DN field it is reading, which this dependency-free matcher does not.
+fn starts_word(haystack: &str, needle: &str) -> bool {
+    let mut from = 0;
+    while let Some(at) = haystack[from..].find(needle) {
+        let start = from + at;
+        if haystack[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !c.is_alphanumeric())
+        {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
+}
+
+/// Classifies a certificate issuer string.
+///
+/// Interceptor hints are tested before public-CA hints, so a string carrying
+/// both resolves to `Intercepted`. Anything unrecognized -- including no
+/// issuer at all -- is `Unknown`, never a guess, and `Unknown` renders a calm
+/// panel line rather than a warning.
+///
+/// This ORDERING is the only thing the precedence rule decides. It used to be
+/// justified as "a false intercepted warning is cheaper than a false normal
+/// one", and that is no longer the house position: the banner states
+/// decryption as fact, so a false positive is the browser telling a user
+/// something untrue about their connection. `symantec` was in the interceptor
+/// list on the strength of that old reasoning and reported every certificate
+/// chaining to Symantec's public roots as decrypted. Prefer a narrow hint that
+/// names the inspection product over a broad one that names a company.
 pub fn classify_issuer(issuer: Option<&str>) -> TlsState {
     let Some(issuer) = issuer else {
         return TlsState::Unknown;
@@ -1417,13 +1601,13 @@ pub fn classify_issuer(issuer: Option<&str>) -> TlsState {
     let issuer = issuer.to_lowercase();
     if INTERCEPTOR_ISSUER_HINTS
         .iter()
-        .any(|hint| issuer.contains(hint))
+        .any(|hint| starts_word(&issuer, hint))
     {
         return TlsState::Intercepted;
     }
     if PUBLIC_CA_ISSUER_HINTS
         .iter()
-        .any(|hint| issuer.contains(hint))
+        .any(|hint| starts_word(&issuer, hint))
     {
         return TlsState::Normal;
     }
@@ -1532,23 +1716,70 @@ pub fn host_matches(host: &str, rule: &str) -> bool {
 pub struct RuleSet {
     pub blocked_hosts: Vec<String>,
     pub cosmetic_selectors: Vec<String>,
+    /// Sorted-hash membership index over `blocked_hosts`, built by
+    /// `from_lines`. At the 59 hosts this list started with, the linear scan
+    /// below was free; at the ~144k the shipped lists now carry, 144k string
+    /// comparisons per subresource on the Windows UI thread is not a budget
+    /// that exists -- hostset.rs makes the argument at length. The index is
+    /// the same `HostSet` the malicious blocklist has run at 580k+ entries
+    /// since it shipped: one lookup structure, not two that can disagree.
+    ///
+    /// PRIVATE, and that is the correctness boundary: the two public Vecs can
+    /// be built by hand (tests do), and a hand-built set has an EMPTY index.
+    /// `blocks_host` therefore consults the index only when it is non-empty
+    /// and falls back to the scan otherwise, so a wrong answer is impossible;
+    /// the worst case is the old speed on a set nothing hot constructs.
+    index: super::HostSet,
 }
 
 impl RuleSet {
     /// Minimal line format — one host per line, `#` comments — so a bigger
     /// hosts-style list can be dropped in later without pulling in a
     /// filter-list crate. Deliberately NOT EasyList syntax.
+    ///
+    /// ONE PARSE, ONE PREDICATE, both representations built from it. This
+    /// mirrors `hashes_from_lines` step for step -- trim, drop comments and
+    /// blanks, take the LAST whitespace field (hosts-file shape
+    /// "0.0.0.0 tracker.example"), then `acceptable`. Parsing the Vec and the
+    /// index differently was three defects in one:
+    ///
+    ///   * the Vec kept whole lines, so a hosts-file line became the literal
+    ///     rule "0.0.0.0 tracker.example" on Unix -- a regex matching no URL --
+    ///     while the index correctly blocked tracker.example on Windows;
+    ///   * the Vec skipped `acceptable`, so an entry the index refuses still
+    ///     compiled into a WebKit rule: blocking on Linux, silently not
+    ///     blocking on Windows;
+    ///   * a list of ONLY refused entries left the index empty, sending
+    ///     `blocks_host` to the linear fallback over that same unvalidated
+    ///     Vec, so `RuleSet::from_lines("com")` blocked every .com host --
+    ///     the exact catastrophe `acceptable` exists to prevent.
+    ///
+    /// Filtering here fixes all three at the source: the Vec and the index
+    /// describe the same set by construction, the fallback can only ever scan
+    /// validated entries, and the two platforms cannot disagree.
     pub fn from_lines(input: &str) -> Self {
-        let blocked_hosts = input
+        let blocked_hosts: Vec<String> = input
             .lines()
             .map(str::trim)
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
-            .map(|line| line.to_lowercase())
+            .filter_map(|line| line.split_whitespace().last())
+            .map(|host| host.to_ascii_lowercase())
+            .filter(|host| super::hostset::acceptable(host))
             .collect();
+        let index = super::HostSet::from_lines(&blocked_hosts.join("\n"));
         Self {
             blocked_hosts,
             cosmetic_selectors: Vec::new(),
+            index,
         }
+    }
+
+    /// Size of the private membership index. Exists so tests can assert the
+    /// index and `blocked_hosts` agree entry-for-entry; nothing in the running
+    /// browser needs it, and exposing the index itself would invite a second
+    /// lookup path.
+    pub fn index_len(&self) -> usize {
+        self.index.len()
     }
 
     /// No allocation. This runs inside the `WebResourceRequested` handler on
@@ -1556,7 +1787,14 @@ impl RuleSet {
     /// the host each time -- an allocation per subresource, redoing work
     /// `host_of` had already done. `host_matches` is case-insensitive now, so
     /// the copy bought nothing.
+    ///
+    /// Suffix semantics are identical on both paths: `host_matches` per rule
+    /// and the index walk both mean "the host is the rule, or ends with `.`
+    /// plus the rule". A test holds the two against each other.
     pub fn blocks_host(&self, host: &str) -> bool {
+        if !self.index.is_empty() {
+            return self.index.matched_rule(host).is_some();
+        }
         self.blocked_hosts
             .iter()
             .any(|rule| host_matches(host, rule))
@@ -1764,7 +2002,10 @@ mod page_scrollbar_tests {
             "sendBeacon",
             "WebSocket",
         ] {
-            assert!(!script.contains(forbidden), "scrollbar script must not contain {forbidden}");
+            assert!(
+                !script.contains(forbidden),
+                "scrollbar script must not contain {forbidden}"
+            );
         }
         assert!(script.contains("#f0a832 transparent"));
         assert!(script.contains("addEventListener(\"message\""));
@@ -1796,7 +2037,10 @@ mod gpc_tests {
     fn gpc_header_is_sec_gpc_1() {
         assert_eq!(GPC_HEADER_NAME, "Sec-GPC");
         assert_eq!(GPC_HEADER_VALUE, "1");
-        assert_eq!(format!("{GPC_HEADER_NAME}: {GPC_HEADER_VALUE}"), "Sec-GPC: 1");
+        assert_eq!(
+            format!("{GPC_HEADER_NAME}: {GPC_HEADER_VALUE}"),
+            "Sec-GPC: 1"
+        );
     }
 
     #[test]
@@ -1897,11 +2141,7 @@ const DIVERGENCE_OVERRIDES_PLACEHOLDER: &str = "__DIVERGENCE_OVERRIDES__";
 /// scripts/divergence-detect-gate.js honest, since it pins the SET of
 /// techniques that can detect the noise and fails on drift in either
 /// direction.
-fn divergence_script_full(
-    enabled: bool,
-    ephemeral: bool,
-    overrides_json: &str,
-) -> Option<String> {
+fn divergence_script_full(enabled: bool, ephemeral: bool, overrides_json: &str) -> Option<String> {
     if !enabled {
         return None;
     }
@@ -1955,7 +2195,9 @@ mod divergence_tests {
         // Twice would mean replacen(.., 1) ships the literal placeholder as
         // the token for the real occurrence; zero would mean no token at all.
         assert_eq!(
-            DIVERGENCE_TEMPLATE.matches(DIVERGENCE_TOKEN_PLACEHOLDER).count(),
+            DIVERGENCE_TEMPLATE
+                .matches(DIVERGENCE_TOKEN_PLACEHOLDER)
+                .count(),
             1
         );
     }
@@ -2047,19 +2289,38 @@ mod divergence_tests {
     }
 
     #[test]
-    fn the_script_has_zero_channels() {
-        // The trust boundary from the script's header, pinned: nothing this
-        // script could read may leave the page. It carries a per-session token.
-        for forbidden in [
-            "fetch(",
-            "XMLHttpRequest",
-            "import(",
-            "window.ipc",
-            "window.chrome.webview",
-        ] {
+    fn the_script_has_only_the_count_report_channel() {
+        // It carries a per-session token, so network/module channels and the
+        // privileged chrome IPC shim remain forbidden. The two native engine
+        // bridges below may receive only the fixed count payload.
+        for forbidden in ["fetch(", "XMLHttpRequest", "import(", "window.ipc"] {
             assert!(
                 !DIVERGENCE_TEMPLATE.contains(forbidden),
                 "fingerprint_divergence.js must not contain {forbidden}"
+            );
+        }
+        assert_eq!(
+            DIVERGENCE_TEMPLATE
+                .matches("window.chrome.webview.postMessage(payload)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            DIVERGENCE_TEMPLATE
+                .matches("window.webkit.messageHandlers.ipc.postMessage(payload)")
+                .count(),
+            1
+        );
+        for forbidden_content in [
+            "sample:",
+            "pixels:",
+            "parameter:",
+            "url: location",
+            "TOKEN:",
+        ] {
+            assert!(
+                !DIVERGENCE_TEMPLATE.contains(forbidden_content),
+                "probe payload must not contain {forbidden_content}"
             );
         }
         // postMessage is the one nuance, and this mirrors the shell channel
@@ -2109,8 +2370,10 @@ mod divergence_tests {
                     .into_iter()
                     .rev()
                     .collect();
+                let count_bridge = line.trim() == "window.chrome.webview.postMessage(payload);"
+                    || line.trim() == "window.webkit.messageHandlers.ipc.postMessage(payload);";
                 assert!(
-                    !BANNED_RECEIVERS.contains(&receiver.as_str()),
+                    count_bridge || !BANNED_RECEIVERS.contains(&receiver.as_str()),
                     "fingerprint_divergence.js line {}: postMessage on `{}` \
                      would send out of the page: {}",
                     i + 1,
@@ -2122,87 +2385,75 @@ mod divergence_tests {
     }
 }
 
-/// Small bundled set of major ad/tracker hosts. Intentionally tiny: it
-/// exists to prove the machinery and cover the worst offenders, not to
-/// compete with EasyList.
-const BUNDLED_HOSTS: &[&str] = &[
-    // Google ad/tracking stack.
-    "doubleclick.net",
-    "googlesyndication.com",
-    "googleadservices.com",
-    "google-analytics.com",
-    "googletagmanager.com",
-    "googletagservices.com",
-    "2mdn.net",
-    // Programmatic exchanges.
-    "adnxs.com",
-    "adsrvr.org",
-    "adform.net",
-    "advertising.com",
-    "amazon-adsystem.com",
-    "pubmatic.com",
-    "rubiconproject.com",
-    "openx.net",
-    "indexww.com",
-    "casalemedia.com",
-    "contextweb.com",
-    "33across.com",
-    "sharethrough.com",
-    "criteo.com",
-    "criteo.net",
-    // Content-recommendation ad networks.
-    "taboola.com",
-    "outbrain.com",
-    "revcontent.com",
-    // Platform ad/tracking endpoints (not the platforms themselves —
-    // blocking facebook.com would break the site, blocking
-    // connect.facebook.net only breaks the tracking pixel).
-    "connect.facebook.net",
-    "ads.twitter.com",
-    "analytics.twitter.com",
-    "bat.bing.com",
-    "ads.linkedin.com",
-    "ads.yahoo.com",
-    // Adobe analytics / Omniture (SiteCatalyst). demdex.net (Audience
-    // Manager) is listed above; these are the analytics beacons.
-    "omtrdc.net",
-    "2o7.net",
-    // Twitter/X conversion pixel (static.ads-twitter.com/uwt.js). The list
-    // already has ads.twitter.com; ads-twitter.com is a DIFFERENT
-    // registrable domain and was missing. NOT t.co -- t.co is Twitter's
-    // link wrapper and blocking it breaks every link on the site.
-    "ads-twitter.com",
-    // Yandex ad network. an.yandex.ru is Yandex.Direct; a subdomain, so the
-    // suffix matcher never touches yandex.ru search. NOT yandex.ru itself.
-    "an.yandex.ru",
-    "yandexadexchange.net",
-    // Ad verification / measurement.
-    "scorecardresearch.com",
-    "quantserve.com",
-    "moatads.com",
-    "doubleverify.com",
-    "adsafeprotected.com",
-    // Behavioural analytics / session recording.
-    "chartbeat.com",   // Chartbeat (static.chartbeat.com)
-    "demdex.net",      // Adobe Audience Manager (dpm.demdex.net)
-    "newrelic.com",    // New Relic agent (js-agent.newrelic.com); the
-                       // nr-data.net RUM beacon is already listed below
-    "hotjar.com",
-    "mouseflow.com",
-    "crazyegg.com",
-    "luckyorange.com",
-    "fullstory.com",
-    "mixpanel.com",
-    "segment.com",
-    "segment.io",
-    "amplitude.com",
-    "heapanalytics.com",
-    "optimizely.com",
-    "branch.io",
-    "adjust.com",
-    "appsflyer.com",
-    "nr-data.net",
-];
+/// The shipped ad and tracker rules: ShadowWhisperer's Ads and Tracking
+/// lists (The Unlicense; a primary curator rather than an aggregate -- each
+/// file's header carries the provenance argument), regenerated by
+/// scripts/build-adlist.sh and checked in like blocklist.txt.
+///
+/// TWO FILES because they compile to two separate WebKit content filters: the
+/// engine refuses a compiled list over 150,000 rules (measured 2026-09-01:
+/// 150,000 compiles, 150,001 errors "Too many rules in JSON array", the same
+/// on 2.50.6 and 2.52.6), and the combined lists already sit at ~144k. Split,
+/// each half has years of headroom, and --verify-content-filter asks the
+/// engine rather than trusting that number to stay true.
+///
+/// Plain text rather than build-time hashes, unlike the malicious blocklist,
+/// because the Unix path needs literal hostnames to serialize into
+/// content-blocker JSON. The ClamAV incident that forced the blocklist to
+/// hashes (bank names in the binary) does not recur here: ad-network
+/// hostnames are not phishing-signature material.
+#[cfg(test)]
+mod shipped_adlist_guard {
+    //! A GATE THE USER CANNOT REACH IS NOT AN AD.
+    //!
+    //! `consent.google.com` sat on the Ads list because an upstream curator
+    //! filed it there. Google routes every visit through that host before it
+    //! will serve Maps or Search, so refusing it did not block an ad: it made
+    //! Google answer "an error has occurred" and the site unusable. Found on
+    //! the 1.0.0 candidate, by loading google.com/maps with exactly the
+    //! shipped rules in force; the only refused host the page asked for was
+    //! that one, and with consent stored the same page worked with every
+    //! other rule still on.
+    //!
+    //! These names are in `scripts/adlist-allow.txt`, so a regeneration drops
+    //! them again. This test is the part that fails loudly if one comes back
+    //! by another route.
+    use super::*;
+
+    #[test]
+    fn hosts_that_break_a_site_are_not_in_the_shipped_rules() {
+        let rules = RuleSet::from_lines(&format!("{ADLIST_ADS}\n{ADLIST_TRACKING}"));
+        for host in [
+            // The gate. Blocking it breaks all of Google, not one ad slot.
+            "consent.google.com",
+            "consent.google.com.au",
+            "consent.google.com.bd",
+            // Map tiles and Street View imagery: the pictures themselves.
+            "t1.gstatic.com",
+            "t2.gstatic.com",
+            "geo1.ggpht.com",
+            "geo3.ggpht.com",
+        ] {
+            assert!(
+                !rules.blocks_host(host),
+                "{host} is back in the shipped ad rules; it breaks the site rather than blocking an ad"
+            );
+        }
+    }
+
+    #[test]
+    fn instrumentation_is_still_blocked() {
+        // The counterpart assertion. Without it, "fix the breakage" could be
+        // satisfied by shipping an empty list, and this test would still pass.
+        let rules = RuleSet::from_lines(&format!("{ADLIST_ADS}\n{ADLIST_TRACKING}"));
+        for host in ["csi.gstatic.com", "metric.gstatic.com", "google-analytics.com"] {
+            assert!(rules.blocks_host(host), "{host} should still be blocked");
+        }
+    }
+}
+
+const ADLIST_ADS: &str = include_str!("../adlist-ads.txt");
+const ADLIST_TRACKING: &str = include_str!("../adlist-tracking.txt");
 
 /// Small, conservative cosmetic set. Broad generic rules hide real page
 /// content, so this sticks to containers that exist only to hold ads.
@@ -2218,12 +2469,52 @@ const COSMETIC_SELECTORS: &[&str] = &[
 ];
 
 static BUNDLED: OnceLock<RuleSet> = OnceLock::new();
+static BUNDLED_ADS: OnceLock<RuleSet> = OnceLock::new();
+static BUNDLED_TRACKING: OnceLock<RuleSet> = OnceLock::new();
 
+/// The COMBINED set: what `decide_request` consults on Windows, where one
+/// membership question is asked per request and the split serves no purpose.
 pub fn bundled_rules() -> &'static RuleSet {
-    BUNDLED.get_or_init(|| RuleSet {
-        blocked_hosts: BUNDLED_HOSTS.iter().map(|s| s.to_string()).collect(),
-        cosmetic_selectors: COSMETIC_SELECTORS.iter().map(|s| s.to_string()).collect(),
+    BUNDLED.get_or_init(|| {
+        let mut rules = RuleSet::from_lines(&format!("{ADLIST_ADS}\n{ADLIST_TRACKING}"));
+        rules.cosmetic_selectors = COSMETIC_SELECTORS.iter().map(|s| s.to_string()).collect();
+        rules
     })
+}
+
+/// The ads half alone, for the Unix path's first compiled filter. Cosmetic
+/// selectors ride here only in the sense that `cosmetic_css` is fed this set;
+/// they never become filter rules and never count against the 150k ceiling.
+pub fn bundled_ads() -> &'static RuleSet {
+    BUNDLED_ADS.get_or_init(|| {
+        let mut rules = RuleSet::from_lines(ADLIST_ADS);
+        rules.cosmetic_selectors = COSMETIC_SELECTORS.iter().map(|s| s.to_string()).collect();
+        rules
+    })
+}
+
+/// The tracking half alone, for the second compiled filter.
+pub fn bundled_tracking() -> &'static RuleSet {
+    BUNDLED_TRACKING.get_or_init(|| RuleSet::from_lines(ADLIST_TRACKING))
+}
+
+static ADS_FILTER_ID: OnceLock<String> = OnceLock::new();
+static TRACKING_FILTER_ID: OnceLock<String> = OnceLock::new();
+
+/// Store identifiers for the two bundled filters, hashed from the SHIPPED TEXT
+/// rather than the serialized JSON. The JSON is ~15MB and building it just to
+/// name a filter would defeat the load-first path these ids exist for: after
+/// the first compile the Unix backend asks the store for this id (~70ms
+/// measured) instead of recompiling (~3.1s and 46MB of bytecode for the pair).
+/// The text determines the JSON byte for byte, so hashing it is the same
+/// version key at a fortieth of the work. The suffix keeps the two lists from
+/// colliding with each other or with a freeze filter's json-derived id.
+pub fn bundled_ads_filter_id() -> &'static str {
+    ADS_FILTER_ID.get_or_init(|| format!("{}-ads", filter_id_for(ADLIST_ADS)))
+}
+
+pub fn bundled_tracking_filter_id() -> &'static str {
+    TRACKING_FILTER_ID.get_or_init(|| format!("{}-tracking", filter_id_for(ADLIST_TRACKING)))
 }
 
 /// Escapes a host for use inside a WebKit content-blocker `url-filter` regex.
@@ -2237,7 +2528,20 @@ fn escape_host_for_filter(host: &str) -> String {
     for ch in host.chars() {
         if matches!(
             ch,
-            '.' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\' | '/'
+            '.' | '+'
+                | '*'
+                | '?'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | '|'
+                | '^'
+                | '$'
+                | '\\'
+                | '/'
         ) {
             out.push('\\');
         }
@@ -2256,10 +2560,7 @@ fn host_url_filter(host: &str) -> String {
     // at all. A request URL always has a path or port after the authority
     // (engines normalise `https://host` to `https://host/`), so requiring one
     // costs nothing and keeps the pattern inside the supported subset.
-    format!(
-        "^https?://([^/]+\\.)?{}[:/]",
-        escape_host_for_filter(host)
-    )
+    format!("^https?://([^/]+\\.)?{}[:/]", escape_host_for_filter(host))
 }
 
 /// Serializes network rules to WebKit content-blocker JSON.
@@ -2292,9 +2593,26 @@ pub fn content_blocker_json(rules: &RuleSet) -> String {
         .collect();
     // Serialization of a Value tree cannot fail; the fallback keeps the
     // never-panic constraint literal rather than theoretical.
-    serde_json::to_string(&serde_json::Value::Array(entries))
-        .unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string(&serde_json::Value::Array(entries)).unwrap_or_else(|_| "[]".to_string())
 }
+
+// NO PER-TAB AD-LIST EXCEPTION ON THIS BACKEND, and the machinery for one is
+// deliberately absent rather than dormant.
+//
+// An earlier revision of this feature carried it: an exact-host
+// `ignore-previous-rules` entry compiled INTO each shipped list, because a
+// separate filter carrying the exception does not override a block in another
+// one (measured on WebKitGTK 2.52.6, 2026-09-15). It worked, and it cost a
+// ~500 ms recompile of the 116k-rule tracking list on every grant and another
+// on every revocation.
+//
+// Removed 2026-09-15: Linux gets the held-page
+// explanation, not the button. The only route past the list here is the
+// browser-wide switch, and About says exactly that.
+//
+// Left as a comment rather than as uncalled functions on purpose. Dormant
+// mechanism with no caller is how the next reader concludes the feature exists
+// and writes copy, or a test, against something nothing invokes.
 
 /// The freeze filter: block every request, then re-allow the per-site
 /// overrides. A frozen tab blocks navigations too — the user proceeds via
@@ -2322,8 +2640,7 @@ pub fn freeze_filter_json(exceptions: &[String]) -> String {
             "action": { "type": "ignore-previous-rules" },
         }));
     }
-    serde_json::to_string(&serde_json::Value::Array(rules))
-        .unwrap_or_else(|_| "[]".to_string())
+    serde_json::to_string(&serde_json::Value::Array(rules)).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// One CSS rule hiding every known ad container. `!important` because the
@@ -2446,6 +2763,171 @@ mod tests {
     }
 
     #[test]
+    fn shipped_adlists_hold_their_floors_and_the_webkit_ceiling() {
+        // scripts/build-adlist.sh asserts both bounds when it regenerates;
+        // this re-asserts them on what was actually CHECKED IN, because the
+        // file and the pipeline run are separated by a human and a diff.
+        // 150k is measured, not documented: WebKit 2.52.6 compiles 150,000
+        // rules and refuses 150,001, so a list crossing it ships a browser
+        // whose ad blocking silently never compiles.
+        let ads = bundled_ads().blocked_hosts.len();
+        let tracking = bundled_tracking().blocked_hosts.len();
+        assert!(
+            ads >= 20_000,
+            "ads list shrank to {ads}: truncated checkin?"
+        );
+        assert!(
+            tracking >= 80_000,
+            "tracking list shrank to {tracking}: truncated checkin?"
+        );
+        assert!(ads < 150_000, "ads list at {ads} has outgrown WebKit");
+        assert!(
+            tracking < 150_000,
+            "tracking list at {tracking} has outgrown WebKit"
+        );
+    }
+
+    #[test]
+    fn shipped_adlists_never_carry_first_party_hosts() {
+        // scripts/adlist-allow.txt screens these out at generation; asserted
+        // here too because an upstream adding our own infrastructure and
+        // slipping through a regeneration would break updates for every
+        // install with ad blocking on, and nothing else would notice.
+        let rules = bundled_rules();
+        for host in ["patanyx.com", "patanyx.net", "edgexene.io"] {
+            assert!(
+                !rules.blocks_host(host),
+                "{host} is first-party and must never be filtered"
+            );
+        }
+        // Suffix matching means the apex assertions cover these, but naming
+        // the real endpoints makes a failure say what it costs.
+        assert!(!rules.blocks_host("patanyx.edgexene.io"));
+        assert!(!rules.blocks_host("relay.edgexene.io"));
+    }
+
+    #[test]
+    fn every_shipped_adlist_host_survives_the_runtime_gate() {
+        // THE PLATFORM-DIVERGENCE GUARD, exhaustive rather than sampled. Unix
+        // compiles `blocked_hosts` into WebKit rules; Windows answers from the
+        // HostSet index, which drops anything `acceptable` rejects. A host
+        // that ships but the index refuses would block on Linux and silently
+        // NOT block on Windows -- a handful of entries in ~144k, which
+        // sampling would miss.
+        // ASSERTED ON THE RAW FILE, not on `blocked_hosts`. `from_lines`
+        // filters through `acceptable`, so a bad entry never reaches the Vec
+        // and a test reading the Vec can never fail -- it would be vacuous.
+        // A planted `evil..example` proved exactly that. Runtime stays safe
+        // either way; what this catches is the file claiming to ship rules it
+        // silently drops, which makes the counts and the floors dishonest.
+        for (label, raw) in [("ads", ADLIST_ADS), ("tracking", ADLIST_TRACKING)] {
+            for line in raw.lines() {
+                let line = line.trim();
+                if line.is_empty() || line.starts_with('#') {
+                    continue;
+                }
+                assert!(
+                    crate::platform::hostset::acceptable(line),
+                    "{label}: {line} is in the shipped file but the runtime \
+                     index rejects it -- it would be counted and never block"
+                );
+            }
+        }
+        assert_eq!(
+            bundled_ads().blocked_hosts.len(),
+            bundled_ads().index_len(),
+            "ads: Vec and index disagree on size"
+        );
+        assert_eq!(
+            bundled_tracking().blocked_hosts.len(),
+            bundled_tracking().index_len(),
+            "tracking: Vec and index disagree on size"
+        );
+    }
+
+    #[test]
+    fn no_shipped_adlist_host_is_a_bare_shared_platform_suffix() {
+        // The catastrophic case named explicitly. A bare `amazonaws.com` in a
+        // url-filter blocks every S3 bucket, and this repository has already
+        // shipped 25 AWS regional endpoints once.
+        // Raw file again, for the same reason: `acceptable` already refuses a
+        // bare protected suffix, so checking the parsed set proves nothing
+        // about what the pipeline emitted.
+        for (label, raw) in [("ads", ADLIST_ADS), ("tracking", ADLIST_TRACKING)] {
+            for suffix in crate::platform::hostset::PROTECTED_SUFFIXES {
+                assert!(
+                    !raw.lines().any(|l| l.trim() == *suffix),
+                    "{label}: {suffix} is a shared-platform suffix and must never ship"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adlist_extra_survives_regeneration() {
+        // connect.facebook.net is the one host of the original hand-picked 59
+        // the upstream lists do not carry; scripts/adlist-extra.txt re-adds
+        // it. A failure here means the extras file was skipped and the
+        // curated-to-bigger-list swap quietly UNBLOCKED something.
+        assert!(bundled_rules().blocks_host("connect.facebook.net"));
+        assert!(bundled_ads().blocks_host("connect.facebook.net"));
+    }
+
+    #[test]
+    fn ruleset_index_and_scan_agree() {
+        // blocks_host has two implementations: the sorted-hash index (any set
+        // from from_lines) and the linear host_matches scan (the fallback for
+        // hand-built sets). They must be the same function. A stratified
+        // sample catches a drifted hash as surely as exhaustion would, in test
+        // time that stays negligible.
+        let indexed = bundled_ads();
+        let scanned = RuleSet {
+            blocked_hosts: indexed.blocked_hosts.clone(),
+            cosmetic_selectors: vec![],
+            ..RuleSet::default()
+        };
+        for host in indexed.blocked_hosts.iter().step_by(997) {
+            assert!(scanned.blocks_host(host), "scan misses shipped {host}");
+            assert!(indexed.blocks_host(host), "index misses shipped {host}");
+            let sub = format!("cdn.{host}");
+            assert_eq!(
+                indexed.blocks_host(&sub),
+                scanned.blocks_host(&sub),
+                "index and scan disagree on subdomain {sub}"
+            );
+        }
+        for miss in ["example.com", "patanyx.com", "a.b.c.example.test"] {
+            assert_eq!(indexed.blocks_host(miss), scanned.blocks_host(miss));
+        }
+    }
+
+    #[test]
+    fn bundled_filter_ids_are_distinct_and_stable() {
+        // The Unix load-first path keys the filter store on these. Colliding
+        // ids would make the second list's load return the FIRST list's
+        // bytecode: ad blocking that looks on while filtering half of what it
+        // claims. Stability across calls is what makes them cache keys.
+        let ads = bundled_ads_filter_id();
+        let tracking = bundled_tracking_filter_id();
+        assert_ne!(ads, tracking);
+        assert_eq!(ads, bundled_ads_filter_id());
+        assert_eq!(tracking, bundled_tracking_filter_id());
+        assert!(ads.ends_with("-ads") && tracking.ends_with("-tracking"));
+    }
+
+    #[test]
+    fn an_all_rejected_list_cannot_reach_the_unsafe_fallback() {
+        // A list whose every entry HostSet rejects leaves the index empty,
+        // which sends blocks_host to the linear fallback. If that fallback
+        // read the raw Vec, a bare TLD would block the whole suffix.
+        let rules = RuleSet::from_lines("com\n");
+        assert!(
+            !rules.blocks_host("example.com"),
+            "a bare TLD reached the fallback and blocked the whole suffix"
+        );
+    }
+
+    #[test]
     fn from_lines_is_the_future_import_seam() {
         let rules = RuleSet::from_lines("# comment\n\nExample.COM\ntracker.example\n");
         assert_eq!(
@@ -2531,6 +3013,7 @@ mod tests {
         let rules = RuleSet {
             blocked_hosts: vec!["doubleclick.net".to_string()],
             cosmetic_selectors: vec![],
+            ..RuleSet::default()
         };
         let parsed: serde_json::Value =
             serde_json::from_str(&content_blocker_json(&rules)).unwrap();
@@ -2542,7 +3025,10 @@ mod tests {
             "if-domain constrains the DOCUMENT domain — the inverse of the intent"
         );
         let filter = trigger["url-filter"].as_str().unwrap();
-        assert_ne!(filter, ".*", "a match-everything filter blocks nothing useful");
+        assert_ne!(
+            filter, ".*",
+            "a match-everything filter blocks nothing useful"
+        );
 
         // The regex must accept the host and its subdomains, and reject
         // lookalikes and unrelated hosts.
@@ -2723,10 +3209,7 @@ mod tests {
         tab.record("x.com", true);
         tab.record("x.com", true);
         fold_closed_tab(tab);
-        assert_eq!(
-            session_blocked_total(std::iter::empty::<u64>()) - before,
-            2
-        );
+        assert_eq!(session_blocked_total(std::iter::empty::<u64>()) - before, 2);
     }
 
     // --- Freeze state machine ------------------------------------------------
@@ -2880,7 +3363,9 @@ mod tests {
     #[test]
     fn known_public_ca_issuers_are_normal() {
         assert_eq!(
-            classify_issuer(Some("CN=DigiCert TLS Hybrid ECC SHA384 2020 CA1, O=DigiCert Inc")),
+            classify_issuer(Some(
+                "CN=DigiCert TLS Hybrid ECC SHA384 2020 CA1, O=DigiCert Inc"
+            )),
             TlsState::Normal
         );
         assert_eq!(
@@ -2897,6 +3382,120 @@ mod tests {
         );
         assert_eq!(classify_issuer(Some("")), TlsState::Unknown);
         assert_eq!(classify_issuer(None), TlsState::Unknown);
+    }
+
+    /// A hint inside another word is not a hint.
+    ///
+    /// Every case here classified as INTERCEPTED before whole-word matching,
+    /// which means the browser told the user their traffic was being decrypted
+    /// on the strength of a coincidence.
+    #[test]
+    fn an_issuer_that_merely_contains_a_hint_is_not_interception() {
+        for issuer in [
+            // "eset" inside a German health insurer's internal CA.
+            "CN=Gesetzliche Krankenversicherung Root CA, O=GKV, C=DE",
+            // "eset" again, inside a product name.
+            "CN=Preset Analytics Internal Root, O=Preset Inc",
+        ] {
+            assert_ne!(
+                classify_issuer(Some(issuer)),
+                TlsState::Intercepted,
+                "{issuer} matched a hint from inside another word"
+            );
+        }
+    }
+
+    /// Non-ASCII issuer text does not panic the byte walk.
+    ///
+    /// `starts_word` indexes by byte. That is sound because every hint is
+    /// ASCII, so a match's start and end are always char boundaries and
+    /// `start + 1` lands inside the matched run -- but a DN is attacker-
+    /// adjacent text and `to_lowercase` can change a string's byte length,
+    /// so the invariant is worth a test rather than a comment.
+    #[test]
+    fn a_non_ascii_issuer_does_not_panic_the_matcher() {
+        for issuer in [
+            "CN=Ångström Certifieringsmyndighet, O=Åäö AB, C=SE",
+            "CN=İstanbul Kök Sertifika, O=TÜRKTRUST, C=TR",
+            "CN=日本ルート認証局, O=セキュリティ, C=JP",
+            // A hint's bytes, adjacent to multi-byte characters on both sides.
+            "CN=Ω eset Ω",
+            "CN=Ωeset Ω",
+            "CN=\u{1F512}zscaler\u{1F512}",
+        ] {
+            // The assertion is that this RETURNS at all.
+            let _ = classify_issuer(Some(issuer));
+        }
+        // And the boundary logic still reads correctly across them: a hint
+        // fenced by non-alphanumerics is a word, one glued to a letter is not.
+        assert_eq!(classify_issuer(Some("CN=Ω eset Ω")), TlsState::Intercepted);
+        assert_ne!(classify_issuer(Some("CN=Ωeset Ω")), TlsState::Intercepted);
+        // A hint glued to a following multi-byte char still matches, because
+        // only the leading edge is tested. That is deliberate: see starts_word.
+        assert_eq!(classify_issuer(Some("CN=Ω esetΩ")), TlsState::Intercepted);
+    }
+
+    /// A retired public CA is not an interception product.
+    ///
+    /// `symantec` was in the interceptor list, so every certificate still
+    /// chaining to Symantec's old public roots was reported as decrypted.
+    #[test]
+    fn a_legacy_public_ca_is_not_an_interceptor() {
+        for issuer in [
+            "CN=Symantec Class 3 Secure Server CA - G4",
+            // Widely deployed for enterprise-INTERNAL TLS. Issuance, not
+            // interception, and the bare token swept it up too.
+            "CN=Symantec Managed PKI for SSL",
+        ] {
+            assert_ne!(
+                classify_issuer(Some(issuer)),
+                TlsState::Intercepted,
+                "{issuer} is issuance, not interception"
+            );
+        }
+    }
+
+    /// The Symantec-branded inspection products are still caught.
+    ///
+    /// Dropping the bare `symantec` token cost these, because `bluecoat` only
+    /// covers the ProxySG-branded lineage. They are named individually so the
+    /// hint matches the product rather than the company.
+    #[test]
+    fn symantec_branded_inspection_is_still_detected() {
+        for issuer in [
+            "CN=Symantec Web Security Service CA",
+            "CN=Symantec SSL Visibility Appliance CA",
+        ] {
+            assert_eq!(
+                classify_issuer(Some(issuer)),
+                TlsState::Intercepted,
+                "{issuer} is an inspection product and stopped being detected"
+            );
+        }
+    }
+
+    /// The hints that DO mean interception still do: multi-word ones, and the
+    /// compound names where the hint is a prefix rather than a whole word.
+    #[test]
+    fn a_hint_at_a_word_start_still_detects_the_real_interceptors() {
+        for issuer in [
+            "CN=Zscaler Intermediate Root CA (zscalertwo.net)",
+            "CN=FortiGate CA, O=Fortinet",
+            "CN=Blue Coat SSL CA, O=Blue Coat Systems",
+            "CN=Cisco Umbrella Secondary SubCA",
+            "CN=ESET SSL Filter CA, O=ESET, spol. s r.o.",
+            // The one whole-word matching broke. `fiddler` is followed by `R`
+            // here and by `2` in the OU, so both ends being tested rejected
+            // a live interception proxy.
+            "CN=DO_NOT_TRUST_FiddlerRoot, O=DO_NOT_TRUST, \
+             OU=Created by http://www.fiddler2.com",
+        ] {
+            assert_eq!(
+                classify_issuer(Some(issuer)),
+                TlsState::Intercepted,
+                "{issuer} is a real interceptor and stopped being detected"
+            );
+        }
     }
 
     // --- Policy presets --------------------------------------------------------
@@ -3148,9 +3747,10 @@ mod freeze_enforcement_tests {
 #[cfg(test)]
 mod request_decision_tests {
     use super::{
-        classify_uri, host_of, host_url_filter, BlockReason, FreezeEnforcement, FreezePhase,
+        classify_uri, host_of,
+        host_url_filter, BlockReason, FreezeEnforcement, FreezePhase,
         InterceptionFailure, InterceptionState, RequestDecision, RuleSet, SettingState, TabPolicy,
-        TabState, UriClass, FREEZE_GRACE,
+        TabState, TrackingPreventionState, UriClass, FREEZE_GRACE,
     };
     use std::time::Instant;
 
@@ -3217,6 +3817,16 @@ mod request_decision_tests {
         assert_eq!(SettingState::Failed.as_str(), "failed");
     }
 
+    #[test]
+    fn tracking_prevention_names_the_confirmed_level() {
+        assert_eq!(TrackingPreventionState::Strict.as_str(), "strict");
+        assert_eq!(TrackingPreventionState::Balanced.as_str(), "balanced");
+        assert_eq!(TrackingPreventionState::Failed.as_str(), "failed");
+        assert_eq!(
+            TrackingPreventionState::NotAttempted.as_str(),
+            "not_attempted"
+        );
+    }
 
     /// A blocked host stays blocked when the URL carries an explicit port.
     ///
@@ -3247,20 +3857,18 @@ mod request_decision_tests {
             Some("http://doubleclick.net:8090/pixel.png"),
             false,
             &rules(),
-            Instant::now(),
-        );
+            Instant::now(), None);
         assert!(
             matches!(decision, RequestDecision::Block(BlockReason::AdRule)),
             "a ported URL to a blocked host must still be blocked, got {decision:?}"
         );
     }
 
-
     #[test]
     fn a_frozen_tab_blocks_and_ledgers_an_ordinary_request() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now());
+        let d = st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         let rows = st.ledger.snapshot();
         assert_eq!(rows.len(), 1);
@@ -3275,14 +3883,14 @@ mod request_decision_tests {
     fn an_unreadable_uri_fails_closed_only_while_frozen() {
         let mut live = registered_tab(TabPolicy::default());
         assert_eq!(
-            live.decide_request(None, false, &rules(), Instant::now()),
+            live.decide_request(None, false, &rules(), Instant::now(), None),
             RequestDecision::Allow
         );
 
         let mut frozen = registered_tab(TabPolicy::default());
         frozen.freeze.freeze();
         assert_eq!(
-            frozen.decide_request(None, false, &rules(), Instant::now()),
+            frozen.decide_request(None, false, &rules(), Instant::now(), None),
             RequestDecision::Block(BlockReason::FrozenOpaque)
         );
         // Not ledgered: there is no host to key a user-facing row on.
@@ -3294,13 +3902,137 @@ mod request_decision_tests {
         let mut frozen = registered_tab(TabPolicy::default());
         frozen.freeze.freeze();
         assert_eq!(
-            frozen.decide_request(Some("https:///no-authority"), false, &rules(), Instant::now()),
+            frozen.decide_request(
+                Some("https:///no-authority"),
+                false,
+                &rules(),
+                Instant::now(), None),
             RequestDecision::Block(BlockReason::FrozenOpaque)
         );
 
         let mut live = registered_tab(TabPolicy::default());
         assert_eq!(
-            live.decide_request(Some("https:///no-authority"), false, &rules(), Instant::now()),
+            live.decide_request(
+                Some("https:///no-authority"),
+                false,
+                &rules(),
+                Instant::now(), None),
+            RequestDecision::Allow
+        );
+    }
+
+    /// T1. The per-tab ad-list override: "this tab may reach HOST despite the
+    /// ad/tracker list".
+    ///
+    /// It exempts ONE predicate and nothing else. The cases below are the
+    /// whole contract, and each is a way the feature could quietly become a
+    /// hole rather than an exception:
+    ///
+    /// - the named host loads, and is ledgered as ALLOWED rather than hidden;
+    /// - a DIFFERENT listed host on the same page stays blocked, so consenting
+    ///   to one tracker is not consenting to the page's others;
+    /// - a SUBDOMAIN of the allowed host stays blocked (exact host only, which
+    ///   is what keeps the two engines in step: the Linux exception rule is
+    ///   anchored to the exact host for the same reason);
+    /// - a FROZEN tab still blocks it, because freeze is a different promise;
+    /// - the browser's own UI origin is still refused, because that check is
+    ///   unconditional and sits above every policy.
+    #[test]
+    fn an_override_exempts_only_the_ad_rule_and_only_for_that_exact_host() {
+        let now = Instant::now();
+
+        // Allowed: the named host, and it must be ledgered as allowed.
+        let mut st = registered_tab(blocking_policy());
+        assert_eq!(
+            st.decide_request(
+                Some("https://tracker.example/pixel"),
+                false,
+                &rules(),
+                now,
+                Some("tracker.example"),
+            ),
+            RequestDecision::Allow,
+            "the override did not let its own host through"
+        );
+        let row = st
+            .ledger
+            .snapshot()
+            .into_iter()
+            .find(|r| r.host == "tracker.example")
+            .expect("an allowed override must still appear in the ledger");
+        assert_eq!(
+            row.blocked, 0,
+            "an overridden request was ledgered as blocked; the panel would \
+             tell the user it was stopped when it was sent"
+        );
+
+        // Still blocked: a different listed host.
+        let mut st = registered_tab(blocking_policy());
+        assert_eq!(
+            st.decide_request(
+                Some("https://doubleclick.net/ad"),
+                false,
+                &rules(),
+                now,
+                Some("tracker.example"),
+            ),
+            RequestDecision::Block(BlockReason::AdRule),
+            "allowing one host also allowed another listed host"
+        );
+
+        // Still blocked: a SUBDOMAIN of the allowed host. Exact host only.
+        let mut st = registered_tab(blocking_policy());
+        assert_eq!(
+            st.decide_request(
+                Some("https://sub.tracker.example/beacon"),
+                false,
+                &rules(),
+                now,
+                Some("tracker.example"),
+            ),
+            RequestDecision::Block(BlockReason::AdRule),
+            "the override covered a subdomain; it must be the exact host, or \
+             the two engines disagree about what was consented to"
+        );
+
+        // Still blocked: frozen beats the override.
+        let mut frozen = registered_tab(blocking_policy());
+        frozen.freeze.freeze();
+        assert_eq!(
+            frozen.decide_request(
+                Some("https://tracker.example/pixel"),
+                false,
+                &rules(),
+                now,
+                Some("tracker.example"),
+            ),
+            RequestDecision::Block(BlockReason::Freeze),
+            "an ad-list override lifted a FREEZE; they are different promises"
+        );
+
+        // Still blocked: the chrome origin, which no policy may reach.
+        let mut st = registered_tab(blocking_policy());
+        let reserved = format!("https://{}/x", super::super::CHROME_RESERVED_HOST);
+        assert_eq!(
+            st.decide_request(Some(&reserved), false, &rules(), now, Some(super::super::CHROME_RESERVED_HOST)),
+            RequestDecision::Block(BlockReason::ReservedOrigin),
+            "an override reached the browser's own UI origin"
+        );
+    }
+
+    /// No override means no change: the ordinary path must be untouched by
+    /// the parameter existing.
+    #[test]
+    fn no_override_decides_exactly_as_before() {
+        let now = Instant::now();
+        let mut st = registered_tab(blocking_policy());
+        assert_eq!(
+            st.decide_request(Some("https://tracker.example/p"), false, &rules(), now, None),
+            RequestDecision::Block(BlockReason::AdRule)
+        );
+        let mut st = registered_tab(blocking_policy());
+        assert_eq!(
+            st.decide_request(Some("https://unlisted.example/p"), false, &rules(), now, None),
             RequestDecision::Allow
         );
     }
@@ -3319,7 +4051,7 @@ mod request_decision_tests {
             "file:///etc/hostname",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now()),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
                 RequestDecision::Allow,
                 "{uri} carries no network traffic and must stay allowed"
             );
@@ -3336,10 +4068,13 @@ mod request_decision_tests {
     fn a_manual_freeze_blocks_new_websocket_upgrades() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now());
+        let d = st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         let rows = st.ledger.snapshot();
-        assert_eq!((rows[0].host.as_str(), rows[0].blocked), ("live.example", 1));
+        assert_eq!(
+            (rows[0].host.as_str(), rows[0].blocked),
+            ("live.example", 1)
+        );
     }
 
     /// Blocking upgrades must not cost the auto-freeze inhibition: a live
@@ -3351,10 +4086,13 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.freeze.set_auto(true);
         st.on_load_finished(t0);
-        let d = st.decide_request(Some("wss://live.example/s"), true, &rules(), t0);
+        let d = st.decide_request(Some("wss://live.example/s"), true, &rules(), t0, None);
         assert_eq!(d, RequestDecision::Allow);
         let rows = st.ledger.snapshot();
-        assert_eq!((rows[0].host.as_str(), rows[0].allowed), ("live.example", 1));
+        assert_eq!(
+            (rows[0].host.as_str(), rows[0].allowed),
+            ("live.example", 1)
+        );
         // The socket was seen, so the tab must not auto-freeze under it.
         assert!(!st.freeze.should_auto_freeze(t0 + FREEZE_GRACE * 10));
     }
@@ -3365,7 +4103,7 @@ mod request_decision_tests {
         st.freeze.add_override("live.example");
         st.freeze.freeze();
         assert_eq!(
-            st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now()),
+            st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None),
             RequestDecision::Allow
         );
     }
@@ -3377,7 +4115,7 @@ mod request_decision_tests {
     fn an_unreadable_context_does_not_inherit_the_socket_path() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("ws://live.example/s"), false, &rules(), Instant::now());
+        let d = st.decide_request(Some("ws://live.example/s"), false, &rules(), Instant::now(), None);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         // ...and no live-channel inhibition was recorded from it.
         st.freeze.unfreeze(Instant::now());
@@ -3399,13 +4137,21 @@ mod request_decision_tests {
             ..TabPolicy::default()
         });
         assert_eq!(
-            off.decide_request(Some("https://ads.doubleclick.net/x"), false, &rules(), Instant::now()),
+            off.decide_request(
+                Some("https://ads.doubleclick.net/x"),
+                false,
+                &rules(),
+                Instant::now(), None),
             RequestDecision::Allow
         );
 
         let mut on = registered_tab(blocking_policy());
         assert_eq!(
-            on.decide_request(Some("https://ads.doubleclick.net/x"), false, &rules(), Instant::now()),
+            on.decide_request(
+                Some("https://ads.doubleclick.net/x"),
+                false,
+                &rules(),
+                Instant::now(), None),
             RequestDecision::Block(BlockReason::AdRule)
         );
 
@@ -3420,11 +4166,15 @@ mod request_decision_tests {
         st.freeze.add_override("App.Example.com");
         st.freeze.freeze();
         assert_eq!(
-            st.decide_request(Some("https://app.example.com/x"), false, &rules(), Instant::now()),
+            st.decide_request(
+                Some("https://app.example.com/x"),
+                false,
+                &rules(),
+                Instant::now(), None),
             RequestDecision::Allow
         );
         assert_eq!(
-            st.decide_request(Some("https://other.com/x"), false, &rules(), Instant::now()),
+            st.decide_request(Some("https://other.com/x"), false, &rules(), Instant::now(), None),
             RequestDecision::Block(BlockReason::Freeze)
         );
     }
@@ -3441,11 +4191,11 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.on_load_finished(t0);
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), t0),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), t0, None),
             RequestDecision::Allow
         );
         assert_eq!(
-            st.decide_request(Some("https://x.com/b"), false, &rules(), t0 + FREEZE_GRACE),
+            st.decide_request(Some("https://x.com/b"), false, &rules(), t0 + FREEZE_GRACE, None),
             RequestDecision::Block(BlockReason::Freeze)
         );
         assert_eq!(st.freeze.phase(), FreezePhase::Frozen);
@@ -3463,7 +4213,12 @@ mod request_decision_tests {
         );
         assert_eq!(classify_uri("https:///nothing"), UriClass::NetworkOpaque);
         assert_eq!(classify_uri("http://"), UriClass::NetworkOpaque);
-        for local in ["data:text/plain,x", "about:blank", "file:///x", "blob:https://x/1"] {
+        for local in [
+            "data:text/plain,x",
+            "about:blank",
+            "file:///x",
+            "blob:https://x/1",
+        ] {
             assert_eq!(classify_uri(local), UriClass::Local, "{local}");
         }
     }
@@ -3482,7 +4237,11 @@ mod request_decision_tests {
             let mut st = TabState::new(&TabPolicy::default());
             st.interception = state;
             st.freeze.freeze_with_interception(st.interception);
-            assert_eq!(st.freeze.enforcement(), FreezeEnforcement::Failed, "{state:?}");
+            assert_eq!(
+                st.freeze.enforcement(),
+                FreezeEnforcement::Failed,
+                "{state:?}"
+            );
             // The REQUEST stands, so the button still offers "unfreeze".
             assert_eq!(st.freeze.phase(), FreezePhase::Frozen);
         }
@@ -3513,7 +4272,7 @@ mod request_decision_tests {
     fn a_registered_tab_stays_pending_until_a_block_is_confirmed() {
         let mut st = registered_tab(TabPolicy::default());
         // Events having fired proves nothing about the block path.
-        st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now());
+        st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None);
         assert!(st.handler_events > 0);
 
         st.freeze.freeze_with_interception(st.interception);
@@ -3598,7 +4357,7 @@ mod request_decision_tests {
             let t0 = Instant::now();
             st.on_load_finished(t0);
             // Past the grace period: this request performs the auto-freeze.
-            let d = st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE);
+            let d = st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None);
             assert_eq!(d, RequestDecision::Block(BlockReason::Freeze), "{state:?}");
             assert_eq!(st.freeze.phase(), FreezePhase::Frozen);
             assert_eq!(
@@ -3620,7 +4379,7 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.on_load_finished(t0);
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None),
             RequestDecision::Block(BlockReason::Freeze)
         );
         assert_eq!(st.freeze.enforcement(), FreezeEnforcement::Pending);
@@ -3636,7 +4395,7 @@ mod request_decision_tests {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now()),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None),
             RequestDecision::Block(BlockReason::Freeze)
         );
         let before = st.ledger.snapshot();
@@ -3662,7 +4421,7 @@ mod request_decision_tests {
         for uri in ["", "   ", "HTTPS://Tracker.example/x", "HtTp://x.test/y"] {
             assert!(
                 matches!(
-                    st.decide_request(Some(uri), false, &rules(), Instant::now()),
+                    st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
                     RequestDecision::Block(_)
                 ),
                 "{uri:?} escaped a freeze"
@@ -3672,7 +4431,7 @@ mod request_decision_tests {
         // case, because they put no bytes on the wire.
         for uri in ["DATA:text/plain,x", "About:Blank"] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now()),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
                 RequestDecision::Allow,
                 "{uri:?} carries no traffic and must stay allowed"
             );
@@ -3697,7 +4456,7 @@ mod request_decision_tests {
             "http://rbchrome.localhost:80/",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now()),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
                 RequestDecision::Block(BlockReason::ReservedOrigin),
                 "{uri:?} reached the browser's own UI origin from content"
             );
@@ -3712,7 +4471,7 @@ mod request_decision_tests {
             "https://example.com/rbchrome.localhost",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now()),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
                 RequestDecision::Allow,
                 "{uri:?} is an ordinary address and must not be blocked"
             );
@@ -3793,7 +4552,7 @@ mod local_network_tests {
         ] {
             let mut st = insecure_tab();
             let uri = format!("http://{host}/status");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now());
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
             assert_eq!(
                 d,
                 RequestDecision::Block(BlockReason::LocalNetwork),
@@ -3810,7 +4569,7 @@ mod local_network_tests {
         for host in ["127.0.0.1", "192.168.1.1", "169.254.169.254"] {
             let mut st = secure_tab();
             let uri = format!("http://{host}/status");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now());
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
             assert_eq!(
                 d,
                 RequestDecision::Allow,
@@ -3838,7 +4597,7 @@ mod local_network_tests {
         ] {
             let mut st = insecure_tab();
             let uri = format!("http://{host}/page");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now());
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
             assert_eq!(d, RequestDecision::Allow, "{host} is public");
         }
     }
@@ -3853,8 +4612,7 @@ mod local_network_tests {
             Some("http://192.168.1.1/"),
             false,
             &RuleSet::default(),
-            Instant::now(),
-        );
+            Instant::now(), None);
         assert_eq!(d, RequestDecision::Allow);
     }
 
@@ -3879,8 +4637,7 @@ mod local_network_tests {
             Some("ws://192.168.1.1:8080/"),
             true,
             &RuleSet::default(),
-            Instant::now(),
-        );
+            Instant::now(), None);
         assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork));
     }
 
@@ -3894,8 +4651,7 @@ mod local_network_tests {
             Some("http://rebind.attacker.example/"),
             false,
             &RuleSet::default(),
-            Instant::now(),
-        );
+            Instant::now(), None);
         assert_eq!(
             d,
             RequestDecision::Allow,

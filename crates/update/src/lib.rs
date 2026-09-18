@@ -117,6 +117,7 @@
 
 #![forbid(unsafe_code)]
 
+mod advisory;
 mod delta;
 mod error;
 mod keys;
@@ -131,14 +132,19 @@ mod version;
 /// and hashes.
 pub mod hex;
 
+pub use advisory::{
+    verify_advisory_manifest, AdvisoryManifest, MAX_FUTURE_SECONDS as ADVISORY_MAX_FUTURE_SECONDS,
+    MAX_MAJOR_AHEAD as ADVISORY_MAX_MAJOR_AHEAD, SIGNING_DOMAIN_ADVISORY,
+};
 pub use delta::{apply_delta, compress as compress_delta};
 pub use error::UpdateError;
 pub use keys::TrustedKeys;
 pub use manifest::{
-    verify_blocklist_manifest, verify_manifest, BlocklistManifest, Delta, Manifest, Platform,
-    MAX_BLOCKLIST_BYTES, SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST,
+    verify_blocklist_manifest, verify_manifest, verify_model_manifest, BlocklistManifest, Delta,
+    EngineFloors, Manifest, ModelManifest, Platform, ReleaseKind, MAX_BLOCKLIST_BYTES,
+    MAX_MODEL_PACK_BYTES, SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST, SIGNING_DOMAIN_MODELS,
 };
-pub use payload::{verify_blocklist_bytes, verify_payload};
+pub use payload::{verify_blocklist_bytes, verify_model_bytes, verify_payload};
 pub use version::Version;
 
 use std::fmt;
@@ -391,6 +397,95 @@ mod tests {
         assert_eq!(d.size(), 7);
         assert_eq!(hex::encode(d.sha256()), delta_hash);
         assert!(m.delta_from(&[0u8; 32]).is_none());
+    }
+
+    /// The engine floor rides inside the signature, so only the publisher
+    /// can raise it; old manifests carry none; and the precision is exact,
+    /// because a three-field WebView2 floor would compare at the wrong depth
+    /// and call the exposed .53 and the fixed .62 the same runtime.
+    #[test]
+    fn the_engine_floor_is_signed_optional_and_exact_in_precision() {
+        let with = |floor: &str| {
+            let payload = good_payload().replace(
+                ",\"published_at\"",
+                &format!(",\"engine_floor\":{floor},\"published_at\""),
+            );
+            let envelope = sign(&payload, &signing_key(SEED_TRUSTED_A));
+            verify_manifest(envelope.as_bytes(), &trusted_keys())
+        };
+        let plain = verify_manifest(
+            sign(&good_payload(), &signing_key(SEED_TRUSTED_A)).as_bytes(),
+            &trusted_keys(),
+        )
+        .expect("must verify");
+        assert!(plain.engine_floors().is_empty());
+
+        let both = with("{\"webview2\":\"152.0.4191.62\",\"webkitgtk\":\"2.52.5\"}")
+            .expect("must verify");
+        assert_eq!(both.engine_floors().webview2(), Some(&[152, 0, 4191, 62][..]));
+        assert_eq!(both.engine_floors().webkitgtk(), Some(&[2, 52, 5][..]));
+        assert_eq!(both.engine_floors().for_engine("WebView2"), Some(&[152, 0, 4191, 62][..]));
+        assert_eq!(both.engine_floors().for_engine("Other"), None);
+
+        let only_one = with("{\"webview2\":\"153.0.4234.6\"}").expect("must verify");
+        assert_eq!(only_one.engine_floors().webkitgtk(), None);
+
+        for bad in [
+            "{\"webview2\":\"152.0.4191\"}",
+            "{\"webkitgtk\":\"2.52.5.1\"}",
+            "{\"webview2\":\"152.0.4191.beta\"}",
+            "{\"webview2\":\"\"}",
+            "{\"blink\":\"1.2.3.4\"}",
+        ] {
+            assert!(with(bad).is_err(), "accepted a malformed engine floor: {bad}");
+        }
+    }
+
+    /// THE SILENT-INSTALL POLICY, pinned. `installs_silently` is the one
+    /// place that decides whether a release may replace the browser without
+    /// telling anyone first, so every combination is asserted here rather
+    /// than inferred at the call site.
+    #[test]
+    fn only_an_unannounced_feature_release_waits_and_a_security_fix_never_does() {
+        let kinds = |kind: &str, security: bool| {
+            let payload = good_payload().replace(
+                ",\"published_at\"",
+                &format!(",\"kind\":\"{kind}\",\"security\":{security},\"published_at\""),
+            );
+            let envelope = sign(&payload, &signing_key(SEED_TRUSTED_A));
+            verify_manifest(envelope.as_bytes(), &trusted_keys()).expect("must verify")
+        };
+
+        // Maintenance: the quiet path, with or without a fix in it.
+        assert!(kinds("maintenance", false).installs_silently());
+        assert!(kinds("maintenance", true).installs_silently());
+
+        // A feature release is announced and waits for the user...
+        let feature = kinds("feature", false);
+        assert_eq!(feature.release_kind(), ReleaseKind::Feature);
+        assert!(!feature.installs_silently());
+
+        // ...UNLESS it carries a security fix, which must never sit behind a
+        // banner nobody clicked. This is the whole reason `security` is a
+        // separate field rather than a third kind.
+        let urgent = kinds("feature", true);
+        assert_eq!(urgent.release_kind(), ReleaseKind::Feature);
+        assert!(urgent.security());
+        assert!(urgent.installs_silently());
+    }
+
+    /// Backward compatibility, and it is load-bearing: every manifest already
+    /// published (0.9.65 among them) carries neither field. Reading those as
+    /// "maintenance, no security fix" is what keeps them installing exactly
+    /// as they always have instead of stalling behind a banner for a feature
+    /// nobody announced.
+    #[test]
+    fn a_manifest_without_the_new_fields_reads_as_quiet_maintenance() {
+        let envelope = sign(&good_payload(), &signing_key(SEED_TRUSTED_A));
+        let m = verify_manifest(envelope.as_bytes(), &trusted_keys()).expect("must verify");
+        assert_eq!(m.release_kind(), ReleaseKind::Maintenance);
+        assert!(!m.security());
+        assert!(m.installs_silently());
     }
 
     #[test]

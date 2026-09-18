@@ -124,9 +124,13 @@ is checked:
   "sha256": "<sha256 of that exact file, 64 hex chars>",
   "size": <size of that exact file, in bytes>,
   "published_at": <unix seconds>,
-  "notes": "<optional: a short user-facing blurb, shown in the update panel>"
+  "notes": "<optional: a short user-facing blurb, shown in the update panel>",
+  "engine_floor": {"webview2": "152.0.4191.66", "webkitgtk": "2.52.6"}
 }
 ```
+
+`engine_floor` is optional and is how an engine advisory reaches installed
+browsers WITHOUT a browser release; see "The engine floor" below.
 
 `platform` must be one of `linux-x86_64`, `linux-aarch64`, `macos-x86_64`,
 `macos-aarch64`, `windows-x86_64`. The set is closed: a platform the browser
@@ -197,7 +201,7 @@ Flatpak, the app id and the host name -- none of which a user reads as a name.
     PATANYX.exe          Windows
     PATANYX              Linux
     PATANYX.flatpak      Linux, Flatpak
-    PATANYX-Premium.exe  private build, NEVER published (until the paid tier
+    PATANYX-Nabu-X.exe   private build, NEVER published (until the paid tier
                          ships a delivery path; named PATANYX-chat.exe before
                          2026-08-05 -- chat is one premium feature, not the
                          whole of them)
@@ -365,7 +369,7 @@ uploads `<platform>.json` today needs a parallel upload step for
 `<platform>-beta.json`, or Beta subscribers get 404s forever the moment
 someone opts in. This is outside what the browser's code can enforce.
 
-`PATANYX-Premium.exe` (see "Artifact naming" above) stays never-published,
+`PATANYX-Nabu-X.exe` (see "Artifact naming" above) stays never-published,
 Beta included -- the public build is the only one either channel serves.
 
 ## Confirm what you published
@@ -389,6 +393,37 @@ raise it, and no install will ever accept that version again, whatever manifest
 appears.
 
 Bump it deliberately, in a commit of its own, naming the incident it answers.
+
+### The engine floor
+
+A different floor, for the engine underneath rather than for PATANYX itself.
+The browser renders with the platform's engine (WebView2 on Windows, WebKitGTK
+on Linux) and compiles in the oldest runtime it considers free of a known,
+exploited bug (`platform::MIN_WEBVIEW2`, `platform::MIN_WEBKITGTK`). Below
+that, Windows shows a banner naming the version that clears it; a Linux
+release build refuses to start.
+
+`engine_floor` in the signed payload RAISES that floor on every install that
+verifies the manifest, including installs already at the newest version: the
+check records the highest floors it has ever seen (`updates/engine-floor.json`)
+and the banner measures against them from then on, in the same session if the
+check just ran. So the day Microsoft's Edge security notes name an in-the-wild
+CVE and its fix version, re-sign the CURRENT manifest with the new floor and
+publish it; no build, no download, no install.
+
+Rules, all enforced by the signer's self-check or the client:
+
+- Either key is optional; unknown engine names are refused.
+- Precision is exact: `webview2` is four fields, `webkitgtk` three. The fourth
+  WebView2 field is where a fix lands (152.0.4191.62 carried CVE-2026-87491,
+  .66 did not).
+- A client only ever raises. A replayed older manifest cannot lower a floor.
+- A raised floor can make the browser WARN. It can never make it refuse to
+  start; that stays tied to the compiled constant, so a signed document is
+  not a kill switch.
+
+Raise the compiled constants too, in the next release, with the advisory text
+beside them; the manifest is the fast path, not the record.
 
 ## Scheduled checks, and what they do not do
 

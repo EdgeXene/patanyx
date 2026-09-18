@@ -38,7 +38,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-BIN="${BIN:-./target/debug/patanyx}"
+BIN="${BIN:-${CARGO_TARGET_DIR:-target}/debug/patanyx}"
 if [ ! -x "$BIN" ]; then
   echo "PROBE FAIL: no binary at $BIN (set BIN=...)" >&2
   exit 1

@@ -1,0 +1,17 @@
+# cargo-audit policy. Every ignore names the advisory, the reason it does not
+# reach this product, and what would make it reachable again.
+[advisories]
+ignore = [
+  # RUSTSEC-2026-0009: `time` 0.3.6..0.3.46 stack exhaustion when the RFC 2822
+  # parser (well_known::Rfc2822) is fed deprecated obs- constructs. Assessed
+  # 2026-09-16 for 1.0.0: `time` reaches the binary through cookie 0.18.1 <- wry,
+  # which parses Expires with four FIXED format descriptions (cookie
+  # src/parse.rs FMT1..FMT4) and never the RFC 2822 parser; on Windows wry
+  # never parses raw Set-Cookie text at all (cookie_from_win32 builds from the
+  # engine's parsed fields); the app parses no cookie text itself. The other
+  # path is liquid <- tract-linalg, a BUILD dependency with no attacker input.
+  # Upgrading is blocked by tract-linalg 0.21.17 pinning time <0.3.42; lifting
+  # it means tract 0.23 (OCR engine major), owed after 1.0.0. Re-check if any
+  # code starts calling Cookie::parse or time's Rfc2822 parser on page data.
+  "RUSTSEC-2026-0009",
+]

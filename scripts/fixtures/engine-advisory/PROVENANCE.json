@@ -1,0 +1,24 @@
+{
+  "description": "Direct-origin captures of the two fixed HTTPS sources the engine-advisory monitor reads, taken by root with fetch-runtime-evidence.py (no proxy, no cache, User-Agent PATANYX-runtime-evidence/1.0). Copied verbatim; the sha256 below is re-checked by test_engine_advisory_monitor.py so a fixture cannot drift from the capture it claims to be.",
+  "captured_by": "root, /root/link/patanyx-user-security/fetch-runtime-evidence.py",
+  "files": [
+    {
+      "file": "edge-security.html",
+      "url": "https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnotes-security",
+      "final_url": "https://learn.microsoft.com/en-us/deployedge/microsoft-edge-relnotes-security",
+      "http_status": 200,
+      "captured_central": "2026-09-11T06:16:57.192102-05:00",
+      "bytes": 222093,
+      "sha256": "c6e020de9fe1803c0f80632d4b78e71d778bc643dedb270923889d7892d4c674"
+    },
+    {
+      "file": "webview2-catalog-152.0.4191.66.html",
+      "url": "https://www.catalog.update.microsoft.com/Search.aspx?q=Microsoft%20Edge-WebView2%20Runtime%20152.0.4191.66",
+      "final_url": "https://www.catalog.update.microsoft.com/Search.aspx?q=Microsoft%20Edge-WebView2%20Runtime%20152.0.4191.66",
+      "http_status": 200,
+      "captured_central": "2026-09-11T06:16:57.688413-05:00",
+      "bytes": 57156,
+      "sha256": "35536a1c039dfacc10da874096ce3f1ccf49639b31a3a01dd94d0c8ce6fa38f2"
+    }
+  ]
+}

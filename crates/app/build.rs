@@ -129,6 +129,7 @@ fn embed_windows_resources() {
 
 fn main() {
     embed_windows_resources();
+    emit_chrome_msg_keys();
     let src = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap())
         .join("src")
         .join("blocklist.txt");
@@ -246,4 +247,166 @@ fn build_psl() {
         exception.len(),
         bytes.len()
     );
+}
+
+
+/// The chrome's marker keys, derived from the markup AT BUILD TIME so the
+/// fill snapshot's key list can never drift from index.html: a marker the
+/// build did not see does not exist to Rust, and a marker whose message is
+/// missing from ANY compiled catalog fails the build here, not at runtime.
+///
+/// The scanner accepts exactly the canonical form the extractor writes and
+/// the sync gate verifies (`data-msg...="key"`, double quotes, no spaces).
+/// A hand-authored marker in another style would be invisible to it -- and
+/// also fails scripts/i18n-html-check.py, which parses HTML properly, so
+/// the two checks disagree loudly instead of one drifting alone.
+fn emit_chrome_msg_keys() {
+    let root = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let html_path = root.join("src/chrome/index.html");
+    println!("cargo:rerun-if-changed={}", html_path.display());
+    let html = std::fs::read_to_string(&html_path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", html_path.display()));
+
+    let mut keys = Vec::new();
+    let mut at = 0;
+    while let Some(i) = html[at..].find("data-msg") {
+        let start = at + i;
+        let rest = &html[start..];
+        // data-msg or data-msg-<attr>, then ="key"
+        if let Some(eq) = rest.find('=') {
+            let name_ok = rest[..eq]
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c == '-');
+            let after = &rest[eq + 1..];
+            if name_ok && after.starts_with('"') {
+                if let Some(close) = after[1..].find('"') {
+                    let key = &after[1..1 + close];
+                    if !key.is_empty()
+                        && key
+                            .chars()
+                            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.')
+                    {
+                        keys.push(key.replace('.', "-"));
+                    }
+                }
+            }
+        }
+        at = start + "data-msg".len();
+    }
+    keys.sort();
+    keys.dedup();
+
+    // The JS-rendered strings reference messages through i18nText("id", ...)
+    // calls; scan them the same way, so the fill snapshot covers both
+    // surfaces and a call naming a message no catalog carries fails the
+    // build here rather than falling back at runtime.
+    let mut js = String::new();
+    for name in ["chrome.js", "integrity.js", "update.js", "chat.js"] {
+        let js_path = root.join("src/chrome").join(name);
+        println!("cargo:rerun-if-changed={}", js_path.display());
+        js.push_str(
+            &std::fs::read_to_string(&js_path)
+                .unwrap_or_else(|e| panic!("reading {}: {e}", js_path.display())),
+        );
+    }
+    for needle in ["i18nText(\"", "i18nResolve(\""] {
+        let mut at = 0;
+        while let Some(i) = js[at..].find(needle) {
+            let start = at + i + needle.len();
+        if let Some(close) = js[start..].find('"') {
+            let key = &js[start..start + close];
+            if !key.is_empty()
+                && key
+                    .chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            {
+                keys.push(key.to_string());
+            }
+        }
+            at = start;
+        }
+    }
+    // i18nSet(el, "id", ...): the id is the SECOND argument. Find the call,
+    // skip past the first comma, then read the quoted id.
+    let mut at2 = 0;
+    while let Some(i) = js[at2..].find("i18nSet(") {
+        let start = at2 + i + 8;
+        at2 = start;
+        let Some(comma) = js[start..].find(',') else { continue };
+        let rest = js[start + comma + 1..].trim_start();
+        if let Some(q) = rest.strip_prefix('"') {
+            if let Some(close) = q.find('"') {
+                let key = &q[..close];
+                if !key.is_empty()
+                    && key
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+                {
+                    keys.push(key.to_string());
+                }
+            }
+        }
+    }
+    // Data-driven label objects: id: "chrome-js-..." consumed via relabel
+    // lists (the emoji groups); the id is data but still names a message
+    // the fill snapshot must cover.
+    let mut at3 = 0;
+    while let Some(i) = js[at3..].find("id: \"chrome-js-") {
+        // +5 puts the cursor just past the opening quote, on the first
+        // character of the id itself.
+        let start = at3 + i + 5;
+        at3 = start;
+        if let Some(close) = js[start..].find('"') {
+            keys.push(js[start..start + close].to_string());
+        }
+    }
+    keys.sort();
+    keys.dedup();
+    assert!(
+        !keys.is_empty(),
+        "no data-msg markers found in index.html -- the scanner or the markup is broken"
+    );
+
+    // Every marker must resolve in EVERY compiled catalog. The catalog list
+    // here mirrors i18n.rs's CATALOGS; a locale added there without a line
+    // here still fails through the i18n tests, so the two cannot drift far.
+    for (tag, path) in [
+        ("en", "src/chrome/i18n/locales/en.ftl"),
+        ("en-XA", "src/chrome/i18n/locales/en-XA.ftl"),
+    ] {
+        let ftl_path = root.join(path);
+        println!("cargo:rerun-if-changed={}", ftl_path.display());
+        let ftl = std::fs::read_to_string(&ftl_path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", ftl_path.display()));
+        let have: std::collections::HashSet<&str> = ftl
+            .lines()
+            .filter_map(|l| {
+                let (id, _) = l.split_once('=')?;
+                let id = id.trim();
+                (!id.is_empty() && !id.starts_with('#')).then_some(id)
+            })
+            .collect();
+        for key in &keys {
+            assert!(
+                have.contains(key.as_str()),
+                "marker {key} has no message in the {tag} catalog -- a locale                  fill would erase that text at runtime"
+            );
+        }
+    }
+
+    let mut out = String::from(
+        "/// Every data-msg key in index.html, dash form, sorted. Generated by
+         /// build.rs; the fill snapshot resolves exactly this list.
+         pub const CHROME_MSG_KEYS: &[&str] = &[
+",
+    );
+    for key in &keys {
+        out.push_str(&format!("    {key:?},
+"));
+    }
+    out.push_str("];
+");
+    let dest = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("chrome_msg_keys.rs");
+    std::fs::write(&dest, out).unwrap_or_else(|e| panic!("writing {}: {e}", dest.display()));
+    println!("cargo:warning=i18n: {} chrome marker keys embedded", keys.len());
 }

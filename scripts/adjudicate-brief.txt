@@ -1,0 +1,40 @@
+You are adjudicating ONE host for the PATANYX Reported Host List.
+
+That list blocks PHISHING, and nothing else. Its published description is
+"sites reported as phishing, refused on sight". It ships to users who were
+told that is what it contains.
+
+The host below was reported by a phishing feed AND sits in the Tranco top
+10000, so a very large number of people use it. Blocking it also blocks every
+subdomain. The blocklist has no appeal path: a user simply sees a site that
+does not work, with no way to tell anyone it was wrong.
+
+Answer with EXACTLY ONE LINE, in one of these three forms, and nothing else:
+
+ALLOW|<one sentence saying what this host legitimately IS>
+CONFIRM|<one sentence saying what phishing it actually performs>
+UNSURE|<one sentence saying what you could not establish>
+
+Rules, which decide most cases without needing judgement:
+
+1. If the host is a legitimate service, platform, or company, answer ALLOW and
+   name what it is. A phishing feed reporting such a host is a feed error,
+   which is ordinary and expected.
+
+2. If the host is disreputable but NOT phishing -- warez, modded APKs, piracy,
+   cracks, torrents, adware -- answer ALLOW. It is out of scope. This is not a
+   general badness list, and quietly widening it is invisible to users and
+   unappealable by them.
+
+3. Answer CONFIRM only if the host's actual purpose is to impersonate someone
+   else in order to harvest credentials, payment details, or tokens. A
+   typosquat of a real brand is the clear case.
+
+4. If you cannot say positively what the host is, answer UNSURE.
+   "I could not find anything bad about it" is NOT a reason to ALLOW, and it
+   is not what ALLOW means here. A wrong ALLOW is invisible on every install
+   forever; a wrong CONFIRM at least shows the user a banner they can
+   override. When the two are close, UNSURE is the honest answer.
+
+Do not hedge, do not explain outside the single line, do not use markdown,
+do not repeat the host name at the start of your answer.

@@ -39,6 +39,37 @@ PHISHUNT_URL="https://phishunt.io/feed.txt"
 # CC0 is theirs to give. Never point this at the community feed.
 PHISHDESTROY_URL="https://raw.githubusercontent.com/phishdestroy/destroylist/main/list.txt"
 
+# ShadowWhisperer, added 2026-09-01. TWO lists, fetched and floored separately
+# because they are different feeds wearing one repository: Malware commits
+# several times a day, Scam every two to seven days. Averaging their cadence
+# into one threshold would either alert hourly on Scam or never notice Malware
+# freezing, which is the failure PDB_DEAD_HOURS exists to catch.
+#
+# WHY IT IS REDISTRIBUTABLE WHERE THE AGGREGATORS ARE NOT. The repository is
+# Unlicense (public-domain dedication) AND its README states "I will not merge
+# other lists" -- the lists are "made from a custom script and manual
+# additions". That second half is what matters: a permissive label on an
+# AGGREGATE cannot pass on rights the upstreams withheld, which is exactly why
+# PhishDestroy's community feed and Hagezi are refused further down. This is
+# the maintainer's own work, so the dedication is his to give.
+SHADOWWHISPERER_SCAM_URL="https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
+SHADOWWHISPERER_MALWARE_URL="https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malware"
+
+# ON BY DEFAULT since 2026-09-01, after the counts were confirmed on an
+# isolated run. It arrived off, and the reason is worth keeping: this script
+# feeds an HOURLY, UNATTENDED publisher that signs and ships to every install,
+# so a source that switched itself on at merge time would have published ~51k
+# hosts to the fleet on the next timer firing with nobody having decided to.
+# The decision has now been made deliberately, against measured numbers --
+# 581986 -> 633032, +8.77%, inside the 20% delta gate, all eighteen top-10000
+# hits adjudicated. Set BLOCKLIST_ENABLE_SHADOWWHISPERER=0 to build without it.
+#
+# When 0, NOTHING here runs: no fetch, no freshness entry, no snapshot, no
+# merge contribution and no header text. The output is byte-identical to a
+# build from before this source existed, which is the property the test
+# asserts.
+ENABLE_SW="${BLOCKLIST_ENABLE_SHADOWWHISPERER:-1}"
+
 # HTTPS only, including across redirects; a bounded size so a runaway response
 # cannot fill the disk; retries because this will run unattended and a single
 # transient 5xx should not freeze the fleet's list for an hour.
@@ -54,6 +85,11 @@ PHISHUNT_FLOOR=100
 # 183,460 on 2026-08-10. Same reasoning as the others: clear of ordinary churn,
 # high enough that a truncated fetch cannot pass for a real list.
 PHISHDESTROY_FLOOR=120000
+# Measured 2026-09-01: Scam 7,309 hosts, Malware 43,848. Same reasoning as the
+# floors above -- clear of ordinary churn, high enough that a truncated fetch
+# cannot pass for a real list.
+SW_SCAM_FLOOR=5000
+SW_MALWARE_FLOOR=30000
 
 # Freshness ceilings, in hours. The floors above catch a TRUNCATED feed; these
 # catch a FROZEN one, which the floors structurally cannot. Measured 2026-08-06:
@@ -84,6 +120,17 @@ PHISHUNT_DEAD_HOURS=72
 # closely as the one it was brought in to cover for.
 PHISHDESTROY_STALE_HOURS=48
 PHISHDESTROY_DEAD_HOURS=120
+# Calibrated against the real commit history on 2026-09-01, not guessed.
+# Lists/Malware: several commits a day (three on 2026-08-27 alone), so it earns
+# thresholds close to PhishDestroy's. Lists/Scam: gaps of two to seven days are
+# NORMAL for it, and it was eight days unchanged on the day it was wired in --
+# a 72h threshold would have paged on arrival and gone on paging, which is the
+# alert fatigue Phishing.Database is already generating. Fourteen days clears
+# the widest observed gap with margin; thirty says the curator has stopped.
+SW_SCAM_STALE_HOURS=336
+SW_SCAM_DEAD_HOURS=720
+SW_MALWARE_STALE_HOURS=72
+SW_MALWARE_DEAD_HOURS=168
 
 # phishunt is a ROLLING WINDOW, not a corpus. Measured 2026-08-10: the whole
 # dataset is ~714 entries, every one of them currently-live, and their API has
@@ -180,6 +227,44 @@ $CURL --max-time 120 --max-filesize 20000000 -o "$WORK/phishdestroy.txt" "$PHISH
   exit 1
 }
 
+# --- ShadowWhisperer, optional ----------------------------------------------
+#
+# The empty files are created UNCONDITIONALLY so every later step -- the merge
+# cat, the counts, the snapshot loop -- can reference them without a second
+# copy of the enable test. An empty file contributes nothing to `sort -u`, so
+# the disabled path really is byte-identical rather than merely equivalent.
+: > "$WORK/sw-scam.hosts"
+: > "$WORK/sw-malware.hosts"
+: > "$WORK/sw.hosts"
+SW_SCAM_N=0
+SW_MALWARE_N=0
+SW_N=0
+SW_SCAM_SHA=""
+SW_MALWARE_SHA=""
+
+if [ "$ENABLE_SW" = "1" ]; then
+  say "fetching ShadowWhisperer (Scam) ..."
+  $CURL --max-time 60 --max-filesize 5000000 -o "$WORK/sw-scam.txt" \
+    "$SHADOWWHISPERER_SCAM_URL" || {
+    say "FAIL: could not fetch $SHADOWWHISPERER_SCAM_URL"
+    say "  $OUT is unchanged."
+    exit 1
+  }
+
+  say "fetching ShadowWhisperer (Malware) ..."
+  $CURL --max-time 120 --max-filesize 20000000 -o "$WORK/sw-malware.txt" \
+    "$SHADOWWHISPERER_MALWARE_URL" || {
+    say "FAIL: could not fetch $SHADOWWHISPERER_MALWARE_URL"
+    say "  $OUT is unchanged."
+    exit 1
+  }
+
+  # Same `|| true` discipline as FETCHED_SHA above: hashing is bookkeeping and
+  # must never be the thing that stops a build under `set -e`.
+  SW_SCAM_SHA="$(sha256sum "$WORK/sw-scam.txt" 2>/dev/null | awk '{print $1}')" || true
+  SW_MALWARE_SHA="$(sha256sum "$WORK/sw-malware.txt" 2>/dev/null | awk '{print $1}')" || true
+fi
+
 # --- source freshness -------------------------------------------------------
 #
 # WHY LOCAL CONTENT TRACKING, and not the two obvious alternatives.
@@ -274,11 +359,33 @@ check_source_freshness() {
     [ -n "$pdb_hint" ] && say "  freshness: seeding Phishing.Database from its upstream commit date"
   fi
 
+  # Built as an ARRAY rather than inlined into the command, because the source
+  # set is no longer fixed: ShadowWhisperer joins only when enabled, and its two
+  # lists are tracked SEPARATELY. One "ShadowWhisperer" entry averaging a
+  # multiple-times-daily feed with a weekly one would report a healthy age for a
+  # Malware freeze as long as Scam kept moving -- the same blind spot the
+  # per-source thresholds exist to remove.
+  local -a src_args=(
+    "Phishing.Database:$FETCHED_SHA:$((PDB_STALE_HOURS * 3600)):$((PDB_DEAD_HOURS * 3600)):$pdb_hint"
+    "phishunt.io:$phishunt_hash:$((PHISHUNT_STALE_HOURS * 3600)):$((PHISHUNT_DEAD_HOURS * 3600)):"
+    "PhishDestroy:$phishdestroy_hash:$((PHISHDESTROY_STALE_HOURS * 3600)):$((PHISHDESTROY_DEAD_HOURS * 3600)):"
+  )
+  if [ "$ENABLE_SW" = "1" ]; then
+    if [ -n "$SW_SCAM_SHA" ] && [ -n "$SW_MALWARE_SHA" ]; then
+      src_args+=(
+        "ShadowWhisperer.Scam:$SW_SCAM_SHA:$((SW_SCAM_STALE_HOURS * 3600)):$((SW_SCAM_DEAD_HOURS * 3600)):"
+        "ShadowWhisperer.Malware:$SW_MALWARE_SHA:$((SW_MALWARE_STALE_HOURS * 3600)):$((SW_MALWARE_DEAD_HOURS * 3600)):"
+      )
+    else
+      # Narrow on purpose: the other three keep their timelines rather than the
+      # whole tracker skipping itself over one unhashable file.
+      say "  freshness: could not hash ShadowWhisperer; it is untracked this run"
+    fi
+  fi
+
   local result=""
   if ! result="$(python3 - "$SOURCE_STATE_FILE" "$SOURCE_STATUS_FILE" \
-      "Phishing.Database:$FETCHED_SHA:$((PDB_STALE_HOURS * 3600)):$((PDB_DEAD_HOURS * 3600)):$pdb_hint" \
-      "phishunt.io:$phishunt_hash:$((PHISHUNT_STALE_HOURS * 3600)):$((PHISHUNT_DEAD_HOURS * 3600)):" \
-      "PhishDestroy:$phishdestroy_hash:$((PHISHDESTROY_STALE_HOURS * 3600)):$((PHISHDESTROY_DEAD_HOURS * 3600)):" <<'PY'
+      "${src_args[@]}" <<'PY'
 import json, os, sys, tempfile, time
 
 state_path, status_path = sys.argv[1], sys.argv[2]
@@ -482,6 +589,55 @@ if [ "$PD_N" -lt "$PHISHDESTROY_FLOOR" ]; then
   say "FAIL: PhishDestroy returned $PD_N hosts, floor is $PHISHDESTROY_FLOOR."
   say "  $OUT is unchanged."
   exit 1
+fi
+
+# ShadowWhisperer ships bare lowercase domains under a ten-line comment header
+# which also DECLARES its own count ("# Domains: 43,848"). That declaration is
+# free integrity evidence of the same kind Phishing-Database's published sha256
+# gives us, so it is cross-checked -- and, like that checksum, it WARNS AND
+# PROCEEDS. It is written by the same generator that wrote the file, so it
+# catches truncation in transit, not a bad list; the floors below are what
+# actually refuse.
+sw_declared_count() {
+  sed -n 's/^#[[:space:]]*Domains:[[:space:]]*//p' "$1" | head -1 | tr -cd '0-9'
+}
+
+if [ "$ENABLE_SW" = "1" ]; then
+  # The same extraction the other feeds get. Today both lists are bare hosts
+  # with no URLs, ports or hosts-file prefixes; the full pipeline runs anyway,
+  # because a feed's shape is a fact about today's pull and not a guarantee.
+  for sw_pair in "Scam:sw-scam" "Malware:sw-malware"; do
+    sw_label="${sw_pair%%:*}" sw_file="${sw_pair##*:}"
+    grep -vE '^\s*(#|$)' "$WORK/$sw_file.txt" | tr -d '\r' | last_field | strip_to_host \
+      | tr 'A-Z' 'a-z' | sort -u > "$WORK/$sw_file.hosts"
+
+    sw_parsed=$(wc -l < "$WORK/$sw_file.hosts")
+    sw_declared="$(sw_declared_count "$WORK/$sw_file.txt")"
+    if [ -n "$sw_declared" ] && [ "$sw_declared" != "$sw_parsed" ]; then
+      say "  WARNING: ShadowWhisperer $sw_label declares $sw_declared hosts, parsed $sw_parsed"
+      say "    proceeding -- the floors and the acceptance filter still stand"
+      say "    between this and a bad list."
+    fi
+  done
+
+  SW_SCAM_N=$(wc -l < "$WORK/sw-scam.hosts")
+  SW_MALWARE_N=$(wc -l < "$WORK/sw-malware.hosts")
+  cat "$WORK/sw-scam.hosts" "$WORK/sw-malware.hosts" | sort -u > "$WORK/sw.hosts"
+  SW_N=$(wc -l < "$WORK/sw.hosts")
+  say "  ShadowWhisperer   : $SW_SCAM_N scam + $SW_MALWARE_N malware = $SW_N unique"
+
+  # FLOORED SEPARATELY. A truncated Scam fetch hiding behind a healthy Malware
+  # count is exactly what one combined floor would allow.
+  if [ "$SW_SCAM_N" -lt "$SW_SCAM_FLOOR" ]; then
+    say "FAIL: ShadowWhisperer Scam returned $SW_SCAM_N hosts, floor is $SW_SCAM_FLOOR."
+    say "  $OUT is unchanged."
+    exit 1
+  fi
+  if [ "$SW_MALWARE_N" -lt "$SW_MALWARE_FLOOR" ]; then
+    say "FAIL: ShadowWhisperer Malware returned $SW_MALWARE_N hosts, floor is $SW_MALWARE_FLOOR."
+    say "  $OUT is unchanged."
+    exit 1
+  fi
 fi
 
 # --- phishunt archive -------------------------------------------------------
@@ -882,8 +1038,11 @@ if [ "$ALLOW_N" -gt "$ALLOW_CEILING" ]; then
   exit 1
 fi
 
+# sw.hosts is empty unless ShadowWhisperer is enabled, so this line is
+# unconditional on purpose: one merge, one place to read, and no second copy of
+# the enable test that could drift out of step with the first.
 cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" "$WORK/phishdestroy.hosts" \
-  "$WORK/archive.hosts" | sort -u | filter_acceptable > "$WORK/merged.prepsl"
+  "$WORK/archive.hosts" "$WORK/sw.hosts" | sort -u | filter_acceptable > "$WORK/merged.prepsl"
 
 # --- bare public suffixes ---------------------------------------------------
 #
@@ -1072,10 +1231,24 @@ else
   fi
   # Rank is line number among data lines, which is why refresh-tranco.sh
   # verifies the ordering rather than trusting it.
+  # PLACEHOLDER ROWS ARE COUNTED BUT NEVER MATCHED. Tranco publishes
+  # `_wildcard_.<suffix>` rows. They are kept, because rank is line number and
+  # dropping rows would shift every rank below them -- but they must not be
+  # LOOKUP keys. It was long asserted here that they could not be: that an
+  # underscore "cannot survive filter_acceptable". That was wrong. Its class is
+  # [^a-z0-9._-], which PERMITS underscore, so `_wildcard_.ph` passes through
+  # intact and sits at rank 1846 -- inside the refuse band, not the report-only
+  # one. A feed emitting that literal string would therefore refuse the build
+  # and freeze hourly publishing for the whole fleet until someone adjudicated a
+  # hostname that does not exist and cannot resolve. Unlikely, and the same was
+  # true of the fourteen-day freeze. Counting without keying costs one line and
+  # makes the code do what the comment always claimed.
   LC_ALL=C awk -v refuse="$TRANCO_REFUSE_RANK" '
     NR == FNR {
       if ($0 ~ /^[[:space:]]*(#|$)/) next
-      rank[$0] = ++n
+      ++n
+      if ($0 ~ /^_wildcard_\./) next
+      rank[$0] = n
       next
     }
     ($0 in rank) { printf "%d\t%s\n", rank[$0], $0 }
@@ -1144,6 +1317,13 @@ NEW_FROM_PD=$(comm -13 \
 NEW_FROM_ARCHIVE=$(comm -13 \
   <(cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" | sort -u | filter_acceptable) \
   <(filter_acceptable < "$WORK/archive.hosts") | wc -l)
+# What ShadowWhisperer adds over every other input, which is the number that
+# says whether a fourth source earned its place. Measured 2026-09-01 before it
+# was wired in: 51,047 of its 51,157 were absent from the published list.
+NEW_FROM_SW=$(comm -13 \
+  <(cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" "$WORK/phishdestroy.hosts" \
+    "$WORK/archive.hosts" | sort -u | filter_acceptable) \
+  <(filter_acceptable < "$WORK/sw.hosts") | wc -l)
 
 # PERSIST THE PER-SOURCE HOST LISTS. They only ever existed inside $WORK, which
 # meant nothing downstream could answer "how many feeds report this host" --
@@ -1153,7 +1333,14 @@ NEW_FROM_ARCHIVE=$(comm -13 \
 # fail because a review aid could not be written.
 SNAPSHOT_DIR="${BLOCKLIST_SNAPSHOT_DIR:-/var/lib/patanyx-blocklist/sources}"
 if mkdir -p "$SNAPSHOT_DIR" 2>/dev/null; then
-  for pair in "Phishing.Database:pdb" "phishunt.io:phishunt" "PhishDestroy:phishdestroy"; do
+  snapshot_pairs=("Phishing.Database:pdb" "phishunt.io:phishunt" "PhishDestroy:phishdestroy")
+  # Only when enabled. Writing empty snapshots for a disabled source would tell
+  # review-blocklist-fps.py that a feed reports nothing, which reads as
+  # "uncorroborated" for every host rather than "not consulted".
+  if [ "$ENABLE_SW" = "1" ]; then
+    snapshot_pairs+=("ShadowWhisperer.Scam:sw-scam" "ShadowWhisperer.Malware:sw-malware")
+  fi
+  for pair in "${snapshot_pairs[@]}"; do
     name="${pair%%:*}" file="${pair##*:}"
     # Same temp-then-rename discipline as everywhere else: a reader must never
     # catch one of these half-written.
@@ -1164,6 +1351,53 @@ if mkdir -p "$SNAPSHOT_DIR" 2>/dev/null; then
   say "  snapshots         : per-source host lists written to $SNAPSHOT_DIR"
 else
   say "  snapshots         : cannot write $SNAPSHOT_DIR; corroboration data skipped"
+fi
+
+# ASSEMBLED BEFORE THE HEREDOC, and empty when the source is off. The variable
+# is interpolated with NO surrounding blank line below, so an empty value
+# leaves the header exactly as it was before this source existed -- that is
+# what makes the disabled build byte-identical rather than merely similar. The
+# value therefore has to carry its own trailing newline; a $( ) substitution
+# would strip it and silently glue two paragraphs together.
+SW_SOURCE_BLOCK=""
+SOURCE_COUNT_WORD="three"
+if [ "$ENABLE_SW" = "1" ]; then
+  SOURCE_COUNT_WORD="four"
+  SW_SOURCE_BLOCK="# 4. ShadowWhisperer -- https://github.com/ShadowWhisperer/BlockLists --
+#    Lists/Scam and Lists/Malware -- $SW_N hosts, of which $NEW_FROM_SW were
+#    not already covered by any list above.
+#
+# The Unlicense (public domain dedication). From the repository's LICENSE:
+# \"This is free and unencumbered software released into the public domain.
+# Anyone is free to copy, modify, publish, use, compile, sell, or distribute
+# this software, either in source code form or as a compiled binary, for any
+# purpose, commercial or non-commercial, and by any means.\" Attribution is
+# not required; it is given here on the same principle as phishunt and
+# PhishDestroy above.
+#
+# THE DEDICATION IS HIS TO GIVE, which is the test every source here has to
+# pass and the one most aggregate feeds fail. The README states \"I will not
+# merge other lists\" and describes the lists as made from a custom script and
+# manual additions. A public-domain label on an AGGREGATE would be worth
+# nothing, because it cannot pass on rights the upstreams withheld -- exactly
+# why PhishDestroy's community feed and Hagezi's TIF are refused below.
+#
+# WHY IT WAS ADDED. Phishing.Database froze on 2026-08-01, resumed, then froze
+# AGAIN on 2026-08-23 while still supplying two thirds of this list. Two
+# freezes is a flapping source rather than an outage, and the answer to that is
+# a fourth independent feed operator, not a tighter alert on the third.
+#
+# WHAT IT IS NOT. This is one curator's work, so it is a SINGLE opinion: of the
+# 51,157 hosts measured on 2026-09-01, none of the eighteen that fell in the
+# Tranco top 10,000 appeared anywhere in a 2.18M-host aggregate threat feed
+# consulted as a cross-check. Its Scam list corroborated at 82% against that
+# feed, its Malware list at 22%. Those eighteen were adjudicated by hand before
+# this shipped: nine to blocklist-allow.txt as false positives or out of scope,
+# nine to blocklist-confirm.txt. The Malware list also reaches into adware and
+# PUP territory, which a phishing list has no business shipping -- entries of
+# that kind belong in the allowlist, and clickadu.net is the worked example.
+#
+"
 fi
 
 TODAY=$(date -u +%Y-%m-%d)
@@ -1292,7 +1526,7 @@ cat > "$WORK/out.txt" <<HEADER
 # resolves nowhere cannot be serving a phishing page. The per-tab override in
 # the blocked banner exists for the cases this still gets wrong.
 #
-# WHY THESE SOURCES. All three of the sources ABOVE are permissively licensed
+${SW_SOURCE_BLOCK}# WHY THESE SOURCES. All $SOURCE_COUNT_WORD of the sources ABOVE are permissively licensed
 # and redistributable inside a shipped browser; a further input, described
 # under REMOVED ENTRIES, is only ever subtracted and is never redistributed.
 #

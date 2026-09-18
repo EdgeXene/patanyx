@@ -39,7 +39,7 @@
        ci-trixie.sh and build-flatpak.sh.
        WHY THAT GATE EXISTS: the comment that used to sit here declared the
        drift "RESOLVED as of 2026-07-28: this, crates/app/Cargo.toml agree on
-       0.9.0." That was true when written and false by 0.9.52 -- the crate was
+       0.9.0." That was true when written and false by 0.9.52: the crate was
        bumped five times and this file was never touched, because nothing
        compared them. The same shape as every other defect in this project's
        history: a careful comment asserting a constraint nobody re-checked.
@@ -48,6 +48,18 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.0" date="2026-09-20">
+      <description>
+        <p>First stable release. Page translation runs on your own computer with language packs that download once and work offline. Notifications are centered, bold, dismissible, and no longer truncate. A locked vault now says why a password was not saved, a password the vault already holds is not offered for saving twice, and forty-four interface strings that stayed English in every language now translate.</p>
+      </description>
+    </release>
+    <release version="0.9.66" date="2026-08-25">
+      <description>
+        <p>Affiliate partner cards now appear in the DNS, Private Tunnel, Vault and Deep Recall panels. Each placement is labeled where it appears, and the About panel explains that PATANYX may earn a commission.</p>
+        <p>Premium activation and release no longer blame the user's network for an expired, not-yet-valid, revoked or name-mismatched certificate. The interception warning is reserved for an unknown issuer or a bad certificate signature.</p>
+        <p>The release gates now ignore comments when checking for unsafe chrome DOM writes, pin the intended release version as well as agreement between manifests, and keep throwaway licence keys entirely inside detached builds.</p>
+      </description>
+    </release>
     <release version="0.9.65" date="2026-08-19">
       <description>
         <p>Fingerprint Divergence is free, permanently, and on by default. Turning its noise off for named sites is free with it; that used to ask for a Premium license and no longer does.</p>
@@ -72,7 +84,7 @@
     <release version="0.9.63" date="2026-08-17">
       <description>
         <p>The tab pack: Multi-Tab Search finds a word across every open tab and shows a snippet from each; the Tab Switcher finds a tab by a few letters of its title or address; Batch Tab Actions select several tabs and close, bookmark, or shelve them together. These three ask for a Premium license from day one and unlock when Premium launches. Bookmark Search in the Library is free and ranks the closest match first, even with letters missing.</p>
-        <p>Text Capture reads the text inside a box you drag on the page. Deep Recall keeps the pages you choose to save and finds them later by a word you remember. Divergence Exceptions turn fingerprint noise off for named sites; Fingerprint Divergence itself is switched on for everyone in this release. In the separate PATANYX-Premium build, Copy Compare asks a contact whether their download hashes the same as yours, and Change Cross-Check asks whether a page changed for them too. All of these ask for a Premium license from day one.</p>
+        <p>Text Capture reads the text inside a box you drag on the page. Deep Recall keeps the pages you choose to save and finds them later by a word you remember. Divergence Exceptions turn fingerprint noise off for named sites; Fingerprint Divergence itself is switched on for everyone in this release. In the separate PATANYX Nabu-X build, Copy Compare asks a contact whether their download hashes the same as yours, and Change Cross-Check asks whether a page changed for them too. All of these ask for a Premium license from day one.</p>
         <p>Cookies can be cleared for every site at once. Premium controls now show as locked instead of refusing after the click. A Premium license may carry no expiry. The reported host list is refreshed and the wording is American English throughout.</p>
         <p>Started without a page, the browser opens PATANYX Search at patanyx.com. A page handed to it on launch opens instead, as before, and new tabs stay blank.</p>
         <p>The accent color now frames the whole window and tints the tab strip, toolbar and address bar; on Windows 11 the title bar and the window border wear it as well. The browser's own scrollbars follow it, and on Windows so do the scrollbars of the pages you open, which means a page can read the accent you chose. The nine accents have names of their own; all nine, and all three chrome color schemes, are free. The feature buttons can sit in a strip down the left edge instead of above the page. A Premium license will activate on up to five devices: one request when the vault first opens after the token is pasted, retried at the next unlock if it could not get through, and checked offline from then on; releasing a device frees its slot, and a license allows a limited number of activations in all.</p>

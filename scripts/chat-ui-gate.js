@@ -132,6 +132,54 @@ function textsWritten() {
   return out;
 }
 
+check(
+  "chat notifications go through the one notification implementation",
+  async () => {
+    // chat.js is a SEPARATE script and cannot see into chrome.js's closure, so
+    // it used to carry its own `toast()`: a plain .toast, no dismiss button,
+    // removed after 6000ms. It inherited the centred bold styling for free and
+    // so LOOKED identical to every other notification while behaving like the
+    // old ones. The ruling was that ALL notifications get the X and the
+    // 15-second life, so chat must delegate rather than reimplement.
+    //
+    // The first version of this check emitted an event nothing handled and
+    // then, finding its spy uncalled, CALLED THE SPY ITSELF and asserted it
+    // had been called. It passed with delegation removed. This one drives a
+    // real path -- `chat_notice` with no peer hash reaches `toast(text, true)`
+    // in onChatNotice -- and asserts the arguments that arrive.
+    assert(
+      typeof global.window.__rb_toast === "function",
+      "chrome.js no longer publishes the shared notification helper, so chat " +
+        "has nothing to delegate to",
+    );
+    const real = global.window.__rb_toast;
+    const seen = [];
+    global.window.__rb_toast = (text, isError) => seen.push({ text, isError });
+    try {
+      global.window.__rb_event({
+        event: "chat_notice",
+        data: { reason: "peer_offline" },
+      });
+      await flush();
+    } finally {
+      global.window.__rb_toast = real;
+    }
+    assert(
+      seen.length === 1,
+      `a chat notice must reach the shared helper exactly once, got ${seen.length}`,
+    );
+    assert(
+      typeof seen[0].text === "string" && seen[0].text.length > 0,
+      "chat forwarded an empty message: " + JSON.stringify(seen[0].text),
+    );
+    assert(
+      seen[0].isError === true,
+      "a chat notice is an error notice; the flag must survive delegation, got " +
+        JSON.stringify(seen[0].isError),
+    );
+  },
+);
+
 check("an out-message is drawn at Sending, not as delivered", async () => {
   await openConversation();
   global.rbResolve = { chat_send: { mid: MID } };
@@ -432,6 +480,146 @@ check("emoji are text, never a fetched asset", () => {
     "chrome.css must name the platform emoji faces, so a glyph renders in the " +
       "system's own artwork rather than falling back to tofu",
   );
+});
+
+// ---- Premium ---------------------------------------------------------------
+// Private chat is a Premium feature (decided 2026-08-16, gated by LICENCE
+// inside the PATANYX-Premium build, not only by which build carries the
+// code). Two halves are pinned: the Rust arms that act ask the gate first,
+// and the panel explains the lock with the shared sentence rather than the
+// tab pack's "Find across tabs" wording that `friendly` maps the code to.
+
+// chrome.js re-reads premium_status on a handful of user actions; a Text
+// Capture click-and-cancel is the cheapest one that leaves no panel open.
+async function setPremium(premium) {
+  global.rbResolve.premium_status = {
+    state: premium ? "active" : "none",
+    premium,
+    on_sale: true,
+  };
+  global.$("btn-ocr-region")._fire("click");
+  await flush();
+  global.$("btn-ocr-region")._fire("click");
+  await flush();
+}
+
+check("the Rust chat arms that ACT ask the Premium gate first", () => {
+  const ipc = fs.readFileSync(
+    path.join(root, "crates/app/src/ipc.rs"),
+    "utf8",
+  );
+  const gated = [
+    "chat_identity_create",
+    "chat_contact_note",
+    "chat_go_online",
+    "chat_set_away",
+    "chat_relay_set",
+    "chat_contact_add",
+    "chat_open",
+    "chat_send",
+    "chat_send_tab",
+    "chat_share_credential",
+    "chat_accept_tab",
+    "corroborate_request",
+  ];
+  for (const arm of gated) {
+    const re = new RegExp('"' + arm + '" => \\{\\s*chat_gate\\(\\)\\?;');
+    assert(re.test(ipc), arm + " must call chat_gate() before anything else");
+  }
+  // Reads stay readable, and turning chat OFF is never gated: a lapse must
+  // not strand someone online with no way out.
+  const open = [
+    "chat_identity",
+    "chat_contacts",
+    "chat_status",
+    "chat_peers",
+    "chat_relay_get",
+    "chat_go_offline",
+    "chat_close",
+    "chat_contact_remove",
+  ];
+  for (const arm of open) {
+    const re = new RegExp('"' + arm + '" => crate::chat_panel::');
+    assert(re.test(ipc), arm + " must stay a plain, ungated arm");
+  }
+  assert(
+    /fn chat_gate\(\) -> Result<\(\), &'static str> \{\s*crate::tab_search::cross_tab_gate\(crate::licence_control::premium_active\(\)\)/.test(
+      ipc,
+    ),
+    "chat_gate must be the licence gate, not a stub",
+  );
+});
+
+check("#btn-chat is marked data-premium so the toolbar pill locks", () => {
+  const html = fs.readFileSync(process.env.HTML_PATH, "utf8");
+  const btn = html.match(/<button\s+id="btn-chat"[\s\S]*?>/);
+  assert(btn, "index.html must carry #btn-chat");
+  assert(/data-premium="1"/.test(btn[0]), "#btn-chat must carry data-premium");
+});
+
+check("without Premium the panel shows the standing lock note in place", async () => {
+  await setPremium(false);
+  global.rbResolve.chat_identity = { hash: MY_HASH, minted: false };
+  global.$("btn-chat")._fire("click");
+  await flush();
+  const note = global.$("chat-premium-note");
+  assert(note && note.hidden === false, "the note must be visible");
+  const text = note._text[note._text.length - 1] || "";
+  assert(/Premium/.test(text), "the note names Premium: " + JSON.stringify(text));
+  assert(!/Find across tabs/.test(text), "never the tab pack's sentence");
+  global.$("btn-chat")._fire("click");
+  await flush();
+});
+
+check("a premium_required refusal is explained with the lock note", async () => {
+  await setPremium(false);
+  global.rbResolve.chat_identity = { hash: null, minted: false };
+  global.$("btn-chat")._fire("click");
+  await flush();
+  global.rbReject = "premium_required";
+  global.$("chat-mint")._fire("click");
+  await flush();
+  global.rbReject = null;
+  const err = global.$("chat-intro-error");
+  const text = err._text[err._text.length - 1] || "";
+  assert(/Premium/.test(text), "the error names Premium: " + JSON.stringify(text));
+  assert(!/Find across tabs/.test(text), "never the tab pack's sentence");
+  global.$("btn-chat")._fire("click");
+  await flush();
+});
+
+check("a licence change re-renders the note while the panel stays open", async () => {
+  await setPremium(false);
+  global.rbResolve.chat_identity = { hash: MY_HASH, minted: false };
+  global.$("btn-chat")._fire("click");
+  await flush();
+  const note = global.$("chat-premium-note");
+  assert(note.hidden === false, "precondition: note visible without Premium");
+  // The token is pasted and activated while chat is open: Rust emits
+  // licence_changed, chrome.js re-reads premium_status. No click, no pane
+  // change -- the note must still follow.
+  global.rbResolve.premium_status = { state: "active", premium: true, on_sale: true };
+  global.window.__rb_event({ event: "licence_changed" });
+  await flush();
+  assert(note.hidden === true, "the note must hide on licence_changed alone");
+  // And back: a removed token brings it back without a reopen.
+  global.rbResolve.premium_status = { state: "none", premium: false, on_sale: true };
+  global.window.__rb_event({ event: "licence_changed" });
+  await flush();
+  assert(note.hidden === false, "the note must return when the licence is removed");
+  global.$("btn-chat")._fire("click");
+  await flush();
+});
+
+check("with Premium the standing note is gone", async () => {
+  await setPremium(true);
+  global.rbResolve.chat_identity = { hash: MY_HASH, minted: false };
+  global.$("btn-chat")._fire("click");
+  await flush();
+  const note = global.$("chat-premium-note");
+  assert(note && note.hidden === true, "the note must hide once Premium is on");
+  global.$("btn-chat")._fire("click");
+  await flush();
 });
 
 (async () => {

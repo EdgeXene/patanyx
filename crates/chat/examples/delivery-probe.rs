@@ -120,26 +120,42 @@ fn main() {
     }
 
     // ...and alice must learn that from bob's own key, not from having sent it.
+    //
+    // THIS LOOP DOES NOT USE `wait_for`, so it used to be the one window the
+    // trace could not see -- which was exactly the window an intermittent
+    // failure lived in. It traces every event itself now, with elapsed time,
+    // because the ORDER and TIMING of a link event against the delivery event
+    // is the whole diagnosis.
+    let trace = std::env::var_os("PATANYX_PROBE_TRACE").is_some();
+    let started = Instant::now();
     let mut states: Vec<Delivery> = Vec::new();
-    let deadline = Instant::now() + DELIVERY_TIMEOUT;
+    let deadline = started + DELIVERY_TIMEOUT;
     while Instant::now() < deadline {
         match alice_events.recv_timeout(Duration::from_millis(200)) {
             Ok(TransportEvent::Delivery { mid: got, state, .. }) if got == mid => {
-                println!("  delivery: {}", state.as_str());
+                // `{state:?}`, never `state.as_str()`. as_str collapses every
+                // Failed(reason) to the bare word "failed", and the reason is
+                // the entire difference between "the ack timed out" and "the
+                // link went away underneath a message that had arrived".
+                // Discarding it turned a diagnosable defect into a flake.
+                println!("  delivery: {state:?} (+{}ms)", started.elapsed().as_millis());
                 states.push(state);
                 if state.is_terminal() {
                     break;
                 }
             }
-            Ok(_) => {}
+            Ok(other) => {
+                if trace {
+                    eprintln!("    +{}ms {other:?}", started.elapsed().as_millis());
+                }
+            }
             Err(_) => {}
         }
     }
     match states.last() {
         Some(Delivery::Delivered) => println!("  acknowledged by bob's key"),
         other => failures.push(format!(
-            "expected Delivered, observed {:?}",
-            other.map(|s| s.as_str())
+            "expected Delivered, observed {other:?}"
         )),
     }
     if states.first() != Some(&Delivery::Sending) {

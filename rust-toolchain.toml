@@ -8,6 +8,6 @@
 # Bumping this is a deliberate act that CHANGES EVERY PUBLISHED HASH. When it
 # moves, the release notes have to say so.
 [toolchain]
-channel = "1.96.0"
+channel = "1.98.0"
 components = ["rustfmt", "clippy"]
 targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]

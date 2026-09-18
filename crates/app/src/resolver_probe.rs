@@ -1,10 +1,10 @@
-//! Noticing when the chosen DNS resolver cannot be reached.
+//! Noticing when the DNS resolver in force cannot be reached.
 //!
-//! Picking Mullvad or Quad9 configures WebView2 in `secure` mode, which FAILS
-//! CLOSED: if that resolver is unreachable the browser does not resolve at all
-//! rather than accepting whatever the network offers. That is the point of the
-//! setting. It also means a user who picked a resolver and then walked into a
-//! hotel sees every page fail with no explanation -- captive portals work BY
+//! Choosing Quad9 configures WebView2 in `secure` mode, which FAILS CLOSED:
+//! if that resolver is unreachable the browser does not resolve at all rather
+//! than accepting whatever the network offers. That is the point of the
+//! setting. It also means a user who chose it and then walked into a hotel
+//! sees every page fail with no explanation -- captive portals work BY
 //! hijacking DNS, so fail-closed is exactly what breaks them.
 //!
 //! This module notices that state and says so. It does not fix it.
@@ -154,11 +154,27 @@ impl Watch {
     /// `about:blank` or an internal page as success would let a broken network
     /// flap the banner, because the interstitial the user is looking at is
     /// itself a successful load of nothing.
+    /// A page loaded. The verdict is cleared; the PROBE BUDGET is not.
+    ///
+    /// `probed_at` used to be reset here, which meant a network that
+    /// alternated one success and one failure could draw one HTTPS request
+    /// to the resolver per failure, with the 60-second window never taking
+    /// effect. The window is a promise about how often this browser talks
+    /// to the resolver on its own; a success does not renew it. The cost is
+    /// that a failure inside the window after a success waits for the
+    /// window to pass before it can raise the banner, which is bounded and
+    /// stated in PROBE_FRESH_FOR's doc.
     pub fn on_navigation_succeeded(&mut self) {
         self.failures = 0;
         self.probe = Probe::Reachable;
-        self.probed_at = None;
         self.dismissed = false;
+    }
+
+    /// The probe could not even start (the worker thread failed to spawn).
+    /// Nothing is in flight, so the next failure may try again; the previous
+    /// verdict and its timestamp are left alone.
+    pub fn on_probe_aborted(&mut self) {
+        self.in_flight = false;
     }
 
     /// A probe finished.
@@ -217,7 +233,7 @@ impl Watch {
 /// That last clause is what makes this detect a captive portal at all, and it
 /// is the one property this function must never lose. A portal intercepts DNS,
 /// so the resolver's name resolves to the portal's address -- and the portal
-/// cannot present a certificate for `base.dns.mullvad.net`. Certificate
+/// cannot present a certificate for `dns.quad9.net`. Certificate
 /// validation is therefore the detector. With validation disabled this
 /// function would cheerfully connect to the portal, report the resolver
 /// reachable, and the banner would never appear on the one network it exists
@@ -227,6 +243,13 @@ pub fn probe_now(template: &str) -> bool {
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(PROBE_TIMEOUT)
         .timeout(PROBE_TIMEOUT)
+        // NO REDIRECTS. This request exists to prove a TLS session to the
+        // template's own hostname; following a 3xx would send a second
+        // request wherever the answer pointed, with this user agent, which
+        // is egress the design does not intend. ureq follows five by
+        // default. A 3xx counts as "reached it" below, like any other
+        // status, because the certificate check already happened.
+        .redirects(0)
         // The minimum a server needs; this request is about reachability, not
         // about telling anyone who we are.
         .user_agent("patanyx")
@@ -256,6 +279,17 @@ pub fn probe_now(_template: &str) -> bool {
 // The live instance, and the seams the rest of the app talks to.
 // ---------------------------------------------------------------------------
 
+// The encrypted choice fails closed, and the ONLY explanation a stranded user
+// gets is the banner this module raises from a real probe. A Windows build
+// without the network feature would offer that choice with a stub that
+// always answers "reachable", so the banner could never appear. Refuse to
+// build that combination rather than ship it.
+#[cfg(all(windows, not(feature = "updater-net")))]
+compile_error!(
+    "PATANYX on Windows offers a fail-closed encrypted resolver; the `updater-net` \
+     feature (the reachability probe behind the resolver-unreachable banner) is required"
+);
+
 use std::sync::Mutex;
 
 use serde_json::{json, Value};
@@ -275,12 +309,17 @@ fn with_watch<T>(f: impl FnOnce(&mut Watch) -> T) -> T {
     f(guard.get_or_insert_with(Watch::default))
 }
 
-/// The resolver the user chose, or `None` when they are on System.
+/// The resolver the ENGINE is running, or `None` when it is on System.
 ///
 /// `None` disables this whole feature, correctly: System carries no DoH mode,
 /// so it never fails closed and there is no captive-portal breakage to explain.
+/// The APPLIED resolver, not the file: the file can change under a running
+/// engine (a choice pending a restart, or the file becoming unreadable and
+/// reading as the System default), and probing a resolver the engine is not
+/// using would explain a failure that has a different cause. On Linux no
+/// engine ever records one, so this is `None` there and nothing probes.
 fn configured_template() -> Option<&'static str> {
-    crate::prefs::load().dns.doh_template()
+    crate::prefs::applied_dns().doh_template()
 }
 
 /// A navigation finished. `success` is the engine's own verdict; `looks_dead`
@@ -288,10 +327,37 @@ fn configured_template() -> Option<&'static str> {
 ///
 /// Called from the platform layer's existing navigation callback, so no new
 /// engine hook and no contact with content webviews.
+/// Whether the engine's traffic rides the Private Tunnel, now or since boot.
+///
+/// The probe must not run then. `ureq` does not use the engine's proxy, so
+/// the probe would leave the machine DIRECT -- from the user's real address,
+/// with the resolver's name in the clear -- and its trigger, a failed
+/// navigation, is exactly what a tunnel outage produces -- so every tunnel
+/// user who also chose Quad9 would be exposed at the moment they are most
+/// exposed. The tunnel's own fail-closed banner explains that outage, so
+/// nothing is lost by staying silent here. Both the current setting and the
+/// booted one count: `engine_proxy_port` is Some whenever the mode is
+/// Imported (bound, or the dead port), and `restart_pending` is true when
+/// the booted mode differs from the current one.
+///
+/// Verified by reading, not by a unit test: both inputs are process-global
+/// tunnel state, and the callers below take an event-loop proxy.
+fn tunnel_is_the_route() -> bool {
+    crate::tunnel_control::engine_proxy_port().is_some()
+        || crate::tunnel_control::restart_pending()
+}
+
 pub fn note_navigation(success: bool, looks_dead: bool, proxy: &EventLoopProxy<UserEvent>) {
     let Some(template) = configured_template() else {
         return;
     };
+    // Checked only on the one shape of event that can lead to a probe, so a
+    // successful navigation never pays for the tunnel state reads. And
+    // checked BEFORE the state machine sees the failure, so it never waits
+    // for a probe result that will not come.
+    if !success && looks_dead && tunnel_is_the_route() {
+        return;
+    }
     let now = Instant::now();
     let action = with_watch(|w| {
         if success {
@@ -319,12 +385,18 @@ pub fn note_navigation(success: bool, looks_dead: bool, proxy: &EventLoopProxy<U
 /// reason about than a worker that must be shut down cleanly on quit.
 fn spawn_probe(template: &'static str, proxy: &EventLoopProxy<UserEvent>) {
     let proxy = proxy.clone();
-    let _ = std::thread::Builder::new()
+    let spawned = std::thread::Builder::new()
         .name("resolver-probe".into())
         .spawn(move || {
             let reachable = probe_now(template);
             let _ = proxy.send_event(UserEvent::ResolverProbe(reachable));
         });
+    // A thread that never started would never answer, and `in_flight` would
+    // stay set forever: no later failure and no manual retry could probe
+    // again, for the rest of the session. Clear it so the next one can.
+    if spawned.is_err() {
+        with_watch(|w| w.on_probe_aborted());
+    }
 }
 
 /// A probe came back. Called on the UI thread from the main loop.
@@ -339,16 +411,33 @@ pub fn on_probe_result(reachable: bool, proxy: &EventLoopProxy<UserEvent>) {
 /// URL, nothing derived from what was browsed.
 fn notify(proxy: &EventLoopProxy<UserEvent>) {
     let visible = with_watch(|w| w.banner_visible(Instant::now()));
-    let mode = crate::prefs::load().dns.as_str();
+    let mode = crate::prefs::applied_dns().as_str();
     let _ = proxy.send_event(UserEvent::ResolverBanner { visible, mode });
 }
 
-pub fn ipc_status() -> Result<Value, &'static str> {
-    let mode = crate::prefs::load().dns;
+/// The banner's whole sentence, composed here for BOTH producers -- the
+/// probe event and the boot-time status reply -- so a banner restored at
+/// startup can never render an empty claim. The resolver's display name
+/// comes from the catalog too: proper nouns today, but the fallback phrase
+/// is language, and one path for all of it beats a special case.
+pub fn banner_body(i18n: &crate::i18n::I18n, mode: &str) -> String {
+    let name = i18n.text(match mode {
+        "quad9" => crate::i18n::keys::CHROME_JS_DNS_SHORT_QUAD9,
+        _ => crate::i18n::keys::CHROME_RESOLVER_NAME_FALLBACK,
+    });
+    let mut args = crate::i18n::Args::default();
+    args.set("name", name);
+    i18n.resolve(crate::i18n::keys::CHROME_RESOLVER_BODY, &args)
+}
+
+pub fn ipc_status(i18n: &crate::i18n::I18n) -> Result<Value, &'static str> {
+    // The banner is about the resolver the engine is RUNNING.
+    let mode = crate::prefs::applied_dns();
     Ok(json!({
         "supported": cfg!(windows),
         "mode": mode.as_str(),
         "showing": with_watch(|w| w.banner_visible(Instant::now())),
+        "body": banner_body(i18n, mode.as_str()),
     }))
 }
 
@@ -356,6 +445,11 @@ pub fn ipc_retry(proxy: &EventLoopProxy<UserEvent>) -> Result<Value, &'static st
     let Some(template) = configured_template() else {
         return Err("unsupported");
     };
+    // Same rule as `note_navigation`: no direct egress while the tunnel is
+    // the route. The banner cannot be showing then anyway.
+    if tunnel_is_the_route() {
+        return Err("unsupported");
+    }
     if with_watch(|w| w.on_retry(Instant::now())) == Action::Probe {
         spawn_probe(template, proxy);
     }
@@ -415,6 +509,37 @@ mod tests {
         w.on_navigation_failed(t(0));
         w.on_probe(true, t(1));
         assert!(!w.banner_visible(t(2)));
+    }
+
+    #[test]
+    fn a_success_does_not_renew_the_probe_budget() {
+        // fail -> probe -> success -> fail, all inside the window. The
+        // second failure must NOT probe again: the window bounds how often
+        // this browser contacts the resolver on its own, and a page loading
+        // in between does not renew it.
+        let mut w = Watch::default();
+        assert_eq!(w.on_navigation_failed(t(0)), Action::Probe);
+        w.on_probe(false, t(1));
+        w.on_navigation_succeeded();
+        assert_eq!(
+            w.on_navigation_failed(t(10)),
+            Action::Nothing,
+            "a probe ran 9 seconds ago; a success in between is not a licence to probe again"
+        );
+        // Once the window has passed, the next failure probes as normal.
+        assert_eq!(w.on_navigation_failed(t(100)), Action::Probe);
+    }
+
+    #[test]
+    fn an_aborted_probe_frees_the_next_one() {
+        // The worker failed to start. Without this, in_flight would stay set
+        // and no failure or retry could ever probe again this session.
+        let mut w = Watch::default();
+        assert_eq!(w.on_navigation_failed(t(0)), Action::Probe);
+        assert_eq!(w.on_navigation_failed(t(1)), Action::Nothing, "one in flight");
+        w.on_probe_aborted();
+        assert_eq!(w.on_navigation_failed(t(2)), Action::Probe, "free again");
+        assert!(!w.banner_visible(t(3)), "an abort is not a verdict");
     }
 
     #[test]

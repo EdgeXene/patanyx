@@ -65,7 +65,7 @@ async function submit(prefix, over) {
   global.rbCalls.length = 0;
   global.rbReject = null;
   global.rbResolve = {
-    vault_import: { recovery_key: "AAAA-BBBB", bookmarks: 3 },
+    vault_import: { recovery_key: "AAAA-BBBB", bookmarks: 3, library: "replaced" },
   };
   fill(prefix, over);
   global.$(prefix + "form")._fire("submit");
@@ -102,7 +102,49 @@ for (const m of MIRRORS) {
       calls[0].args.new_passphrase === "new-passphrase",
       "the new passphrase was not sent",
     );
+    assert(
+      global.$(m.prefix + "error").textContent === "",
+      "a complete import left a Library warning up",
+    );
   });
+
+  for (const outcome of ["not_replaced", "not_opened"]) {
+    check(
+      `${m.where}: a successful import with Library ${outcome} pins a result note without costing the recovery key`,
+      async () => {
+        global.rbCalls.length = 0;
+        global.rbReject = null;
+        global.rbResolve = {
+          vault_import: {
+            recovery_key: "AAAA-BBBB",
+            bookmarks: 0,
+            library: outcome,
+          },
+        };
+        fill(m.prefix);
+        global.$(m.prefix + "form")._fire("submit");
+        await flush();
+
+        assert(
+          global.$("vault-recovery").hidden === false,
+          "the Library warning displaced the one-time recovery-key screen",
+        );
+        assert(
+          global.$("recovery-key").textContent === "AAAA-BBBB",
+          "the Library warning cost the only display of the new recovery key",
+        );
+        const note = global.$(m.prefix + "error");
+        assert(
+          /vault was imported/i.test(note.textContent),
+          "the note does not distinguish a successful vault import from the Library failure",
+        );
+        assert(
+          /library/i.test(note.textContent) && /unavailable/i.test(note.textContent),
+          "the note does not say which data is unavailable",
+        );
+      },
+    );
+  }
 
   // THE IMPORTANT ONE. Import destroys the current vault, so a submission that
   // should not have gone through must not reach Rust at all. Validating after
@@ -115,8 +157,9 @@ for (const m of MIRRORS) {
         "irreversible wipe on a typo",
     );
     assert(
-      /do not match/i.test(global.$(m.prefix + "error").textContent),
-      "the user was not told why nothing happened",
+      global.$(m.prefix + "error").dataset.reason === "mismatch",
+      "the user was not told why nothing happened; reason=" +
+        JSON.stringify(global.$(m.prefix + "error").dataset.reason),
     );
   });
 
@@ -148,6 +191,26 @@ for (const m of MIRRORS) {
     );
   });
 
+  check(`${m.where}: Library refusal codes are explained as user-facing text`, async () => {
+    for (const [code, claim] of [
+      ["library_replace_refused", /vault was not imported/i],
+      ["library_not_replaced", /library.*unavailable/i],
+    ]) {
+      global.rbCalls.length = 0;
+      global.rbResolve = {};
+      global.rbReject = code;
+      fill(m.prefix);
+      global.$(m.prefix + "form")._fire("submit");
+      await flush();
+      const shown = global.$(m.prefix + "error").textContent;
+      assert(
+        claim.test(shown),
+        `${code} rendered as ${JSON.stringify(shown)} instead of explaining the outcome`,
+      );
+    }
+    global.rbReject = null;
+  });
+
   check(`${m.where}: the secrets typed in are cleared afterwards`, async () => {
     await submit(m.prefix);
     for (const suffix of ["export-pass", "pass1", "pass2"]) {
@@ -167,7 +230,7 @@ check(
   "the Backup pane states that importing replaces the current vault",
   () => {
     const pane = html.slice(html.indexOf('id="pane-backup"'));
-    const section = pane.slice(0, pane.indexOf("<h2>Change passphrase</h2>"));
+    const section = pane.slice(0, pane.search(/<h2[^>]*>Change passphrase<\/h2>/));
     assert(
       /class="destructive-warning"/.test(section),
       "the destructive-import warning is gone from the Backup pane",

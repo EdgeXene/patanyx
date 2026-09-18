@@ -9,10 +9,26 @@ pub enum VaultError {
     /// implausible KDF parameters, or an undecodable payload.
     #[error("invalid vault file: {0}")]
     BadFormat(String),
+    /// The file is INTACT and decrypted correctly; its payload was simply
+    /// written by a build newer than this one.
+    ///
+    /// Its own variant rather than a BadFormat message, because the two lead a
+    /// reader to opposite conclusions: one says the file may be lost, this one
+    /// says use your other build and nothing is wrong. Reporting the second as
+    /// the first cost a tester a real scare on 2026-08-31.
+    #[error("vault written by a newer PATANYX (schema {found}; this build understands {supported})")]
+    NewerVault { found: u32, supported: u32 },
     /// Wrong passphrase and tampered ciphertext/header are deliberately
     /// indistinguishable: both surface as this single AEAD failure.
     #[error("wrong passphrase or corrupted vault")]
     AuthFailed,
+    /// The passphrase DID change and the vault is consistent under the new
+    /// one, but one or more backups of the old-passphrase file could not be
+    /// removed and still open with the old passphrase. Not a rollback
+    /// condition: the rotation is committed; the caller must say so and name
+    /// the retained files' consequence.
+    #[error("passphrase changed, but old backups could not be removed: {0}")]
+    BackupsRetained(String),
     #[error("vault already exists at {}", .0.display())]
     AlreadyExists(PathBuf),
     /// Another PATANYX process has this vault open.

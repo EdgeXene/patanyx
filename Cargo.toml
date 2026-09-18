@@ -6,6 +6,12 @@ resolver = "2"
 # wire protocol it speaks stays open here, in crates/chat.
 members = ["crates/vault", "crates/app", "crates/ocr", "crates/chat", "crates/integrity", "crates/store", "crates/corroborate", "crates/update", "crates/tunnel", "crates/licence"]
 
+[patch.crates-io]
+# wry 0.55.1 installs a frozen window.ipc in every content page even when the
+# builder has no IPC handler. Keep the patch local and auditable until both
+# WebView2 and WebKitGTK condition their bootstrap upstream.
+wry = { path = "vendor/wry" }
+
 [profile.release]
 lto = true
 strip = true

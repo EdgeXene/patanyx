@@ -46,6 +46,53 @@ echo "using $(command -v llvm-lib)"
 # which reads as "no features", silently produced a chat build. The published
 # binary is the one that must never contain chat, so the default has to fail
 # in that direction, not this one.
+# CONTROL FLOW GUARD, and the path prefix that used to name this machine.
+#
+# A security review of the SHIPPED BINARY found DllCharacteristics carrying
+# ASLR, high-entropy ASLR and DEP but NOT GUARD_CF, while a .00cfg section
+# and a load-config directory were present -- the signature of a link that
+# could have had CFG and was never asked for it. CFG validates indirect-call
+# targets, so its absence does not create a bug; it lowers the cost of
+# turning one into control-flow hijack. Every other browser ships it.
+#
+# `-C control-flow-guard` is STABLE rustc (it was `-Z` once, which is why
+# reviews still call it nightly-only), so this needs nothing beyond the
+# pinned toolchain, whatever rust-toolchain.toml currently names. Spelling the
+# version here bought nothing and went stale the day the pin moved. The linker flag arms the CRT objects that carry
+# CFG metadata already; the rustc flag is what instruments OUR code, and
+# without it the linker flag alone would set a bit this binary had not
+# earned.
+#
+# --remap-path-prefix answers the same review's information-leak finding:
+# panic strings embedded /root/.cargo/... into the artifact, telling anyone
+# with `strings` that the build runs as root and how its disk is laid out.
+# Remapping keeps the panic messages useful and stops them describing this
+# machine.
+CFG_FLAGS="-C control-flow-guard=yes -C link-arg=/guard:cf"
+# The SAME THREE roots repro-build.sh normalizes, spelled identically. A second
+# convention here (/patanyx instead of /build) would make this script and the
+# reproducible build disagree on the bytes they produce, which is the one thing
+# docs/reproducible-builds.md exists to prevent.
+#
+# THE SYSROOT IS THE THIRD, and it was missing until 2026-08-27. Remapping
+# CARGO_HOME and the source root still left 39 copies of
+# /root/.rustup/toolchains/<version>-<host>/lib/rustlib/src/rust/library/... in
+# the shipped exe: those are std's OWN panic locations, which come from the
+# toolchain rather than from our code or our dependencies, so neither of the
+# other two prefixes could reach them. They named the account the build ran
+# under, the toolchain version and the build host triple. Measured before and
+# after on a real exe: 39 occurrences, then zero.
+#
+# Computed at runtime, never hardcoded, for the reason the comment in
+# repro-build.sh gives: a literal /root/.rustup would be correct on exactly one
+# machine. rust-toolchain.toml pins the channel, so this resolves to the same
+# pinned toolchain for everyone, and remapping erases the version and host
+# triple from the artifact along with the path.
+SYSROOT="$(rustc --print sysroot)"
+REMAP="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$PWD=/build --remap-path-prefix=${SYSROOT}=/rust"
+export RUSTFLAGS="${RUSTFLAGS:-} $CFG_FLAGS $REMAP"
+echo "hardening: control-flow-guard on, build paths remapped"
+
 FEATURES="${FEATURES-}"
 if [ -n "$FEATURES" ]; then
   echo "=== windows build: --features $FEATURES ==="
@@ -59,11 +106,12 @@ fi
 
 # The title is the only thing that tells a user which variant they launched,
 # so confirm it is in the binary rather than assuming the cfg took.
-exe=target/x86_64-pc-windows-msvc/release/patanyx.exe
+target_dir="${CARGO_TARGET_DIR:-target}"
+exe="$target_dir/x86_64-pc-windows-msvc/release/patanyx.exe"
 case "$FEATURES" in
-  *relay-client*) want="Premium + relay" ;;
-  *chat*)         want="Premium (LAN chat only)" ;;
-  *)              want="" ;;
+  *premium-unlocked*) want="UNLOCKED TEST BUILD: Premium forced on; no license checked" ;;
+  *chat*)             want="PATANYX-Nabu-X for " ;;
+  *)                  want="" ;;
 esac
 # The PUBLIC build is verified by its ABSENCE of the chat marker, not by the
 # presence of one. It used to be skipped entirely (`want` is empty for it, and
@@ -71,21 +119,35 @@ esac
 # script exists to protect -- the one that must never contain chat -- was the
 # one configuration nothing asserted about.
 if [ -z "$want" ]; then
-  # Matched on the SUFFIX, never on the full title. `strings` breaks its output
-  # at the em-dash in "PATANYX Browser — Premium ...", so grepping the whole
-  # title finds nothing in a Premium binary either, and the check passes on
-  # exactly the build it exists to catch. Verified against the staged PREMIUM
-  # exe, where "Premium + relay" matches and the full title does not.
+  # THE MARKER IS THE ATTRIBUTION HEADER, NOT THE WINDOW TITLE, AND THAT IS
+  # A MEASURED DECISION RATHER THAN A PREFERENCE.
   #
-  # NEVER shorten these markers to the bare word "Premium": the PUBLIC build's
-  # About copy legitimately contains it (the future-tense teaser), so a bare
-  # grep would fail the one configuration this check exists to pass.
-  leaked="$(strings -a "$exe" | grep -cE "Premium \+ relay|Premium \(LAN chat only\)" || true)"
+  # The obvious marker is the title, and it does not work. "PATANYX Nabu-X"
+  # is fourteen bytes, so rustc does not put it in .rdata at all: it builds
+  # the string at runtime from two eight-byte immediate moves, and the
+  # disassembly reads movabs rax,"X Nabu-X" / movabs rax,"PATANYX ". The
+  # phrase never exists as contiguous bytes in the file, so grep and strings
+  # both find nothing, and a gate matching it passes the very build it is
+  # meant to catch. Verified by searching the raw bytes of a built exe.
+  # The old title survived only because "PATANYX Browser — Premium + relay"
+  # was long enough to be stored; shortening the name removed that accident.
+  #
+  # The attribution header is a better marker anyway. about.rs picks
+  # windows-chat.txt or windows.txt on cfg(feature = "chat"), so the header
+  # tracks the COMPILED FEATURE by construction rather than by a developer
+  # remembering to update a string, it is include_str!'d from a 300 KB file
+  # so it is always in .rdata, and attribution-gate.sh independently
+  # regenerates and diffs it, so it cannot drift unnoticed.
+  #
+  # The window title is still asserted, by main.rs::build_variant_tests,
+  # which compares Rust strings and is unaffected by how they are stored.
+  leaked="$(strings -a "$exe" | grep -cE "PATANYX-Nabu-X for |UNLOCKED TEST BUILD: Premium forced on; no license checked" || true)"
   if [ "${leaked:-0}" -gt 0 ]; then
-    echo "BUILD FAIL: the PUBLIC binary carries a Premium title; it was built with chat compiled in" >&2
+    echo "BUILD FAIL: the PUBLIC binary carries a non-public Nabu-X title marker" >&2
+    echo "  It was built with chat or premium-unlocked compiled in; refusing to stage it as public." >&2
     exit 1
   fi
-  echo "title says: PATANYX Browser (public; no Premium marker present)"
+  echo "attribution says: PATANYX (public; no Nabu-X build marker present)"
 fi
 if [ -n "$want" ]; then
   # `grep -c`, not `grep -q`. Under `set -o pipefail`, `grep -q` exits the
@@ -97,10 +159,46 @@ if [ -n "$want" ]; then
   if [ "${found:-0}" -gt 0 ]; then
     echo "title says: $want"
   else
-    echo "BUILD FAIL: the binary's title does not say \"$want\"" >&2
+    echo "BUILD FAIL: the binary does not carry the marker \"$want\"" >&2
     exit 1
   fi
 fi
+# NO BUILD-MACHINE PATHS IN THE ARTIFACT, and this asserts it.
+#
+# The remap flags above are the fix; this is the check that they still work.
+# Without it the flags are a diff nobody re-verifies, which is how the sysroot
+# leak survived the first path-leak fix: that round set two prefixes, moved on,
+# and nothing measured the result. 39 copies of the build account shipped.
+#
+# Matched on the DOTTED directory names, which are what a real leak looks like
+# (/root/.cargo/..., /root/.rustup/toolchains/...). The remapped forms have no
+# dot (/cargo, /rust, /build), so they cannot match this and a correct binary
+# stays silent.
+# ANCHORED TO A PATH COMPONENT. The unanchored form (\.cargo|\.rustup) was
+# sound while no compiled-in DATA contained ".cargo" -- then the ad list
+# arrived carrying ads.cargo.lt, assets.cargoboard.com and three more, and
+# every Windows build failed on a binary where nothing had leaked. A real
+# leak is a dotted DIRECTORY inside a path (/root/.cargo/registry/...), so
+# the dot must sit between slashes; a domain can never match.
+leaked_paths="$(strings -a "$exe" | grep -cE '/\.(cargo|rustup)/' || true)"
+if [ "${leaked_paths:-0}" -gt 0 ]; then
+  echo "BUILD FAIL: $leaked_paths build-machine path(s) embedded in the binary" >&2
+  echo "  A --remap-path-prefix is missing or stopped matching. Offenders:" >&2
+  strings -a "$exe" | grep -oE '[^ "]*/\.(cargo|rustup)/[^ "]{0,60}' | sort -u | head -5 >&2
+  echo "  Fix the REMAP line above, and mirror it in scripts/repro-build.sh." >&2
+  exit 1
+fi
+# Positive control: prove the remap RAN rather than that the paths merely
+# vanished. A binary with neither the real paths nor the remapped ones would
+# pass the check above while telling us nothing.
+remapped="$(strings -a "$exe" | grep -cE '^/cargo|^/rust' || true)"
+if [ "${remapped:-0}" -eq 0 ]; then
+  echo "BUILD FAIL: no remapped /cargo or /rust paths found either." >&2
+  echo "  The absence check above is therefore meaningless. Investigate." >&2
+  exit 1
+fi
+echo "paths: no build-machine paths present, $remapped remapped references"
+
 # OCR WEIGHTS ARE COMPILED IN, and this asserts it.
 #
 # They used to be COPIED beside the binary here, because ocr_support.rs
@@ -116,7 +214,7 @@ fi
 # So the weights are include_bytes! now, and a build that somehow loses them
 # should fail HERE rather than shipping a browser whose OCR quietly reports
 # unavailable.
-exe=target/x86_64-pc-windows-msvc/release/patanyx.exe
+exe="$target_dir/x86_64-pc-windows-msvc/release/patanyx.exe"
 # The ONNX magic/producer string is present in a real graph and absent from a
 # binary built without one. Cheap, and it checks the artifact rather than the
 # source tree.

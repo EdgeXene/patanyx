@@ -55,7 +55,7 @@ const TAB_STATUS = {
   interception: "registered",
   script_setting: "applied",
   smartscreen_off: "applied",
-  tracking_prevention: "applied",
+  tracking_prevention: "strict",
   navigation_tracking: "applied",
   autofill_off: "applied",
   ephemeral_confirmed: "applied",

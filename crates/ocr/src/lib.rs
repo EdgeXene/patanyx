@@ -17,6 +17,7 @@ use image::RgbImage;
 use tract_onnx::prelude::*;
 
 pub const DET_MODEL_FILE: &str = "det.onnx";
+pub const CLS_MODEL_FILE: &str = "cls.onnx";
 pub const REC_MODEL_FILE: &str = "rec.onnx";
 pub const REC_DICT_FILE: &str = "rec_dict.txt";
 
@@ -39,8 +40,14 @@ type Plan = SimplePlan<TypedFact, Box<dyn TypedOp>, TypedModel>;
 /// 960 because PP-OCR det is trained around it; larger photos only cost CPU,
 /// they do not add readable text. Divisible by 32, as the head requires.
 const DET_SIDE: u32 = 960;
-/// Binarization threshold on the shrink map. 0.3 matches upstream defaults.
+/// PaddleOCR 2.10 DB defaults from `tools/infer/utility.py`: binarize the
+/// shrink map at 0.3, retain boxes scoring at least 0.6, then unclip at 1.5
+/// using `ppocr/postprocess/db_postprocess.py`'s distance formula.
+/// Keeping all three together prevents the threshold from looking like the
+/// whole DB postprocess when it is only its first gate.
 const DET_THRESHOLD: f32 = 0.3;
+const DET_BOX_THRESHOLD: f32 = 0.6;
+const DET_UNCLIP_RATIO: f64 = 1.5;
 /// Below this many foreground pixels a component is noise, not a text line.
 const MIN_COMPONENT_PX: usize = 8;
 /// Hard cap on recognized boxes per image so a pathological mask cannot
@@ -53,6 +60,12 @@ const MAX_BOXES: usize = 200;
 /// these features meet (page captures at 100% zoom run 14-40px) and wide
 /// enough that a short word is never split in both directions at once.
 const DET_TILE_OVERLAP: u32 = 96;
+/// Source-coordinate overlap needed to call detections from two tiles the
+/// same line. This is intersection / smaller-box area rather than IoU: a box
+/// clipped by a tile edge may sit almost wholly inside the complete box while
+/// having a low IoU with it. Three quarters still tolerates detector expansion
+/// jitter without collapsing nearby words or stacked lines.
+const TILE_DEDUP_CONTAINED_FRACTION: f64 = 0.75;
 /// Cap on the pieces one detected line is split into for recognition. Each
 /// piece is a recognizer pass; a line needing more than this is pathological
 /// (a whole paragraph detected as one box) and is squeezed as before rather
@@ -74,8 +87,24 @@ const MAX_DET_TILES: usize = 24;
 /// inference does anyway.
 const REC_HEIGHT: u32 = 48;
 const REC_WIDTH: u32 = 320;
-/// Decode-time bomb guard: a small compressed file can decode to gigabytes.
+/// PP-OCR's mobile angle classifier input and decision threshold. These are
+/// the PaddleOCR 2.10 inference defaults (`cls_image_shape=3,48,192` and
+/// `cls_thresh=0.9` in `tools/infer/utility.py`). Class 0 is upright and
+/// class 1 is 180 degrees.
+const CLS_HEIGHT: u32 = 48;
+const CLS_WIDTH: u32 = 192;
+const CLS_THRESHOLD: f32 = 0.9;
+/// Whole-image and region-crop bomb guard: RGB storage is at most 120 MB.
+/// A small compressed file can otherwise decode to gigabytes.
 const MAX_PIXELS: u64 = 40_000_000;
+/// Region capture complexity guard. Region decoding is row-streamed, so this
+/// is a CPU/work ceiling rather than an allocation request: realistic tall
+/// pages up to 200 MP pass, while a crafted near-u32-sized PNG does not make a
+/// worker walk billions of pixels to reach a selection near the bottom.
+const MAX_REGION_SOURCE_PIXELS: u64 = 200_000_000;
+/// Best-effort ceiling for allocations owned by the streaming PNG decoder.
+/// The crop buffer is separate and is bounded by `MAX_PIXELS` above.
+const REGION_DECODER_ALLOC_LIMIT: usize = 64 * 1024 * 1024;
 
 // Note: PP-OCR's reference inference feeds OpenCV BGR order with
 // ImageNet stats for det and symmetric normalization for rec. If the ONNX
@@ -91,8 +120,12 @@ pub enum OcrError {
     ModelsMissing(String),
     /// Files exist but do not load, or the dict does not match the model.
     ModelsInvalid(String),
-    /// Input bytes are not a decodable image, or exceed the pixel cap.
+    /// Input bytes are not a decodable image.
     ImageDecode,
+    /// A valid image, region crop, or streaming decode exceeds a deliberate
+    /// size/complexity ceiling. Kept separate from `ImageDecode` so an honest
+    /// size refusal never wears file-format copy.
+    ImageTooLarge,
     /// A `recognize_region` rect that is empty or falls outside the image.
     /// Its own class because the image was FINE -- reporting it as a decode
     /// failure would send whoever reads the diagnostic to the wrong code.
@@ -110,7 +143,8 @@ impl std::fmt::Display for OcrError {
         match self {
             Self::ModelsMissing(p) => write!(f, "OCR model file missing: {p}"),
             Self::ModelsInvalid(d) => write!(f, "OCR models unusable: {d}"),
-            Self::ImageDecode => write!(f, "not a decodable image, or too large"),
+            Self::ImageDecode => write!(f, "not a decodable image"),
+            Self::ImageTooLarge => write!(f, "image or region exceeds OCR resource limits"),
             Self::BadRegion => write!(f, "region rect empty or outside the image"),
             Self::Inference(d) => write!(f, "OCR inference failed: {d}"),
         }
@@ -143,9 +177,22 @@ pub struct TextRegion {
 
 pub struct OcrEngine {
     det: Plan,
+    /// Optional by design: a broken angle graph must degrade to the old
+    /// det -> rec pipeline, never make all OCR unavailable.
+    cls: Option<Plan>,
     rec: Plan,
+    /// Set at load time, or on the first classifier inference failure. Kept
+    /// separate from `OcrError` because the classifier is a best-effort stage.
+    cls_diagnostic: std::sync::Mutex<Option<String>>,
     /// CTC class k maps to dict[k - 1]; class 0 is the blank.
     dict: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TileDetection {
+    rect: (u32, u32, u32, u32),
+    tile_id: usize,
+    tile_rect: (u32, u32, u32, u32),
 }
 
 /// The weights, COMPILED IN.
@@ -163,6 +210,7 @@ pub struct OcrEngine {
 /// signed executable" shape intact rather than growing a second artifact that
 /// would need its own signing, its own verification and its own failure modes.
 const DET_MODEL_BYTES: &[u8] = include_bytes!("../../../models/ocr/det.onnx");
+const CLS_MODEL_BYTES: &[u8] = include_bytes!("../../../models/ocr/cls.onnx");
 const REC_MODEL_BYTES: &[u8] = include_bytes!("../../../models/ocr/rec.onnx");
 const REC_DICT_BYTES: &str = include_str!("../../../models/ocr/rec_dict.txt");
 
@@ -188,7 +236,22 @@ impl OcrEngine {
             f32::fact([1, 3, REC_HEIGHT as i32, REC_WIDTH as i32]).into(),
         )
         .map_err(|e| OcrError::ModelsInvalid(format!("embedded rec: {e}")))?;
-        Ok(Self { det, rec, dict })
+        let (cls, cls_diagnostic) = optional_classifier(
+            || {
+                load_onnx_bytes(
+                    CLS_MODEL_BYTES,
+                    f32::fact([1, 3, CLS_HEIGHT as i32, CLS_WIDTH as i32]).into(),
+                )
+            },
+            "embedded cls",
+        );
+        Ok(Self {
+            det,
+            cls,
+            rec,
+            cls_diagnostic: std::sync::Mutex::new(cls_diagnostic),
+            dict,
+        })
     }
 
     /// Loads models from `dir`. Missing files are a distinct error so the
@@ -200,6 +263,7 @@ impl OcrEngine {
     pub fn load(dir: &Path) -> Result<Self, OcrError> {
         let det_path = dir.join(DET_MODEL_FILE);
         let rec_path = dir.join(REC_MODEL_FILE);
+        let cls_path = dir.join(CLS_MODEL_FILE);
         let dict_path = dir.join(REC_DICT_FILE);
         for p in [&det_path, &rec_path, &dict_path] {
             if !p.is_file() {
@@ -226,7 +290,42 @@ impl OcrEngine {
             f32::fact([1, 3, REC_HEIGHT as i32, REC_WIDTH as i32]).into(),
         )
         .map_err(|e| OcrError::ModelsInvalid(format!("rec: {e}")))?;
-        Ok(Self { det, rec, dict })
+        let (cls, cls_diagnostic) = if cls_path.is_file() {
+            optional_classifier(
+                || {
+                    load_onnx(
+                        &cls_path,
+                        f32::fact([1, 3, CLS_HEIGHT as i32, CLS_WIDTH as i32]).into(),
+                    )
+                },
+                "cls",
+            )
+        } else {
+            (
+                None,
+                Some(format!("cls model missing: {}", cls_path.display())),
+            )
+        };
+        Ok(Self {
+            det,
+            cls,
+            rec,
+            cls_diagnostic: std::sync::Mutex::new(cls_diagnostic),
+            dict,
+        })
+    }
+
+    /// Whether the optional angle stage is healthy right now.
+    pub fn classifier_available(&self) -> bool {
+        self.cls.is_some() && self.classifier_diagnostic().is_none()
+    }
+
+    /// A developer-facing degraded-mode reason for the diagnostics export.
+    pub fn classifier_diagnostic(&self) -> Option<String> {
+        self.cls_diagnostic
+            .lock()
+            .map(|d| d.clone())
+            .unwrap_or_else(|_| Some("cls diagnostic lock poisoned".into()))
     }
 
     /// Recognizes text in an encoded image (PNG/JPEG bytes). Returns regions
@@ -236,8 +335,11 @@ impl OcrEngine {
         self.recognize_pixels(&img)
     }
 
-    /// Recognizes text inside one rectangle of an encoded image, decoding
-    /// exactly once: decode, crop in pixel space, run the same pipeline.
+    /// Recognizes text inside one rectangle of a native PNG page capture.
+    /// PNG has no random access, so rows are decoded in order through `y + h`,
+    /// but only the crop is retained. A 40+ MP page with a small selection
+    /// therefore consumes one decoder scanline plus the crop, not a full RGB
+    /// page allocation.
     /// Returned boxes are in ORIGINAL-image pixels (offset back by the
     /// rect's corner), so a caller drawing results over the full image needs
     /// no second coordinate space.
@@ -254,16 +356,7 @@ impl OcrEngine {
         w: u32,
         h: u32,
     ) -> Result<Vec<TextRegion>, OcrError> {
-        let img = decode_image(bytes)?;
-        let (iw, ih) = img.dimensions();
-        let in_bounds = w > 0
-            && h > 0
-            && x.checked_add(w).is_some_and(|r| r <= iw)
-            && y.checked_add(h).is_some_and(|r| r <= ih);
-        if !in_bounds {
-            return Err(OcrError::BadRegion);
-        }
-        let crop = image::imageops::crop_imm(&img, x, y, w, h).to_image();
+        let crop = decode_png_region(bytes, x, y, w, h)?;
         let mut regions = self.recognize_pixels(&crop)?;
         for r in &mut regions {
             // Saturating because the truncation marker carries y: u32::MAX to
@@ -280,7 +373,23 @@ impl OcrEngine {
     /// The shared pipeline behind both entry points: detect, then recognize
     /// each detected line, on pixels that are already decoded.
     fn recognize_pixels(&self, img: &RgbImage) -> Result<Vec<TextRegion>, OcrError> {
-        let (boxes, gave_up) = self.detect_tiled(img)?;
+        // PP-OCR's detector and recognizer were trained on dark ink over a
+        // light ground. Normalize THIS crop, not a process-wide/page-wide
+        // setting: adjacent captures and user selections can have opposite
+        // themes. Mean BT.601 luminance below 128 means the crop is mostly a
+        // dark ground, so invert it once and let both det and rec consume the
+        // same normalized pixels. We rejected border sampling because a tight
+        // selection can begin mid-glyph (making its border ink), and rejected
+        // border-vs-centre voting because a centred heading/photo can reverse
+        // those roles. A median threshold was also rejected: bold or zoomed
+        // glyphs crossing 50% of a tight crop make it flip discontinuously.
+        // Mean luminance has the honest failure mode that a mostly-dark photo
+        // can be inverted, but at the explicit 128 threshold it is stable for
+        // the light/dark page grounds this OCR path is intended to read.
+        let normalized = normalized_polarity(img);
+        let ocr_img = normalized.as_ref();
+
+        let (boxes, gave_up) = self.detect_tiled(ocr_img)?;
         // SILENT TRUNCATION IS THE ONE THING THIS MUST NOT DO. The cap keeps
         // a pathological mask from turning one call into minutes of work, and
         // it never bound before -- the whole image was squashed to 960px and
@@ -296,8 +405,9 @@ impl OcrEngine {
             if w < 2 || h < 2 {
                 continue;
             }
-            let crop = image::imageops::crop_imm(img, x, y, w, h).to_image();
-            let text = self.recognize_line(&crop)?;
+            let crop = image::imageops::crop_imm(ocr_img, x, y, w, h).to_image();
+            let oriented = self.orient_line(&crop);
+            let text = self.recognize_line(oriented.as_ref())?;
             if !text.trim().is_empty() {
                 // Measured here, on the page that is already decoded and in
                 // scope. Doing it later would mean handing the caller the bytes
@@ -382,9 +492,9 @@ impl OcrEngine {
         seams_y.sort_unstable();
         seams_y.dedup();
 
-        let mut all: Vec<(u32, u32, u32, u32)> = Vec::new();
+        let mut all: Vec<TileDetection> = Vec::new();
         let mut gave_up = false;
-        for (tx, ty, tw, th) in tiles {
+        for (tile_id, (tx, ty, tw, th)) in tiles.into_iter().enumerate() {
             if tw < 2 || th < 2 {
                 continue;
             }
@@ -404,7 +514,20 @@ impl OcrEngine {
                 let w = w.min(ow - x);
                 let h = h.min(oh - y);
                 if w > 0 && h > 0 {
-                    all.push((x, y, w, h));
+                    let tile_x0 = ((tx as f64) * inv).round() as u32;
+                    let tile_y0 = ((ty as f64) * inv).round() as u32;
+                    let tile_x1 = (((tx + tw) as f64) * inv).round() as u32;
+                    let tile_y1 = (((ty + th) as f64) * inv).round() as u32;
+                    all.push(TileDetection {
+                        rect: (x, y, w, h),
+                        tile_id,
+                        tile_rect: (
+                            tile_x0.min(ow),
+                            tile_y0.min(oh),
+                            tile_x1.min(ow).saturating_sub(tile_x0.min(ow)),
+                            tile_y1.min(oh).saturating_sub(tile_y0.min(oh)),
+                        ),
+                    });
                 }
             }
             // The cap counts DETECTIONS, not tiles: a pathological mask in an
@@ -414,6 +537,12 @@ impl OcrEngine {
                 break;
             }
         }
+        // Provenance is deliberately retained until here: only detections
+        // from DIFFERENT tiles are duplicates. Once mapped to source space,
+        // drop a near-contained copy before the seam rejoin sees it. Keeping
+        // the copy with more clearance from its tile edges prefers the line
+        // the detector saw whole; area breaks ties in favour of more glyphs.
+        let all = dedupe_tile_boxes(all);
         Ok((merge_split_boxes(all, &seams_x, &seams_y), gave_up))
     }
 
@@ -492,6 +621,7 @@ impl OcrEngine {
         let map_to_canvas = DET_SIDE as f64 / mw.max(1) as f64;
         let mut boxes: Vec<(u32, u32, u32, u32)> = components(&mask, mw, mh)
             .into_iter()
+            .filter(|b| component_box_score(&vals, mw, *b) >= DET_BOX_THRESHOLD)
             .map(|b| expand_and_map(b, mw as u32, mh as u32, map_to_canvas, scale, ow, oh))
             .filter(|(_, _, w, h)| *w > 0 && *h > 0)
             .collect();
@@ -543,19 +673,35 @@ impl OcrEngine {
                     // A mid-word cut joins with nothing: inserting a space
                     // there is what produced "som ething" and "CA RRIAGE" at
                     // every chunk boundary.
-                    if idx > 0 && !text.is_empty() && !part_text.is_empty() {
-                        let (_, prev_was_gap) = cuts[idx - 1];
-                        if prev_was_gap && !text.ends_with(' ') && !part_text.starts_with(' ') {
-                            text.push(' ');
-                        }
-                    }
-                    text.push_str(&part_text);
+                    let prev_was_gap = idx > 0 && cuts[idx - 1].1;
+                    append_recognized_part(&mut text, &part_text, prev_was_gap);
                     start = cut;
                 }
                 return Ok(text.trim().to_string());
             }
         }
         self.recognize_one(crop)
+    }
+
+    /// Runs PP-OCR's optional angle stage. Any classifier failure records a
+    /// degraded diagnostic and returns the original crop: recognition remains
+    /// available, matching the old det -> rec pipeline.
+    fn orient_line<'a>(&self, crop: &'a RgbImage) -> std::borrow::Cow<'a, RgbImage> {
+        let Some(cls) = &self.cls else {
+            return std::borrow::Cow::Borrowed(crop);
+        };
+        match classifier_says_180(cls, crop) {
+            Ok(true) => std::borrow::Cow::Owned(image::imageops::rotate180(crop)),
+            Ok(false) => std::borrow::Cow::Borrowed(crop),
+            Err(e) => {
+                if let Ok(mut slot) = self.cls_diagnostic.lock() {
+                    if slot.is_none() {
+                        *slot = Some(e.to_string());
+                    }
+                }
+                std::borrow::Cow::Borrowed(crop)
+            }
+        }
     }
 
     /// One crop, one pass through the recognizer, at whatever aspect it has.
@@ -567,7 +713,11 @@ impl OcrEngine {
         // truncated. Truncating would silently drop the tail of a line, which
         // for a recovery key means losing characters with no signal at all;
         // squeezing degrades gracefully and the CTC decoder still reads it.
-        let ideal = ((w as f32) * REC_HEIGHT as f32 / h.max(1) as f32).round() as u32;
+        // PaddleOCR 2.10 `tools/infer/predict_rec.py`'s
+        // `TextRecognizer.resize_norm_img` uses ceil here.
+        // A one-column narrower render changes the right-padding boundary and
+        // is enough to move a marginal CTC character.
+        let ideal = ((w as f64) * REC_HEIGHT as f64 / h.max(1) as f64).ceil() as u32;
         let rw = ideal.clamp(8, REC_WIDTH);
         let resized = image::imageops::resize(crop, rw, REC_HEIGHT, FilterType::Triangle);
 
@@ -635,6 +785,51 @@ impl OcrEngine {
     }
 }
 
+fn optional_classifier(
+    load: impl FnOnce() -> TractResult<Plan>,
+    label: &str,
+) -> (Option<Plan>, Option<String>) {
+    match load() {
+        Ok(plan) => (Some(plan), None),
+        Err(e) => (None, Some(format!("{label}: {e}"))),
+    }
+}
+
+/// PaddleOCR 2.10's `TextClassifier.resize_norm_img`, ported exactly: keep
+/// aspect, ceil the resized width, resize to 48px high, right-pad to 192 with
+/// normalized zero, and apply `(pixel / 255 - 0.5) / 0.5` in BGR order.
+fn classifier_says_180(cls: &Plan, crop: &RgbImage) -> Result<bool, OcrError> {
+    let (w, h) = crop.dimensions();
+    let rw = ((CLS_HEIGHT as f64 * w as f64 / h.max(1) as f64).ceil() as u32).clamp(1, CLS_WIDTH);
+    let resized = image::imageops::resize(crop, rw, CLS_HEIGHT, FilterType::Triangle);
+    let (w_us, h_us) = (CLS_WIDTH as usize, CLS_HEIGHT as usize);
+    let mut data = vec![0f32; 3 * w_us * h_us];
+    for (x, y, px) in resized.enumerate_pixels() {
+        for c in 0..3usize {
+            let ch = if MODEL_EXPECTS_BGR { 2 - c } else { c };
+            let v = px[ch] as f32 / 255.0;
+            data[c * w_us * h_us + y as usize * w_us + x as usize] = (v - 0.5) / 0.5;
+        }
+    }
+    let input = Tensor::from_shape(&[1, 3, h_us, w_us], &data)
+        .map_err(|e| OcrError::Inference(format!("cls input: {e}")))?;
+    let outputs = cls
+        .run(tvec!(input.into()))
+        .map_err(|e| OcrError::Inference(format!("cls: {e}")))?;
+    let output = outputs
+        .get(0)
+        .ok_or_else(|| OcrError::Inference("cls returned no output".into()))?;
+    let view = output
+        .to_array_view::<f32>()
+        .map_err(|e| OcrError::Inference(format!("cls output: {e}")))?;
+    let shape = view.shape().to_vec();
+    if shape != [1, 2] {
+        return Err(OcrError::Inference(format!("cls output shape {shape:?}")));
+    }
+    // PaddleOCR takes argmax and rotates only label 180 above cls_thresh=0.9.
+    Ok(view[[0, 1]] > view[[0, 0]] && view[[0, 1]] > CLS_THRESHOLD)
+}
+
 /// One dict entry per line, verbatim: a line that is a single space is a real
 /// entry in PP-OCR dicts, so no trimming. A trailing newline produces one
 /// phantom empty entry and exactly one is dropped.
@@ -686,11 +881,162 @@ fn decode_image(bytes: &[u8]) -> Result<RgbImage, OcrError> {
         .into_dimensions()
         .map_err(|_| OcrError::ImageDecode)?;
     if w as u64 * h as u64 > MAX_PIXELS {
-        return Err(OcrError::ImageDecode);
+        return Err(OcrError::ImageTooLarge);
     }
     image::load_from_memory(bytes)
         .map(|i| i.to_rgb8())
         .map_err(|_| OcrError::ImageDecode)
+}
+
+/// Row-stream a PNG into one RGB crop. The returned row count is kept as a
+/// small test seam: it proves the implementation stopped after the requested
+/// band instead of silently returning to a whole-frame decode.
+fn decode_png_region_with_rows(
+    bytes: &[u8],
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+) -> Result<(RgbImage, u32), OcrError> {
+    use png::{BitDepth, ColorType, Decoder, DecodingError, Limits, Transformations};
+    use std::io::Cursor;
+
+    let map_decode_error = |e: DecodingError| match e {
+        DecodingError::LimitsExceeded => OcrError::ImageTooLarge,
+        _ => OcrError::ImageDecode,
+    };
+
+    let mut decoder = Decoder::new_with_limits(
+        Cursor::new(bytes),
+        Limits {
+            bytes: REGION_DECODER_ALLOC_LIMIT,
+        },
+    );
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    // Captures do not need metadata, and untrusted ancillary chunks must not
+    // spend memory that belongs to the selected pixels.
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(map_decode_error)?;
+    let (iw, ih) = reader.info().size();
+    if u64::from(iw) * u64::from(ih) > MAX_REGION_SOURCE_PIXELS {
+        return Err(OcrError::ImageTooLarge);
+    }
+    let end_x = x.checked_add(w).ok_or(OcrError::BadRegion)?;
+    let end_y = y.checked_add(h).ok_or(OcrError::BadRegion)?;
+    if w == 0 || h == 0 || end_x > iw || end_y > ih {
+        return Err(OcrError::BadRegion);
+    }
+    if u64::from(w) * u64::from(h) > MAX_PIXELS {
+        return Err(OcrError::ImageTooLarge);
+    }
+    // Adam7 rows are partial passes, not complete source scanlines. Browser
+    // capture encoders emit non-interlaced PNGs; refusing this extra
+    // complexity is bounded and honest instead of allocating a full frame to
+    // deinterlace an input that the capture path never produces.
+    if reader.info().interlaced {
+        return Err(OcrError::ImageTooLarge);
+    }
+    let (color, depth) = reader.output_color_type();
+    if depth != BitDepth::Eight || color == ColorType::Indexed {
+        return Err(OcrError::ImageDecode);
+    }
+    let samples = color.samples();
+    let crop_len =
+        usize::try_from(u64::from(w) * u64::from(h) * 3).map_err(|_| OcrError::ImageTooLarge)?;
+    let mut pixels = Vec::new();
+    pixels
+        .try_reserve_exact(crop_len)
+        .map_err(|_| OcrError::ImageTooLarge)?;
+    pixels.resize(crop_len, 0);
+
+    let mut rows_decoded = 0u32;
+    for source_y in 0..end_y {
+        let row = reader
+            .next_row()
+            .map_err(map_decode_error)?
+            .ok_or(OcrError::ImageDecode)?;
+        rows_decoded += 1;
+        if source_y < y {
+            continue;
+        }
+        let source = row.data();
+        let source_start = usize::try_from(x)
+            .ok()
+            .and_then(|v| v.checked_mul(samples))
+            .ok_or(OcrError::ImageTooLarge)?;
+        let source_len = usize::try_from(w)
+            .ok()
+            .and_then(|v| v.checked_mul(samples))
+            .ok_or(OcrError::ImageTooLarge)?;
+        if source_start
+            .checked_add(source_len)
+            .is_none_or(|end| end > source.len())
+        {
+            return Err(OcrError::ImageDecode);
+        }
+        let dest_row = usize::try_from(source_y - y).map_err(|_| OcrError::ImageTooLarge)?;
+        let dest_start = dest_row
+            .checked_mul(usize::try_from(w).map_err(|_| OcrError::ImageTooLarge)?)
+            .and_then(|v| v.checked_mul(3))
+            .ok_or(OcrError::ImageTooLarge)?;
+        for column in 0..usize::try_from(w).map_err(|_| OcrError::ImageTooLarge)? {
+            let source_at = source_start + column * samples;
+            let dest_at = dest_start + column * 3;
+            match color {
+                ColorType::Grayscale | ColorType::GrayscaleAlpha => {
+                    let gray = source[source_at];
+                    pixels[dest_at..dest_at + 3].fill(gray);
+                }
+                ColorType::Rgb | ColorType::Rgba => {
+                    pixels[dest_at..dest_at + 3].copy_from_slice(&source[source_at..source_at + 3]);
+                }
+                ColorType::Indexed => unreachable!("expanded above"),
+            }
+        }
+    }
+
+    let crop = RgbImage::from_raw(w, h, pixels).ok_or(OcrError::ImageDecode)?;
+    Ok((crop, rows_decoded))
+}
+
+fn decode_png_region(bytes: &[u8], x: u32, y: u32, w: u32, h: u32) -> Result<RgbImage, OcrError> {
+    decode_png_region_with_rows(bytes, x, y, w, h).map(|(crop, _)| crop)
+}
+
+/// True when a crop is predominantly light marks over a dark ground.
+///
+/// Integer BT.601 weights keep the decision deterministic across platforms;
+/// the 128 threshold and alternatives are documented where normalization is
+/// wired into `recognize_pixels`.
+fn light_text_on_dark(img: &RgbImage) -> bool {
+    let pixels = u64::from(img.width()) * u64::from(img.height());
+    if pixels == 0 {
+        return false;
+    }
+    let sum: u64 = img
+        .pixels()
+        .map(|p| {
+            (77u64 * u64::from(p[0]) + 150u64 * u64::from(p[1]) + 29u64 * u64::from(p[2])) >> 8
+        })
+        .sum();
+    sum < pixels * 128
+}
+
+fn inverted(img: &RgbImage) -> RgbImage {
+    let mut out = img.clone();
+    for p in out.pixels_mut() {
+        p.0 = [255 - p[0], 255 - p[1], 255 - p[2]];
+    }
+    out
+}
+
+fn normalized_polarity(img: &RgbImage) -> std::borrow::Cow<'_, RgbImage> {
+    if light_text_on_dark(img) {
+        std::borrow::Cow::Owned(inverted(img))
+    } else {
+        std::borrow::Cow::Borrowed(img)
+    }
 }
 
 /// Resize target for det: aspect preserved, capped at DET_MAX_SIDE, each side
@@ -746,6 +1092,22 @@ fn ink_profile(crop: &RgbImage) -> Vec<f32> {
         .collect()
 }
 
+/// Joins one recognizer chunk across the split decision made from the source
+/// pixels. Kept separate so the exact hardware strings can pin what this
+/// heuristic can fix (an inserted space) without pretending a model-free unit
+/// test can correct characters the recognizer itself read incorrectly.
+fn append_recognized_part(text: &mut String, part: &str, separated: bool) {
+    if separated
+        && !text.is_empty()
+        && !part.is_empty()
+        && !text.ends_with(' ')
+        && !part.starts_with(' ')
+    {
+        text.push(' ');
+    }
+    text.push_str(part);
+}
+
 /// Where to cut a line into `parts` pieces, and whether each cut fell in a
 /// real word gap.
 ///
@@ -778,27 +1140,42 @@ fn choose_cuts(profile: &[f32], parts: usize, line_height: u32) -> Vec<(usize, b
         return Vec::new();
     }
     let quiet_at = peak * 0.10;
-    // A word gap is about a quarter of the text height wide; letter spacing
-    // is far narrower. Three columns is the floor for very small text.
-    let min_gap = ((line_height / 4) as usize).max(3);
-
-    // Every run of quiet columns, as (start, end_exclusive).
-    let mut runs: Vec<(usize, usize)> = Vec::new();
+    // Every interior run of quiet columns, as (start, end_exclusive). Keep
+    // even narrow runs for the line's own letter-spacing statistic; the old
+    // height floor is applied only after that statistic is known.
+    let mut all_runs: Vec<(usize, usize)> = Vec::new();
     let mut run_start: Option<usize> = None;
     for (x, v) in profile.iter().enumerate() {
         if *v <= quiet_at {
             run_start.get_or_insert(x);
         } else if let Some(st) = run_start.take() {
-            if x - st >= min_gap {
-                runs.push((st, x));
+            if st > 0 {
+                all_runs.push((st, x));
             }
         }
     }
-    if let Some(st) = run_start {
-        if w - st >= min_gap {
-            runs.push((st, w));
-        }
-    }
+    // A run still open here is the trailing margin, not spacing between
+    // glyphs, and deliberately does not participate in the statistic.
+
+    // A word gap is about a quarter of the text height wide. On deliberately
+    // letter-spaced small caps, however, ordinary inter-letter runs can also
+    // clear that absolute floor. Six or more interior runs are enough to
+    // establish the line's own spacing: require a word gap to be at least
+    // 1.5x its median. Sparse lines retain the old rule, so a line exposing
+    // only a few genuine word gaps is not reclassified against itself.
+    let height_floor = ((line_height / 4) as usize).max(3);
+    let relative_floor = if all_runs.len() >= 6 {
+        let mut widths: Vec<usize> = all_runs.iter().map(|(st, end)| end - st).collect();
+        widths.sort_unstable();
+        (widths[widths.len() / 2] * 3).div_ceil(2)
+    } else {
+        0
+    };
+    let min_gap = height_floor.max(relative_floor);
+    let runs: Vec<(usize, usize)> = all_runs
+        .into_iter()
+        .filter(|(st, end)| end - st >= min_gap)
+        .collect();
 
     let part = w / parts;
     let window = (part / 2).max(8);
@@ -915,6 +1292,63 @@ fn tile_plan(w: u32, h: u32) -> (f64, Vec<(u32, u32, u32, u32)>) {
         }
         scale *= 0.8;
     }
+}
+
+/// Removes repeated detections caused by the overlap band between tiles.
+/// Returns bare source-coordinate boxes only after tile provenance has served
+/// its purpose, so two genuinely separate detections from one tile cannot be
+/// mistaken for a seam duplicate.
+fn dedupe_tile_boxes(mut boxes: Vec<TileDetection>) -> Vec<(u32, u32, u32, u32)> {
+    boxes.sort_by_key(|b| (b.rect.1, b.rect.0, b.tile_id));
+    let mut kept: Vec<TileDetection> = Vec::new();
+    'candidate: for candidate in boxes {
+        for existing in &mut kept {
+            if existing.tile_id == candidate.tile_id
+                || contained_overlap(existing.rect, candidate.rect) < TILE_DEDUP_CONTAINED_FRACTION
+            {
+                continue;
+            }
+            if tile_fit(candidate) > tile_fit(*existing) {
+                *existing = candidate;
+            }
+            continue 'candidate;
+        }
+        kept.push(candidate);
+    }
+    let mut rects: Vec<_> = kept.into_iter().map(|b| b.rect).collect();
+    rects.sort_by_key(|b| (b.1, b.0));
+    rects
+}
+
+fn contained_overlap(a: (u32, u32, u32, u32), b: (u32, u32, u32, u32)) -> f64 {
+    let ax1 = a.0.saturating_add(a.2);
+    let ay1 = a.1.saturating_add(a.3);
+    let bx1 = b.0.saturating_add(b.2);
+    let by1 = b.1.saturating_add(b.3);
+    let iw = ax1.min(bx1).saturating_sub(a.0.max(b.0));
+    let ih = ay1.min(by1).saturating_sub(a.1.max(b.1));
+    let intersection = u64::from(iw) * u64::from(ih);
+    let smaller = (u64::from(a.2) * u64::from(a.3)).min(u64::from(b.2) * u64::from(b.3));
+    if smaller == 0 {
+        0.0
+    } else {
+        intersection as f64 / smaller as f64
+    }
+}
+
+/// Preference key for duplicate copies. Clearance is the conservative proxy
+/// for "how much of the line was inside this tile": a zero means detector
+/// expansion met an edge and may have clipped glyphs. Area then prefers the
+/// longer copy when both candidates meet an edge.
+fn tile_fit(b: TileDetection) -> (u32, u64) {
+    let (x, y, w, h) = b.rect;
+    let (tx, ty, tw, th) = b.tile_rect;
+    let clearance = x
+        .saturating_sub(tx)
+        .min(y.saturating_sub(ty))
+        .min(tx.saturating_add(tw).saturating_sub(x.saturating_add(w)))
+        .min(ty.saturating_add(th).saturating_sub(y.saturating_add(h)));
+    (clearance, u64::from(w) * u64::from(h))
 }
 
 /// Joins boxes that the tiling split apart -- and ONLY those.
@@ -1111,14 +1545,46 @@ fn components(mask: &[bool], w: usize, h: usize) -> Vec<(u32, u32, u32, u32)> {
     out
 }
 
+/// Mean detector probability inside an axis-aligned component box. PaddleOCR
+/// uses `box_score_fast` over the minimum-area polygon; components give this
+/// dependency-free implementation an axis-aligned polygon, but the 0.6 score
+/// gate and the probability values being averaged are the same.
+fn component_box_score(
+    probabilities: &[f32],
+    map_width: usize,
+    b: (u32, u32, u32, u32),
+) -> f32 {
+    let (x, y, w, h) = b;
+    if w == 0 || h == 0 || map_width == 0 {
+        return 0.0;
+    }
+    let map_height = probabilities.len() / map_width;
+    let x0 = (x as usize).min(map_width);
+    let y0 = (y as usize).min(map_height);
+    let x1 = x0.saturating_add(w as usize).min(map_width);
+    let y1 = y0.saturating_add(h as usize).min(map_height);
+    let mut sum = 0.0f64;
+    let mut count = 0usize;
+    for row in y0..y1 {
+        for col in x0..x1 {
+            sum += probabilities[row * map_width + col] as f64;
+            count += 1;
+        }
+    }
+    if count == 0 {
+        0.0
+    } else {
+        (sum / count as f64) as f32
+    }
+}
+
 /// Expands a mask-space box and maps it to original-image pixels.
 ///
-/// The margin approximates DBNet's Vatti unclip, which grows the shrink-map
-/// region to cover full glyph extents. A polygon clipper would track upstream
-/// more closely; a fractional margin is the dependency-free stand-in and errs
-/// toward wider crops, which the recognizer tolerates far better than clipped
-/// strokes. Vertical margin is larger because thresholding eats ascenders and
-/// descenders first.
+/// PaddleOCR's DB postprocess grows a polygon by
+/// `area * unclip_ratio / perimeter`. The components path has axis-aligned
+/// rectangles rather than OpenCV contours, so expanding every edge by that
+/// exact distance is the corresponding rectangle operation. The ratio is the
+/// PaddleOCR inference default 1.5, not a hand-tuned x/y percentage.
 /// Grows a detected box slightly, then maps it from probability-map space back
 /// to source-image pixels.
 ///
@@ -1140,12 +1606,17 @@ fn expand_and_map(
     oh: u32,
 ) -> (u32, u32, u32, u32) {
     let (x, y, w, h) = b;
-    let mx = (w as f32 * 0.10).ceil() as u32 + 1;
-    let my = (h as f32 * 0.20).ceil() as u32 + 1;
-    let x0 = x.saturating_sub(mx);
-    let y0 = y.saturating_sub(my);
-    let x1 = (x.saturating_add(w).saturating_add(mx)).min(dw);
-    let y1 = (y.saturating_add(h).saturating_add(my)).min(dh);
+    let area = f64::from(w) * f64::from(h);
+    let perimeter = 2.0 * f64::from(w.saturating_add(h));
+    let margin = if perimeter > 0.0 {
+        (area * DET_UNCLIP_RATIO / perimeter).ceil() as u32
+    } else {
+        0
+    };
+    let x0 = x.saturating_sub(margin);
+    let y0 = y.saturating_sub(margin);
+    let x1 = (x.saturating_add(w).saturating_add(margin)).min(dw);
+    let y1 = (y.saturating_add(h).saturating_add(margin)).min(dh);
     // A zero scale would come from a zero-sized source, which decode rejects;
     // guard anyway so this stays total rather than producing infinities.
     let inv = if scale > 0.0 { 1.0 / scale } else { 1.0 };
@@ -1298,6 +1769,64 @@ mod tests {
     }
 
     #[test]
+    fn letter_spaced_caps_use_the_lines_own_median_gap() {
+        // The hardware examples were deliberately letter-spaced small caps.
+        // Six-column gaps are wide enough to clear the old height/4 rule at
+        // this size, so it called whichever one happened to sit near a chunk
+        // division a word boundary. Relative to this line they are ordinary:
+        // the 14-column runs are the actual spaces.
+        let mut profile = vec![9.0f32; 600];
+        for start in (10usize..590).step_by(20) {
+            for x in start..start + 6 {
+                profile[x] = 0.0;
+            }
+        }
+        for (start, end) in [(193usize, 207usize), (393usize, 407usize)] {
+            for x in start..end {
+                profile[x] = 0.0;
+            }
+        }
+        let cuts = choose_cuts(&profile, 3, 16);
+        assert_eq!(cuts.len(), 2);
+        for (at, is_gap) in cuts {
+            assert!(is_gap, "the real word gap at {at} was not recognized");
+            assert!(
+                (193..207).contains(&at) || (393..407).contains(&at),
+                "cut {at} chose ordinary letter spacing"
+            );
+        }
+    }
+
+    #[test]
+    fn letter_spacing_does_not_insert_the_reported_fixture_spaces() {
+        // These are the exact gap-family strings from hardware. This test is
+        // intentionally honest about scope: false boundaries remove only the
+        // spaces this join heuristic invented. It does not claim to turn the
+        // model's C/L, P/n, "tor", or "contig" readings into other letters.
+        let fixtures: &[(&[&str], &str)] = &[
+            (&["PRI", "VACY"], "PRIVACY"),
+            (&["PLAN", "NED. BROWS", "ER"], "PLANNED. BROWSER"),
+            (&["CONNE", "C", "LON"], "CONNECLON"),
+            (&["Nord", "VPn"], "NordVPn"),
+            (
+                &["-WireGuard contig", "uration."],
+                "-WireGuard contiguration.",
+            ),
+        ];
+        for (parts, expected) in fixtures {
+            let mut joined = String::new();
+            for part in *parts {
+                append_recognized_part(&mut joined, part, false);
+            }
+            assert_eq!(&joined, expected);
+        }
+        // A genuine boundary still survives the same join helper.
+        let mut words = "small".to_string();
+        append_recognized_part(&mut words, "caps", true);
+        assert_eq!(words, "small caps");
+    }
+
+    #[test]
     fn a_wide_gap_is_preferred_over_a_narrow_one_nearby() {
         // Both qualify; the wider run is the likelier word boundary.
         let mut profile = vec![9.0f32; 400];
@@ -1358,6 +1887,41 @@ mod tests {
         let b = ink_profile(&light_bg);
         assert!(a[5] > a[0] * 5.0 + 1.0, "stripe not found on a dark page");
         assert!(b[5] > b[0] * 5.0 + 1.0, "stripe not found on a light page");
+    }
+
+    #[test]
+    fn polarity_is_decided_for_each_crop_at_mean_luminance_128() {
+        let light = RgbImage::from_pixel(40, 20, image::Rgb([240, 240, 240]));
+        let dark = RgbImage::from_pixel(40, 20, image::Rgb([15, 15, 15]));
+        assert!(!light_text_on_dark(&light));
+        assert!(light_text_on_dark(&dark));
+
+        // Exact threshold: 127 is inverted and 128 is retained.
+        assert!(light_text_on_dark(&RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([127, 127, 127]),
+        )));
+        assert!(!light_text_on_dark(&RgbImage::from_pixel(
+            1,
+            1,
+            image::Rgb([128, 128, 128]),
+        )));
+
+        let normalized = inverted(&dark);
+        assert_eq!(*normalized.get_pixel(0, 0), image::Rgb([240, 240, 240]));
+        // A second crop makes its own choice rather than inheriting a mode.
+        assert!(!light_text_on_dark(&light));
+
+        // Pin the shared-pixel wiring as well as the arithmetic: both detector
+        // and recognizer crops must come from the normalized per-crop image.
+        let src = include_str!("lib.rs");
+        let start = src.find("fn recognize_pixels(").unwrap();
+        let end = src[start..].find("fn detect_tiled(").unwrap() + start;
+        let body = &src[start..end];
+        assert!(body.contains("normalized_polarity(img)"));
+        assert!(body.contains("detect_tiled(ocr_img)"));
+        assert!(body.contains("crop_imm(ocr_img"));
     }
 
     #[test]
@@ -1446,6 +2010,42 @@ mod tests {
         // A horizontal seam at 494 is what split this line.
         let merged = merge_split_boxes(vec![top, bottom], &[], &[494]);
         assert_eq!(merged.len(), 1, "the halves did not rejoin: {merged:?}");
+    }
+
+    #[test]
+    fn a_text_line_straddling_a_tile_seam_is_kept_once() {
+        // Synthetic detector fixture for one source line in the 96px overlap
+        // of tiles 0 (x=0..960) and 1 (x=864..1500). Expansion jitter makes
+        // the source boxes differ slightly, but 86/98 of the smaller box is
+        // contained by the other. The copy with 10px clearance from tile 0's
+        // edge wins over the copy clipped at tile 1's left edge.
+        let line_from_left_tile = TileDetection {
+            rect: (850, 100, 100, 30),
+            tile_id: 0,
+            tile_rect: (0, 0, 960, 600),
+        };
+        let same_line_from_right_tile = TileDetection {
+            rect: (864, 101, 98, 29),
+            tile_id: 1,
+            tile_rect: (864, 0, 636, 600),
+        };
+        let once = dedupe_tile_boxes(vec![line_from_left_tile, same_line_from_right_tile]);
+        assert_eq!(once, vec![line_from_left_tile.rect]);
+    }
+
+    #[test]
+    fn tile_dedup_never_collapses_two_boxes_from_the_same_tile() {
+        let a = TileDetection {
+            rect: (100, 100, 300, 24),
+            tile_id: 4,
+            tile_rect: (0, 0, 960, 960),
+        };
+        let b = TileDetection {
+            rect: (102, 101, 296, 23),
+            tile_id: 4,
+            tile_rect: (0, 0, 960, 960),
+        };
+        assert_eq!(dedupe_tile_boxes(vec![a, b]).len(), 2);
     }
 
     #[test]
@@ -1592,6 +2192,19 @@ mod tests {
     }
 
     #[test]
+    fn db_box_score_and_unclip_match_the_paddleocr_defaults() {
+        let probabilities = vec![0.6f32; 4 * 3];
+        let score = component_box_score(&probabilities, 4, (1, 1, 2, 2));
+        assert!((score - DET_BOX_THRESHOLD).abs() < f32::EPSILON);
+
+        // area=200, perimeter=60, ratio=1.5 => distance=5 on every edge.
+        assert_eq!(
+            expand_and_map((10, 10, 20, 10), 100, 100, 1.0, 1.0, 100, 100),
+            (5, 5, 30, 20)
+        );
+    }
+
+    #[test]
     fn expand_and_map_scales_both_axes_by_the_same_factor() {
         // The regression this pins: the draft computed the x edge as
         // `x1 * sy.recip().recip() * sx` -- that is x1 * sy * sx -- so x was
@@ -1599,18 +2212,17 @@ mod tests {
         // horizontally, worse the further from the origin.
         //
         // Both axes must use the SAME factor, here map_to_canvas(8.0) divided
-        // by scale(0.5), i.e. 16. Note the margins are deliberately
-        // ANISOTROPIC (10% of width, 20% of height), so the two extents are
-        // legitimately unequal -- which is exactly why this asserts the mapped
-        // COORDINATES rather than comparing width to height.
+        // by scale(0.5), i.e. 16. The upstream unclip is isotropic for this
+        // square; this still asserts mapped coordinates rather than relying on
+        // equal extents to prove the scale.
         let m2c = DET_SIDE as f64 / 120.0; // 8.0
         let b = expand_and_map((10, 10, 20, 20), 120, 120, m2c, 0.5, 4000, 4000);
-        // mx = ceil(20*0.10)+1 = 3  ->  x: 7..33   -> *16 -> 112..528
-        // my = ceil(20*0.20)+1 = 5  ->  y: 5..35   -> *16 ->  80..560
-        assert_eq!(b, (112, 80, 416, 480), "both axes must map through *16");
+        // area=400, perimeter=80, ratio=1.5 => margin=ceil(7.5)=8.
+        // Both axes are 2..38 in map space, then *16 => 32..608.
+        assert_eq!(b, (32, 32, 576, 576), "both axes must map through *16");
         // Under the old expression the x edge would have been scaled by an
-        // extra factor and nx0 could not have been exactly 7*16.
-        assert_eq!(b.0, 7 * 16);
+        // extra factor and nx0 could not have been exactly 2*16.
+        assert_eq!(b.0, 2 * 16);
     }
 
     #[test]
@@ -1650,10 +2262,38 @@ mod embedded_tests {
             "rec model is {} bytes -- not the real weights",
             REC_MODEL_BYTES.len()
         );
+        assert!(
+            CLS_MODEL_BYTES.len() > 500_000,
+            "cls model is {} bytes -- not the real weights",
+            CLS_MODEL_BYTES.len()
+        );
         // Loading is what proves the bytes are a usable graph and not just a
         // file of the right size.
         let engine = OcrEngine::load_embedded().expect("embedded models must load");
         assert!(!engine.dict.is_empty());
+        assert!(
+            engine.classifier_available(),
+            "embedded cls degraded: {:?}",
+            engine.classifier_diagnostic()
+        );
+    }
+
+    #[test]
+    fn a_broken_classifier_degrades_instead_of_failing_engine_load() {
+        let (cls, diagnostic) = optional_classifier(
+            || {
+                load_onnx_bytes(
+                    b"not an ONNX graph",
+                    f32::fact([1, 3, CLS_HEIGHT as i32, CLS_WIDTH as i32]).into(),
+                )
+            },
+            "test cls",
+        );
+        assert!(cls.is_none());
+        assert!(
+            diagnostic.as_deref().is_some_and(|d| d.contains("test cls")),
+            "the degraded reason must survive for diagnostics: {diagnostic:?}"
+        );
     }
 
     #[test]
@@ -1712,5 +2352,183 @@ mod embedded_tests {
             Err(OcrError::ImageDecode) => {}
             other => panic!("garbage bytes gave {other:?}, wanted ImageDecode"),
         }
+    }
+
+    /// A synthetic Liberation Sans raster at 20 source pixels, containing the
+    /// exact f-heavy phrase from the hardware report. Kept as base64 inside
+    /// this Rust test rather than as an opaque binary fixture; the dark-mode
+    /// fixture is rendered from the same pixels by exact channel inversion.
+    const F_HEAVY_LINE_PNG: &str = concat!(
+        "iVBORw0KGgoAAAANSUhEUgAAAVQAAAAUCAAAAAD31pqxAAAFiUlEQVRYw+1Ya0wUVxg9K7sLi7viq+AuyAqtIb4osTStVWMDRDT4",
+        "hLartooKtaCtolGxTXw2rrY2Wkt9RBMk0Na0NloSjTH9YQ2+UGtJG6FRCYiWpSg+ijwE4fTH7GN2ZnYdAf9x/kzud893vjPf3Dt7",
+        "dzREL3oafbqRO0dzRyn8Q4R2jap81USVbup6Rl0q9Px4ZlMfrLYGRs26CAAPc4bpLZmOZyQ8ynz8ebKa0n6J228+753EJQd2yYas",
+        "qkSoK6B/NAxDyvr3tUF/kk/GIm3rYl3UfdecDbcVMi5jKVXBH7EWJ9WJdEn9xVUVoH1GzzdU530MpKatO4E9V79YCyTbtn7lN6MV",
+        "JnWP0x/xcnfXinobPVrVCcVWt34Z28845ssOMiexjWSnwUrGmVpJ8pXQTifLhspVFn3MHpKsWxqpGzzzEpkMAB+R1QstukHTS0na",
+        "8G9SULGIIsBFFIVLZw3SWT+oIlMAoIQpeECyHYlKIh6PLjcOzkXjWqs+Ymenbxtz8WBJqOGN0qYVlr7jfleqaoNDnOfRVA3lpi7C",
+        "vH37Z2OZu8m68WwJSCRJLkSl+zZSJto3ROMgWW8NyS2yRwT+xvN2pB4rY02ocU3B1vDAEnI+5k21/yWiCHASReErQZYtB9aZQu/x",
+        "wnxsONYgbqpcROrRBgfTkZx14dxk5Pu2kY6kzVcLgiKn5V75uX9Ym0JVGxziPI9mN5saPI4kV6Y9dY53I4/XsZAkuRG/um9jYgdZ",
+        "rY8is7WXSdaY4skS5JJMx1GS5QFvkosxuYNeFAECURTeO/Y0yTzkkdtwkhQ3VS4i9WiDgxmYS7IS03zbyEA2yffwDskVOKdQVXg6",
+        "7jyRploov1N1t+pDgZ2u4Zk1E7LQiL4AACMa3bysPoB1/OnbEUdiI+oA3VunHhuFl8ovYbMAjBh3tmGQBul9AEopzrePKJydDbR3",
+        "jES1giO5iMSjE+kAooNdRz25DQCpAIZjJoAYOAClquI8qaYKKB+pttQOX3DoH9focPLoYi0AjVDQeQWAWACIxq36e1fNZrPZfAo1",
+        "wkTdo1EaAIjBdQAxAGQUAV7hokkD9IZEPFX0JBXx9uhCJADo2uHLBoBwAFqEA9ChHYpVvfO8NVVAeaUuH513tEgzda8VADdtmfKT",
+        "CejnXKH/iX5W+wFAMFobEbdNiFiES5NzWRvQBCAEgIwiQBz+bFv8rqjAa5nKTqUiYo8e6LxGchtuipuoVNU7z1uzy01FQsKTku8K",
+        "k67pwcz8T3YFAIjU3gIAVGK4m9YCAM0INgFTvPKNaHK6cz0BGUUWbv166Gkj8EhKaVNkiz36hNyGDIpVVeT5g89/VIFJBVk3y4CV",
+        "+fZvAgBA/9qlZgCdZ4ZGukkVQpejwwb//RAA7romhgysIACUa5x7DjKKLFzXEm8EcMYzKWzPKkW22KNPyG3IIK+qLu+5m3oxvFCY",
+        "0+Ho7hWfOqMZzTsAHKgVbZR8AHfOjxyCd1t3ALgbO901k+ooBlB2KaG/KyKjSMNhmmoAZYVoBQLQAsCMCgCFimyRRz+Q25BCXlVd",
+        "nj8obv/4gR+ejdNcKZgQh7XoXAcAyB2wuGjTH2Mrfhyz2kN8Mntq84G29cCmE3bHpNr9DctdM5uPz18eU73H6Pl1llGkYUPK8ay3",
+        "y7/9fsaJwzOisb1q4usL9q3aEVx8waTEFnn0A7kNKeRV1eX5heJBqyHn5eCQV+2N9HwYrCIbV1t14csa3KyZuJ9j1o84RJKO7KHa",
+        "/jNK3cdP1iwya0PnlJPMwA16U8TnVFG4ft5LIQkl3Gwc4mhLMww4QhaMNIQteWiZoCTi8Sg+p94gyZBRvm0Il40oIXkQhxWq2uBQy",
+        "AsZpf6cqun9ntrz6M731F74QG9TXwB6m/oC8D9UHUIJRWOCpQAAAABJRU5ErkJggg==",
+    );
+
+    fn decode_test_base64(input: &str) -> Vec<u8> {
+        let value = |c: u8| -> u32 {
+            match c {
+                b'A'..=b'Z' => u32::from(c - b'A'),
+                b'a'..=b'z' => u32::from(c - b'a' + 26),
+                b'0'..=b'9' => u32::from(c - b'0' + 52),
+                b'+' => 62,
+                b'/' => 63,
+                _ => panic!("invalid fixture base64"),
+            }
+        };
+        let mut out = Vec::with_capacity(input.len() / 4 * 3);
+        let mut acc = 0u32;
+        let mut bits = 0u32;
+        for c in input.bytes().take_while(|c| *c != b'=') {
+            acc = (acc << 6) | value(c);
+            bits += 6;
+            if bits >= 8 {
+                bits -= 8;
+                out.push((acc >> bits) as u8);
+                acc &= (1 << bits) - 1;
+            }
+        }
+        out
+    }
+
+    /// A 40,002,000-pixel PNG built row by row, so the test fixture itself
+    /// never allocates the whole image. The known OCR line sits in the first
+    /// 20 rows; everything below it is white.
+    fn larger_than_old_guard_with_text_band() -> Vec<u8> {
+        use std::io::Write;
+
+        const WIDTH: u32 = 2_000;
+        const HEIGHT: u32 = 20_001;
+        assert!(u64::from(WIDTH) * u64::from(HEIGHT) > MAX_PIXELS);
+        let band = image::load_from_memory(&decode_test_base64(F_HEAVY_LINE_PNG))
+            .expect("decode text band")
+            .to_luma8();
+        assert_eq!(band.height(), 20);
+        let mut bytes = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut bytes, WIDTH, HEIGHT);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder.set_compression(png::Compression::Fastest);
+            let mut writer = encoder.write_header().expect("write tall PNG header");
+            let mut stream = writer.stream_writer().expect("start tall PNG stream");
+            let mut row = vec![255u8; WIDTH as usize];
+            for source_y in 0..HEIGHT {
+                row.fill(255);
+                if source_y < band.height() {
+                    let start = source_y as usize * band.width() as usize;
+                    let end = start + band.width() as usize;
+                    row[..band.width() as usize].copy_from_slice(&band.as_raw()[start..end]);
+                }
+                stream.write_all(&row).expect("write tall PNG row");
+            }
+            stream.finish().expect("finish tall PNG stream");
+        }
+        bytes
+    }
+
+    #[test]
+    fn region_streams_a_text_crop_from_beyond_the_old_whole_image_guard() {
+        let png = larger_than_old_guard_with_text_band();
+        let (crop, rows) = decode_png_region_with_rows(&png, 0, 0, 340, 20)
+            .expect("small crop from a 40+ MP page must decode");
+        assert_eq!(crop.dimensions(), (340, 20));
+        assert_eq!(rows, 20, "the decoder materialised rows below the crop band");
+        assert_eq!(
+            REGION_DECODER_ALLOC_LIMIT,
+            64 * 1024 * 1024,
+            "the explicit decoder allocation ceiling changed"
+        );
+
+        let engine = OcrEngine::load_embedded().expect("embedded models must load");
+        let regions = engine
+            .recognize_region(&png, 0, 0, 340, 20)
+            .expect("OCR must run on the streamed crop");
+        let text = regions
+            .iter()
+            .map(|region| region.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("before features information"),
+            "the >40 MP region did not return its selected text: {text:?}"
+        );
+
+        match decode_png_region(&png, 0, 0, 2_000, 20_001) {
+            Err(OcrError::ImageTooLarge) => {}
+            other => panic!("a >40 MP crop gave {other:?}, wanted ImageTooLarge"),
+        }
+    }
+
+    #[test]
+    fn f_heavy_text_recognizes_on_both_polarities_without_f_to_t() {
+        let engine = OcrEngine::load_embedded().expect("embedded models must load");
+        let light = image::load_from_memory(&decode_test_base64(F_HEAVY_LINE_PNG))
+            .expect("decode rendered fixture")
+            .to_rgb8();
+        let dark = inverted(&light);
+        assert!(!light_text_on_dark(&light));
+        assert!(
+            light_text_on_dark(&dark),
+            "dark fixture must take inversion path"
+        );
+
+        let light_text = engine
+            .recognize_line(normalized_polarity(&light).as_ref())
+            .expect("recognize dark-on-light fixture");
+        let dark_text = engine
+            .recognize_line(normalized_polarity(&dark).as_ref())
+            .expect("recognize inverted light-on-dark fixture");
+        assert_eq!(light_text, "s20 before features information");
+        assert_eq!(dark_text, light_text, "polarity changed recognition");
+        for substitution in ["betore", "teatures", "intormation", " tor "] {
+            assert!(
+                !dark_text.contains(substitution),
+                "inverted path retained f->t substitution {substitution:?}: {dark_text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_upside_down_line_reads_correctly_with_cls_and_garbles_without_it() {
+        let engine = OcrEngine::load_embedded().expect("embedded models must load");
+        let upright = image::load_from_memory(&decode_test_base64(F_HEAVY_LINE_PNG))
+            .expect("decode rendered fixture")
+            .to_rgb8();
+        let upside_down = image::imageops::rotate180(&upright);
+
+        let oriented = engine.orient_line(&upside_down);
+        assert_eq!(
+            oriented.as_ref(),
+            &upright,
+            "class 180 did not rotate the crop back upright"
+        );
+        let with_cls = engine
+            .recognize_line(oriented.as_ref())
+            .expect("recognize classifier-oriented fixture");
+        let without_cls = engine
+            .recognize_line(&upside_down)
+            .expect("recognize raw upside-down fixture");
+        assert_eq!(with_cls, "s20 before features information");
+        assert_ne!(
+            without_cls, with_cls,
+            "the no-cls control unexpectedly read the upside-down fixture: {without_cls:?}"
+        );
     }
 }

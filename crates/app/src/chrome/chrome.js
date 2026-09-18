@@ -22,20 +22,29 @@
   // floor is the old constant, so a measurement taken before layout settles
   // can only ever be too generous, never clipping.
   const CHROME_CLOSED_FLOOR_PX = 148;
-  // The same floor for the layout whose toolbar is down the left edge. One
+  // The same floor for either layout whose toolbar is down a side edge. One
   // row of pills leaves the top, so the strip is the tab row plus the address
   // row, and the honest floor is lower. Measured at 1280x800 in Chromium:
   // 41 + 47 = 88. Keeping the 148 floor here would have padded the page down
   // by 60px of nothing, in the layout the floor was raised to protect.
   const CHROME_CLOSED_FLOOR_LEFT_PX = 88;
 
-  function closedChromePx() {
+  // `extra` is height showing BELOW the two fixed rows right now: a banner, or
+  // an open folder menu. It is part of the measurement rather than something
+  // added to the result, because the floor must be applied ONCE, to the whole.
+  // Flooring the rows and then adding counts the slack between the measured
+  // rows and the floor a second time; see the note at the call site in
+  // `syncChromeInsets`.
+  function closedChromePx(extra = 0) {
     const strip = $("tabstrip");
     const bar = $("toolbar");
     const floor = sidebarShowing()
       ? CHROME_CLOSED_FLOOR_LEFT_PX
       : CHROME_CLOSED_FLOOR_PX;
-    if (!strip || !bar) return floor;
+    // Nothing to measure yet, at boot. Reserve the room rather than lose it:
+    // an unmeasured banner given no height is a banner drawn outside the
+    // clipped strip, which is the defect BANNERS exists to prevent.
+    if (!strip || !bar) return floor + extra;
     // The bookmarks bar is a THIRD row when it is showing, and it has to be
     // measured with the other two. A row the strip does not know about is
     // drawn outside it, which is the scrollbar-on-a-fixed-strip defect this
@@ -48,26 +57,69 @@
       (marks ? marks.getBoundingClientRect().height : 0);
     // Ceil, then the floor: a fractional layout height rounded DOWN is exactly
     // how you get one row of pixels clipped and a scrollbar to reach them.
-    return Math.max(floor, Math.ceil(measured));
+    // `extra` joins the measurement BEFORE the floor, so the floor applies to
+    // the whole height once.
+    return Math.max(floor, Math.ceil(measured + extra));
   }
-  // Whether the feature buttons are currently in the left strip. Read from
+  // Everything showing BELOW the two fixed rows: banners, and an open folder
+  // menu. Its own function because TWO callers need it and they must not
+  // disagree -- `syncChromeInsets`, which tells Rust, and `publishChromeMetric`,
+  // which tells the stylesheet. While only the first computed it, a toolbar
+  // rewrap through the ResizeObserver refreshed the bare metric and left
+  // `--chrome-strip-px` stale, and a panel positioned from the stale one opens
+  // underneath the row it is meant to clear.
+  //
+  // An open folder menu grows the strip for the same reason banners do: the
+  // chrome is CLIPPED to the height Rust was told, so anything drawn below
+  // that height is not drawn at all. That is the lock-warning defect in a
+  // different costume, and the fix is the same -- measure it and ask for the
+  // room.
+  //
+  // Heights stay UNROUNDED. `closedChromePx` ceils the whole measurement once;
+  // rounding each banner up first repeats, a pixel at a time, the mistake the
+  // floor ordering was corrected for -- two banners of 48.25 round to 98 where
+  // 96.5 was wanted, claiming 234 against a real bottom edge of 232.5.
+  function bannerExtraPx() {
+    let extra = 0;
+    const folderMenu = document.querySelector(".bmfolder-menu");
+    if (folderMenu) {
+      extra += folderMenu.getBoundingClientRect().height + 8;
+    }
+    for (const id of BANNERS) {
+      const banner = $(id);
+      if (banner && !banner.hidden) {
+        extra += banner.getBoundingClientRect().height;
+      }
+    }
+    return extra;
+  }
+  // Whether the feature buttons are currently in either side strip. Read from
   // the DOM rather than from a variable so there is one answer: the attribute
   // IS the layout, and everything else -- the stylesheet, the measurement,
   // the inset -- keys off it.
   function sidebarShowing() {
-    return document.documentElement.dataset.toolbarPlacement === "left";
+    return ["left", "right"].includes(
+      document.documentElement.dataset.toolbarPlacement,
+    );
   }
-  // What the chrome is using down the left edge. Zero unless the sidebar is
+  // What the chrome is using down the left edge. Zero unless that sidebar is
   // showing, and measured rather than assumed for the same reason the height
   // is: a width in this file would be a claim about padding and icon metrics
   // that the stylesheet is free to change.
   function closedChromeLeftPx() {
     const rail = $("sidebar");
-    if (!sidebarShowing() || !rail) return 0;
+    if (document.documentElement.dataset.toolbarPlacement !== "left" || !rail)
+      return 0;
+    return Math.ceil(rail.getBoundingClientRect().width);
+  }
+  function closedChromeRightPx() {
+    const rail = $("sidebar");
+    if (document.documentElement.dataset.toolbarPlacement !== "right" || !rail)
+      return 0;
     return Math.ceil(rail.getBoundingClientRect().width);
   }
   // The stylesheet needs the same measurements: panels sit BELOW the chrome
-  // and beside the sidebar, and a constant there is how their first line
+  // and beside either sidebar, and a constant there is how their first line
   // ended up rendering under the toolbar (96px against a 148px chrome).
   // Published as CSS variables and kept current whenever a row or the rail
   // changes size. The observer is guarded: the DOM harness the gates run in
@@ -76,7 +128,15 @@
   function publishChromeMetric() {
     const root = document.documentElement.style;
     root.setProperty("--chrome-closed-px", closedChromePx() + "px");
+    // The banner-inclusive strip, from the SAME call the backend is given. The
+    // ResizeObserver refreshes this too, so a toolbar rewrap that changes the
+    // rows cannot leave a panel positioned from a stale one.
+    root.setProperty(
+      "--chrome-strip-px",
+      closedChromePx(bannerExtraPx()) + "px",
+    );
     root.setProperty("--chrome-left-px", closedChromeLeftPx() + "px");
+    root.setProperty("--chrome-right-px", closedChromeRightPx() + "px");
   }
   // Deferred a tick: `$` is declared further down this file, so running the
   // measurement inline here would throw at boot and take the whole chrome
@@ -86,8 +146,20 @@
   setTimeout(() => {
     publishChromeMetric();
     if (typeof ResizeObserver !== "undefined") {
-      const ro = new ResizeObserver(publishChromeMetric);
-      for (const id of ["tabstrip", "toolbar", "bmbar", "sidebar"]) {
+      // syncChromeInsets, NOT publishChromeMetric. The observer used to
+      // refresh the stylesheet and tell Rust nothing, so a toolbar rewrap left
+      // the two holding different strip heights -- the page clipped to the old
+      // one while the panel was placed against the new. Going through
+      // syncChromeInsets updates both, and it re-publishes the variables on
+      // the way, so there is still one writer for them.
+      const ro = new ResizeObserver(() => syncChromeInsets());
+      // THE BANNERS ARE OBSERVED TOO, and they were the bigger gap: only a
+      // change in VISIBILITY re-measured, so an already-showing banner that
+      // grew -- `applyUpdateChecked` swapping its text, a Fluent string
+      // arriving late and rewrapping to a second line -- kept the old height.
+      // The panel is placed from that number, so it would open across the
+      // banner's new rows.
+      for (const id of ["tabstrip", "toolbar", "bmbar", "sidebar", ...BANNERS]) {
         const el = $(id);
         if (el) ro.observe(el);
       }
@@ -145,6 +217,195 @@
     else slot.reject(new Error(msg.error || "unknown_error"));
   };
 
+  // The locale fill: one snapshot, all marker strings, applied atomically
+  // or not at all. Strictly-newer generations only -- a stale snapshot from
+  // a raced switch must never paint a mixed-language UI. And COMPLETE
+  // snapshots only: if any marker on this page is missing from the payload,
+  // nothing is written and the generation is NOT committed, because a
+  // partial fill is exactly the mixed-language page the generation gate
+  // exists to prevent (fail closed, keep the old language, say so).
+  //
+  // Writes go through textContent and setAttribute alone. No innerHTML --
+  // the release gate bans it in this webview, and these strings include
+  // the product's privacy claims.
+  let lastLocaleGeneration = 0;
+  // Resolved non-English strings for the JS-rendered surfaces, keyed by
+  // message id. Closure-local like everything else here; delivered by the
+  // same fill snapshot the markup uses. EMPTY in an English session, and
+  // i18nText then returns its second argument -- the literal in the code
+  // IS the golden English, so an English build never pays a lookup that
+  // could miss. A surface rendered before a locale switch keeps its old
+  // words until it renders again; panels re-render on open, so the seam
+  // is the strip between switch and next paint, and the markup (which the
+  // applier repaints in place) never shows it.
+  let localeJsStrings = {};
+  // Structures built from i18nText at module load would freeze their
+  // English forever -- the fill arrives after load. Anything holding
+  // localized text in a module-level const registers a builder here; the
+  // applier re-runs every builder after committing a snapshot, so the
+  // structures follow the locale the way call-site lookups already do.
+  const localeRebuilders = [];
+  function rebuildOnLocaleFill(build) {
+    localeRebuilders.push(build);
+    build();
+  }
+  // Async twin of i18nText for strings whose arguments are born here
+  // (confirm dialogs, local counts). English sessions return the composed
+  // fallback synchronously-in-a-promise and never cross the bridge; other
+  // locales resolve in Rust, where the plural logic lives. On any failure
+  // the English fallback renders -- a dialog the user cannot read is worse
+  // than one in the wrong language. Callers that must not double-fire
+  // guard with their own per-action flag; this helper stays stateless.
+  let currentUiLocale = "en";
+  async function i18nResolve(id, args, english) {
+    if (currentUiLocale === "en") return english;
+    try {
+      const r = await rb("i18n_resolve", { id, args: args || {} });
+      return (r && typeof r.text === "string") ? r.text : english;
+    } catch (e) {
+      return english;
+    }
+  }
+  // Render-then-patch for SYNC render paths with local arguments: the
+  // English paints immediately (correct and final in an English session);
+  // in any other locale the resolved text replaces it when the bridge
+  // answers. The brief flash of English in a non-English session is the
+  // same accepted seam as text rendered just before a locale switch.
+  // Every write gets a token, and a resolve only lands if its token is still
+  // the element's. Without it the async assignment was unconditional: render
+  // host A, render host B before A's bridge call returns, and A's completion
+  // overwrites B -- naming the wrong site in a live security warning. The
+  // plain-HTTP banner is the caller that matters, since it interpolates a host
+  // into a sentence the user is meant to act on. Ordered replies do not save
+  // it, because the window between B's synchronous paint and A's late resolve
+  // is still open, and a request that fails slowly can land after a newer one
+  // succeeded.
+  //
+  // The token lives on the element rather than in a map so it cannot leak.
+  // `i18nHold` is split out so a caller that clears an element by hand can
+  // take ownership before doing so; nothing does that today -- its only
+  // consumer was the removed issuer line -- and it stays because the next
+  // hand-clear needs it and the reason is easy to miss.
+  let i18nWriteToken = 0;
+  function i18nHold(el) {
+    el.__i18nToken = ++i18nWriteToken;
+    return el.__i18nToken;
+  }
+  function i18nSet(el, id, args, english) {
+    const mine = i18nHold(el);
+    el.textContent = english;
+    if (currentUiLocale !== "en") {
+      i18nResolve(id, args, english).then((t) => {
+        if (el.__i18nToken !== mine) return;
+        el.textContent = t;
+      });
+    }
+  }
+  function i18nText(id, english) {
+    const s = localeJsStrings[id];
+    return typeof s === "string" ? s : english;
+  }
+  // ---- the language picker -----------------------------------------------
+  // Buttons are built from ui_locale_get's list, so the control and the
+  // binary cannot disagree about what is on offer. `active` follows the
+  // same picker convention every other choice row uses.
+  async function initLocalePicker() {
+    const wrap = $("locale-buttons");
+    if (!wrap) return;
+    let info;
+    try {
+      info = await rb("ui_locale_get");
+    } catch (e) {
+      return; // no arm, no picker -- an old engine keeps a clean panel
+    }
+    const NAMES = { "en": "English", "en-XA": "Ẋá-test" };
+    // The generated test locale is not OFFERED to users: l10n is the second
+    // stable release's story, and a layout-stress locale in a stable
+    // settings panel reads as a bug. It stays fully functional through
+    // prefs and ui_locale_set for the harness and the hardware pass -- and
+    // if it IS the active locale, it is listed so whoever put the session
+    // there can find the way back. With one visible choice, the whole
+    // section hides: a picker with nothing to pick is furniture.
+    const visible = (info.available || []).filter(
+      (tag) => !tag.endsWith("-XA") || tag === info.locale,
+    );
+    const section = $("locale-choice");
+    if (section) section.hidden = visible.length < 2;
+    if (visible.length < 2) return;
+    wrap.textContent = "";
+    for (const tag of visible) {
+      const btn = document.createElement("button");
+      btn.type = "button";
+      btn.className = "small";
+      btn.textContent = NAMES[tag] || tag;
+      btn.classList.toggle("active", tag === info.locale);
+      btn.addEventListener("click", async () => {
+        try {
+          await rb("ui_locale_set", { locale: tag });
+          for (const other of wrap.children) {
+            other.classList.toggle("active", other === btn);
+          }
+        } catch (e) {
+          toast(friendly(e), true);
+        }
+      });
+      wrap.appendChild(btn);
+    }
+  }
+
+  const LOCALE_ATTR_MARKERS = {
+    "data-msg-title": "title",
+    "data-msg-placeholder": "placeholder",
+    "data-msg-aria-label": "aria-label",
+    "data-msg-alt": "alt",
+  };
+  function applyUiLocaleFill(data) {
+    const gen = Number(data.generation) || 0;
+    if (gen <= lastLocaleGeneration) return;
+    const messages = data.messages || {};
+    // An empty or absent key is malformed markup, which is the sync gate's
+    // to catch at build time; here it is skipped, not treated as missing,
+    // so a defect in one marker cannot hold the whole language hostage.
+    const key = (el, attr) => (el.getAttribute(attr) || "").replace(/\./g, "-");
+    // Pass 1: completeness. Every keyed marker in THIS document must
+    // resolve, or the snapshot is refused whole -- a partial fill is the
+    // mixed-language page the generation gate exists to prevent.
+    for (const el of document.querySelectorAll("[data-msg]")) {
+      const k = key(el, "data-msg");
+      if (k && !(k in messages)) return;
+    }
+    for (const marker of Object.keys(LOCALE_ATTR_MARKERS)) {
+      for (const el of document.querySelectorAll("[" + marker + "]")) {
+        const k = key(el, marker);
+        if (k && !(k in messages)) return;
+      }
+    }
+    // Pass 2: write.
+    for (const el of document.querySelectorAll("[data-msg]")) {
+      const k = key(el, "data-msg");
+      if (k) el.textContent = messages[k];
+    }
+    for (const [marker, attr] of Object.entries(LOCALE_ATTR_MARKERS)) {
+      for (const el of document.querySelectorAll("[" + marker + "]")) {
+        const k = key(el, marker);
+        if (k) el.setAttribute(attr, messages[k]);
+      }
+    }
+    localeJsStrings = data.locale === "en" ? {} : messages;
+    currentUiLocale = data.locale || "en";
+    // Screen readers and hyphenation read the document's lang; it follows
+    // the committed locale, and only the committed one.
+    document.documentElement.setAttribute("lang", currentUiLocale);
+    lastLocaleGeneration = gen;
+    for (const build of localeRebuilders) build();
+    // LAST, because the pass above has just reapplied every static
+    // `data-msg-aria-label` in the document -- including the tab button's,
+    // which would otherwise replace a live interception announcement with the
+    // plain name and leave a dismissed warning with no trace a screen reader
+    // can reach.
+    applyTabButtonLabel();
+  }
+
   window.__rb_event = (msg) => {
     if (!msg || typeof msg.event !== "string") return;
     switch (msg.event) {
@@ -161,16 +422,20 @@
       case "tabs_changed":
         // Remembered so entering select mode can re-render the strip with
         // checkboxes immediately instead of waiting for the next
-        // tabs_changed. This event stays the only writer, so there is
-        // still exactly one source of truth for what the strip shows.
-        lastTabItems = (msg.data && msg.data.items) || [];
-        renderTabs(lastTabItems);
+        // tabs_changed. Reorder replies enter through the same writer, so a
+        // drop renders the canonical Rust order rather than trusting its DOM
+        // preview.
+        acceptTabItems((msg.data && msg.data.items) || []);
         break;
       case "find_open":
         openFindBar();
         break;
       // Phase 4: an activation or release call finished on its worker;
       // the row and the toolbar re-read the state from Rust.
+      case "ui_locale_fill": {
+        applyUiLocaleFill(msg.data || {});
+        break;
+      }
       case "licence_changed":
         void refreshLicence();
         break;
@@ -214,7 +479,7 @@
       // because a toast any site could provoke is a notification primitive.
       case "toast":
         toast(
-          (msg.data && msg.data.text) || "Something went wrong.",
+          (msg.data && msg.data.text) || i18nText("chrome-js-ipc-toast-fallback", "Something went wrong."),
           !!(msg.data && msg.data.error),
         );
         break;
@@ -233,11 +498,35 @@
       // message went nowhere and the key was an unexplained no-op anyway. The
       // reason is worded by Rust; this only shows it.
       case "print_unavailable":
+        if (msg.data && msg.data.reason) {
+          i18nResolve(
+            "chrome-js-ipc-print-reason",
+            { reason: msg.data.reason },
+            "Cannot print: " + msg.data.reason,
+          ).then((t) => toast(t, true));
+        } else {
+          toast(
+            i18nText("chrome-js-ipc-print-fallback", "Cannot print from this build."),
+            true,
+          );
+        }
+        break;
+      // A login was submitted while the vault was locked, so nothing was
+      // saved. Said out loud, because the alternative is what a tester
+      // actually hit: log in, watch nothing happen, and have no way to tell a
+      // locked vault from a browser that has stopped working.
+      //
+      // A plain toast, NOT `toast(text, true)`. The error variant recolours
+      // the text as a failure, and this is the browser explaining itself
+      // rather than reporting something the user did wrong. Rust rate-limits
+      // it (LOCKED_SAVE_NOTICE_COOLDOWN) so a page that submits in a loop
+      // cannot stack these up the side of the chrome.
+      case "vault_locked_no_save":
+        // The key stays on the SAME LINE as the call: build.rs scans for a
+        // contiguous `i18nText("` and a wrapped one is invisible to it, so the
+        // string would silently render English in every locale.
         toast(
-          msg.data && msg.data.reason
-            ? "Cannot print: " + msg.data.reason
-            : "Cannot print from this build.",
-          true,
+          i18nText("chrome-js-toast-locked-no-save", "Password not saved. The vault is locked, so unlock it and sign in again to save it."),
         );
         break;
       case "vault_locked":
@@ -248,6 +537,15 @@
         // the one place that handles it.)
         hideLockWarning();
         onLocked();
+        break;
+      case "bookmark_check_result":
+        rememberSnapshotCheck(msg.data || {}, null);
+        break;
+      case "bookmark_check_error":
+        rememberSnapshotCheck(
+          msg.data || {},
+          (msg.data && msg.data.code) || "io",
+        );
         break;
       // Ctrl+K, resolved natively in Rust (shortcuts.rs) so it works while a
       // content webview has focus. Toggled like every other panel: pressing
@@ -263,31 +561,45 @@
       case "tab_status":
         applyTabStatus(msg.data || {});
         break;
+      // Rust cleared a blocked-site notice's record for a tab that gets no
+      // tab_status (background navigation, tab closed): take it down.
+      case "navigation_blocked_retired":
+        if (msg.data && blockedTabId !== null && msg.data.tab_id === blockedTabId) hideBlocked();
+        break;
+      // The packs panel's live feed. The host emits this on every progress
+      // tick and once an install ends -- and NOTHING was listening, so the
+      // panel rendered whatever it happened to hold when the tab was opened:
+      // a percentage frozen at its first value, a finished install still
+      // claiming to download, and a FAILED one indistinguishable from a
+      // running one. Exactly the defect described two cases above, one event
+      // later.
+      case "packs_status":
+        // VALIDATED HERE, ONCE, because ten call sites read
+        // `translatePacks.languages` and guarding them individually does not
+        // hold: a first attempt guarded two of them and the panel still threw
+        // `TypeError: reading 'slice'` from a third. A payload without an
+        // array of languages -- a truncated or errored host reply, or `{}` --
+        // is not a pack list, and treating it as absent degrades the section
+        // instead of taking it down.
+        translatePacks =
+          msg.data && Array.isArray(msg.data.languages) ? msg.data : null;
+        renderTranslateUi();
+        break;
       case "load_state":
         document.body.classList.toggle(
           "loading",
           !!(msg.data && msg.data.loading),
         );
-        // A check requested from the bookmarks list runs when the page it
-        // named has finished loading. Checking earlier would digest the
-        // PREVIOUS page and report a verdict about the wrong document,
-        // which is worse than no verdict.
-        if (pendingBookmarkCheck && !(msg.data && msg.data.loading)) {
-          const wanted = pendingBookmarkCheck;
-          pendingBookmarkCheck = null;
-          // Only if we actually landed where we were sent: a redirect, a
-          // refusal by the URL allowlist, or the user navigating away in the
-          // meantime all mean the request no longer refers to this page.
-          if (urlInput.value === wanted) {
-            rb("integrity_check", {}).catch((e) => toast(friendly(e), true));
-          }
-        }
         break;
-      case "download_started":
-        toast(
-          "Downloading " + fileNameFromUrl(msg.data && msg.data.url) + "...",
-        );
+      case "download_started": {
+        const name = fileNameFromUrl(msg.data && msg.data.url);
+        i18nResolve(
+          "chrome-js-toast-downloading",
+          { name },
+          "Downloading " + name + "...",
+        ).then((t) => toast(t));
         break;
+      }
       case "download_finished": {
         const data = msg.data || {};
         if (data.success) {
@@ -299,29 +611,32 @@
           // written next to the file, and that is said plainly rather than
           // hidden behind an ordinary "Saved".
           if (data.mark === "failed") {
-            toast(
-              "Saved " +
-                name +
-                ", but Windows kept the download's source " +
+            i18nResolve(
+              "chrome-download-mark-failed-body",
+              { name },
+              "Saved " + name + ", but Windows kept the download's source " +
                 "address next to the file and it could not be removed.",
-              true,
-            );
+            ).then((t) => toast(t, true));
+            // "unknown" here is the WIRE TOKEN from Rust, never a display
+            // string: comparing against a localized word would break this
+            // branch in any non-English session.
           } else if (data.mark === "unknown") {
             // NOT the same sentence as "failed". That one asserts the
             // address is there; this one says only that it could not be
             // checked, which is the honest limit of what the browser knows.
-            toast(
-              "Saved " +
-                name +
-                ". PATANYX could not check whether Windows wrote the " +
-                "download's source address next to it.",
-              true,
-            );
+            i18nResolve(
+              "chrome-download-mark-unknown-body",
+              { name },
+              "Saved " + name + ". PATANYX could not check whether Windows " +
+                "wrote the download's source address next to it.",
+            ).then((t) => toast(t, true));
           } else {
-            toast("Saved " + name);
+            i18nResolve("chrome-js-toast-saved", { name }, "Saved " + name).then(
+              (t) => toast(t),
+            );
           }
         } else {
-          toast("Download failed", true);
+          toast(i18nText("chrome-js-toast-download-failed", "Download failed"), true);
         }
         break;
       }
@@ -352,6 +667,12 @@
         break;
       case "resolver_state":
         applyResolverState(msg.data);
+        break;
+      // Rust re-asks the engine question after an update check, because a
+      // verified manifest can raise the floor mid-session. Same renderer as
+      // the boot reply; only pushed when the answer is "below".
+      case "engine_state":
+        applyEngineState(msg.data);
         break;
       // Rust has emitted this since the blocklist gained a refresh schedule.
       // NOTHING listened. The whole malicious-site subsystem reported its
@@ -388,11 +709,13 @@
       // automatically. Surfaced unconditionally: an automatic reply the
       // user cannot see is the shape of a backdoor even when it is not one.
       case "download_compare_request_received":
-        toast(
-          "A contact asked what you downloaded from " +
-            hostOf((msg.data && msg.data.url) || "") +
-            ". Your record's fingerprint was sent back.",
-        );
+        {
+          const host = hostOf((msg.data && msg.data.url) || "");
+          i18nResolve("chrome-compare-request-toast", { host },
+            "A contact asked what you downloaded from " + host +
+              ". Your record's fingerprint was sent back.",
+          ).then((t) => toast(t));
+        }
         break;
       case "archive_saved":
         onArchiveSaved(msg.data || {});
@@ -413,7 +736,7 @@
         break;
       case "download_record_failed":
         toast(
-          "Saved the file, but could not record it. Verification will not be available for this download.",
+          i18nText("chrome-js-toast-record-failed", "Saved the file, but could not record it. Verification will not be available for this download."),
           true,
         );
         break;
@@ -452,172 +775,209 @@
     return node;
   }
 
-  const ERROR_TEXT = {
-    auth_failed: "Wrong passphrase, or the vault file is damaged",
-    bad_format: "That vault file is damaged or unreadable",
-    not_unlocked: "Vault is locked",
-    not_found: "Item not found",
-    io: "Could not read or write to this computer's storage",
-    too_large: "That file is too big to be a bookmarks export",
-    no_capture_page: "Nothing to capture on this page",
-    capture_failed: "The capture failed; nothing was saved",
-    // Whole-page capture has no size bound of its own, so a very long page
-    // can exceed what this browser will hold at once. Named separately from
-    // capture_failed because the remedy differs: this one has a cause the
-    // user can act on.
-    capture_too_large:
-      "That page is too long to capture in one picture. Try saving a shorter page.",
-    busy: "A capture is already in progress",
-    no_storable_tabs:
-      "Nothing to set aside: every tab here is ephemeral or an internal page",
-    // The restart did not happen and nothing was lost: the session was put
-    // back exactly as it was, so the honest thing to offer is the old
-    // manual route rather than a retry that would fail the same way.
-    relaunch_failed:
-      "PATANYX could not start a replacement, so nothing was changed. " +
-      "Close the browser and open it again to apply the tunnel setting.",
-    bad_args: "That does not look right",
-    // Find across tabs is the first premium-gated feature. The panel ALSO
-    // un-hides a standing note on this code -- a toast alone would vanish
-    // and leave the run button looking broken.
-    premium_required: "Find across tabs is a Premium feature.",
-    // Site permissions. `bad_origin` is reachable from a real page: an
-    // opaque or sandboxed document has no site to attach a permission to, so
-    // there is nothing the user could allow even in principle. Say that,
-    // rather than implying they mistyped something.
-    unknown_permission: "That is not a permission this browser controls",
-    bad_origin:
-      "This page has no site address to allow, so nothing can be changed here",
-    vault_exists: "A vault already exists",
-    recovery_exists:
-      "This vault already has a recovery key. There can only be one, and " +
-      "you were shown it when it was made.",
-    // Chat codes (chat_panel.rs). peer_offline is a designed refusal — the
-    // message is refused, never queued — so it must not read like a fault
-    // the user should retry blindly.
-    peer_offline:
-      "They are not on this network right now. Nothing was sent, and nothing is waiting",
-    no_session: "You are not connected to this person right now",
-    too_long: "Message is too long",
-    chat_down: "Chat is not available right now",
-    duplicate_contact: "You already have a contact with that number",
-    // Its own code rather than bad_args: the requirement is not guessable
-    // from "Invalid input", and a well-formed http:// address is exactly the
-    // thing a user reaches for. TLS is mandatory in the protocol.
-    // OCR runs locally; there is no service to be down, so every one of these
-    // is about the file or the install, never about a network.
-    ocr_unavailable:
-      "Text recognition is not available in this build. The model files are not installed.",
-    ocr_failed:
-      "Could not read any text in that picture. A sharper, straighter, better lit one usually works.",
-    bad_image:
-      "That file is not a picture PATANYX can read. Try a PNG or JPEG.",
-    // The region-read mode's own refusals. Stale is a state, not a fault:
-    // the capture this panel was looking at has been replaced or released,
-    // and capturing again is the whole remedy.
-    // Download corroboration, asking side. Both are about OUR OWN record,
-    // not the contact's: the contact's refusals arrive as notes, worded
-    // separately, because "you have no record of this" and "they have no
-    // record of this" are different sentences and must not share one.
-    no_download: "There is no record of that download to compare.",
-    record_untrusted:
-      "Your own record of this download failed its integrity check, so its fingerprint cannot be trusted. Nothing was sent.",
-    // Deep Recall. Its own sentence rather than a generic "full": the user
-    // can act on this, and the action is to delete something first.
-    archive_full:
-      "Deep Recall is full. Delete a saved page to make room for this one.",
-    region_stale: "That capture expired. Capture the page again.",
-    region_empty: "Drag a rectangle around the text to read.",
-    region_out_of_bounds:
-      "That selection is outside the capture. Drag inside the image.",
-    bad_relay_url:
-      "The relay address has to start with wss://. Encrypted connections only, so http:// and ws:// are refused.",
-    // Every code Rust can return must appear here, or friendly() renders the
-    // raw identifier. bad_recovery_key was reachable on the vault's
-    // last-resort path and showed the user "Unexpected error:
-    // bad_recovery_key" when they mistyped their recovery key.
-    bad_recovery_key:
-      "That recovery key is not right. Check for typos. Capitals do not matter and the dashes are optional.",
-    no_recovery_slot:
-      "This vault has no recovery key. It was set up without one, so your passphrase is the only way in.",
-    export_auth_failed: "Wrong export passphrase, or the file is corrupt.",
-    bad_export: "That file is not a PATANYX vault export.",
-    export_not_confirmed: "Type the confirmation sentence exactly to continue.",
-    target_is_vault:
-      "That path is your live vault. Choose a different destination.",
-    store_bad_format:
-      "The bookmarks file is unreadable or was written by something else.",
-    no_page: "This page has not finished loading yet.",
-    no_page_bytes: "This build cannot read the page's content.",
-    no_snapshot: "No snapshot saved for this page yet.",
-    managed_by_flatpak:
-      "Updates for this installation are delivered by Flatpak. Install it from your software center, or run: flatpak update io.edgexene.Patanyx",
-    vault_in_use:
-      "This vault is already open in another PATANYX window. Close that window and try again \u2014 two copies open at once would each overwrite the other's changes.",
-    not_bookmarked:
-      "Bookmark this page first. Snapshots are kept with the bookmark.",
-    unsupported: "Not available on this platform.",
-    offline:
-      "You are offline. Go online from the Chat panel to reach contacts.",
-    relay_unavailable: "Relay support is not compiled into this build.",
-    store_needs_passphrase:
-      "Bookmarks and downloads are encrypted with your passphrase, so they stay locked when you get in with a recovery key. Unlock with the passphrase to see them.",
-    // FOUR CODES THAT RENDERED AS "Unexpected error: <identifier>".
-    //
-    // The claim above ("Every code Rust can return must appear here") and the
-    // matching one in ipc.rs were both false: no_tab, not_ready and
-    // install_failed have been reachable and unrenderable. There is now a test
-    // in ipc.rs that fails when a code is missing from this table, so the
-    // claim is enforced rather than repeated.
-    no_tab: "There is no active tab to apply that to.",
-    not_ready:
-      "The update has not finished downloading and verifying yet. Wait for it to complete, then try again.",
-    install_failed:
-      "The verified update could not be installed. The downloaded file is kept, so you can try again.",
-    // The engine refused to create a webview -- out of memory, a lost GPU
-    // process, or a WebView2 runtime problem. Says what to do, because
-    // "engine error" leaves the user with nothing.
-    tab_failed:
-      "The browser engine could not open that tab. Close some tabs and try again; if it keeps happening, restart PATANYX.",
-    // Found by the parity test, not by hand. chat.js has a `link_lost` entry
-    // already, but that table renders DELIVERY status on a message row; this
-    // code also comes back as the reply to `chat_send` itself, which goes
-    // through friendly() and had no text at all. Two channels, one code.
-    link_lost:
-      "The connection to that contact dropped. Reopen the conversation and try again.",
-    // Client-side, not from Rust: rb() gave up waiting. Rust drops frames it
-    // cannot parse without replying, so this is what that looks like from
-    // here. Phrased as "no answer" rather than "failed" because the command
-    // may well have run -- what is known is only that nothing came back.
-    no_reply:
-      "The browser did not answer that in time. Nothing may have changed; check before trying again.",
-    // Site-info's "Forget this site". no_site is a real, expected outcome --
-    // about:blank, an internal page, or anything else with no http(s)
-    // authority -- not a fault; phrased as a statement, not an apology.
-    no_site: "This page has no site to forget.",
-    cookie_delete_failed:
-      "Could not clear cookies for this site. The engine refused the request; nothing was changed.",
-    // The browser-wide clear's own failures. Separate codes from the per-site
-    // ones above because the sentences differ: "for this site" is false here,
-    // and no_persistent_tab is not a fault at all.
-    cookie_delete_all_failed:
-      "Could not clear cookies. The engine refused the request; nothing was changed.",
-    // Expected, not broken: quarantine tabs keep their cookies in memory and
-    // throw them away when they close, so there is genuinely nothing saved to
-    // clear. Says what to do rather than only what went wrong.
-    no_persistent_tab:
-      "Every open tab is a quarantine tab, and those keep no saved cookies. Open an ordinary tab to clear the saved ones.",
-    // Inline credential autofill. no_pending_save fires if Save/Never is
-    // clicked twice (e.g. a double click) -- the first click already
-    // resolved it, so the second has nothing left to act on.
-    no_pending_save: "There is no password waiting to be saved.",
-    // Refused rather than silently skipped: the tab navigated between
-    // showing the fill offer and the click, so filling now would put a
-    // saved password into a different site than the one it was saved for.
-    origin_mismatch:
-      "That saved password is for a different site than the one open now.",
-    fill_failed: "Could not fill that password into the page.",
-  };
+  let ERROR_TEXT;
+  rebuildOnLocaleFill(() => {
+    ERROR_TEXT = {
+      // NOT "or the vault file is damaged". A damaged file has its own code
+      // and its own message (bad_format); by the time AuthFailed is raised the
+      // file has been READ AND ITS SLOTS PARSED, and only the key derivation
+      // failed. The old wording told a user their vault might be corrupt in
+      // the one case the code had just proved it was not, and it caused
+      // a genuine scare during a hardware test.
+      auth_failed: i18nText("chrome-js-error-auth-failed", "Wrong passphrase. The vault file was read fine and nothing was changed."),
+      unknown_locale: "This build does not carry that language",
+      unknown_message: i18nText("chrome-js-error-unknown-message", "This build does not carry that text"),
+      premium_language_required: i18nText("chrome-js-error-premium-required-language", "This language needs PATANYX Premium active on this device."),
+      pivot_language: i18nText("chrome-js-error-pivot-language", "English comes with every language pack and is not installed on its own."),
+      invalid_catalog: "This build's language data is damaged",
+      bad_format: i18nText("chrome-js-error-bad-format", "That vault file is damaged or unreadable"),
+      vault_newer: i18nText("chrome-js-error-vault-newer", "This vault was saved by a newer PATANYX than this build. Nothing is wrong with it. Open it with the newer build."),
+      not_unlocked: i18nText("chrome-js-error-not-unlocked", "Vault is locked"),
+      not_found: i18nText("chrome-js-error-not-found", "Item not found"),
+      capture_engine_failed: i18nText("chrome-js-error-capture-engine-failed", "The page could not be captured"),
+      capture_decode_failed: i18nText("chrome-js-error-capture-decode-failed", "The capture was not a readable PNG"),
+      capture_preview_failed: i18nText("chrome-js-error-capture-preview-failed", "The page was captured, but its preview could not be prepared"),
+      region_too_large: i18nText("chrome-js-error-region-too-large", "This page or selection is too large to read safely. Try a shorter page, or zoom in and select a smaller area."),
+      fetch_failed: i18nText("chrome-js-error-fetch-failed", "The page could not be fetched for comparison. Check the connection and try again."),
+      io: i18nText("chrome-js-error-io", "Could not read or write to this computer's storage"),
+      library_not_replaced: i18nText("chrome-js-error-library-not-replaced", "The previous profile's Library could not be replaced, so bookmarks, Tab Shelf, and download records are unavailable. The imported vault and its passwords are still available."),
+      library_replace_refused: i18nText("chrome-js-error-library-replace-refused", "The Library could not be prepared for safe replacement, so the vault was not imported."),
+      too_large: i18nText("chrome-js-error-too-large", "That file is too big to be a bookmarks export"),
+      no_capture_page: i18nText("chrome-js-error-no-capture-page", "Nothing to capture on this page"),
+      capture_failed: i18nText("chrome-js-error-capture-failed", "The capture failed; nothing was saved"),
+      // Whole-page capture has no size bound of its own, so a very long page
+      // can exceed what this browser will hold at once. Named separately from
+      // capture_failed because the remedy differs: this one has a cause the
+      // user can act on.
+      capture_too_large:
+        i18nText("chrome-js-error-capture-too-large", "This page is too large to capture whole. Try a smaller window or a zoomed-in selection."),
+      busy: i18nText("chrome-js-error-busy", "A capture is already in progress"),
+      no_storable_tabs:
+        i18nText("chrome-js-error-no-storable-tabs", "No tabs can be shelved. Ephemeral and internal tabs are skipped."),
+      // The restart did not happen and nothing was lost: the session was put
+      // back exactly as it was, so the honest thing to offer is the old
+      // manual route rather than a retry that would fail the same way.
+      relaunch_failed:
+        "PATANYX could not start a replacement, so nothing was changed. " +
+        "Close the browser and open it again to apply the tunnel setting.",
+      bad_args: i18nText("chrome-js-error-bad-args", "That does not look right"),
+      // Find across tabs is the first premium-gated feature. The panel ALSO
+      // un-hides a standing note on this code -- a toast alone would vanish
+      // and leave the run button looking broken.
+      premium_required: i18nText("chrome-js-error-premium-required", "Find across tabs requires Premium."),
+      // Site permissions. `bad_origin` is reachable from a real page: an
+      // opaque or sandboxed document has no site to attach a permission to, so
+      // there is nothing the user could allow even in principle. Say that,
+      // rather than implying they mistyped something.
+      unknown_permission: i18nText("chrome-js-error-unknown-permission", "That is not a permission this browser controls"),
+      bad_origin:
+        i18nText("chrome-js-error-bad-origin", "This page has no site address to allow, so nothing can be changed here"),
+      vault_exists: i18nText("chrome-js-error-vault-exists", "A vault already exists"),
+      recovery_exists:
+        "This vault already has a recovery key. There can only be one, and " +
+        "you were shown it when it was made.",
+      // Chat codes (chat_panel.rs). peer_offline is a designed refusal — the
+      // message is refused, never queued — so it must not read like a fault
+      // the user should retry blindly.
+      peer_offline:
+        i18nText("chrome-js-error-peer-offline", "They are not on this network right now. Nothing was sent, and nothing is waiting"),
+      no_session: i18nText("chrome-js-error-no-session", "You are not connected to this person right now"),
+      too_long: i18nText("chrome-js-error-too-long", "Message is too long"),
+      chat_down: i18nText("chrome-js-error-chat-down", "Chat is not available right now"),
+      // The held-page banner's refusals (adlist_consent.rs). Without these a
+      // stale click toasted the raw identifier (launch sweep F-004).
+      adlist_no_pending: i18nText("chrome-js-error-adlist-no-pending", "That page is no longer held"),
+      adlist_stale_banner: i18nText("chrome-js-error-adlist-stale-banner", "This notice is out of date. Try again from the page"),
+      adlist_host_mismatch: i18nText("chrome-js-error-adlist-host-mismatch", "The page moved to a different site; nothing was allowed"),
+      adlist_not_listed: i18nText("chrome-js-error-adlist-not-listed", "That site is no longer on the list, so nothing needs allowing"),
+      adlist_no_exception: i18nText("chrome-js-error-adlist-no-exception", "Opening anyway is not available on this platform"),
+      blocked_stale: i18nText("chrome-js-error-blocked-stale", "That notice is out of date. Try the page again"),
+      passphrase_changed_backups_retained: i18nText("chrome-js-error-passphrase-changed-backups-retained", "Passphrase changed, but an older backup beside the vault could not be removed and still opens with the old passphrase. Delete it by hand"),
+      passphrase_change_unavailable: i18nText("chrome-js-error-passphrase-change-unavailable", "Changing the passphrase is not available in this version. Your recovery key and current passphrase keep working"),
+      duplicate_contact: i18nText("chrome-js-error-duplicate-contact", "You already have a contact with that number"),
+      // Its own code rather than bad_args: the requirement is not guessable
+      // from "Invalid input", and a well-formed http:// address is exactly the
+      // thing a user reaches for. TLS is mandatory in the protocol.
+      // OCR runs locally; there is no service to be down, so every one of these
+      // is about the file or the install, never about a network.
+      ocr_unavailable:
+        i18nText("chrome-js-error-ocr-unavailable", "Text recognition is not available in this build. The model files are not installed."),
+      ocr_failed:
+        i18nText("chrome-js-error-ocr-failed", "Could not read any text in that picture. A sharper, straighter, better lit one usually works."),
+      bad_image:
+        i18nText("chrome-js-error-bad-image", "That file is not a picture PATANYX can read. Try a PNG or JPEG."),
+      // The region-read mode's own refusals. Stale is a state, not a fault:
+      // the capture this panel was looking at has been replaced or released,
+      // and capturing again is the whole remedy.
+      // Download corroboration, asking side. Both are about OUR OWN record,
+      // not the contact's: the contact's refusals arrive as notes, worded
+      // separately, because "you have no record of this" and "they have no
+      // record of this" are different sentences and must not share one.
+      no_download: i18nText("chrome-js-error-no-download", "There is no record of that download to compare."),
+      record_untrusted:
+        i18nText("chrome-js-error-record-untrusted", "Your own record of this download failed its integrity check, so its fingerprint cannot be trusted. Nothing was sent."),
+      // Deep Recall. Its own sentence rather than a generic "full": the user
+      // can act on this, and the action is to delete something first.
+      archive_full:
+        i18nText("chrome-js-error-archive-full", "Deep Recall is full. Delete a saved page to make room for this one."),
+      region_stale: i18nText("chrome-js-error-region-stale", "That capture expired. Capture the page again."),
+      region_empty: i18nText("chrome-js-error-region-empty", "Drag a rectangle around the text to read."),
+      region_out_of_bounds:
+        i18nText("chrome-js-error-region-out-of-bounds", "That selection is outside the capture. Drag inside the image."),
+      bad_relay_url:
+        i18nText("chrome-js-error-bad-relay-url", "The relay address has to start with wss://. Encrypted connections only, so http:// and ws:// are refused."),
+      // Every code Rust can return must appear here, or friendly() renders the
+      // raw identifier. bad_recovery_key was reachable on the vault's
+      // last-resort path and showed the user "Unexpected error:
+      // bad_recovery_key" when they mistyped their recovery key.
+      bad_recovery_key:
+        i18nText("chrome-js-error-bad-recovery-key", "That recovery key is not right. Check for typos. Capitals do not matter and the dashes are optional."),
+      no_recovery_slot:
+        i18nText("chrome-js-error-no-recovery-slot", "This vault has no recovery key. It was set up without one, so your passphrase is the only way in."),
+      export_auth_failed: i18nText("chrome-js-error-export-auth-failed", "Wrong export passphrase, or the file is corrupt."),
+      bad_export: i18nText("chrome-js-error-bad-export", "That file is not a PATANYX vault export."),
+      export_not_confirmed: i18nText("chrome-js-error-export-not-confirmed", "Type the confirmation sentence exactly to continue."),
+      target_is_vault:
+        i18nText("chrome-js-error-target-is-vault", "That path is your live vault. Choose a different destination."),
+      store_bad_format:
+        i18nText("chrome-js-error-store-bad-format", "The bookmarks file is unreadable or was written by something else."),
+      no_page: i18nText("chrome-js-error-no-page", "This page has not finished loading yet."),
+      no_page_bytes: i18nText("chrome-js-error-no-page-bytes", "This build cannot read the page's content."),
+      no_snapshot: i18nText("chrome-js-error-no-snapshot", "No snapshot saved for this page yet."),
+      managed_by_flatpak:
+        i18nText("chrome-js-error-managed-by-flatpak", "Updates for this installation are delivered by Flatpak. Install it from your software center, or run: flatpak update io.edgexene.Patanyx"),
+      vault_in_use:
+        i18nText("chrome-js-error-vault-in-use", "This vault is already open in another PATANYX window. Close that window and try again -- two copies open at once would each overwrite the other's changes."),
+      not_bookmarked:
+        i18nText("chrome-js-error-not-bookmarked", "Bookmark this page first. Snapshots are kept with the bookmark."),
+      unsupported: i18nText("chrome-js-error-unsupported", "Not available on this platform."),
+      offline:
+        i18nText("chrome-js-error-offline", "You are offline. Go online from the Chat panel to reach contacts."),
+      relay_unavailable: i18nText("chrome-js-error-relay-unavailable", "Relay support is not compiled into this build."),
+      store_needs_passphrase:
+        i18nText("chrome-js-error-store-needs-passphrase", "Bookmarks and downloads are encrypted with your passphrase, so they stay locked when you get in with a recovery key. Unlock with the passphrase to see them."),
+      // FOUR CODES THAT RENDERED AS "Unexpected error: <identifier>".
+      //
+      // The claim above ("Every code Rust can return must appear here") and the
+      // matching one in ipc.rs were both false: no_tab, not_ready and
+      // install_failed have been reachable and unrenderable. There is now a test
+      // in ipc.rs that fails when a code is missing from this table, so the
+      // claim is enforced rather than repeated.
+      no_tab: i18nText("chrome-js-error-no-tab", "No active tab. Open or select one, then try again."),
+      not_ready:
+        i18nText("chrome-js-error-not-ready", "The update has not finished downloading and verifying yet. Wait for it to complete, then try again."),
+      install_failed:
+        i18nText("chrome-js-error-install-failed", "The verified update could not be installed. The downloaded file is kept, so you can try again."),
+      // The engine refused to create a webview -- out of memory, a lost GPU
+      // process, or a WebView2 runtime problem. Says what to do, because
+      // "engine error" leaves the user with nothing.
+      tab_failed:
+        i18nText("chrome-js-error-tab-failed", "The engine could not open the tab. Close some tabs and try again. If it repeats, restart PATANYX."),
+      // Found by the parity test, not by hand. chat.js has a `link_lost` entry
+      // already, but that table renders DELIVERY status on a message row; this
+      // code also comes back as the reply to `chat_send` itself, which goes
+      // through friendly() and had no text at all. Two channels, one code.
+      link_lost:
+        i18nText("chrome-js-error-link-lost", "The connection to that contact dropped. Reopen the conversation and try again."),
+      // Client-side, not from Rust: rb() gave up waiting. Rust drops frames it
+      // cannot parse without replying, so this is what that looks like from
+      // here. Phrased as "no answer" rather than "failed" because the command
+      // may well have run -- what is known is only that nothing came back.
+      no_reply:
+        i18nText("chrome-js-error-no-reply", "The browser did not answer that in time. Nothing may have changed; check before trying again."),
+      // Site-info's "Forget this site". no_site is a real, expected outcome --
+      // about:blank, an internal page, or anything else with no http(s)
+      // authority -- not a fault; phrased as a statement, not an apology.
+      no_site: i18nText("chrome-js-error-no-site", "This page has no site to forget."),
+      cookie_delete_failed:
+        i18nText("chrome-js-error-cookie-delete-failed", "Could not clear cookies for this site. The engine refused the request; nothing was changed."),
+      // The browser-wide clear's own failures. Separate codes from the per-site
+      // ones above because the sentences differ: "for this site" is false here,
+      // and no_persistent_tab is not a fault at all.
+      cookie_delete_all_failed:
+        i18nText("chrome-js-error-cookie-delete-all-failed", "Could not clear cookies. The engine refused the request; nothing was changed."),
+      // Not built for this backend (WebKitGTK, 1.0.0). The engine was never
+      // asked, so neither sentence above may be used for it: both blame the
+      // engine for a refusal that happened before it.
+      cookie_clear_unavailable:
+        i18nText("chrome-js-error-cookie-clear-unavailable", "Clearing cookies is not available on this platform in this release. Nothing was changed."),
+      // Expected, not broken: quarantine tabs keep their cookies in memory and
+      // throw them away when they close, so there is genuinely nothing saved to
+      // clear. Says what to do rather than only what went wrong.
+      no_persistent_tab:
+        i18nText("chrome-js-error-no-persistent-tab", "All open tabs are quarantine tabs, so no cookies are saved. Open an ordinary tab to clear saved cookies."),
+      // Inline credential autofill. no_pending_save fires if Save/Never is
+      // clicked twice (e.g. a double click) -- the first click already
+      // resolved it, so the second has nothing left to act on.
+      no_pending_save: i18nText("chrome-js-error-no-pending-save", "There is no password waiting to be saved."),
+      // Refused rather than silently skipped: the tab navigated between
+      // showing the fill offer and the click, so filling now would put a
+      // saved password into a different site than the one it was saved for.
+      origin_mismatch:
+        i18nText("chrome-js-error-origin-mismatch", "The open site does not match this saved password. Open the matching site, then try again."),
+      fill_failed: i18nText("chrome-js-error-fill-failed", "Could not fill that password into the page."),
+    };
+  });
 
   function friendly(err) {
     const code = err && err.message;
@@ -632,6 +992,8 @@
   // `registerPanel` is shared too, so chat.js joins the same one-panel-at-a-time
   // rotation instead of running a fourth independent toggle that could leave two
   // panels open fighting over the chrome height.
+  initLocalePicker().catch(() => {});
+
   window.__rb = {
     request: rb,
     friendly,
@@ -641,6 +1003,29 @@
     // dialog, not fall back to the engine's window.confirm and reintroduce
     // the rbchrome:// title this replaced.
     askConfirm: (message, confirmLabel) => askConfirm(message, confirmLabel),
+    // The catalog helpers, shared for the same reason again: integrity.js,
+    // update.js and chat.js render user-facing sentences and must resolve
+    // them from the same catalog with the same locale, not carry a second
+    // English of their own. This is the CHROME document -- pages live in
+    // other webviews and cannot reach it -- so the exposure hands nothing
+    // to a site.
+    i18nText,
+    i18nResolve,
+    i18nSet,
+    rebuildOnLocaleFill,
+    // Shared so chat.js and integrity.js explain a `premium_required` refusal
+    // with the SAME sentence the toolbar pill and the panel notes use (locked
+    // vault / not on sale yet / lapsed / upgrade), instead of the tab pack's
+    // wording that `friendly` maps the code to. Both are defined further
+    // down; arrow wrappers so the late binding is fine.
+    premiumBlocked: () => premiumBlocked(),
+    premiumLockNote: () => premiumLockNote(premiumState),
+    premiumActive: () => premiumState.premium === true,
+    // Fired from applyPremiumState on EVERY refresh, including the one that
+    // licence_changed triggers. Chat's standing note used to re-render only
+    // when its pane changed, so a token pasted while the panel was open left
+    // "Add your Premium token" on screen until the panel was reopened.
+    onPremiumChange: (fn) => premiumListeners.push(fn),
   };
 
   // ---- element handles ---------------------------------------------------------
@@ -694,13 +1079,12 @@
   let ledgerTimer = null;
 
   // ---- library panel state ----
-  let digestsReady = false;
-  // URL of a bookmark opened from the library with "Open and check": the
-  // check fires when that page finishes loading. Null when nothing is
-  // pending, and cleared on the first load event either way, so a stale
-  // request cannot attach itself to some later page.
-  let pendingBookmarkCheck = null;
   let bookmarkItems = [];
+  // Library-only, memory-only compare state. Stored passages arrive only
+  // while the vault is open and this entire cache is cleared on vault lock.
+  const snapshotCheckResults = new Map();
+  const snapshotChecksPending = new Set();
+  const snapshotSelections = new Map();
   // Known folder names from bookmark_list's `folders` reply. Kept separate
   // from the tags carried on bookmarks so an EMPTY folder -- one made but not
   // yet filled -- still shows up. The union of the two is what the organizer
@@ -712,10 +1096,6 @@
   // engine), and the internal bookmark id never rides in text/plain where a
   // drop onto some other app could carry it away.
   let draggedBookmarkId = null;
-  // The bookmark search box's current text. Held here, never sent anywhere:
-  // filtering is done over the list this panel already has, so searching your
-  // own bookmarks produces no IPC, no request, and no record of the term.
-  let bookmarkQuery = "";
   let downloadItems = [];
   let editingBookmark = null;
   const btnBookmark = $("btn-bookmark");
@@ -748,11 +1128,89 @@
   function chipLabel(tab) {
     const title = (tab.title || "").trim();
     if (title) return title;
-    if (!tab.url || tab.url === "about:blank") return "New tab";
+    if (!tab.url || tab.url === "about:blank") return i18nText("chrome-js-tabs-new-tab", "New tab");
     return hostOf(tab.url);
   }
 
-  let lastTabItems = []; // last payload of the tabs_changed event
+  let lastTabItems = []; // last canonical tab payload from Rust
+  // Stable id held in module state for the lifetime of one drag. Nothing is
+  // placed in dataTransfer: tab ids are internal chrome addresses and must
+  // not ride in a payload that can be dropped into another application.
+  let draggedTabId = null;
+
+  function acceptTabItems(items) {
+    lastTabItems = Array.isArray(items) ? items : [];
+    renderTabs(lastTabItems);
+  }
+
+  function tabDomIds(wrap) {
+    return Array.from(wrap.children || [])
+      .map((chip) => Number(chip.dataset && chip.dataset.tabId))
+      .filter((id) => Number.isSafeInteger(id));
+  }
+
+  function reorderedTabIds(ids, draggedId, targetId, afterTarget) {
+    if (
+      draggedId === targetId ||
+      ids.indexOf(draggedId) < 0 ||
+      ids.indexOf(targetId) < 0
+    ) {
+      return ids.slice();
+    }
+    const next = ids.filter((id) => id !== draggedId);
+    const target = next.indexOf(targetId);
+    next.splice(target + (afterTarget ? 1 : 0), 0, draggedId);
+    return next;
+  }
+
+  function putTabDomInOrder(wrap, ids) {
+    const byId = new Map(
+      Array.from(wrap.children || []).map((chip) => [
+        Number(chip.dataset && chip.dataset.tabId),
+        chip,
+      ]),
+    );
+    for (const id of ids) {
+      const chip = byId.get(id);
+      if (chip) wrap.appendChild(chip);
+    }
+  }
+
+  function previewTabReorder(wrap, targetChip, ev) {
+    const ids = tabDomIds(wrap);
+    const box = targetChip.getBoundingClientRect();
+    const pointer = typeof ev.clientX === "number" ? ev.clientX : box.left;
+    const after = pointer >= box.left + box.width / 2;
+    const next = reorderedTabIds(
+      ids,
+      draggedTabId,
+      Number(targetChip.dataset.tabId),
+      after,
+    );
+    putTabDomInOrder(wrap, next);
+    return next;
+  }
+
+  async function persistTabOrder(ids, focusId) {
+    try {
+      const reply = await rb("tab_reorder", { ids });
+      if (!reply || !Array.isArray(reply.items)) throw new Error("bad_reply");
+      // The dragover order was only a preview. Rust has revalidated the full
+      // permutation and this is its canonical order, including active flags.
+      acceptTabItems(reply.items);
+      if (focusId !== undefined && focusId !== null) {
+        const chip = Array.from($("tabs").children || []).find(
+          (candidate) => Number(candidate.dataset.tabId) === focusId,
+        );
+        if (chip) chip.focus();
+      }
+    } catch (e) {
+      // A concurrent open/close makes the preview stale. Restore the latest
+      // authoritative list; the refused permutation changed no Rust state.
+      renderTabs(lastTabItems);
+      toast(friendly(e), true);
+    }
+  }
 
   function renderTabs(items) {
     const wrap = $("tabs");
@@ -769,14 +1227,27 @@
     }
     for (const tab of items || []) {
       const chip = el("div", "tab-chip" + (tab.active ? " active" : ""));
-      chip.title = tab.title || tab.url || "";
+      chip.setAttribute("draggable", "true");
+      chip.setAttribute("tabindex", "0");
+      chip.dataset.tabId = String(tab.id);
+      chip.title =
+        (tab.title || tab.url || chipLabel(tab)) +
+        " -- Drag or press Left/Right to reorder";
       // Truncation itself is CSS (max-width + ellipsis).
       if (tabSelectMode) {
         const tick = document.createElement("input");
         tick.type = "checkbox";
         tick.className = "chip-select";
         tick.checked = tabSelection.has(tab.id);
-        tick.setAttribute("aria-label", "Select " + chipLabel(tab));
+        const label = chipLabel(tab);
+        tick.setAttribute("aria-label", "Select " + label);
+        if (currentUiLocale !== "en") {
+          i18nResolve(
+            "chrome-js-tabs-select-aria",
+            { label },
+            "Select " + label,
+          ).then((t) => tick.setAttribute("aria-label", t));
+        }
         tick.addEventListener("click", (ev) => ev.stopPropagation());
         tick.addEventListener("change", () => {
           if (tick.checked) tabSelection.add(tab.id);
@@ -788,7 +1259,7 @@
       chip.appendChild(el("span", "chip-title", chipLabel(tab)));
       const close = el("button", "chip-close", "\u00D7");
       close.type = "button";
-      close.title = "Close tab";
+      close.title = i18nText("chrome-js-tabs-close-title", "Close tab");
       close.addEventListener("click", (ev) => {
         ev.stopPropagation();
         rb("tab_close", { id: tab.id }).catch(() => {});
@@ -807,6 +1278,65 @@
           return;
         }
         if (!tab.active) rb("tab_switch", { id: tab.id }).catch(() => {});
+      });
+      chip.addEventListener("dragstart", (ev) => {
+        draggedTabId = tab.id;
+        chip.classList.add("dragging");
+        if (ev.dataTransfer) {
+          ev.dataTransfer.effectAllowed = "move";
+          // A drag with NOTHING in dataTransfer is not a drag. Both engines
+          // abandon it and fall back to selecting the text under the cursor,
+          // which is exactly what the tab strip did: press, move, and the
+          // tab title highlighted instead of the tab moving. The other three
+          // drags in this file (bookmarks, Quick Access tiles, bookmark rows)
+          // all call setData and all worked; this one did not and did not.
+          //
+          // The constant is deliberately meaningless. The rule this file set
+          // out to keep still holds -- the tab id is an internal chrome
+          // address and must not ride in a payload another application could
+          // receive on drop -- so the id travels in `draggedTabId` and what
+          // goes on the wire is a word that identifies nothing.
+          ev.dataTransfer.setData("text/plain", "tab");
+        }
+      });
+      chip.addEventListener("dragover", (ev) => {
+        const ids = tabDomIds(wrap);
+        if (
+          draggedTabId === null ||
+          ids.indexOf(draggedTabId) < 0 ||
+          draggedTabId === tab.id
+        ) {
+          return;
+        }
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+        previewTabReorder(wrap, chip, ev);
+      });
+      chip.addEventListener("drop", (ev) => {
+        const ids = tabDomIds(wrap);
+        if (draggedTabId === null || ids.indexOf(draggedTabId) < 0) return;
+        ev.preventDefault();
+        const next = previewTabReorder(wrap, chip, ev);
+        draggedTabId = null;
+        void persistTabOrder(next);
+      });
+      chip.addEventListener("dragend", () => {
+        draggedTabId = null;
+        for (const candidate of wrap.querySelectorAll(".dragging")) {
+          candidate.classList.remove("dragging");
+        }
+      });
+      chip.addEventListener("keydown", (ev) => {
+        if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+        const ids = tabDomIds(wrap);
+        const from = ids.indexOf(tab.id);
+        const to = from + (ev.key === "ArrowLeft" ? -1 : 1);
+        if (from < 0 || to < 0 || to >= ids.length) return;
+        ev.preventDefault();
+        const next = ids.slice();
+        [next[from], next[to]] = [next[to], next[from]];
+        putTabDomInOrder(wrap, next);
+        void persistTabOrder(next, tab.id);
       });
       wrap.appendChild(chip);
     }
@@ -846,7 +1376,7 @@
       await rb("tabs_batch_enter", {});
     } catch (e) {
       if (e && e.message === "premium_required") {
-        toast("Selecting several tabs at once is a Premium feature.", true);
+        toast(i18nText("chrome-js-batch-premium", "Selecting multiple tabs requires Premium."), true);
       } else {
         toast(friendly(e), true);
       }
@@ -908,10 +1438,11 @@
     for (const id of failed) tabSelection.add(id);
     tabBatchBusy = false;
     if (failed.length) {
-      toast(
-        failed.length + " of " + ids.length + " could not be changed.",
-        true,
-      );
+      i18nResolve(
+        "chrome-js-batch-partial-failure",
+        { failed: failed.length, total: ids.length },
+        failed.length + " of " + ids.length + " tabs could not be changed.",
+      ).then((t) => toast(t, true));
     }
     renderTabBatchBar();
     renderTabs(lastTabItems);
@@ -924,7 +1455,11 @@
     const ids = Array.from(tabSelection);
     if (!ids.length || tabBatchBusy) return;
     const ok = await askConfirm(
-      "Close " + ids.length + (ids.length === 1 ? " tab?" : " tabs?"),
+      await i18nResolve(
+        "chrome-js-batch-close-confirm",
+        { count: ids.length },
+        "Close " + ids.length + (ids.length === 1 ? " tab?" : " tabs?"),
+      ),
     );
     if (!ok) return;
     const failed = await runTabBatch(ids, (id) => rb("tab_close", { id }));
@@ -959,9 +1494,14 @@
       tabBatchBusy = false;
       if (res && res.left_out) {
         toast(
-          res.left_out +
-            (res.left_out === 1 ? " tab was" : " tabs were") +
-            " not set aside: ephemeral and internal tabs are never shelved.",
+          await i18nResolve(
+            "chrome-batch-left-out",
+            { count: res.left_out },
+            res.left_out +
+              (res.left_out === 1
+                ? " ephemeral or internal tab was skipped."
+                : " ephemeral or internal tabs were skipped."),
+          ),
           true,
         );
       }
@@ -1004,7 +1544,7 @@
       stale(false);
     }
     $("confirm-text").textContent = message;
-    yes.textContent = confirmLabel || "Delete";
+    yes.textContent = confirmLabel || i18nText("chrome-js-confirm-default-label", "Delete");
     const returnFocusTo =
       document.activeElement && document.activeElement.focus
         ? document.activeElement
@@ -1050,17 +1590,83 @@
   );
 
   // ---- download toasts ------------------------------------------------------------
+  // How long a notification stays before it clears itself, with nothing asked
+  // of the user. Fixed at 15 seconds.
+  //
+  // It is NOT the old 6000. These notices moved to the centre because the
+  // corner was easy to miss, and six seconds is short for something you
+  // actually want read -- a glance away and it is gone. Fifteen gives a reader
+  // time to finish and reach the X, and the X is what makes a longer notice
+  // safe: nobody has to wait it out.
+  //
+  // Rust's LOCKED_SAVE_NOTICE_COOLDOWN must stay LONGER than this, or two
+  // locked-vault notices could be on screen at once. A test reads this
+  // constant out of this file rather than restating the number, so the two
+  // cannot drift apart.
+  const TOAST_MS = 15000;
+
+  // How many notifications may be on screen at once.
+  //
+  // Centred, bold, wrapping and fifteen seconds each were all reasonable
+  // alone; together they mean a single long message can cover the address bar
+  // and most of the toolbar for the whole of that fifteen seconds, and a burst
+  // can push later ones below the visible strip -- the document is
+  // `overflow: hidden`, so anything past the edge is unreachable rather than
+  // merely off screen. Three is what fits without swallowing the chrome.
+  //
+  // The OLDEST goes when a fourth arrives, not the newest: the message that
+  // just appeared is the one the user is most likely to be looking for, and
+  // refusing it would make a flood silence the thing it buried.
+  const MAX_VISIBLE_TOASTS = 3;
+
   function toast(text, isError) {
-    const node = el("div", "toast" + (isError ? " error" : ""), text);
+    const node = el("div", "toast" + (isError ? " error" : ""));
     node.title = text;
-    $("toasts").appendChild(node);
-    setTimeout(() => node.remove(), 6000);
+    // The message is a child now rather than the node's own text, because the
+    // node also carries a dismiss button. Still textContent, never HTML.
+    node.appendChild(el("span", "toast-text", text));
+
+    // DISMISS. The container and the notice are `pointer-events: none` so a
+    // notice over the address bar cannot swallow a click meant for it; this
+    // button turns them back on for itself alone.
+    const close = el("button", "toast-close", "\u00d7");
+    close.type = "button";
+    const label = i18nText("chrome-js-toast-dismiss", "Dismiss");
+    close.setAttribute("aria-label", label);
+    close.title = label;
+    let timer = null;
+    const dismiss = () => {
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      node.remove();
+    };
+    close.addEventListener("click", dismiss);
+    node.appendChild(close);
+
+    const host = $("toasts");
+    host.appendChild(node);
+    // `removeChild`, not the evicted node's own `remove()`: the DOM harness
+    // implements the former and no-ops the latter, and a `while` loop around a
+    // no-op removal never terminates.
+    while (host.children.length > MAX_VISIBLE_TOASTS) {
+      host.removeChild(host.children[0]);
+    }
+    timer = setTimeout(dismiss, TOAST_MS);
   }
+
+  // chat.js is injected as a SEPARATE script in chat builds and cannot see
+  // into this closure, so it grew its own `toast()` -- which meant chat
+  // notices inherited the centred bold CSS while keeping a six-second life
+  // and NO dismiss button. One implementation, exposed the same way
+  // `window.__rb_ocr` already is, rather than two that drift.
+  window.__rb_toast = toast;
 
   function fileNameFromUrl(url) {
     const clean = String(url || "").split(/[?#]/)[0];
     const segments = clean.split("/").filter(Boolean);
-    return segments.length ? segments[segments.length - 1] : "download";
+    return segments.length ? segments[segments.length - 1] : i18nText("chrome-js-toast-filename-fallback", "download");
   }
 
   function fileNameFromPath(path) {
@@ -1108,10 +1714,21 @@
     //
     // Guarded so a panel that ships its own close control keeps it.
     if (!spec.el.querySelector(".panel-close")) {
-      const close = el("button", "panel-close", "Close");
+      const close = el("button", "panel-close", i18nText("chrome-js-panel-close-button", "Close"));
       close.type = "button";
-      close.setAttribute("aria-label", "Close this panel");
+      close.setAttribute("aria-label", i18nText("chrome-js-panel-close-aria", "Close this panel"));
       close.addEventListener("click", () => togglePanelNamed(name));
+      // Created at REGISTRATION, which runs at load -- before any fill can
+      // arrive -- so without this hook every panel's Close stayed English
+      // in a non-English session. Found by the first live en-XA run, not
+      // by the stub, which cannot model creation-time freezing.
+      rebuildOnLocaleFill(() => {
+        close.textContent = i18nText("chrome-js-panel-close-button", "Close");
+        close.setAttribute(
+          "aria-label",
+          i18nText("chrome-js-panel-close-aria", "Close this panel"),
+        );
+      });
       // First child, so Tab reaches the way out before the panel's contents.
       spec.el.insertBefore(close, spec.el.firstChild);
     }
@@ -1123,7 +1740,7 @@
     err.textContent = "";
     const key = $("recovery-input").value.trim();
     if (!key) {
-      err.textContent = "Enter the recovery key you were given.";
+      err.textContent = i18nText("chrome-js-recovery-empty-prompt", "Enter the recovery key you were given.");
       return;
     }
     try {
@@ -1201,6 +1818,7 @@
           "translucent-backdrop",
           !!(r && r.translucent_overlay),
         );
+        applyTranslateCapability(r);
         document.body.classList.toggle(
           "page-covers-chrome",
           !!(r && r.page_covers_chrome),
@@ -1577,9 +2195,9 @@
       // page is a page with no title, never evidence the tab closed. The
       // fallback mirrors chipLabel: the host if there is one, else the
       // same "New tab" wording the strip uses.
-      const title = row.title || host || "New tab";
+      const title = row.title || host || i18nText("chrome-js-tabs-new-tab", "New tab");
       let status = "";
-      if (row.state === "pending") status = "Searching...";
+      if (row.state === "pending") status = i18nText("chrome-js-findtabs-searching", "Searching...");
       else if (row.state === "done" && typeof row.text === "string")
         status = row.text;
       else if (row.state === "unsearchable" && typeof row.reason === "string")
@@ -1613,8 +2231,12 @@
 
     if (scanning) {
       const settled = rows.filter((row) => row.state !== "pending").length;
-      findtabsProgress.textContent =
-        "Searched " + settled + " of " + rows.length + " tabs.";
+      i18nSet(
+        findtabsProgress,
+        "chrome-js-findtabs-progress",
+        { settled, total: rows.length },
+        "Searched " + settled + "/" + rows.length + " tabs.",
+      );
     } else {
       findtabsProgress.textContent = "";
     }
@@ -1777,7 +2399,7 @@
       // Cancel -- read as a click outside the panel and closed the panel out
       // from under the question it was asking.
       //
-      // #sidebar is exempt because in the left layout it IS the toolbar. The
+      // #sidebar is exempt because in either side layout it IS the toolbar. The
       // buttons move into it, so without this a press on a feature button
       // would close the open panel before the click reached the button --
       // running its onClose, which clears vault secrets and wipes a chat
@@ -1786,7 +2408,18 @@
       if (
         panel &&
         !panel.el.contains(ev.target) &&
-        !ev.target.closest("#toolbar, #sidebar, #tabstrip, #confirm-overlay")
+        // #toasts joins this list for exactly the reason the paragraph above
+        // gives about #sidebar. Notifications became CLICKABLE over a panel
+        // when their surface was lifted above the modal scrim, and the first
+        // thing that made possible was this: a mousedown on the dismiss
+        // button bubbled to here, read as a click outside the panel, and ran
+        // `closeOpenPanel()` -- whose onClose wipes a chat transcript and its
+        // unsent draft. Pressing X to clear a notice would have destroyed the
+        // conversation behind it. Reproduced in a browser before this line
+        // existed: panel open, press X, panel gone.
+        !ev.target.closest(
+          "#toolbar, #sidebar, #tabstrip, #confirm-overlay, #toasts",
+        )
       ) {
         closeOpenPanel();
       }
@@ -1823,11 +2456,11 @@
   // the same reason: one unit across the whole row means there is nothing to
   // convert in your head while comparing them.
   const AUTOLOCK_LABELS = {
-    0: "Never",
-    300: "5 minutes",
-    900: "15 minutes",
-    1800: "30 minutes",
-    3600: "60 minutes",
+    0: i18nText("chrome-js-autolock-never", "Never"),
+    300: i18nText("chrome-js-autolock-five", "5 minutes"),
+    900: i18nText("chrome-js-autolock-fifteen", "15 minutes"),
+    1800: i18nText("chrome-js-autolock-thirty", "30 minutes"),
+    3600: i18nText("chrome-js-autolock-sixty", "60 minutes"),
   };
 
   function autolockLabel(seconds) {
@@ -1895,7 +2528,12 @@
     try {
       st = await rb("vault_autolock_get");
     } catch (e) {
-      setNote("Could not read this setting: " + friendly(e));
+      const detail = friendly(e);
+      i18nResolve(
+        "chrome-js-autolock-read-failed",
+        { detail },
+        "Could not read this setting: " + detail,
+      ).then(setNote);
       return;
     }
     const current = Number(st && st.seconds);
@@ -1914,7 +2552,15 @@
             await refreshAutolock();
           } catch (e) {
             const note = $(noteId);
-            if (note) note.textContent = "Could not save that: " + friendly(e);
+            if (note) {
+              const detail = friendly(e);
+              i18nSet(
+                note,
+                "chrome-js-autolock-save-failed",
+                { detail },
+                "Could not save that: " + detail,
+              );
+            }
           }
         },
       );
@@ -1932,7 +2578,7 @@
     // setting.
     setNote(
       current === 0
-        ? "Once unlocked, the vault stays unlocked until you lock it or close the browser."
+        ? i18nText("chrome-js-autolock-note-never", "Once unlocked, the vault stays unlocked until you lock it or close the browser.")
         : "Locks after " +
             autolockLabel(current) +
             " with nothing happening. A countdown appears " +
@@ -1984,13 +2630,113 @@
       // engine writes asynchronously and reports back through a toast, so
       // this must not claim the file exists yet.
       await rb("page_save_pdf");
-      toast("Saving this page as a PDF...");
+      toast(i18nText("chrome-js-capture-saving-pdf", "Saving this page as a PDF..."));
     } catch (e) {
       toast(friendly(e), true);
     } finally {
       btn.disabled = false;
     }
   });
+
+  // Written from privacy status; read by the per-site renderer below.
+  //
+  // THREE states, not two. `null` means privacy_get has not answered yet, and
+  // it is NOT the same as false: `refreshPrivacy()` runs at startup, so the
+  // unknown window is milliseconds, but a tab status can land inside it. While
+  // unknown the button stays disabled (it cannot be known to work) and the
+  // description says nothing about the platform -- claiming "not available on
+  // this platform" on Windows, even for a frame, is the same species of false
+  // claim this change exists to remove. Only an explicit `false` from Rust
+  // prints that sentence (Linux readiness review, 2026-09-15).
+  //
+  // COVERAGE, stated plainly: the `false` case is gated in
+  // scripts/forget-all-cookies-gate.js, and the absent-field default in
+  // scripts/site-forget-gate.js. The `null` case is NOT gated -- chrome.js
+  // calls refreshPrivacy() at load and the DOM harness resolves it before any
+  // check runs, so the window cannot be reached there. It is reachable in the
+  // product, where the reply crosses real IPC.
+  let cookieClearAvailable = null;
+  $("btn-site-forget").disabled = true;
+  $("btn-forget-all-cookies").disabled = true;
+
+  // RECOVERY, because "unknown" must not be permanent. refreshPrivacy() writes
+  // its failure into the Privacy panel and returns, so a startup privacy_get
+  // that times out used to leave both controls disabled until the user happened
+  // to open Privacy -- on Windows that is a working feature lost to one dropped
+  // reply (R-001). Asking again costs one IPC round trip and only ever happens
+  // while the answer is still unknown.
+  //
+  // `inFlight` collapses the burst: tab_status fires on every navigation and
+  // load-state change, and without it a backend that is down would be asked on
+  // each one. A FAILED attempt clears the flag so the next render retries; a
+  // successful one sets `cookieClearAvailable`, after which this returns
+  // immediately and never asks again.
+  let cookieAvailabilityInFlight = false;
+  function ensureCookieAvailability() {
+    if (cookieClearAvailable !== null || cookieAvailabilityInFlight) return;
+    cookieAvailabilityInFlight = true;
+    rb("privacy_get")
+      .then((st) => {
+        cookieAvailabilityInFlight = false;
+        if (!st || typeof st !== "object") return;
+        applyCookieClearAvailability(st);
+      })
+      .catch(() => {
+        // Left unknown on purpose, and the flag is cleared so the next render
+        // may try again. Guessing "available" here would put back the enabled
+        // button that always fails.
+        cookieAvailabilityInFlight = false;
+      });
+  }
+
+  // The one place availability is applied, so the panel path and the recovery
+  // path above cannot diverge.
+  function applyCookieClearAvailability(st) {
+    const available = st.cookie_clear_available !== false;
+    cookieClearAvailable = available;
+    $("btn-forget-all-cookies").disabled = !available;
+    if (!available) {
+      // An unsupported action must not stay actionable. A confirmation opened
+      // before the backend answered is retired here rather than left on screen
+      // with a live "Yes" button (R-003).
+      $("forget-all-confirm").hidden = true;
+      $("site-forget-confirm").hidden = true;
+    }
+    renderSiteForgetControl();
+  }
+
+  // ONE renderer for the per-site control, called from tab status (the origin
+  // changed) AND from privacy status (availability changed), so neither can
+  // leave the other's state on screen. The unavailable sentence goes through
+  // i18nSet, which holds the element's translation token, so a late-resolving
+  // translation of the ordinary sentence cannot overwrite it.
+  function renderSiteForgetControl() {
+    const origin = lastForgetOrigin;
+    if (cookieClearAvailable === false) {
+      $("btn-site-forget").disabled = true;
+      i18nSet($("tab-forget-desc"), "chrome-js-site-forget-unavailable", {},
+        "Clearing cookies for a site is not available on this platform in this release.");
+      return;
+    }
+    if (cookieClearAvailable === null) {
+      // Not yet known. Disabled, but described by the ordinary rules below,
+      // and asked for again so "unknown" cannot become permanent.
+      ensureCookieAvailability();
+      $("btn-site-forget").disabled = true;
+      if (origin) {
+        i18nSet($("tab-forget-desc"), "chrome-site-forget-desc", { origin },
+          "Clears cookies for " + origin +
+            ". Saved passwords, local storage, and other site data stay.");
+      } else $("tab-forget-desc").textContent = i18nText("chrome-js-error-no-site", "This page has no site to forget.");
+      return;
+    }
+    if (origin) {
+      i18nSet($("tab-forget-desc"), "chrome-site-forget-desc", { origin },
+        "Clears cookies for " + origin +
+          ". Saved passwords, local storage, and other site data stay.");
+    } else $("tab-forget-desc").textContent = i18nText("chrome-js-error-no-site", "This page has no site to forget.");
+    $("btn-site-forget").disabled = !origin;
+  }
 
   $("btn-site-forget").addEventListener("click", () => {
     $("site-forget-result").hidden = true;
@@ -2026,6 +2772,628 @@
     }
   });
 
+  // ---- page translation --------------------------------------------------
+  //
+  // The Translation tab. Detected source (correctable), a target chosen from
+  // INSTALLED languages, Translate and Show original, and a Manage-languages
+  // list to install/remove packs. NOTHING starts a translation on its own --
+  // not on load, not on navigation, not on a language being remembered. A
+  // translation is a click, always.
+  //
+  // Language NAMES come from the host (packs_status), English until a second
+  // locale exists -- stated in the panel, not pretended. The dropdowns and the
+  // list are built from the host's data, so the UI can never offer a language
+  // the build cannot actually deliver.
+
+  let translatePacks = null; // last packs_status payload
+  let translateDetected = null; // the tab's declared language, if any
+
+  function translateLangName(code) {
+    if (!translatePacks) return code;
+    const row = translatePacks.languages.find((l) => l.code === code);
+    return row ? row.name : code;
+  }
+
+  // Tokens installed on disk, either direction, as a Set.
+  function installedTokens() {
+    const set = new Set();
+    if (!translatePacks) return set;
+    translatePacks.languages.forEach((l) => {
+      (l.directions || []).forEach((d) => {
+        if (d.installed) set.add(d.token);
+      });
+    });
+    return set;
+  }
+
+  // The pivot-free rule made concrete: from a source, the targets you can pick.
+  // If the source is English, any installed en-X. Otherwise English only (and
+  // only if the X-en pack is installed). Returns [{code, token}].
+  function validTargets(source) {
+    if (!translatePacks) return [];
+    const installed = installedTokens();
+    const out = [];
+    translatePacks.languages.forEach((l) => {
+      (l.directions || []).forEach((d) => {
+        if (d.from === source && installed.has(d.token)) {
+          out.push({ code: d.to, token: d.token });
+        }
+      });
+    });
+    return out;
+  }
+
+  // `preferDetected` is the CALLER's decision, and it has to be, because the
+  // two callers want opposite things. A new detection should prefill the
+  // source; a pack-status tick must not touch it. Before this parameter
+  // existed, detection always won, so any packs_status event -- including a
+  // download-progress tick -- silently discarded a user's manual correction.
+  // The guard applyTabStatus documents ("a user's manual source choice is not
+  // fought by every status push") was real but reachable only through that one
+  // caller; renderTranslateUi went straight past it.
+  function fillSourceOptions(preferDetected = false) {
+    const sel = $("translate-source");
+    // `.languages` AND NOT JUST THE OBJECT. Guarding the object alone left a
+    // truthy-but-shapeless payload -- `{}` from a truncated or errored host
+    // reply -- to reach `translatePacks.languages.slice()` and throw
+    // `TypeError: reading 'slice'`, which takes the whole Translation section
+    // down rather than degrading. A pack list we cannot read is a pack list
+    // we have not got.
+    if (!sel || !translatePacks || !Array.isArray(translatePacks.languages)) {
+      return;
+    }
+    const prev = sel.value;
+    sel.textContent = "";
+    // Every registry language can be a source the user selects (detection can
+    // be wrong; the dropdown is how they correct it).
+    translatePacks.languages
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((l) => {
+        const o = document.createElement("option");
+        o.value = l.code;
+        o.textContent = l.name;
+        sel.appendChild(o);
+      });
+    // DETECTION FIRST, then the previous choice, then NOTHING. The old
+    // order preferred `prev`, which is right within one page (a manual
+    // correction must stick) and wrong across a navigation: leave a Greek
+    // site for a French one and the dropdown stayed Greek. The change guard
+    // at the assignment site is what protects manual corrections now -- this
+    // function re-runs on a NEW detection, not on every push, so `prev` only
+    // wins while the page has declared nothing.
+    //
+    // No English fallback, by decision: a dropdown that says English
+    // about a page nobody read is a guess wearing a verdict's clothes. When
+    // neither signal answered, the placeholder stays selected and the user
+    // is asked, which is the honest state.
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.disabled = true;
+    placeholder.textContent = i18nText("chrome-translate-source-unset",
+      "Choose the page's language",
+    );
+    sel.insertBefore(placeholder, sel.firstChild);
+    const known = (code) =>
+      !!code && translatePacks.languages.some((l) => l.code === code);
+    // KEEP WHAT IS THERE unless the caller asked for the detection. An empty
+    // `prev` still falls through to the detected language, so a first render
+    // prefills exactly as it always did.
+    const want = preferDetected
+      ? (known(translateDetected) && translateDetected) ||
+        (known(prev) && prev) ||
+        ""
+      : (known(prev) && prev) ||
+        (known(translateDetected) && translateDetected) ||
+        "";
+    sel.value = want;
+  }
+
+  function fillTargetOptions() {
+    const srcSel = $("translate-source");
+    const tgtSel = $("translate-target");
+    // Same shape as fillSourceOptions: a pack list that is not an array is
+    // not a pack list.
+    if (!srcSel || !tgtSel) return;
+    if (!translatePacks || !Array.isArray(translatePacks.languages)) return;
+    const prev = tgtSel.value;
+    // No source chosen yet: the target list must not claim "no language
+    // installed" (which reads as a missing pack) about a question that has
+    // simply not been answered.
+    if (!srcSel.value) {
+      tgtSel.textContent = "";
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent = i18nText("chrome-translate-target-unset", "Pick the page's language first");
+      tgtSel.appendChild(o);
+      $("btn-translate").disabled = true;
+      return;
+    }
+    const targets = validTargets(srcSel.value);
+    tgtSel.textContent = "";
+    targets
+      .slice()
+      .sort((a, b) => translateLangName(a.code).localeCompare(translateLangName(b.code)))
+      .forEach((t) => {
+        const o = document.createElement("option");
+        o.value = t.token; // the pair token, ready for translate_page
+        o.textContent = translateLangName(t.code);
+        tgtSel.appendChild(o);
+      });
+    if (prev && targets.some((t) => t.token === prev)) tgtSel.value = prev;
+    const none = targets.length === 0;
+    $("btn-translate").disabled = none;
+    // Nothing to translate INTO from this source, said where the target would
+    // be. Two different situations reach here and they need different words:
+    // a language you have not installed at all, and one where you have the
+    // direction you are not asking for. The second used to read "No language
+    // installed for this", which is false and sends the user to install a
+    // language the list already shows as present.
+    if (none) {
+      const row = translatePacks.languages.find((l) => l.code === srcSel.value);
+      const o = document.createElement("option");
+      o.value = "";
+      o.textContent =
+        row && row.partial
+          ? i18nText("chrome-translate-no-target-partial",
+              "You have the other direction only. Get this one below.",
+            )
+          : i18nText("chrome-translate-no-target",
+              "No language installed for this. Install one below.",
+            );
+      tgtSel.appendChild(o);
+    }
+  }
+
+  function renderLangList() {
+    const host = $("translate-langs");
+    if (!host || !translatePacks) return;
+    host.textContent = "";
+    translatePacks.languages
+      .slice()
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .forEach((l) => {
+        // The pivot is not an installable thing: every pair includes English,
+        // so an "Install English" row would mean "download the entire
+        // registry" -- and the host refuses it. No row, no dead button.
+        if (l.code === "en") return;
+        const li = document.createElement("li");
+        const name = document.createElement("span");
+        name.textContent = l.name;
+        li.appendChild(name);
+        if (l.premium) {
+          const chip = document.createElement("span");
+          chip.className = "premium-chip";
+          chip.textContent = i18nText("chrome-translate-lang-premium", "Premium");
+          li.appendChild(chip);
+        }
+
+        const status = document.createElement("span");
+        status.className = "muted";
+        if (l.downloading) {
+          // Real bytes, not a spinner, from the progress the host reports.
+          const dir = (l.directions || []).find((d) => d.downloading && d.total);
+          if (dir && dir.total) {
+            const pct = Math.floor((dir.got / dir.total) * 100);
+            status.textContent = i18nText("chrome-translate-lang-downloading-pct",
+              "Downloading… ",
+            ) + pct + "%";
+          } else {
+            status.textContent = i18nText("chrome-translate-lang-downloading", "Downloading…");
+          }
+        } else if (l.failed) {
+          // Ahead of `installed`: with one direction on disk and the other
+          // failed the row IS installed, and saying so alone would hide the
+          // half that did not arrive.
+          status.textContent = packFailureText(l.failed);
+          status.classList.add("pack-failed");
+        } else if (l.installed) {
+          status.textContent = i18nText("chrome-translate-lang-installed", "Installed");
+        } else if (l.partial) {
+          // Half a language is not an installed language: one direction
+          // present and the other missing used to read "Installed" and offer
+          // only Remove, which stranded the direction the user wanted.
+          status.textContent = i18nText("chrome-translate-lang-partial", "One direction only");
+        } else {
+          const mb = Math.round(Number(l.approx_bytes || 0) / 1048576);
+          status.textContent = mb > 0 ? "~" + mb + " MB" : "";
+        }
+        li.appendChild(status);
+
+        // Written once and used by two branches: `installed` removes, and
+        // `partial` removes the half that landed. Duplicating the handler is
+        // how the two would drift.
+        const wireRemove = (b) => {
+          b.classList.add("danger");
+          b.textContent = i18nText("chrome-translate-lang-remove", "Remove");
+          b.addEventListener("click", async () => {
+            b.disabled = true;
+            try {
+              translatePacks = await rb("pack_remove", { code: l.code });
+              renderTranslateUi();
+            } catch (e) {
+              toast(friendly(e), true);
+              b.disabled = false;
+            }
+          });
+          return b;
+        };
+
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "small";
+        // A SECOND action, only for `partial`. Set below and appended after
+        // `btn`; every other state leaves it null and appends nothing.
+        let extraBtn = null;
+        if (l.downloading) {
+          btn.disabled = true;
+          btn.textContent = i18nText("chrome-translate-lang-installing", "Installing…");
+        } else if (l.partial) {
+          // Completing costs only the missing direction: install_language
+          // skips what is already on disk.
+          btn.textContent = i18nText("chrome-translate-lang-complete", "Get the other direction");
+          btn.addEventListener("click", async () => {
+            btn.disabled = true;
+            try {
+              translatePacks = await rb("pack_install", { code: l.code });
+              renderTranslateUi();
+            } catch (e) {
+              toast(friendly(e), true);
+              btn.disabled = false;
+            }
+          });
+          // AND a way out. Without this, the direction that DID install had
+          // no removal control anywhere in this list: `Remove` lived only in
+          // the `installed` branch below, so the only route to it was to
+          // finish a download the user may not want, for tens of megabytes
+          // they have decided against.
+          extraBtn = document.createElement("button");
+          extraBtn.type = "button";
+          extraBtn.className = "small";
+          wireRemove(extraBtn);
+        } else if (l.installed) {
+          wireRemove(btn);
+        } else if (l.premium && !translatePacks.premium_active) {
+          // Locked, stated, and honest: the host enforces this same rule
+          // (install_language refuses tier-2 without an active licence), so
+          // the disabled button is a mirror of reality, not a style choice.
+          btn.disabled = true;
+          btn.textContent = i18nText("chrome-translate-lang-premium-locked", "Premium required");
+        } else {
+          btn.textContent = i18nText("chrome-translate-lang-install", "Install");
+          btn.addEventListener("click", async () => {
+            btn.disabled = true;
+            try {
+              translatePacks = await rb("pack_install", { code: l.code });
+              renderTranslateUi();
+            } catch (e) {
+              toast(friendly(e), true);
+              btn.disabled = false;
+            }
+          });
+        }
+        li.appendChild(btn);
+        if (extraBtn) li.appendChild(extraBtn);
+        host.appendChild(li);
+      });
+  }
+
+  function renderTranslateUi() {
+    fillSourceOptions();
+    fillTargetOptions();
+    renderLangList();
+    renderDetectedHint();
+  }
+
+  // The friendly "this page looks like X" line. Its own function because it
+  // has two callers with different timing: applyTabStatus sets the detected
+  // language the moment the tab reports it (often before any pack list has
+  // loaded), and renderTranslateUi repaints it once packs ARE loaded so the
+  // language NAME resolves. Without the second caller the line stayed hidden
+  // even though the source dropdown had already been pre-set from detection.
+  function renderDetectedHint() {
+    const el = $("translate-detected");
+    if (!el) return;
+    if (translateDetected && translatePacks) {
+      el.hidden = false;
+      el.textContent =
+        i18nText("chrome-translate-detected-prefix", "This page looks like ") +
+        translateLangName(translateDetected) +
+        ".";
+    } else {
+      el.hidden = true;
+    }
+  }
+
+  async function refreshTranslatePacks() {
+    try {
+      translatePacks = await rb("packs_status");
+      renderTranslateUi();
+    } catch (e) {
+      /* leave the last known state; the panel simply does not update */
+    }
+  }
+
+  // Why a pack download stopped, for the packs list. Deliberately NOT
+  // translateFailureText: that copy ends "the page is unchanged and still
+  // readable", which is true when a translation failed and meaningless here,
+  // where no page was being translated. Literal i18nText calls per case so
+  // the i18n gate sees every string.
+  function packFailureText(key) {
+    switch (key) {
+      case "translate-pack-unreachable":
+        return i18nText("chrome-translate-lang-failed-unreachable",
+          "Download failed: could not reach the language pack server.",
+        );
+      case "translate-pack-not-offered":
+        return i18nText("chrome-translate-lang-failed-not-offered",
+          "This language pack is not available yet.");
+      case "translate-pack-untrusted":
+        return i18nText("chrome-translate-lang-failed-untrusted",
+          "Download failed: the pack did not verify, so nothing was kept.",
+        );
+      case "translate-pack-storage":
+        return i18nText("chrome-translate-lang-failed-storage",
+          "Download failed: it could not be saved to disk.",
+        );
+      default:
+        return i18nText("chrome-translate-lang-failed", "Download failed.");
+    }
+  }
+
+  // The failure copy for a stopped translation. Literal i18nText calls per
+  // case (not a lookup table) so the i18n gate sees every string; the
+  // source-unknown copy states the Latin-vs-Latin limit honestly.
+  function translateFailureText(key) {
+    switch (key) {
+      case "translate-pack-unreachable":
+        return i18nText("chrome-translate-status-failed-unreachable",
+          "Could not reach the language pack server. The page is unchanged and still readable.",
+        );
+      case "translate-pack-not-offered":
+        return i18nText("chrome-translate-lang-failed-not-offered",
+          "This language pack is not available yet.");
+      case "translate-pack-untrusted":
+        return i18nText("chrome-translate-status-failed-untrusted",
+          "The language pack did not verify, so nothing was installed. The page is unchanged and still readable.",
+        );
+      case "translate-pack-storage":
+        return i18nText("chrome-translate-status-failed-storage",
+          "The language pack could not be saved. The page is unchanged and still readable.",
+        );
+      case "translate-script-mismatch":
+        return i18nText("chrome-translate-status-failed-script",
+          "This page is not written in the language you chose, so it was left unchanged. Pick the correct source language and try again.",
+        );
+      case "translate-source-unknown":
+        return i18nText("chrome-translate-status-failed-source-unknown",
+          "Could not tell what language this page is in. Choose the source language and try again. (Languages that share an alphabet, like English and French, cannot be told apart automatically.)",
+        );
+      case "translate-timeout":
+        return i18nText("chrome-translate-status-failed-timeout",
+          "This took too long and was stopped. The page is unchanged and still readable.",
+        );
+      case "translate-pair-unavailable":
+        return i18nText("chrome-translate-status-failed-unavailable",
+          "There is no language pack for that translation direction yet. The page is unchanged.",
+        );
+      case "translate-busy":
+        return i18nText("chrome-translate-status-failed-busy",
+          "Another translation is already running. Let it finish, then try this page.",
+        );
+      default:
+        return i18nText("chrome-translate-status-failed",
+          "Translation stopped. The page is unchanged and still readable.",
+        );
+    }
+  }
+
+  function renderTranslate(status) {
+    const active = status && status.active;
+    const done = active && status.phase === "done";
+    $("btn-translate-restore").hidden = !done;
+    $("btn-translate").hidden = !!(active && status.phase !== "failed" && status.phase !== "done");
+    const line = $("translate-status");
+    if (active) {
+      line.hidden = false;
+      const phase = status.phase;
+      // A pack download for this session names ITSELF, with real bytes --
+      // the phase word alone said "loading" while fifty megabytes moved, and
+      // said nothing at all about a page that never answered.
+      const dlPct =
+        status.downloading && status.dl_total
+          ? Math.floor((status.dl_got / status.dl_total) * 100)
+          : null;
+      line.textContent = status.downloading
+        ? i18nText("chrome-translate-status-downloading",
+            "Downloading the language pack…",
+          ) + (dlPct === null ? "" : " " + dlPct + "%")
+        : phase === "preparing"
+          ? i18nText("chrome-translate-status-preparing", "Getting ready.")
+          : phase === "translating"
+            ? i18nText("chrome-translate-status-translating", "Translating this page.") +
+              // Real progress when the page has told us how much there is.
+              // A long page can spend minutes here, and a phase word alone
+              // gives a reader no way to tell working from stuck.
+              (status.total_nodes
+                ? " " +
+                  Math.min(
+                    99,
+                    Math.floor((status.done_nodes / status.total_nodes) * 100),
+                  ) +
+                  "%"
+                : "")
+            : phase === "done"
+              ? i18nText("chrome-translate-status-done", "This page is translated.")
+              : translateFailureText(status.failure);
+      $("translate-active").hidden = phase !== "translating" && phase !== "preparing";
+    } else {
+      line.hidden = true;
+      $("translate-active").hidden = true;
+    }
+    // THE DIAGNOSTIC LINE. Shown only while a translation is live, and only
+    // when the engine has answered: which copy of translator.js is actually
+    // running, whether it matches this build, and how much heap the engine
+    // got. Four builds produced identical wrong output while the code changed
+    // underneath them; nothing on screen could tell a stale script from a
+    // correct one computing a wrong answer, so every round was inference.
+    // A person can read this and know.
+    const diag = $("translate-engine-diag");
+    if (diag) {
+      const rev = status && status.engine_asset_rev;
+      const want = status && status.expected_asset_rev;
+      const heap = status && status.engine_heap_bytes;
+      if (active && rev) {
+        const mb = heap ? Math.round(heap / 1048576) : 0;
+        const stale = !!(want && rev !== want);
+        if (stale) {
+          i18nSet(
+            diag,
+            "chrome-translate-engine-diag-stale",
+            { rev, want, mb },
+            "Engine " + rev + " is STALE; this build expects " + want + ". " + mb + " MB heap.",
+          );
+        } else {
+          i18nSet(
+            diag,
+            "chrome-translate-engine-diag",
+            { rev, mb },
+            "Engine " + rev + ". " + mb + " MB heap.",
+          );
+        }
+        // The census rides in the same line: which alphabets actually
+        // reached the engine. Counts only -- never the page's words.
+        // SCRIPT CODES, not words: "cyrl/grek/latn/zzzz" are ISO 15924, the
+        // same identifiers a font or a locale uses, and they are the same in
+        // every language. Nothing here is prose to translate, which is why it
+        // is built from constants rather than routed through the catalog.
+        const cen = status && status.engine_last_input;
+        if (cen) {
+          const CODES = [
+            ["cyrl", cen.cyrillic],
+            ["grek", cen.greek],
+            ["latn", cen.latin],
+            ["zzzz", cen.other],
+          ];
+          const parts = CODES.filter((c) => c[1]).map((c) => c[0] + "=" + c[1]);
+          diag.textContent = diag.textContent + " | " + (parts.join(" ") || "0");
+        }
+        diag.classList.toggle("pack-failed", stale);
+        diag.hidden = false;
+      } else {
+        diag.hidden = true;
+      }
+    }
+
+    // The toolbar chip: visible exactly while the page on screen is
+    // translated, gone the moment it is not -- same contract as the zoom
+    // chip, and cleared by the same navigation-driven repaint that fixed the
+    // panel. A chip that lingered would claim a page is translated when it
+    // is not, which is the lie this whole feed exists to prevent.
+    const chip = $("translate-chip");
+    if (chip) {
+      if (done) chip.textContent = i18nText("chrome-translate-chip", "Translated");
+      if (chip.hidden !== !done) {
+        chip.hidden = !done;
+        syncChromeInsets();
+      }
+    }
+  }
+
+  // Gated on the host confirming the channel; a control that cannot finish its
+  // own action must not be on screen. Gates the whole Translation tab body.
+  function applyTranslateCapability(caps) {
+    const on = !!(caps && caps.page_translation);
+    const tabBtn = $("btn-tab-translate");
+    if (tabBtn) tabBtn.hidden = !on;
+    const body = $("tab-translate-body");
+    if (body && !on) body.hidden = true;
+  }
+  window.__rbApplyTranslateCapability = applyTranslateCapability;
+
+  const srcSel = $("translate-source");
+  if (srcSel) srcSel.addEventListener("change", fillTargetOptions);
+
+  $("btn-translate").addEventListener("click", async () => {
+    const pair = $("translate-target").value;
+    if (!pair) return;
+    const btn = $("btn-translate");
+    btn.disabled = true;
+    try {
+      // Remember the target for next time, then translate. The ONLY argument
+      // is the pair; Rust picks the active tab and reads its URL itself.
+      const tgtCode = validTargets($("translate-source").value).find(
+        (t) => t.token === pair,
+      );
+      if (tgtCode) {
+        try {
+          await rb("translate_set_target", { code: tgtCode.code });
+        } catch (e) {
+          /* remembering is a convenience; a failure must not block translating */
+        }
+      }
+      renderTranslate(await rb("translate_page", { pair }));
+    } catch (e) {
+      toast(friendly(e), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("btn-translate-restore").addEventListener("click", async () => {
+    const btn = $("btn-translate-restore");
+    btn.disabled = true;
+    try {
+      renderTranslate(await rb("translate_restore"));
+    } catch (e) {
+      toast(friendly(e), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  $("btn-translate-stop").addEventListener("click", async () => {
+    const btn = $("btn-translate-stop");
+    btn.disabled = true;
+    try {
+      renderTranslate(await rb("translate_cancel"));
+    } catch (e) {
+      toast(friendly(e), true);
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  // The Info / Translation tab strip inside the panel. Same aria-pressed
+  // convention as #tools-tabs. Opening Translation refreshes the pack list so
+  // install/remove state is current.
+  const TAB_PANEL_SECTIONS = [
+    { tab: "btn-tab-info", body: "tab-info-body" },
+    { tab: "btn-tab-translate", body: "tab-translate-body" },
+  ];
+  function selectTabPanelSection(tabId) {
+    TAB_PANEL_SECTIONS.forEach(({ tab, body }) => {
+      const active = tab === tabId;
+      const b = $(tab);
+      if (b) b.setAttribute("aria-pressed", active ? "true" : "false");
+      const el = $(body);
+      if (el) el.hidden = !active;
+    });
+    if (tabId === "btn-tab-translate") refreshTranslatePacks();
+  }
+  $("btn-tab-info").addEventListener("click", () => selectTabPanelSection("btn-tab-info"));
+  $("btn-tab-translate").addEventListener("click", () =>
+    selectTabPanelSection("btn-tab-translate"),
+  );
+  // The chip opens the panel it summarises, on its Translation tab, where
+  // Show original lives. It never acts on the page directly: undoing a
+  // translation from a chip is one accidental click, from the panel it is a
+  // deliberate one.
+  $("translate-chip").addEventListener("click", () => {
+    if ($("tab-panel").hidden) togglePanelNamed("tab");
+    selectTabPanelSection("btn-tab-translate");
+  });
+
   // ---- inline credential autofill ----
   //
   // Two independent surfaces, and neither ever holds a password in this
@@ -2046,6 +3414,10 @@
   // exists purely so somebody who DOES open the panel gets a reason instead of
   // a dead control.
   let lastAutofillReason = "";
+  // Machine-readable twin of the reason above, mirrored onto the desc node
+  // so the gate can assert WHICH reason is showing without pinning English:
+  // no-site | unavailable | no-match | check-failed | offer.
+  let lastAutofillState = "";
 
   // Tracked here rather than read back per call because locking the vault must
   // retract a fill button that is already on screen: the offer is only valid
@@ -2069,6 +3441,40 @@
   // `.iter().filter()` over an already-decrypted Vec -- no disk, no crypto --
   // and `tab_status` is event-driven rather than on a repeating timer. The
   // cache was guarding a cost that does not exist with a bug that does.
+  // What the host's `reason` means, in words. Keyed by the EXACT strings
+  // `autofill_offer_reason` in ipc.rs can return; a Rust test reads this table
+  // and fails if either side adds, renames or drops one. Only "no-match"
+  // asserts that a search actually ran -- the other three say no search was
+  // made, which is the distinction this chrome used to be unable to draw.
+  // Each entry RESOLVES its own text rather than holding an id to look up
+  // later. Two reasons, and the second one is a gate: a catalog id must appear
+  // as a literal first argument to `i18nText` or scripts/i18n-gate.sh counts
+  // it unreferenced and fails -- which is how it catches wording that was
+  // added to the catalog but never wired to a surface. Resolving here also
+  // means the sentence follows a live locale switch instead of being frozen
+  // at whatever the locale was when the table was built.
+  //
+  // Every key is quoted, including the one JS would let us leave bare: the
+  // Rust contract test reads this table as text and looks for the quoted
+  // reason.
+  const AUTOFILL_REASON_TEXT = {
+    // NO PROTOTYPE. With an ordinary object literal, a reason the host never
+    // sends still selected something: "constructor" rendered "[object Object]"
+    // with state "constructor", "toString" rendered "[object Undefined]", and
+    // "__proto__" threw and landed on check-failed. None of them degraded to
+    // no-match the way an unknown reason must. This is a lookup table for
+    // strings that arrive over IPC, so it inherits nothing.
+    __proto__: null,
+    "locked": () =>
+      i18nText("chrome-js-autofill-reason-locked", "Unlock the vault to check for a saved password."),
+    "no-vault": () =>
+      i18nText("chrome-js-autofill-reason-no-vault", "No vault yet. Create one to save passwords."),
+    "no-site": () =>
+      i18nText("chrome-js-autofill-reason-no-site", "No site to check for a saved password."),
+    "no-match": () =>
+      i18nText("chrome-js-autofill-reason-no-match", "No saved password for this site."),
+  };
+
   function autofillKey(st) {
     if (!st) return "none";
     return [st.origin || "", vaultUnlocked, st.content_script_registered].join(
@@ -2086,10 +3492,27 @@
     const offer = lastAutofillOffer;
 
     if (offer) {
-      desc.textContent =
-        "A saved password for " + offer.username + " is available.";
+      i18nSet(
+        desc,
+        "chrome-js-autofill-offer-desc",
+        { username: offer.username },
+        // Two drafts of this sentence were concatenated instead of one being
+        // chosen, and `i18nSet` writes this argument to textContent
+        // SYNCHRONOUSLY -- and, on the default "en" locale, writes nothing
+        // else. So every English user with a saved password read
+        // "A saved password for aliceSaved password available for ". The
+        // catalog entry (en.ftl chrome-js-autofill-offer-desc) was correct all
+        // along; only this fallback was wrong.
+        "A saved password for " + offer.username + " is available.",
+      );
+      desc.dataset.state = "offer";
       panelBtn.disabled = false;
-      panelBtn.textContent = "Fill password for " + offer.username;
+      i18nSet(
+        panelBtn,
+        "chrome-js-autofill-offer-button",
+        { username: offer.username },
+        "Fill password for " + offer.username,
+      );
       if (toolbarBtn) {
         toolbarBtn.hidden = false;
         // LIT, not merely present. Appearing was supposed to be the whole
@@ -2103,16 +3526,47 @@
         // button borrows the vocabulary rather than inventing a tenth colour.
         toolbarBtn.classList.add("is-active");
         toolbarBtn.title = "Fill the saved password for " + offer.username;
+        if (currentUiLocale !== "en") {
+          // Same token discipline as `i18nSet`, which this call deliberately
+          // does not use (it writes `title`, not textContent). Without it a
+          // late reply would write the account name into the tooltip of a
+          // button the lock had already hidden.
+          const mine = i18nHold(toolbarBtn);
+          i18nResolve(
+            "chrome-js-autofill-offer-title",
+            { username: offer.username },
+            "Fill the saved password for " + offer.username,
+          ).then((t) => {
+            if (toolbarBtn.__i18nToken !== mine) return;
+            toolbarBtn.title = t;
+          });
+        }
       }
       return;
     }
+    // INVALIDATE ANY TRANSLATION STILL IN FLIGHT. `i18nSet` guards its own
+    // completion with a per-element token, but the lines below write
+    // textContent directly, which leaves the previous token valid. In a
+    // non-English locale that let a translation requested for a LIVE OFFER
+    // land after the vault had locked and put the account name back on
+    // screen -- in the description and on the button -- under a panel that
+    // said the vault was locked. Bumping the token here is what makes those
+    // late writes no-ops.
+    i18nHold(desc);
+    i18nHold(panelBtn);
     desc.textContent = lastAutofillReason;
+    desc.dataset.state = lastAutofillState;
     panelBtn.disabled = true;
-    panelBtn.textContent = "Fill saved password";
+    panelBtn.textContent = i18nText("chrome-js-autofill-fill-default", "Fill saved password");
     // Hidden, not disabled. See the markup comment on #btn-fill: a greyed
     // button on every page the user has no saved password for is nine-tenths
     // of the time noise, and its absence is the clearer signal.
     if (toolbarBtn) {
+      // The tooltip named the account too, so it is cleared with the button
+      // and its token bumped, or a translation still in flight would write it
+      // back after the lock.
+      i18nHold(toolbarBtn);
+      toolbarBtn.title = "";
       toolbarBtn.hidden = true;
       // Cleared as well as hidden. A hidden button keeps its classes, and the
       // next offer would otherwise be able to arrive already-green from the
@@ -2132,15 +3586,30 @@
     const origin = st && st.origin;
     if (!origin) {
       lastAutofillReason =
-        "This page has no site to check for a saved password.";
+        i18nText("chrome-js-autofill-reason-no-site", "No site to check for a saved password.");
+      lastAutofillState = "no-site";
       renderAutofillOffer();
       return;
     }
     if (st.content_script_registered !== "applied") {
-      lastAutofillReason = "Autofill is not available in this tab.";
+      lastAutofillReason = i18nText("chrome-js-autofill-reason-unavailable", "Autofill is not available in this tab.");
+      lastAutofillState = "unavailable";
       renderAutofillOffer();
       return;
     }
+    // REPAINT BEFORE THE ROUND TRIP. `lastAutofillOffer` was cleared above,
+    // but nothing on screen knows that until the reply lands -- and one of the
+    // callers is the vault LOCKING. Without this, locking leaves the previous
+    // "Fill password for alice" sitting in the panel with its button ENABLED
+    // and the toolbar button lit, for as long as the lookup takes. Found by
+    // holding the reply pending and looking at the screen in the gap, not by
+    // reading the code.
+    //
+    // It paints "checking", not a guess at the answer: the one thing that is
+    // certainly true here is that we have asked and do not know yet.
+    lastAutofillReason = i18nText("chrome-js-autofill-reason-checking", "Checking for a saved password.");
+    lastAutofillState = "checking";
+    renderAutofillOffer();
     rb("cred_autofill_offer_get")
       .then((data) => {
         // The tab may have navigated to a different site while this was in
@@ -2150,12 +3619,27 @@
         if (autofillKey(lastTabStatus) !== key) return;
         const item = ((data && data.items) || [])[0];
         lastAutofillOffer = item || null;
-        if (!item) lastAutofillReason = "No saved password for this site.";
+        if (!item) {
+          // THE HOST SAYS WHICH of four things happened, because only the host
+          // knows: an empty list from a locked vault and an empty list from a
+          // completed search look identical from here. Assuming the second was
+          // the bug -- a tester with a correctly saved password was told
+          // "No saved password for this site" while his vault was simply shut.
+          //
+          // A reply with no reason is treated as no-match, which is exactly
+          // what this code assumed unconditionally before, so an older host
+          // degrades to the old behaviour rather than to a blank line.
+          const reason = (data && data.reason) || "no-match";
+          const text = AUTOFILL_REASON_TEXT[reason] || AUTOFILL_REASON_TEXT["no-match"];
+          lastAutofillReason = text();
+          lastAutofillState = AUTOFILL_REASON_TEXT[reason] ? reason : "no-match";
+        }
         renderAutofillOffer();
       })
       .catch(() => {
         lastAutofillOffer = null;
-        lastAutofillReason = "Could not check for a saved password.";
+        lastAutofillReason = i18nText("chrome-js-autofill-reason-check-failed", "Could not check for a saved password.");
+        lastAutofillState = "check-failed";
         renderAutofillOffer();
       });
   }
@@ -2180,10 +3664,15 @@
     } catch (e) {
       toast(friendly(e), true);
     } finally {
-      // Re-enabled regardless of outcome: nothing about a fill attempt makes
-      // the offer stop being valid, so there is no reason to leave the
-      // button stuck disabled after either a success or a refusal.
-      btn.disabled = false;
+      // NOT an unconditional re-enable. Nothing about a fill attempt makes the
+      // offer stop being valid -- but something else can, WHILE the fill is in
+      // flight. Locking the vault retracts the offer and disables this button;
+      // a blanket `disabled = false` here then put a live-looking Fill control
+      // back underneath a panel reading "Unlock the vault". Repainting from
+      // the current state is the only thing that is right in both cases: it
+      // re-enables when the offer survived, and leaves it disabled when it
+      // did not.
+      renderAutofillOffer();
     }
   });
 
@@ -2276,45 +3765,52 @@
   // the real button -- never a second copy of what an action does. Two code
   // paths for one action is how they drift; this file's own history is full
   // of examples.
-  const PALETTE_ACTIONS = [
-    { label: "New tab", buttonId: "btn-newtab" },
-    { label: "New quarantine tab", buttonId: "btn-quarantine-menu" },
-    { label: "Bookmark this page", buttonId: "btn-bookmark" },
-    { label: "Open Privacy", buttonId: "btn-privacy" },
-    { label: "Open Theme", buttonId: "btn-theme" },
-    { label: "Toggle freeze for this tab", buttonId: "btn-freeze" },
-    { label: "Open Tab Activity", buttonId: "btn-tab" },
-    { label: "Open Vault", buttonId: "btn-vault" },
-    { label: "Open DNS settings", buttonId: "btn-dns" },
-    { label: "Open Tunnel", buttonId: "btn-tunnel" },
-    { label: "Open Chat", buttonId: "btn-chat" },
-    { label: "Open Library", buttonId: "btn-library" },
-    // The only control that makes a shelf, and it sits in the bookmarks
-    // view -- hidden from the "Sets of tabs" view that lists shelves. The
-    // palette is its second way in.
-    { label: "Set aside all tabs", buttonId: "set-aside" },
-    // These two buttons are built at runtime by integrity.js/update.js, not
-    // in index.html -- which is exactly why they were missed here: nothing
-    // failed when the palette predated them. `paletteVisibleActions` resolves
-    // ids live at open time, so runtime injection needs no special casing.
-    { label: "Open Integrity", buttonId: "btn-integrity" },
-    // The other two tabs of the tools modal. Their buttons are the tab strip
-    // itself, so choosing one opens the modal AND lands on the right tool --
-    // this is what put all three in one modal in the first place: neither
-    // Deep Recall nor the image check was findable from here before.
-    { label: "Open Deep Recall", buttonId: "btn-tab-recall" },
-    { label: "Check an image before you share it", buttonId: "btn-tab-imagecheck" },
-    { label: "Open Updates", buttonId: "btn-update" },
-    { label: "About this site", buttonId: "btn-site-info" },
-    { label: "Save page as PDF", buttonId: "btn-save-pdf" },
-    { label: "About PATANYX", buttonId: "btn-about" },
-    // Premium tab-pack entries. Their buttons are hidden literals in
-    // index.html (the gate resolves ids there), and the premium refusal
-    // happens server-side when the clicked surface asks Rust -- the
-    // palette rows stay visible so the features are discoverable.
-    { label: "Switch tab...", buttonId: "btn-switcher" },
-    { label: "Select tabs...", buttonId: "btn-tabselect" },
-  ];
+  let PALETTE_ACTIONS;
+  rebuildOnLocaleFill(() => {
+    PALETTE_ACTIONS = [
+      { label: i18nText("chrome-js-tabs-new-tab", "New tab"), buttonId: "btn-newtab" },
+      { label: i18nText("chrome-js-palette-new-quarantine", "New quarantine tab"), buttonId: "btn-quarantine-menu" },
+      { label: i18nText("chrome-js-palette-bookmark", "Bookmark this page"), buttonId: "btn-bookmark" },
+      { label: i18nText("chrome-js-palette-privacy", "Open Privacy"), buttonId: "btn-privacy" },
+      { label: i18nText("chrome-js-palette-theme", "Open Theme"), buttonId: "btn-theme" },
+      { label: i18nText("chrome-js-palette-freeze", "Toggle freeze for this tab"), buttonId: "btn-freeze" },
+      { label: i18nText("chrome-js-palette-tab-activity", "Open Tab Activity"), buttonId: "btn-tab" },
+      { label: i18nText("chrome-js-palette-vault", "Open Vault"), buttonId: "btn-vault" },
+      { label: i18nText("chrome-js-palette-imagecheck", "Check an image before you share it"), buttonId: "btn-tab-imagecheck" },
+      { label: i18nText("chrome-js-palette-dns", "Open DNS settings"), buttonId: "btn-dns" },
+      { label: i18nText("chrome-js-palette-tunnel", "Open Tunnel"), buttonId: "btn-tunnel" },
+      { label: i18nText("chrome-js-palette-chat", "Open Chat"), buttonId: "btn-chat" },
+      { label: i18nText("chrome-js-palette-library", "Open Library"), buttonId: "btn-library" },
+      // The only control that makes a shelf, and it sits in the bookmarks
+      // view -- hidden from the "Tab Shelf" view that lists shelves. The
+      // palette is its second way in.
+      { label: i18nText("chrome-js-palette-set-aside", "Shelve all tabs"), buttonId: "set-aside" },
+      // These two buttons are built at runtime by integrity.js/update.js, not
+      // in index.html -- which is exactly why they were missed here: nothing
+      // failed when the palette predated them. `paletteVisibleActions` resolves
+      // ids live at open time, so runtime injection needs no special casing.
+      { label: i18nText("chrome-js-palette-integrity", "Open Integrity"), buttonId: "btn-integrity" },
+      // The other two tabs of the tools modal. Their buttons are the tab strip
+      // itself, so choosing one opens the modal AND lands on the right tool --
+      // this is what put all three in one modal in the first place: neither
+      // Deep Recall nor the image check was findable from here before.
+      { label: i18nText("chrome-js-palette-recall", "Open Deep Recall"), buttonId: "btn-tab-recall" },
+      {
+        label: i18nText("chrome-js-palette-imagecheck", "Check an image before you share it"),
+        buttonId: "btn-tab-imagecheck",
+      },
+      { label: i18nText("chrome-js-palette-updates", "Open Updates"), buttonId: "btn-update" },
+      { label: i18nText("chrome-js-palette-site-info", "About this site"), buttonId: "btn-site-info" },
+      { label: i18nText("chrome-js-palette-save-pdf", "Save page as PDF"), buttonId: "btn-save-pdf" },
+      { label: i18nText("chrome-js-palette-about", "About PATANYX"), buttonId: "btn-about" },
+      // Premium tab-pack entries. Their buttons are hidden literals in
+      // index.html (the gate resolves ids there), and the premium refusal
+      // happens server-side when the clicked surface asks Rust -- the
+      // palette rows stay visible so the features are discoverable.
+      { label: i18nText("chrome-js-palette-switch-tab", "Switch tab..."), buttonId: "btn-switcher" },
+      { label: i18nText("chrome-js-palette-select-tabs", "Select tabs..."), buttonId: "btn-tabselect" },
+    ];
+  });
   const PALETTE_OPEN_PX = 420;
   let paletteMatches = [];
   let paletteSelected = -1;
@@ -2589,7 +4085,10 @@
     el: panel,
     button: $("btn-vault"),
     heightPx: CHROME_OPEN_PX,
-    onOpen: refreshVault,
+    onOpen: () => {
+      refreshVault();
+      void refreshPartnerCard("partner-vault", "nordpass");
+    },
     // Closing the panel must not leave secrets on screen.
     onClose: clearSecrets,
   });
@@ -2628,7 +4127,13 @@
     el: $("dns-panel"),
     button: $("btn-dns"),
     heightPx: DNS_OPEN_PX,
-    onOpen: refreshDns,
+    onOpen: () => {
+      // A fresh open answers the panel's question first. The affiliate
+      // disclosure is reached deliberately from its fourth chip and never
+      // replaces the resolver view merely because it was open last time.
+      showDnsPartner(false);
+      refreshDns();
+    },
   });
   $("recovery-ack").addEventListener("click", () => {
     // Clear it from the DOM as well as the screen: it must not sit in the
@@ -2661,12 +4166,54 @@
   // tunnel is carrying traffic and the vault locked itself behind it".
   let tunnelMeasured = "not_attempted";
   const TUNNEL_FAIL_GRACE_MS = 15000;
+  // The anonymity limit is an emphasized clause, not a plain sentence, and it
+  // is built as text nodes plus one strong element so the stress is real and
+  // the copy never touches an unsafe HTML sink.
+  const WIREGUARD_IMPORT_PRE =
+    "Already have a WireGuard configuration? Import it into Private Tunnel, " +
+    "PATANYX's free browser-only option. Only this browser's traffic is " +
+    "routed through the server you choose. ";
+  const WIREGUARD_IMPORT_STRONG = "Private Tunnel is not anonymity:";
+  const WIREGUARD_IMPORT_POST =
+    " the VPN server can still see the traffic you send through it.";
+
+  function renderWireguardImport(elId) {
+    const el = $(elId);
+    if (!el) return;
+    el.textContent = "";
+    el.appendChild(document.createTextNode(WIREGUARD_IMPORT_PRE));
+    const strong = document.createElement("strong");
+    strong.className = "emph";
+    strong.textContent = WIREGUARD_IMPORT_STRONG;
+    el.appendChild(strong);
+    el.appendChild(document.createTextNode(WIREGUARD_IMPORT_POST));
+  }
+
+  $("managed-vpn-framing").textContent =
+    "Private Tunnel routes this browser through a WireGuard server you " +
+    "supply. These are paid managed VPNs run by their own providers.";
+  renderWireguardImport("managed-vpn-wireguard");
+
+  $("tab-tunnel").addEventListener("click", () => selectTunnelTab("tunnel"));
+  $("tab-managed-vpn").addEventListener("click", () =>
+    selectTunnelTab("managed-vpn"),
+  );
+
+  function selectTunnelTab(which) {
+    for (const name of ["tunnel", "managed-vpn"]) {
+      $("tab-" + name).classList.toggle("active", which === name);
+      $("pane-" + name).hidden = which !== name;
+    }
+  }
 
   registerPanel("tunnel", {
     el: $("tunnel-panel"),
     button: $("btn-tunnel"),
     heightPx: 500,
-    onOpen: refreshTunnel,
+    onOpen: () => {
+      refreshTunnel();
+      void refreshPartnerCards("partner-tunnel", ["nordvpn", "pia"]);
+    },
   });
 
   function renderTunnelRestart(pending) {
@@ -2676,16 +4223,19 @@
       // about it: the user has already changed the setting and the browser
       // is still behaving the old way, which is the surprising half.
       // "Tabs that can be" rather than "your tabs": ephemeral tabs and
-      // internal pages are never set aside, and the unqualified promise was
+      // internal pages are never shelved, and the unqualified promise was
       // simply false for anyone browsing without a saved profile. The exact
       // count is not known until the button is pressed, and that is where
       // it is now stated.
       note.textContent =
-        "Not in effect yet. The engine takes the tunnel setting only at " +
-        "startup. Apply and restart does it for you: the tabs that can be " +
-        "set aside reopen after you unlock.";
+i18nText("chrome-tunnel-restart-note", "Not in effect yet. Restart to apply Private Tunnel. Shelved tabs reopen after you unlock; tabs without a saved profile do not.");
+      // Machine-readable mirror of what the copy means, so the gate can
+      // assert the MEANING without pinning the English words. The claims
+      // manifest, not the gate, is what pins wording.
+      note.dataset.state = "restart-pending";
       note.hidden = false;
     } else {
+      delete note.dataset.state;
       note.hidden = true;
     }
     // The button lives or dies with the note it answers.
@@ -2709,25 +4259,23 @@
   //
   // Same phrasing as the engine-confirmed row elsewhere in this file, so
   // two surfaces cannot describe one state differently.
-  const TUNNEL_REPORT_TEXT = {
-    not_attempted: "off (no tunnel chosen)",
-    applied: "carrying this browser's traffic",
-    failed: "not carrying traffic",
-  };
+  let TUNNEL_REPORT_TEXT;
+  rebuildOnLocaleFill(() => {
+    TUNNEL_REPORT_TEXT = {
+      not_attempted: i18nText("chrome-js-tunnel-report-not-attempted", "off (no tunnel chosen)"),
+      applied: i18nText("chrome-js-tunnel-report-applied", "carrying this browser's traffic"),
+      failed: i18nText("chrome-js-tunnel-report-failed", "not carrying traffic"),
+    };
+  });
 
-  function tunnelReportLine(report, startError) {
+  function tunnelReportStatusText(report) {
     // An unknown value from a future engine falls back to the raw word
     // rather than to silence: a status this build cannot name is still
     // better shown than hidden.
     const known = report == null ? null : TUNNEL_REPORT_TEXT[String(report)];
-    let line =
-      "Status: " +
-      (report == null ? "no measurement yet" : known || String(report));
-    if (startError) {
-      // Verbatim: the engine's error text is key-free by contract.
-      line += ". Could not start: " + startError;
-    }
-    return line;
+    return report == null
+      ? i18nText("chrome-js-tunnel-no-measurement", ". Could not start: ")
+      : known || String(report);
   }
 
   async function refreshTunnel() {
@@ -2744,10 +4292,25 @@
     // differently.
     $("tunnelp-describe-off").textContent = st.describe_off || "";
     $("tunnelp-describe-imported").textContent = st.describe_imported || "";
-    $("tunnelp-status").textContent = tunnelReportLine(
-      st.report,
-      st.start_error,
-    );
+    {
+      const status = tunnelReportStatusText(st.report);
+      if (st.start_error) {
+        // Verbatim: the engine's error text is key-free by contract.
+        i18nSet(
+          $("tunnelp-status"),
+          "chrome-js-tunnel-status-line-error",
+          { status, error: st.start_error },
+          "Status: " + status + ". Could not start: " + st.start_error,
+        );
+      } else {
+        i18nSet(
+          $("tunnelp-status"),
+          "chrome-js-tunnel-status-line",
+          { status },
+          "Status: " + status,
+        );
+      }
+    }
     // The restart note is driven by the ENGINE's answer, on every refresh --
     // not set once as a reaction to a click. It used to be the latter, so
     // closing and reopening the panel lost it while the restart stayed just
@@ -2762,7 +4325,11 @@
     const vaultLocked = st.has_config === null || st.has_config === undefined;
     const prereq = $("tunnelp-vault-first");
     if (prereq) prereq.hidden = !vaultLocked;
-    for (const id of ["tunnelp-import", "tunnelp-paste-import", "tunnelp-remove"]) {
+    for (const id of [
+      "tunnelp-import",
+      "tunnelp-paste-import",
+      "tunnelp-remove",
+    ]) {
       const btn = $(id);
       if (btn) btn.disabled = vaultLocked;
     }
@@ -2771,11 +4338,11 @@
 
     if (vaultLocked) {
       configLine.textContent =
-        "Unlock the vault to see whether a configuration is stored.";
+        i18nText("chrome-js-tunnel-config-locked", "Unlock the vault to view its configuration.");
     } else if (st.has_config) {
-      configLine.textContent = "A configuration is stored in the vault.";
+      configLine.textContent = i18nText("chrome-js-tunnel-config-stored", "Configuration stored.");
     } else {
-      configLine.textContent = "No configuration imported yet.";
+      configLine.textContent = i18nText("chrome-js-tunnel-config-none", "No configuration imported yet.");
     }
     // Step 4 always says something: with nothing pending, the honest answer
     // is that there is nothing to apply, not an empty space that reads as a
@@ -2834,7 +4401,9 @@
     // not report a working tunnel. The boot case still fires immediately,
     // because a tunnel that never came up is never "applied".
     const vaultShut =
-      tunnelMode === "imported" && !vaultUnlocked && tunnelMeasured !== "applied";
+      tunnelMode === "imported" &&
+      !vaultUnlocked &&
+      tunnelMeasured !== "applied";
     const measuredFailure =
       tunnelMode === "imported" &&
       tunnelFailSince !== 0 &&
@@ -2846,23 +4415,23 @@
       const body = $("tunnel-warning-body");
       const open = $("tunnel-warning-open");
       if (vaultShut) {
-        title.textContent = "Unlock your vault to use Private Tunnel";
+        title.textContent = i18nText("chrome-js-tunnel-warn-vault-title", "Unlock your vault to use Private Tunnel");
         body.textContent =
-          "Private Tunnel keeps its configuration in the vault, so pages " +
-          "will not load until you unlock it. PATANYX will NOT fall back " +
-          "to a direct connection. Unlock the vault, or switch the tunnel " +
-          "off in its panel.";
+i18nText("chrome-tunnel-warn-vault-body", "Pages will not load until you unlock the vault because Private Tunnel stores its configuration there. PATANYX will NOT fall back to a direct connection. Unlock the vault or switch Private Tunnel off.");
         // Point at the thing that fixes it, not at the panel that explains
         // it. One button, retargeted, so the banner never grows a second.
-        open.textContent = "Open vault";
+        open.textContent = i18nText("chrome-js-tunnel-warn-open-vault", "Open vault");
         open.dataset.target = "vault";
+        // Cause, machine-readable, on the banner itself: the gate asserts
+        // WHICH failure is being explained without pinning the English.
+        $("tunnel-warning").dataset.cause = "vault-locked";
       } else {
-        title.textContent = "The tunnel is not carrying traffic";
+        title.textContent = i18nText("chrome-js-tunnel-warn-down-title", "The tunnel is not carrying traffic");
         body.textContent =
-          "Pages are not loading because the tunnel is down. PATANYX will " +
-          "NOT fall back to a direct connection. Open the tunnel panel.";
-        open.textContent = "Open Tunnel panel";
+i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will not load. PATANYX will NOT fall back to a direct connection.");
+        open.textContent = i18nText("chrome-js-tunnel-warn-open-tunnel", "Open Tunnel panel");
         open.dataset.target = "tunnel";
+        $("tunnel-warning").dataset.cause = "tunnel-down";
       }
     }
 
@@ -2948,7 +4517,7 @@
       err.hidden = true;
       const text = box ? box.value : "";
       if (!text.trim()) {
-        err.textContent = "Paste a configuration first.";
+        err.textContent = i18nText("chrome-js-tunnel-paste-empty", "Paste a configuration first.");
         err.hidden = false;
         return;
       }
@@ -3016,26 +4585,24 @@
         const kept = preview.kept;
         const ok = await askConfirm(
           kept === 0
-            ? "None of your " +
+            ? "Restarting will permanently close all " +
                 lost +
                 (lost === 1 ? " open tab" : " open tabs") +
-                " can be set aside, because tabs opened without a saved " +
-                "profile are never written to the vault. Restarting now " +
-                "closes them for good."
+                ". Tabs without a saved profile are never written to the vault."
             : lost +
                 (lost === 1 ? " tab" : " tabs") +
-                " cannot be set aside and will close for good; " +
+                " will close for good; " +
                 kept +
                 (kept === 1 ? " will" : " will") +
-                " reopen after you unlock. Tabs opened without a saved " +
-                "profile are never written to the vault.",
-          "Restart anyway",
+                " reopen after you unlock. Tabs without a saved profile " +
+                "are never written to the vault.",
+          i18nText("chrome-js-tunnel-restart-anyway", "Restart anyway"),
         );
         if (!ok) return;
       }
 
       btn.disabled = true;
-      btn.textContent = "Restarting…";
+      btn.textContent = i18nText("chrome-js-tunnel-restarting", "Restarting…");
       try {
         await rb("tunnel_apply_restart");
         // No success path to render: the reply means the replacement is
@@ -3044,7 +4611,7 @@
         // It did NOT happen. Nothing was shelved that is not also cleaned
         // up, so the honest thing is to put the button back.
         btn.disabled = false;
-        btn.textContent = "Apply and restart now";
+        btn.textContent = i18nText("chrome-js-tunnel-apply-restart", "Apply and restart now");
         err.textContent = friendly(e);
         err.hidden = false;
       }
@@ -3079,6 +4646,13 @@
     $(t.id).addEventListener("change", (ev) => {
       rb("privacy_set", { [t.key]: ev.target.checked })
         .then(applyPrivacyStatus)
+        // The reply carries privacy_status only, and a policy change can
+        // clear a held-page banner on the Rust side (blocking off removes
+        // every pending). Nothing pushed the tab status, so the banner
+        // stayed up explaining a hold that no longer existed and its
+        // action met "no pending" (review R-003, round 6). Fetch the full
+        // status, same shape as login_submit_detected above.
+        .then(() => rb("tab_status").then(applyTabStatus).catch(() => {}))
         // Put the switch back where it was: a control that shows "on" while
         // the setting is off is worse than one that visibly refuses.
         .catch(() => refreshPrivacy());
@@ -3109,6 +4683,63 @@
     }
   }
 
+  // WebView2's profile-level belt-and-braces layer. It is intentionally not
+  // part of PRIVACY_TOGGLES: those mutate PATANYX's per-tab policy, while
+  // this pair persists an engine-profile choice and applies it through its
+  // own runtime setter. WebKitGTK has ITP on/off and no corresponding level,
+  // so the entire row is absent there, exactly like encrypted DNS.
+  const TRACKING_PREVENTION_LEVELS = ["strict", "balanced"];
+
+  function applyTrackingPreventionChoice(st) {
+    const section = $("tracking-prevention-choice");
+    const supported = !!(st && st.supported);
+    section.hidden = !supported;
+    if (!supported) return;
+
+    for (const level of TRACKING_PREVENTION_LEVELS) {
+      $("tracking-prevention-" + level).classList.toggle(
+        "active",
+        st.level === level,
+      );
+    }
+    const result = $("tracking-prevention-result");
+    if (st.applied === false) {
+      // DRAFT COPY -- WP-AB marketing-voice pass required.
+      result.textContent =
+        "Saved, but not confirmed for every open tab. Check What the engine " +
+        "confirmed below.";
+    } else if (st.applied === true) {
+      // DRAFT COPY -- WP-AB marketing-voice pass required.
+      result.textContent =
+        (st.level === "balanced" ? "Balanced" : "Strict") +
+        " confirmed for every open tab.";
+    } else {
+      result.textContent = "";
+    }
+  }
+
+  async function refreshTrackingPrevention() {
+    try {
+      applyTrackingPreventionChoice(await rb("tracking_prevention_get"));
+    } catch (_) {
+      $("tracking-prevention-choice").hidden = true;
+    }
+  }
+
+  for (const level of TRACKING_PREVENTION_LEVELS) {
+    $("tracking-prevention-" + level).addEventListener("click", async () => {
+      try {
+        applyTrackingPreventionChoice(
+          await rb("tracking_prevention_set", { level }),
+        );
+      } catch (_) {
+        // The saved/confirmed answer owns the highlight. A refused write must
+        // never leave the last button clicked looking like the level in force.
+        await refreshTrackingPrevention();
+      }
+    });
+  }
+
   // ---- per-site Fingerprint Divergence, and the proof ---------------------
   //
   // Two honest limits the copy must keep, and this code must not undermine:
@@ -3132,30 +4763,45 @@
       divergenceHost = proof.host || "";
       $("dv-premium").hidden = true;
       section.hidden = false;
-      $("dv-host").textContent = divergenceHost
-        ? "This tab is on " + divergenceHost + "."
-        : "This tab is not on a website.";
+      if (divergenceHost) {
+        i18nSet(
+          $("dv-host"),
+          "chrome-js-divergence-host",
+          { host: divergenceHost },
+          "Open tab: " + divergenceHost + ".",
+        );
+      } else {
+        $("dv-host").textContent = i18nText("chrome-js-divergence-no-host", "This tab is not on a website.");
+      }
       $("dv-off").checked = !!proof.off_for_this_site;
       $("dv-off").disabled = !divergenceHost;
       // Observed, never inferred from the pref: a tab opened before the
       // pref last changed still carries what it was built with.
       if (!proof.enabled_globally) {
         $("dv-proof").textContent =
-          "Fingerprint Divergence is switched off, so this tab was given no noise.";
+          i18nText("chrome-js-divergence-proof-off", "Fingerprint Divergence is off in this tab.");
       } else if (proof.registered) {
         $("dv-proof").textContent =
-          "This tab was given divergence for " +
+          "Installed for " +
           (proof.surfaces || []).join(", ") +
-          ". That is what was installed in it, not proof that a site was fooled.";
+          ". This is not proof a site was fooled.";
       } else {
         $("dv-proof").textContent =
-          "This tab was given no divergence. A tab keeps whatever it started with, so a change made since it opened is not in it.";
+          i18nText("chrome-js-divergence-proof-none", "No divergence in this tab; it keeps what it started with.");
       }
       const list = await rb("divergence_sites_list");
       const off = (list.items || []).filter((i) => i.off).map((i) => i.host);
-      $("dv-list").textContent = off.length
-        ? "Switched off for: " + off.join(", ")
-        : "No site has it switched off.";
+      if (off.length) {
+        const hosts = off.join(", ");
+        i18nSet(
+          $("dv-list"),
+          "chrome-js-divergence-off-list",
+          { hosts },
+          "Divergence Exceptions: " + hosts,
+        );
+      } else {
+        $("dv-list").textContent = i18nText("chrome-js-divergence-list-none", "No Divergence Exceptions.");
+      }
     } catch (e) {
       if (e && e.message === "premium_required") {
         // The section stays VISIBLE and explains itself. Hiding it would
@@ -3189,16 +4835,144 @@
     // divergence-site-gate caught this -- the first only reads ipc.rs, and
     // the second ran every check with premium: true.
     try {
-      await rb("divergence_site_set", {
-        host: divergenceHost,
-        off: $("dv-off").checked,
-      });
+      if ($("dv-off").checked) {
+        await rb("divergence_site_set", {
+          host: divergenceHost,
+          off: true,
+        });
+      } else {
+        // Default is the ABSENCE of an exception. Clearing instead of storing
+        // a `Default` row keeps the list, encrypted snapshot and checkbox as
+        // three views of the same fact, and reaches the purpose-built clear
+        // arm rather than accumulating rows that do nothing forever.
+        await rb("divergence_site_clear", { host: divergenceHost });
+      }
     } catch (e) {
       $("dv-off").checked = !$("dv-off").checked;
       toast(friendly(e), true);
     }
     await refreshDivergenceSite();
   });
+
+  // Build a disclosed partner card. DOM ONLY -- parsing HTML strings is banned
+  // in this document because it holds the IPC bridge and the vault, so every
+  // node here is created and filled with textContent.
+  //
+  // THE BUTTON IS A BUTTON, NOT AN ANCHOR. The chrome has no business holding
+  // partner URLs: it names a partner and the engine resolves that name to a
+  // compiled-in destination (see partner.rs). An `<a href>` here would put the
+  // URL back in the document and hand anything that can reach this DOM a way
+  // to change where it points.
+  //
+  // The disclosure is visible text in two places, above the pitch and below
+  // the button, because `rel="sponsored"` is for crawlers and says nothing to
+  // a person. On this surface there is no crawler at all, so the sentence is
+  // the whole disclosure.
+  function renderPartnerCard(container, partner) {
+    const card = document.createElement("section");
+    card.className = "pcard";
+
+    const label = document.createElement("p");
+    label.className = "pcard-label";
+    label.textContent = i18nText("chrome-js-partner-label", "Affiliate partner");
+    card.appendChild(label);
+
+    const name = document.createElement("h3");
+    name.className = "pcard-name";
+    name.textContent = partner.name;
+    card.appendChild(name);
+
+    const desc = document.createElement("p");
+    desc.className = "pcard-desc";
+    desc.textContent = partner.description;
+    card.appendChild(desc);
+
+    // A discount code, when this partner has one. Only Saily does; the backend
+    // sends `offer: null` for every other card, so no card but Saily's can show
+    // a coupon here. Built as nodes, not innerHTML, and the renderer owns the
+    // sentence so no partner can phrase its own -- the same discipline as the
+    // affiliate label and the disclosure above and below it.
+    if (partner.offer && partner.offer.code && partner.offer.terms) {
+      const offer = document.createElement("p");
+      offer.className = "pcard-offer";
+      offer.appendChild(document.createTextNode("Use coupon code "));
+      const code = document.createElement("code");
+      code.className = "pcard-code";
+      code.textContent = partner.offer.code;
+      offer.appendChild(code);
+      offer.appendChild(
+        document.createTextNode(" to get a " + partner.offer.terms + "."),
+      );
+      card.appendChild(offer);
+    }
+
+    const cta = document.createElement("button");
+    cta.type = "button";
+    cta.className = "small pcard-cta";
+    i18nSet(cta, "chrome-js-partner-visit", { name: partner.name }, "Visit " + partner.name);
+    cta.addEventListener("click", async () => {
+      try {
+        await rb("partner_open", { partner: partner.id });
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+    card.appendChild(cta);
+
+    const disclosure = document.createElement("p");
+    disclosure.className = "pcard-disclosure";
+    disclosure.textContent =
+      i18nText("chrome-js-partner-disclosure", "PATANYX may earn a commission if you purchase through this link.");
+    card.appendChild(disclosure);
+
+    container.appendChild(card);
+    return card;
+  }
+
+  async function refreshPartnerCards(containerId, partnerIds) {
+    const container = $(containerId);
+    if (!container) return;
+    // Empty once so a partner that stops applying disappears on the next
+    // panel open, then append every applicable card through the one renderer
+    // that owns the affiliate label and commission disclosure.
+    container.textContent = "";
+    try {
+      const list = await rb("partner_list");
+      const items = Array.isArray(list && list.items) ? list.items : [];
+      for (const partnerId of partnerIds) {
+        const partner = items.find((item) => item.id === partnerId);
+        if (partner) renderPartnerCard(container, partner);
+      }
+    } catch (_) {
+      // A partner placement is optional. Failure must not leave a shell that
+      // looks like a broken feature beside the first-party controls.
+    }
+  }
+
+  function refreshPartnerCard(containerId, partnerId) {
+    return refreshPartnerCards(containerId, [partnerId]);
+  }
+
+  async function refreshPartnerLibrary() {
+    const container = $("partner-library");
+    const empty = $("partner-library-empty");
+    if (!container || !empty) return;
+    container.textContent = "";
+    empty.hidden = true;
+    try {
+      const list = await rb("partner_list");
+      const items = Array.isArray(list && list.items) ? list.items : [];
+      if (!items.length) {
+        empty.textContent = i18nText("chrome-js-partners-empty", "No partner services are available right now.");
+        empty.hidden = false;
+        return;
+      }
+      for (const partner of items) renderPartnerCard(container, partner);
+    } catch (_) {
+      empty.textContent = i18nText("chrome-js-partners-failed", "Partner services could not be loaded.");
+      empty.hidden = false;
+    }
+  }
 
   $("dv-prove").addEventListener("click", async () => {
     // The live test page computes its badges in whatever browser opens it,
@@ -3219,6 +4993,7 @@
     } catch (e) {
       $("privacy-foot").textContent = friendly(e);
     }
+    await refreshTrackingPrevention();
     await refreshFingerprint();
     await refreshDivergenceSite();
     await refreshPermissions();
@@ -3273,12 +5048,15 @@
   // callback writes to it, so a cached copy here would go stale the moment a
   // page asked for something.
 
-  const PERMISSION_LABELS = {
-    camera: "Camera",
-    microphone: "Microphone",
-    geolocation: "Location",
-    notifications: "Notifications",
-  };
+  let PERMISSION_LABELS;
+  rebuildOnLocaleFill(() => {
+    PERMISSION_LABELS = {
+      camera: i18nText("chrome-js-permissions-camera", "Camera"),
+      microphone: i18nText("chrome-js-permissions-microphone", "Microphone"),
+      geolocation: i18nText("chrome-js-permissions-geolocation", "Location"),
+      notifications: i18nText("chrome-js-permissions-notifications", "Notifications"),
+    };
+  });
 
   async function refreshPermissions() {
     let st;
@@ -3302,7 +5080,7 @@
     // nothing is the exact shape of defect this project has paid for before.
     if (!st.supported) {
       note.textContent =
-        "This tab is not enforcing permission choices, so nothing here would take effect.";
+        i18nText("chrome-js-permissions-unsupported", "This tab is not enforcing Permission Defaults.");
       return;
     }
 
@@ -3314,7 +5092,7 @@
     // refusal first and go looking for the row it left behind.
     if (entries.length === 0) {
       note.textContent =
-        "Open a site to choose what it may use. Camera, microphone, location and notifications stay off until you allow them.";
+        i18nText("chrome-js-permissions-empty", "Open a site to set Permission Defaults; they stay off until allowed.");
       return;
     }
     note.textContent = "";
@@ -3353,16 +5131,24 @@
       // An embedded frame's own origin, named, because "this site" would be
       // wrong: the request came from something the page embeds, and allowing
       // it allows that thing, not the page.
-      const who = entry.origin === st.site ? "this site" : entry.origin;
+      const who =
+        entry.origin === st.site
+          ? i18nText("chrome-permissions-who-this-site", "this site")
+          : entry.origin;
       // The reload that makes a change take effect is done for the user now
       // (see permission_grant in ipc.rs), so this no longer tells them to do
       // it themselves. What it must still say is that the grant DIES ON CLOSE,
       // because anyone arriving from another browser will expect it to persist.
-      sub.textContent = entry.granted
-        ? `Allowed for ${who} until PATANYX closes`
-        : entry.deniedCount > 1
-          ? `Refused ${entry.deniedCount} times for ${who}`
-          : `Refused for ${who}`;
+      if (entry.granted) {
+        i18nSet(sub, "chrome-permissions-granted", { who },
+          `Allowed for ${who} until PATANYX closes`);
+      } else {
+        i18nSet(sub, "chrome-permissions-refused",
+          { who, count: entry.deniedCount || 0 },
+          entry.deniedCount > 1
+            ? `Refused ${entry.deniedCount} times for ${who}`
+            : `Refused for ${who}`);
+      }
       text.appendChild(title);
       text.appendChild(sub);
       row.appendChild(input);
@@ -3390,7 +5176,16 @@
     // no longer what the button does. Blank is legible and safe; stale is
     // neither.
     const copy = st.forget_all || {};
-    $("pv-forget-all-desc").textContent = copy.intro || "";
+    // Where the backend cannot clear cookies (WebKitGTK in 1.0.0) BOTH controls
+    // are disabled and the intro says so in Rust's words: an enabled button
+    // that always fails is a false claim about what the product does.
+    // `!== false` so a reply from an older Rust that omits the field keeps the
+    // enabled behaviour rather than silently disabling a working control.
+    applyCookieClearAvailability(st);
+    const available = cookieClearAvailable;
+    $("pv-forget-all-desc").textContent = available
+      ? (copy.intro || "")
+      : (st.cookie_clear_unavailable_intro || "");
     $("btn-forget-all-cookies").textContent = copy.button || "";
     $("forget-all-warn").textContent = copy.warning || "";
     $("forget-all-yes").textContent = copy.confirm || "";
@@ -3429,13 +5224,13 @@
       "pv-block-ads",
       st.network_blocking_supported && intercepting,
       intercepting
-        ? "Not available on this platform: ads can be hidden here, but their requests are still made."
-        : "Not available in this tab: its request filter could not be installed, so nothing is being intercepted. Reopen the page in a new tab.",
+        ? i18nText("chrome-js-privacy-blockads-platform", "Ad and tracker requests cannot be blocked on this platform.")
+        : i18nText("chrome-js-privacy-blockads-tab", "Ad and tracker blocking is unavailable in this tab. Reopen it."),
     );
     setSupported(
       "pv-freeze",
       st.freeze_enforced,
-      "Not available on this platform: pages cannot be stopped from making requests.",
+      i18nText("chrome-js-privacy-freeze-platform", "Page freezing is unavailable on this platform."),
     );
 
     // Count only what is actually protecting the user right now: JavaScript
@@ -3462,8 +5257,8 @@
 
     $("privacy-foot").textContent =
       active === 0
-        ? "No protections are active. This browser is behaving like an ordinary one."
-        : "Protections apply to every open tab.";
+        ? i18nText("chrome-js-privacy-foot-none", "No protections selected.")
+        : i18nText("chrome-js-privacy-foot-active", "Applies to all open tabs.");
   }
 
   // ---- the shield --------------------------------------------------------
@@ -3564,7 +5359,7 @@
     if (showBlocked) {
       parts.push(
         blockedOnPage === 0
-          ? "Nothing blocked on this page"
+          ? i18nText("chrome-js-shield-blocked-none", "Nothing blocked on this page")
           : blockedOnPage +
               " request" +
               (blockedOnPage === 1 ? "" : "s") +
@@ -3573,17 +5368,18 @@
     }
     parts.push(
       shieldActive === 0
-        ? "No protections active"
+        ? i18nText("chrome-js-shield-active-none", "No protections active")
         : shieldActive +
             " protection" +
             (shieldActive === 1 ? "" : "s") +
             " active",
     );
-    if (refused.length) {
-      parts.push("REFUSED by the engine: " + refused.join(", "));
-    }
+    const refusedPart = refused.length
+      ? "REFUSED by the engine: " + refused.join(", ")
+      : null;
+    if (refusedPart) parts.push(refusedPart);
     if (blocklistFailed) {
-      parts.push("the malicious-site list could not be refreshed");
+      parts.push(i18nText("chrome-js-shield-blocklist-failed", "the malicious-site list could not be refreshed"));
     }
     const sentence = parts.join(". ") + ".";
     btn.title = sentence;
@@ -3591,6 +5387,28 @@
     // The visible label stays one word because the button is 90px wide; the
     // accessible name has no such budget and should not inherit that limit.
     btn.setAttribute("aria-label", "Privacy protections: " + sentence);
+    if (currentUiLocale !== "en") {
+      (async () => {
+        const resolved = parts.slice();
+        if (refusedPart) {
+          resolved[parts.indexOf(refusedPart)] = await i18nResolve(
+            "chrome-js-shield-refused",
+            { labels: refused.join(", ") },
+            refusedPart,
+          );
+        }
+        const text = resolved.join(". ") + ".";
+        btn.title = text;
+        btn.setAttribute(
+          "aria-label",
+          await i18nResolve(
+            "chrome-js-shield-aria",
+            { sentence: text },
+            "Privacy protections: " + sentence,
+          ),
+        );
+      })();
+    }
   }
 
   // ---- the vault is about to lock ----------------------------------------
@@ -3622,10 +5440,8 @@
     const paint = () => {
       body.textContent =
         left > 1
-          ? "Locking in " +
-            left +
-            " seconds because nothing has happened for a while."
-          : "Locking now.";
+          ? "Vault locks in " + left + " seconds."
+          : i18nText("chrome-js-lockwarn-now", "Locking now.");
     };
     paint();
     if (banner.hidden) {
@@ -3707,12 +5523,11 @@
     // own error handling, and showState is called from synchronous paths.
     if (name === "open") {
       void refreshLicence();
-      // The folder bar draws from bookmarks, which only exist once the store
-      // is open. At boot it rendered its empty note because the vault was
-      // still locked, and nothing brought it back: unlock is the moment its
-      // contents become knowable, so it refreshes here rather than waiting
-      // for the Library panel to be opened.
-      void refreshBookmarkBar();
+      // Unlock is when every bookmark becomes knowable. Refresh the cache,
+      // not merely the optional bar: when that bar is hidden it deliberately
+      // renders nothing, but the toolbar star still needs bookmarkItems to
+      // answer for the current page.
+      refreshLibraryAfterUnlock();
       // The Backup pane's copy of the auto-lock picker, for the same reason
       // the locked screen's is refreshed below: the value it shows must be
       // the current one whenever the screen carrying it appears.
@@ -3730,7 +5545,10 @@
   // The padlock in the toolbar reflects the vault WITHOUT the panel being
   // open: the shackle lifts when unlocked and a dot appears, so "are my
   // secrets currently reachable" is answerable at a glance. That question
-  // matters because the vault auto-locks after five minutes.
+  // matters because the vault auto-locks on its own, after an interval the
+  // user chooses (Never / 5 / 15 / 30 / 60 minutes, five by default --
+  // AUTOLOCK_LABELS above, prefs::AUTOLOCK_DEFAULT_SECS in Rust). No string
+  // in this file may name a duration for that reason.
   function setVaultIndicator(name) {
     const unlocked = name === "open" || name === "recovery";
     // Locking the vault has to retract a fill button that is already on the
@@ -3759,7 +5577,7 @@
           : "M5.5 7 V4.75 A2.5 2.5 0 0 1 10.5 4.75 V7",
       );
     }
-    btn.title = unlocked ? "Vault: unlocked" : "Vault: locked";
+    btn.title = unlocked ? i18nText("chrome-js-vault-indicator-unlocked", "Vault: unlocked") : i18nText("chrome-js-vault-indicator-locked", "Vault: locked");
   }
 
   async function refreshVault() {
@@ -3787,15 +5605,18 @@
   // words: everything else (the row head/sub, the ended date) arrives
   // already worded by Rust. All of it is design-3.2 DRAFT copy pending
   // review.
-  const LICENCE_PASTE_TEXT = {
-    licence_not_a_token:
-      "That doesn't look like a PATANYX Premium token. Copy the full token from your receipt and paste it again.",
-    licence_needs_newer_build:
-      "This token needs a newer version of PATANYX. Update and try again.",
-    licence_not_issued:
-      "This token was not issued by EdgeXene. Check that you copied it from your EdgeXene receipt.",
-    licence_keys_unavailable: "This build cannot verify Premium tokens yet.",
-  };
+  let LICENCE_PASTE_TEXT;
+  rebuildOnLocaleFill(() => {
+    LICENCE_PASTE_TEXT = {
+      licence_not_a_token:
+        i18nText("chrome-js-licence-not-a-token", "That doesn't look like a PATANYX Premium token. Copy the full token from your receipt and paste it again."),
+      licence_needs_newer_build:
+        i18nText("chrome-js-licence-needs-newer-build", "This token needs a newer version of PATANYX. Update and try again."),
+      licence_not_issued:
+        i18nText("chrome-js-licence-not-issued", "This token was not issued by EdgeXene. Check that you copied it from your EdgeXene receipt."),
+      licence_keys_unavailable: i18nText("chrome-js-licence-keys-unavailable", "This build cannot verify Premium tokens yet."),
+    };
+  });
 
   // A pasted token awaiting the different-license confirmation. A bearer
   // credential: held in memory only and dropped on EVERY exit from the
@@ -3824,22 +5645,23 @@
   // Nothing is for sale before launch, so `on_sale` decides whether the
   // wording may point at a purchase at all.
   let premiumState = { state: "locked", premium: false, on_sale: false };
+  const premiumListeners = [];
 
   function premiumLockNote(st) {
     if (st.state === "locked") {
-      return "Unlock your vault to use Premium features.";
+      return i18nText("chrome-js-premium-lock-note", "Unlock your vault to use Premium features.");
     }
     // Phase 4: paid and ACTIVE, but not activated on THIS device. Never a
     // purchase prompt (they already paid); the Vault panel says why.
     if (st.state === "unactivated") {
-      return "Premium is not activated on this device yet. Open the Vault panel to activate it.";
+      return i18nText("chrome-js-premium-unactivated", "Premium is not activated on this device yet. Open the Vault panel to activate it.");
     }
     if (!st.on_sale) {
-      return "A Premium feature, arriving the day Premium launches.";
+      return i18nText("chrome-js-premium-pre-launch", "A Premium feature. It unlocks with a Premium license in your Vault.");
     }
     return st.state === "lapsed"
-      ? "Your Premium has ended. Renew to use this again."
-      : "A Premium feature. Upgrade to Premium to use it.";
+      ? i18nText("chrome-js-premium-lapsed", "Your Premium has ended. Renew to use this again.")
+      : i18nText("chrome-js-premium-upgrade", "A Premium feature. Upgrade to Premium to use it.");
   }
 
   // Each control's OWN description, captured from the markup once, before any
@@ -3870,6 +5692,7 @@
         el.setAttribute("title", note);
       }
     }
+      for (const fn of premiumListeners) fn(st);
   }
 
   // Returns true when the click was swallowed by the lock. Every gated
@@ -3902,15 +5725,31 @@
         // Locked vault: the quietest rendering is no row at all — and no
         // held token either.
         clearLicenceConfirm();
+        $("premium-remove").hidden = true;
+        $("premium-token-actions").hidden = true;
+        $("premium-buy").textContent = "";
+        $("premium-buy").hidden = true;
         row.hidden = true;
         return;
       }
       row.hidden = false;
       $("premium-head").textContent = lic.row_head;
       $("premium-sub").textContent = lic.row_sub || "";
+      const buy = $("premium-buy");
+      buy.textContent = lic.purchase_copy || "";
+      buy.hidden = !lic.purchase_copy;
       renderActivation(lic);
+      const remove = $("premium-remove");
+      remove.hidden = !lic.has_token;
+      remove.disabled = !!lic.activation_busy;
+      remove.dataset.activated = lic.activation === "activated" ? "1" : "0";
+      $("premium-token-actions").hidden = !lic.has_token;
     } catch (e) {
       clearLicenceConfirm();
+      $("premium-remove").hidden = true;
+      $("premium-token-actions").hidden = true;
+      $("premium-buy").textContent = "";
+      $("premium-buy").hidden = true;
       row.hidden = true;
     }
   }
@@ -3926,14 +5765,20 @@
     const note = $("premium-activation-note");
     const activate = $("premium-activate");
     const release = $("premium-release");
+    const offline = $("premium-offline");
+    const deviceId = $("premium-device-id");
     if (!box || !note || !activate || !release) return;
+    // The device id is the same in every state; fill it whenever we have it.
+    if (deviceId && lic.device_id_hex) deviceId.textContent = lic.device_id_hex;
     if (lic.activation === "activated") {
       box.hidden = false;
       note.textContent =
-        "Activated on this device. A license can be active on up to 5 devices.";
+        i18nText("chrome-js-licence-activated-note", "Activated on this device. A license can be active on up to 5 devices.");
       activate.hidden = true;
       release.hidden = false;
       release.disabled = !!lic.activation_busy;
+      // Already activated: nothing to import.
+      if (offline) offline.hidden = true;
       return;
     }
     if (lic.activation === "unactivated") {
@@ -3942,12 +5787,15 @@
       release.hidden = true;
       activate.hidden = false;
       activate.disabled = !!lic.activation_busy;
+      // Offer the offline path only when there is a device id to bind to.
+      if (offline) offline.hidden = !lic.device_id_hex;
       return;
     }
     box.hidden = true;
     note.textContent = "";
     activate.hidden = true;
     release.hidden = true;
+    if (offline) offline.hidden = true;
   }
 
   $("premium-activate").addEventListener("click", async () => {
@@ -3962,18 +5810,106 @@
     await refreshLicence();
   });
 
+  // Offline activation: copy this device's id, and import a receipt.
+  $("premium-device-id-copy")?.addEventListener("click", async () => {
+    const id = ($("premium-device-id")?.textContent || "").trim();
+    if (!id || id === "\u2014") return;
+    try {
+      await navigator.clipboard.writeText(id);
+      toast(i18nText("chrome-js-device-id-copied", "Device ID copied."));
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+  });
+
+  $("premium-receipt-import")?.addEventListener("click", async () => {
+    const field = $("premium-receipt");
+    const status = $("premium-receipt-status");
+    const btn = $("premium-receipt-import");
+    const receipt = (field?.value || "").trim();
+    const show = (msg, isError) => {
+      if (!status) return;
+      status.hidden = false;
+      status.textContent = msg;
+      status.classList.toggle("error", !!isError);
+    };
+    if (!receipt) {
+      show("Paste the activation code first.", true);
+      return;
+    }
+    if (btn) btn.disabled = true;
+    try {
+      const res = await rb("licence_import_receipt", { receipt });
+      if (res && res.activated) {
+        if (field) field.value = "";
+        show("Activated on this device.", false);
+        await refreshLicence();
+      } else {
+        // Rust returns a stable code; word each one for a person.
+        const msg =
+          {
+            receipt_malformed:
+              "That does not look like an activation code. It should start " +
+              "with prx1-.",
+            looks_like_token:
+              "That is your Premium token (ptx1-), not an activation code. " +
+              "The token goes in \u201cAdd Premium token\u201d. The " +
+              "activation code is a separate prx1- code we generate for this " +
+              "device from the ID above.",
+            receipt_rejected:
+              "This code was not accepted. Make sure it was generated for " +
+              "this device's ID, shown above.",
+            no_licence: "Add your Premium token first, then import the code.",
+            locked: "Unlock your vault first, then try again.",
+            device_id: "Could not read this device's ID. Try reopening this panel.",
+            vault_io: "Could not save the activation. Try again.",
+          }[res && res.code] || "This code was not accepted.";
+        show(msg, true);
+      }
+    } catch (e) {
+      show(friendly(e), true);
+    } finally {
+      if (btn) btn.disabled = false;
+    }
+  });
+
   $("premium-release").addEventListener("click", async () => {
     // Destructive for THIS machine (Premium goes off here), so it asks.
     const yes = await askConfirm(
-      "Release this device? Premium turns off on this computer and the " +
-        "slot becomes free for another one. You can activate again later " +
-        "if a slot is free.",
-      "Release",
+      i18nText("chrome-licence-release-confirm",
+        "Release this device? Premium turns off on this computer and the " +
+          "slot becomes free for another one. You can activate again later " +
+          "if a slot is free."),
+      i18nText("chrome-js-licence-release-label", "Release"),
     );
     if (!yes) return;
     $("premium-release").disabled = true;
     try {
       await rb("licence_release", {});
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+    await refreshLicence();
+  });
+
+  $("premium-remove").addEventListener("click", async () => {
+    const activated = $("premium-remove").dataset.activated === "1";
+    const message = activated
+      ? "Remove the Premium token from this computer? This erases the token " +
+        "and local activation receipt, but it does not release this device " +
+        "at EdgeXene. Its server slot will stay in use. Cancel and use " +
+        "Release this device first if you want the slot back."
+      : "Remove the Premium token from this computer? This erases the stored " +
+        "token and local activation records. This device is not currently " +
+        "using a server slot.";
+    const yes = await askConfirm(
+      message,
+      activated ? "Remove without releasing" : "Remove token",
+    );
+    if (!yes) return;
+    $("premium-remove").disabled = true;
+    try {
+      await rb("licence_remove", {});
     } catch (e) {
       toast(friendly(e), true);
     }
@@ -4011,7 +5947,7 @@
     if (res.needs_confirm) {
       pendingLicenceToken = token;
       $("premium-confirm-text").textContent =
-        "This token is for a different license. Replace the current one?";
+        i18nText("chrome-js-licence-confirm-replace", "This token is for a different license. Replace the current one?");
       $("premium-confirm").hidden = false;
       errEl.textContent = "";
       return;
@@ -4020,13 +5956,21 @@
     // outlive the exchange that created it.
     clearLicenceConfirm();
     errEl.textContent =
-      LICENCE_PASTE_TEXT[res.code] || "That token could not be added.";
+      LICENCE_PASTE_TEXT[res.code] || i18nText("chrome-js-licence-add-failed", "That token could not be added.");
   }
 
   $("premium-add").addEventListener("click", () => {
     $("premium-add").hidden = true;
     $("premium-form").hidden = false;
     $("premium-token").focus();
+  });
+
+  $("premium-buy").addEventListener("click", async () => {
+    try {
+      await rb("premium_purchase_open", { purchase: "patanyx" });
+    } catch (err) {
+      toast(friendly(err), true);
+    }
   });
 
   // The chrome-js gate requires every form to have a submit handler.
@@ -4099,6 +6043,10 @@
     clearSecrets();
     credItems = [];
     noteItems = [];
+    clearLibrarySnapshotData();
+    $("library-content").hidden = true;
+    $("library-locked").hidden = false;
+    $("bmm-snapshots-caption").hidden = true;
     renderCreds();
     renderNotes();
     showState("locked");
@@ -4128,13 +6076,13 @@
   wireSavePicker(
     "bk-exp-pick",
     "bk-exp-dest",
-    "Save the encrypted backup",
+    i18nText("chrome-js-backup-pick-exp-title", "Save the encrypted backup"),
     "patanyx-export.rbx",
   );
   wireSavePicker(
     "bk-plain-pick",
     "bk-plain-dest",
-    "Save the plaintext export",
+    i18nText("chrome-js-backup-pick-plain-title", "Save the plaintext export"),
     "patanyx-export.json",
   );
 
@@ -4158,11 +6106,11 @@
     // Confirmed client-side because the backend cannot see the second field,
     // and a typo here locks the user out of their own vault.
     if (next !== $("bk-pw-new2").value) {
-      err.textContent = "The two new passphrases do not match.";
+      err.textContent = i18nText("chrome-js-backup-pw-mismatch", "The two new passphrases do not match.");
       return;
     }
     if (!current || !next) {
-      err.textContent = "Both the current and the new passphrase are required.";
+      err.textContent = i18nText("chrome-js-backup-pw-required", "Both the current and the new passphrase are required.");
       return;
     }
     try {
@@ -4171,7 +6119,7 @@
       $("bk-pw-new1").value = "";
       $("bk-pw-new2").value = "";
       ok.textContent =
-        "Passphrase changed. The old one no longer opens this vault; your recovery key is unchanged.";
+        i18nText("chrome-js-backup-pw-changed", "Passphrase changed. Your recovery key still works; the old passphrase does not.");
     } catch (e) {
       err.textContent = friendly(e);
     }
@@ -4186,11 +6134,11 @@
     const dest = $("bk-exp-dest").value;
     const passphrase = $("bk-exp-pass1").value;
     if (passphrase !== $("bk-exp-pass2").value) {
-      err.textContent = "The two export passphrases do not match.";
+      err.textContent = i18nText("chrome-js-backup-exp-mismatch", "The two export passphrases do not match.");
       return;
     }
     if (!dest || !passphrase) {
-      err.textContent = "Choose a destination and set an export passphrase.";
+      err.textContent = i18nText("chrome-js-backup-exp-required", "Choose a destination and set an export passphrase.");
       return;
     }
     try {
@@ -4200,7 +6148,7 @@
       // Named plainly because it is a separate secret from the vault
       // passphrase and there is no recovery key for an export.
       ok.textContent =
-        "Encrypted export written. It opens only with the export passphrase you just set, and there is no recovery key for it.";
+        i18nText("chrome-js-backup-exp-written", "Encrypted export written. Only its passphrase can open it; there is no recovery key.");
     } catch (e) {
       err.textContent = friendly(e);
     }
@@ -4215,20 +6163,20 @@
     const dest = $("bk-plain-dest").value;
     const confirmation = $("bk-plain-confirm").value;
     if (!dest) {
-      err.textContent = "Choose a destination.";
+      err.textContent = i18nText("chrome-js-backup-plain-dest", "Choose a destination.");
       return;
     }
     // The backend enforces this too, and must -- this check only turns a
     // round trip into an immediate answer.
     if (!confirmation) {
-      err.textContent = "Type the confirmation sentence exactly to continue.";
+      err.textContent = i18nText("chrome-js-error-export-not-confirmed", "Type the confirmation sentence exactly to continue.");
       return;
     }
     try {
       await rb("vault_export_plaintext", { dest, confirmation });
       $("bk-plain-confirm").value = "";
       ok.textContent =
-        "Plaintext export written. It is NOT encrypted, so anyone who opens that file can read every credential in it.";
+        i18nText("chrome-js-backup-plain-written", "Plaintext export written. It is unencrypted; anyone with the file can read every credential.");
     } catch (e) {
       err.textContent = friendly(e);
     }
@@ -4281,11 +6229,11 @@
         // portal path is not something anyone would type, and hiding it
         // entirely would leave the form looking like nothing happened.
         typed.readOnly = true;
-        typed.placeholder = "No file chosen yet";
+        typed.placeholder = i18nText("chrome-js-import-no-file-placeholder", "No file chosen yet");
       } else {
         pick.hidden = true;
         typed.readOnly = false;
-        typed.placeholder = "Backup file path";
+        typed.placeholder = i18nText("chrome-js-import-path-placeholder", "Backup file path");
       }
     }
     importModeAppliers.push(applyMode);
@@ -4295,12 +6243,17 @@
       err.textContent = "";
       try {
         const r = await rb("file_pick_open", {
-          title: "Choose a PATANYX backup file",
+          title: i18nText("chrome-js-import-pick-title", "Choose a PATANYX backup file"),
         });
         // Cancel is an answer, not a failure: leave everything as it was.
         if (!r || !r.path) return;
         $(id("src")).value = r.path;
-        $(id("chosen")).textContent = "Chosen: " + r.path;
+        i18nSet(
+          $(id("chosen")),
+          "chrome-js-import-chosen",
+          { path: r.path },
+          "Chosen: " + r.path,
+        );
       } catch (e) {
         err.textContent = friendly(e);
       }
@@ -4310,6 +6263,7 @@
       ev.preventDefault();
       const err = $(id("error"));
       err.textContent = "";
+      delete err.dataset.reason;
       const src = $(id("src")).value.trim();
       const exportPass = $(id("export-pass")).value;
       const p1 = $(id("pass1")).value;
@@ -4319,20 +6273,22 @@
       // the confirmation field must cost a re-type, not a vault.
       if (!src) {
         err.textContent = importFileChoice
-          ? "Choose the backup file first."
-          : "Enter the path to the backup file.";
+          ? i18nText("chrome-js-import-no-src-pick", "Choose the backup file first.")
+          : i18nText("chrome-js-import-no-src-typed", "Enter the path to the backup file.");
         return;
       }
       if (!exportPass) {
-        err.textContent = "Enter the passphrase that protects the backup file.";
+        err.textContent = i18nText("chrome-js-import-no-export-pass", "Enter the passphrase that protects the backup file.");
         return;
       }
       if (p1.length < 8) {
-        err.textContent = "New passphrase must be at least 8 characters.";
+        err.textContent = i18nText("chrome-js-import-pass-short", "New passphrase must be at least 8 characters.");
+        err.dataset.reason = "short";
         return;
       }
       if (p1 !== p2) {
-        err.textContent = "New passphrases do not match.";
+        err.textContent = i18nText("chrome-js-import-pass-mismatch", "New passphrases do not match.");
+        err.dataset.reason = "mismatch";
         return;
       }
       try {
@@ -4345,6 +6301,11 @@
           $(id(suffix)).value = "";
         }
         $(id("chosen")).textContent = "";
+        if (imported && imported.library !== "replaced") {
+          err.textContent = imported.library === "not_replaced"
+            ? i18nText("chrome-js-import-library-not-replaced", "The vault was imported, but the previous profile's Library could not be replaced. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.")
+            : i18nText("chrome-js-import-library-not-opened", "The vault was imported and the previous Library was replaced, but the new Library could not be opened. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.");
+        }
         // Import mints a FRESH recovery key, exactly like creation, and it is
         // returned once. The user must see it before anything else happens.
         if (imported && imported.recovery_key) {
@@ -4370,11 +6331,11 @@
     const p1 = $("create-pass1").value;
     const p2 = $("create-pass2").value;
     if (p1.length < 8) {
-      err.textContent = "Passphrase must be at least 8 characters.";
+      err.textContent = i18nText("chrome-js-create-pass-short", "Passphrase must be at least 8 characters.");
       return;
     }
     if (p1 !== p2) {
-      err.textContent = "Passphrases do not match.";
+      err.textContent = i18nText("chrome-js-create-pass-mismatch", "Passphrases do not match.");
       return;
     }
     try {
@@ -4422,7 +6383,7 @@
     err.textContent = "";
     const pass = $("recovery-create-pass").value;
     if (!pass) {
-      err.textContent = "Enter your vault passphrase to confirm.";
+      err.textContent = i18nText("chrome-js-recovery-create-confirm-prompt", "Enter your vault passphrase to confirm.");
       return;
     }
     try {
@@ -4454,12 +6415,17 @@
   // ---- tabs --------------------------------------------------------------------
   $("tab-creds").addEventListener("click", () => selectTab("creds"));
   $("tab-notes").addEventListener("click", () => selectTab("notes"));
+  $("tab-sync").addEventListener("click", () => selectTab("sync"));
+
+  $("vault-sync-framing").textContent =
+    "PATANYX Vault keeps your passwords on this device. To use them on your " +
+    "phone or another computer too, NordPass syncs across devices.";
 
   function selectTab(which) {
     // Backup was shipped in index.html with a tab button and a pane, and this
     // function never knew about it — so the whole encrypted-export,
     // change-passphrase and plaintext-export surface was unreachable.
-    for (const name of ["creds", "notes", "backup"]) {
+    for (const name of ["creds", "notes", "backup", "sync"]) {
       $("tab-" + name).classList.toggle("active", which === name);
       $("pane-" + name).hidden = which !== name;
     }
@@ -4467,8 +6433,8 @@
     // The Premium row sits ABOVE the panes, so it survives a tab switch --
     // and so did the result of the last token paste, which meant a refusal
     // like "This build cannot verify Premium tokens yet" followed the user
-    // from Credentials to Notes to Backup as if it were about the pane they
-    // had just opened. A message about an action belongs to that action:
+    // from Credentials to Notes, Backup or Sync as if it were about the pane
+    // they had just opened. A message about an action belongs to that action:
     // moving away ends it.
     const premiumError = $("premium-error");
     if (premiumError) premiumError.textContent = "";
@@ -4520,21 +6486,23 @@
         //
         // Null when the stored origin has no registrable domain of its own
         // (a bare public suffix); then it really does fill on itself alone.
-        li.appendChild(
-          el(
-            "div",
-            "cred-origin",
-            item.fills_on
-              ? "Fills on " + item.fills_on + " and its subdomains"
-              : "Fills on " + item.origin + " only",
-          ),
-        );
+        {
+          const scope = el("div", "cred-origin", "");
+          if (item.fills_on) {
+            i18nSet(scope, "chrome-cred-fills-subdomains", { domain: item.fills_on },
+              "Fills on " + item.fills_on + " and its subdomains");
+          } else {
+            i18nSet(scope, "chrome-cred-fills-only", { origin: item.origin },
+              "Fills on " + item.origin + " only");
+          }
+          li.appendChild(scope);
+        }
       } else {
         li.appendChild(
           el(
             "div",
             "cred-origin none",
-            "Copy only: no site to match. Edit it on the site's page to fix.",
+            i18nText("chrome-js-creds-copy-only", "Copy only: no site to match. Edit it on the site's page to fix."),
           ),
         );
       }
@@ -4550,7 +6518,7 @@
       const revealBtn = el(
         "button",
         "small",
-        revealed.has(item.id) ? "Hide" : "Reveal",
+        revealed.has(item.id) ? i18nText("chrome-js-creds-hide", "Hide") : i18nText("chrome-js-creds-reveal", "Reveal"),
       );
       revealBtn.type = "button";
       revealBtn.addEventListener("click", async () => {
@@ -4568,7 +6536,7 @@
       });
       row.appendChild(revealBtn);
 
-      const editBtn = el("button", "small", "Edit");
+      const editBtn = el("button", "small", i18nText("chrome-js-creds-edit", "Edit"));
       editBtn.type = "button";
       editBtn.addEventListener("click", async () => {
         try {
@@ -4578,7 +6546,7 @@
           $("cred-username").value = entry.username || "";
           $("cred-password").value = entry.password || "";
           $("cred-note").value = entry.note || "";
-          $("cred-submit").textContent = "Save changes";
+          $("cred-submit").textContent = i18nText("chrome-js-creds-save-changes", "Save changes");
           $("cred-cancel").hidden = false;
         } catch (e) {
           /* ignore */
@@ -4586,11 +6554,17 @@
       });
       row.appendChild(editBtn);
 
-      const delBtn = el("button", "small danger", "Delete");
+      const delBtn = el("button", "small danger", i18nText("chrome-js-confirm-default-label", "Delete"));
       delBtn.type = "button";
       delBtn.addEventListener("click", async () => {
-        if (!(await askConfirm("Delete credential for " + item.site + "?")))
-          return;
+        const ok = await askConfirm(
+          await i18nResolve(
+            "chrome-js-creds-delete-confirm",
+            { site: item.site },
+            "Delete credential for " + item.site + "?",
+          ),
+        );
+        if (!ok) return;
         try {
           await rb("cred_delete", { id: item.id });
           revealed.delete(item.id);
@@ -4616,7 +6590,7 @@
       li.appendChild(head);
 
       const row = el("div", "item-row");
-      const editBtn = el("button", "small", "Edit");
+      const editBtn = el("button", "small", i18nText("chrome-js-creds-edit", "Edit"));
       editBtn.type = "button";
       editBtn.addEventListener("click", async () => {
         try {
@@ -4624,7 +6598,7 @@
           editingNote = item.id;
           $("note-title").value = note.title || "";
           $("note-body").value = note.body || "";
-          $("note-submit").textContent = "Save changes";
+          $("note-submit").textContent = i18nText("chrome-js-creds-save-changes", "Save changes");
           $("note-cancel").hidden = false;
         } catch (e) {
           /* ignore */
@@ -4632,7 +6606,7 @@
       });
       row.appendChild(editBtn);
 
-      const delBtn = el("button", "small danger", "Delete");
+      const delBtn = el("button", "small danger", i18nText("chrome-js-confirm-default-label", "Delete"));
       delBtn.type = "button";
       delBtn.addEventListener("click", async () => {
         if (!(await askConfirm('Delete note "' + item.title + '"?'))) return;
@@ -4661,7 +6635,7 @@
     const password = $("cred-password").value;
     const note = $("cred-note").value;
     if (!site || !username) {
-      err.textContent = "Site and username are required.";
+      err.textContent = i18nText("chrome-js-credform-required", "Site and username are required.");
       return;
     }
     try {
@@ -4707,7 +6681,18 @@
     if (!btn) return;
     const origin = lastTabStatus && lastTabStatus.origin;
     btn.hidden = !origin;
-    if (origin) btn.title = "Use " + origin + ", the site in this tab";
+    if (origin) {
+      btn.title = "Use " + origin + ", the site in this tab";
+      if (currentUiLocale !== "en") {
+        i18nResolve(
+          "chrome-js-creds-use-site-title",
+          { origin },
+          "Use " + origin + ", the site in this tab",
+        ).then((t) => {
+          btn.title = t;
+        });
+      }
+    }
   }
 
   function resetCredForm() {
@@ -4716,7 +6701,7 @@
     $("cred-username").value = "";
     $("cred-password").value = "";
     $("cred-note").value = "";
-    $("cred-submit").textContent = "Add credential";
+    $("cred-submit").textContent = i18nText("chrome-js-credform-add", "Add credential");
     $("cred-cancel").hidden = true;
     $("cred-error").textContent = "";
   }
@@ -4728,7 +6713,7 @@
     const title = $("note-title").value.trim();
     const body = $("note-body").value;
     if (!title) {
-      err.textContent = "Title is required.";
+      err.textContent = i18nText("chrome-js-noteform-required", "Title is required.");
       return;
     }
     try {
@@ -4749,7 +6734,7 @@
     editingNote = null;
     $("note-title").value = "";
     $("note-body").value = "";
-    $("note-submit").textContent = "Add note";
+    $("note-submit").textContent = i18nText("chrome-js-noteform-add", "Add note");
     $("note-cancel").hidden = true;
     $("note-error").textContent = "";
   }
@@ -4774,7 +6759,7 @@
   // The first tabs_changed may also fire before this script loaded, so the
   // initial strip is fetched explicitly.
   rb("tab_list")
-    .then((data) => renderTabs(data && data.items))
+    .then((data) => acceptTabItems(data && data.items))
     .catch(() => {});
 
   // First-run tour. Runs after everything above has registered -- this is an
@@ -4830,14 +6815,15 @@
 
   // ---- from the privsurface draft ----
   // The chrome strip height is owned here, in one place: the open panel's
-  // budget (or the closed height) plus the TLS warning's measured height
-  // while it is visible. The warning lives inside the chrome webview, so
-  // without this it would be clipped by the fixed strip height.
+  // budget (or the closed height) plus the measured height of every visible
+  // banner. Banners live inside the chrome webview, so without this they
+  // would be clipped by the fixed strip height.
   // Every banner that can appear under the toolbar. They live inside the
   // chrome webview, so the Rust side has to be told how tall the strip needs
-  // to be or they are simply clipped. This was a single hardcoded reference to
-  // #tls-warning; a second banner would have rendered half-visible with no
-  // error anywhere.
+  // to be or they are simply clipped. This began as a single hardcoded
+  // reference to the only banner that existed then -- the TLS interception
+  // warning, since removed -- and the second banner added rendered
+  // half-visible with no error anywhere.
   // EVERY banner in index.html, and the list is gated because it was wrong.
   //
   // `lock-warning` was missing. A banner that is not measured here does not
@@ -4854,7 +6840,6 @@
     "blocked-warning",
     "update-banner",
     "resolver-warning",
-    "tls-warning",
     "save-password-banner",
     "lock-warning",
     // The fail-closed tunnel banner. A banner absent from this list renders
@@ -4862,12 +6847,18 @@
     "tunnel-warning",
     // The plain-HTTP warning: same band, same clipping rule.
     "insecure-warning",
+    // The ad-list hold. Same band, same rule: a banner missing from this list
+    // renders outside the clipped strip and is invisible, which is the
+    // lock-warning defect and is not discoverable by reading the markup.
+    "adlist-warning",
+    // The engine-below-floor warning, raised at boot: same band, same rule.
+    "engine-floor-warning",
     // The find bar. NOT a banner by role (role="search"), which is exactly how
     // it escaped the toolbar gate's role=alert|status sweep and this list.
     // With the toolbar across the top the closed strip is measured against a
     // 148px floor, and the ~40px of slack under the two rows happened to be
     // enough for the bar -- so Ctrl+F looked fine on every top-toolbar test.
-    // With the toolbar down the LEFT edge the strip is only the tab row and
+    // With the toolbar down either side the strip is only the tab/address rows and
     // is measured tightly (floor 88), the slack is gone, and the bar rendered
     // under the page: Ctrl+F "did nothing". Its own comment in index.html
     // says it "goes through the same height sync the banners use"; now it
@@ -4876,29 +6867,63 @@
   ];
 
   function syncChromeInsets() {
-    const base = openPanelName
-      ? panels.get(openPanelName).heightPx
-      : closedChromePx();
-    let extra = 0;
-    // An open folder menu grows the strip while it is open, for the same
-    // reason banners do: the chrome is CLIPPED to the height Rust was told,
-    // so anything drawn below that height is not drawn at all. This is the
-    // lock-warning banner defect in a different costume, and the fix is the
-    // same one -- measure it and ask for the room.
-    const folderMenu = document.querySelector(".bmfolder-menu");
-    if (folderMenu) {
-      extra += Math.ceil(folderMenu.getBoundingClientRect().height) + 8;
-    }
-    for (const id of BANNERS) {
-      const banner = $(id);
-      if (banner && !banner.hidden) {
-        extra += Math.ceil(banner.getBoundingClientRect().height);
-      }
-    }
-    const top = base + extra;
-    rb("set_chrome_insets", { top, left: closedChromeLeftPx() }).catch(
-      () => {},
-    );
+    const extra = bannerExtraPx();
+    // THE FLOOR IS APPLIED AFTER THE EXTRA, NOT BEFORE IT.
+    //
+    // This used to read `closedChromePx() + extra`, which floors the two rows
+    // at 148 and THEN adds the banner. On a real Windows build the rows
+    // measure ~136, so the floor wins by 12px and that slack got counted
+    // twice: a 48px banner ending at 184 reported a strip of 196. Opaque
+    // chrome hid the overshoot. It stops being hidden the moment anything lays
+    // the page out against this number, because then 12 logical pixels between
+    // the banner's last row and the page's first belong to nobody -- the same
+    // twelve the stylesheet's "THE 12px NOBODY PAINTS" comment is about,
+    // reached by a different route.
+    //
+    // Measuring first and flooring once gives max(148, 136 + 48) = 184, which
+    // is where the banner actually ends. With no panel open `top` IS the
+    // strip, from the same call, so the two cannot disagree.
+    const strip = closedChromePx(extra);
+    const left = closedChromeLeftPx();
+    const right = closedChromeRightPx();
+    // CEILED, because `top` crosses the IPC and ipc.rs reads it with
+    // `Value::as_i64`, which returns None for a fractional number and answers
+    // bad_args. `strip` already comes back whole from `closedChromePx`; this
+    // branch adds a raw `extra` to a panel height and did not. Unrounded
+    // banner heights are correct for the MEASUREMENT -- that is what stopped
+    // the double-rounding overshoot -- but the wire wants an integer, and a
+    // silently rejected inset leaves native geometry disagreeing with the CSS
+    // that was published from the same number.
+    const top = openPanelName
+      ? Math.ceil(panels.get(openPanelName).heightPx + extra)
+      : strip;
+    // The stylesheet needs this number too, and the SAME one: a panel is
+    // placed below the chrome, and `--chrome-closed-px` is the BARE closed
+    // strip with no banner in it. With a banner showing, a panel positioned
+    // from the bare value starts 52px inside the banner's band. That was
+    // invisible only because banners sat under the modal scrim; it is the
+    // defect the `.panel-modal` comment already describes, arriving by a
+    // banner instead of by a constant.
+    // Republished through the one function that owns these variables, so
+    // there is no second place to keep in sync.
+    publishChromeMetric();
+    rb("set_chrome_insets", {
+      top,
+      // The CLOSED strip, sent every time and never inferred.
+      //
+      // `top` is the panel's height while a panel is open, and the backend
+      // used to work out which kind of height it had been given from the
+      // arrangement it had been told about separately. Those two commands are
+      // not ordered: `togglePanelNamed` sets `openPanelName` and runs the
+      // panel's onOpen (which can call this) BEFORE `syncChromeCoverage`
+      // sends the arrangement, so a panel height could arrive first and be
+      // recorded as the strip. On the GTK backend that put the page 272px
+      // down the window for as long as the modal was open. Stating the
+      // measurement removes the guess.
+      strip,
+      left,
+      right,
+    }).catch(() => {});
     // The exact number Rust was given, for the stylesheet.
     //
     // A modal card is capped against the viewport with `100vh`, and that is
@@ -4936,6 +6961,7 @@
   // (toolbar chip and panel button) are driven from here so they can never
   // disagree.
   function applyTabStatus(st) {
+    retireBlockedOnNavigation(st);
     if (!st) return;
     lastTabStatus = st;
     // The engine-confirmed rows belong HERE, not in applyPrivacyStatus: every
@@ -4982,14 +7008,14 @@
     const btn = $("btn-freeze");
     $("freeze-label").textContent =
       phase === "loading"
-        ? "Loading\u2026"
+        ? i18nText("chrome-js-freeze-label-loading", "Loading\u2026")
         : freezeFailed
-          ? "Not frozen"
+          ? i18nText("chrome-js-freeze-label-failed", "Not frozen")
           : freezePending
-            ? "Freezing\u2026"
+            ? i18nText("chrome-js-freeze-label-pending", "Freezing\u2026")
             : reallyFrozen
-              ? "Frozen"
-              : "Live";
+              ? i18nText("chrome-js-freeze-label-frozen", "Frozen")
+              : i18nText("chrome-js-freeze-label-live", "Live");
     // aria-pressed tracks the REQUEST, because that is what the button
     // toggles: a failed freeze must still offer "unfreeze" to clear it.
     btn.setAttribute("aria-pressed", requested ? "true" : "false");
@@ -4999,30 +7025,30 @@
     // explained — never a switch that does nothing.
     btn.disabled = !enforceable;
     btn.title = !enforceable
-      ? "Freezing is not available on this platform"
+      ? i18nText("chrome-js-freeze-title-unavailable", "Freezing is not available on this platform")
       : freezeFailed
-        ? "Freeze FAILED: the engine could not install the block, so this tab is still making network requests"
+        ? i18nText("chrome-js-freeze-title-failed", "Freeze FAILED; this tab can still send requests")
         : freezePending
-          ? "Freezing this tab\u2026 requests may still be going out until it finishes"
+          ? i18nText("chrome-js-freeze-title-pending", "Freezing this tab; requests may continue")
           : reallyFrozen
-            ? "This tab is frozen and sending nothing. Click to unfreeze."
-            : "Freeze this tab: stop it from making network requests";
+            ? i18nText("chrome-js-freeze-title-frozen", "Frozen: no network requests. Click to unfreeze.")
+            : i18nText("chrome-js-freeze-title-live", "Freeze this tab: stop it from making network requests");
 
     // Panel mirror of the same state.
     $("tab-freeze-desc").textContent =
       phase === "loading"
-        ? "This tab is loading. Requests are allowed until it finishes."
+        ? i18nText("chrome-js-freeze-desc-loading", "Loading. Requests are allowed until loading finishes.")
         : freezeFailed
-          ? "Freeze failed. The engine could not install the block, so this tab is STILL making network requests. Close it if that matters."
+          ? i18nText("chrome-js-freeze-desc-failed", "Freeze failed. This tab can still send requests; close it if that matters.")
           : freezePending
-            ? "Freezing this tab. Until that finishes it may still be making requests."
+            ? i18nText("chrome-js-freeze-desc-pending", "Freezing. Requests may continue.")
             : reallyFrozen
-              ? "This tab is frozen. It is making no network requests."
-              : "This tab is live. It can keep making network requests.";
+              ? i18nText("chrome-js-freeze-desc-frozen", "Frozen. No network requests.")
+              : i18nText("chrome-js-freeze-desc-live", "Live. Network requests can continue.");
     const panelFreeze = $("btn-tabfreeze");
     panelFreeze.textContent = requested
-      ? "Unfreeze this tab"
-      : "Freeze this tab";
+      ? i18nText("chrome-js-freeze-unfreeze-button", "Unfreeze this tab")
+      : i18nText("chrome-js-freeze-freeze-button", "Freeze this tab");
     panelFreeze.disabled = !enforceable;
 
     // The Tab button lights up when the active tab has any non-default
@@ -5032,48 +7058,105 @@
       "is-active",
       reallyFrozen || st.profile === "ephemeral",
     );
+    // THE ambient interception signal. It began as a backstop -- something
+    // that survived dismissing the full-width banner -- and removing that
+    // banner promotes it to the only trace outside the panel. What made it
+    // the right backstop makes it the right primary: it is deliberately not
+    // `is-active`, which means "this tab is doing something the user chose",
+    // and interception is something done TO the tab; and it tracks the
+    // connection rather than any acknowledgement, so it lasts exactly as long
+    // as the condition does.
+    //
+    // The banner was removed because it asserted decryption in prose, across
+    // the whole window, without showing the certificate it reasoned from. Every
+    // `classify_issuer` collision was therefore the browser stating something
+    // untrue about the user's connection, and no lexical rule removes them all
+    // -- "Norton Rose Fulbright SSL Issuing CA" matches the `norton` hint, and
+    // narrowing the hints far enough to miss it also switched the verdict off
+    // for the antivirus roots it exists to catch. In the panel the summary
+    // verdict `#tab-safety-desc` sits directly above `#tab-issuer-desc`, an
+    // order interception-ui-gate.js holds, so the claim and its evidence are
+    // read together and a wrong one is visibly wrong instead of authoritative.
+    // (Ids, not line numbers. The first draft of this comment cited lines and
+    // was already wrong when it was written, because adding the comment moved
+    // them.) Sensitivity is unchanged; only the loud surface went.
+    //
+    // The longer sentence under "Connection" is two sections further down and
+    // does NOT have the issuer beside it, so it carries the qualifier the
+    // banner used to carry -- common on work networks and with some antivirus
+    // software. That sentence left the product with the banner and had to come
+    // back: it is what lets the reader who cannot interpret a CA name shrug at
+    // a false positive, which is exactly the reader this design is for.
+    const intercepted = st.tls === "intercepted";
+    tabButtonIntercepted = intercepted;
+    $("btn-tab").classList.toggle("is-intercepted", intercepted);
+    // AND IN THE ACCESSIBLE NAME, not only in the colour. A border and a glyph
+    // tint are nothing at all to a screen reader and little to a red/green
+    // deficit, so for those users the mark carries no information -- and with
+    // the banner gone there is nothing else in the chrome to fall back on. The
+    // label carries the condition while it lasts and goes back to the plain
+    // one when it ends.
+    applyTabButtonLabel();
 
-    // TLS: the full-width banner is reserved for the one verdict that must
-    // not be missable — Intercepted means traffic the user believes is
-    // private is being decrypted by a third party. It has no dismiss
-    // control; it clears when the connection state does. Unknown is common
-    // (unrecognized issuer names) and stays a calm line in the panel:
-    // crying wolf there would teach the user to ignore the real warning.
+    // TLS, stated once, in the panel. Unknown is common (unrecognized issuer
+    // names) and stays a calm line rather than a verdict: crying wolf there
+    // would teach the user to ignore the one that means something.
     //
     // "unreadable" is NOT "unknown" and the two must never share a string.
-    // Unknown says the browser looked at the issuer and did not recognize
-    // it — a fact about the certificate. Unreadable says the platform
-    // exposes no chain to look at (WebView2 on Windows, every page, always),
-    // so the sentence has to be about the browser instead. They were one
-    // branch, which told every Windows user their ordinary public
-    // certificate had an issuer this browser did not recognize.
-    const intercepted = st.tls === "intercepted";
-    const banner = $("tls-warning");
-    if (banner.hidden !== !intercepted) {
-      banner.hidden = !intercepted;
-      syncChromeInsets();
-    }
+    // Unknown says the browser looked at the issuer and did not recognize it
+    // -- a fact about the certificate. Unreadable says the platform exposes no
+    // chain to look at (WebView2 on Windows, every page, always), so the
+    // sentence has to be about the browser instead. They were one branch,
+    // which told every Windows user their ordinary public certificate had an
+    // issuer this browser did not recognize.
     $("tab-tls-desc").textContent =
       st.tls === "normal"
-        ? "This connection is encrypted and the certificate issuer is a recognized public authority."
+        ? i18nText("chrome-js-tls-normal", "Encrypted. The certificate issuer is a recognized public authority.")
         : intercepted
-          ? "This connection is being intercepted. See the warning above."
+          ? i18nText("chrome-js-tls-intercepted", "This connection is being intercepted. Something between you and this site can read and change what you send and receive. This is common on work networks and with some antivirus software.")
           : st.tls === "not_tls"
-            ? "This page is not using an encrypted connection."
-            : st.tls === "unknown"
-              ? "The certificate issuer is not one this browser recognizes. That is not necessarily a problem; it is simply unconfirmed."
+            ? i18nText("chrome-js-tls-not-tls", "This connection is not encrypted.")
+            : st.tls === "unknown" // wire token, not display text
+              ? i18nText("chrome-js-tls-unknown", "This browser does not recognize the certificate issuer. That alone may not be a problem; the issuer is unconfirmed.")
               : // "unreadable", and the default for anything unrecognized:
                 // the only claim that stays true when the browser does not
                 // know what it is looking at.
-                "This browser cannot read certificate details on this platform, so the issuer is unconfirmed. That is a limit of the browser, not a finding about this site.";
+                i18nText("chrome-js-tls-unreadable", "Certificate details are unavailable on this platform, so the issuer is unconfirmed. This does not indicate a site problem.");
+
+    // Info-tab safety summary: is this page safe, in one line, plus the issuer.
+    if ($("tab-safety-desc")) {
+      $("tab-safety-desc").textContent = st.page_insecure
+        ? i18nText("chrome-js-safety-insecure", "This page is not encrypted. Anything you send it can be read on the way.")
+        : intercepted
+          ? i18nText("chrome-js-safety-intercepted", "This connection is being intercepted, so it is not private.")
+          : st.tls === "normal"
+            ? i18nText("chrome-js-safety-secure", "This page is served over an encrypted, verified connection.")
+            : st.tls === "unreadable" // wire token, not display text
+              ? i18nText("chrome-js-safety-unreadable", "Encrypted. This browser cannot read certificate details on this platform, so it cannot confirm who issued it. That does not indicate a problem with this site.")
+              // "unconfirmed" is for a chain the browser READ and could not
+              // verify. It must never answer for a platform that exposes no
+              // chain at all: on WebView2 `st.tls` is always "unreadable", so
+              // without the arm above every correctly-secured page told the
+              // user its certificate could not be confirmed -- the same
+              // unknown/unreadable conflation chrome.js:6722 and
+              // windows.rs:5104 both forbid, in the one ternary that was
+              // never split.
+              : i18nText("chrome-js-safety-unconfirmed", "This page is encrypted, but the certificate could not be fully confirmed.");
+    }
+    if ($("tab-issuer-desc")) {
+      const issuer = st.tls_issuer;
+      $("tab-issuer-desc").textContent = issuer
+        ? i18nText("chrome-js-issuer-prefix", "Certificate issued by: ") + issuer
+        : i18nText("chrome-js-issuer-none", "No certificate issuer to show for this page.");
+    }
 
     // Storage profile: stated as fact. It is fixed when the tab is built, so
     // there is deliberately no control here — only what IS, and a pointer to
     // the way to get a tab that keeps nothing.
     $("tab-profile-desc").textContent =
       st.profile === "ephemeral"
-        ? "This tab keeps no site data: cookies and storage live only in memory and die with the session. This was chosen when the tab opened and cannot change."
-        : "This tab saves cookies, cache and site data, like an ordinary browser.";
+        ? i18nText("chrome-js-profile-ephemeral", "Cookies and site data are discarded when this tab closes. This cannot change after opening.")
+        : i18nText("chrome-js-profile-persistent", "This tab saves cookies, cache, and site data.");
 
     // Cookies: origin-scoped, and closed the moment the origin changes (see
     // the comment on `lastForgetOrigin`). `origin` is `null` for a page with
@@ -5085,12 +7168,7 @@
       $("site-forget-confirm").hidden = true;
       $("site-forget-result").hidden = true;
     }
-    $("tab-forget-desc").textContent = origin
-      ? "Clears cookies for " +
-        origin +
-        ". Saved passwords, local storage, and other site data are not affected."
-      : "This page has no site to forget.";
-    $("btn-site-forget").disabled = !origin;
+    renderSiteForgetControl();
 
     // Save-password banner: `pending_save` is only ever non-null when the
     // ACTIVE tab is the one that submitted a login, and never carries the
@@ -5108,6 +7186,15 @@
       st.insecure_pending_host || null,
     );
 
+    // The ad-list hold. Rendered from status for the DISPLAYED tab, like the
+    // two above, so a tab switch shows or hides it correctly rather than
+    // leaving the previous tab's banner on screen.
+    applyAdlistPending(st.adlist_pending || null, st.id);
+    // Read by the Tab Activity rows. From status rather than remembered from
+    // the click, so it disappears when Rust drops the override rather than
+    // when the chrome happens to notice.
+    adlistOverrideHost = st.adlist_override_host || null;
+
     // Passwords used to be refreshed HERE, and only while Tab Activity was
     // open -- the round trip was not worth making for a panel nobody had
     // opened. It now happens unconditionally at the top of this same function,
@@ -5116,6 +7203,31 @@
     // of them conditional, is how the two controls would drift apart.
 
     syncAllowSiteButton();
+
+    // Translation state rides with tab status, so the panel AND the toolbar
+    // chip repaint on navigation and on every phase change -- not only on the
+    // user's own three clicks, which was how a panel kept saying "This page
+    // is translated" about a page the browser had never touched.
+    renderTranslate(st.translation || null);
+
+    // The declared-language signal, into the translate panel. The host has
+    // sent detected_lang with every one of these payloads since the badge was
+    // built, and translateDetected -- read by the source prefill AND the
+    // "looks like" hint -- was never assigned from it. Fourth dangling wire
+    // in this family: designed, built on the host, unplugged on the page.
+    // Guarded on CHANGE so a user's manual source choice is not fought by
+    // every status push; only a new detection re-prefills.
+    // Always a REGISTRY code now (the host resolves the raw tag), so it is
+    // compared verbatim -- splitting it here is what once cut "zh-Hans" to a
+    // "zh" that named no language at all.
+    const det = st.detected_lang ? String(st.detected_lang) : null;
+    if (det !== translateDetected) {
+      translateDetected = det;
+      // A NEW detection is the one case that may overwrite the field.
+      fillSourceOptions(true);
+      fillTargetOptions();
+      renderDetectedHint();
+    }
   }
 
   // ---- from the privsurface draft ----
@@ -5157,9 +7269,16 @@
     const btn = $("btn-allow-site");
     const host = normalizeAllowHost(urlInput.value);
     btn.disabled = !host;
-    btn.textContent = host
-      ? "Allow " + host + " while frozen"
-      : "Allow this site while frozen";
+    if (host) {
+      i18nSet(
+        btn,
+        "chrome-js-allowsite-allow-host",
+        { host },
+        "Allow " + host + " while frozen",
+      );
+    } else {
+      btn.textContent = i18nText("chrome-js-allowsite-allow-generic", "Allow this site while frozen");
+    }
   }
 
   // ---- from the privsurface draft ----
@@ -5189,6 +7308,7 @@
       .catch(() => {});
     refreshLedger();
     refreshPrivacyReceipt();
+    refreshFingerprintProbes();
   }
 
   // ---- privacy receipt ----
@@ -5204,6 +7324,7 @@
     // call leaves the lines EMPTY, never zeroed -- a zero would read as
     // "nothing was refused", a measurement never taken.
     $("receipt-session").textContent = "";
+    $("receipt-session-caption").textContent = "";
     $("receipt-page").textContent = "";
     rb("privacy_receipt")
       .then(renderPrivacyReceipt)
@@ -5212,6 +7333,7 @@
 
   function renderPrivacyReceipt(r) {
     const sessionEl = $("receipt-session");
+    const captionEl = $("receipt-session-caption");
     const pageEl = $("receipt-page");
     if (!r) return;
     // The same gate the badge and the ledger list apply
@@ -5221,7 +7343,7 @@
     // and it leaves the lines empty rather than mislabelled.
     if (r.counts_blocked !== true) {
       sessionEl.textContent =
-        "Refused-request counts are not observable with this engine.";
+        i18nText("chrome-js-receipt-not-observable", "Refused-request counts are not observable with this engine.");
       pageEl.textContent = "";
       return;
     }
@@ -5236,11 +7358,57 @@
       (r.session_blocked === 1
         ? " request refused this session, across all tabs."
         : " requests refused this session, across all tabs.");
+    captionEl.textContent =
+      "Refused by the blocker since the browser was launched, counted across every tab, including tabs you have since closed.";
     pageEl.textContent =
       String(r.page_blocked) +
       (r.page_blocked === 1
         ? " refused on this page."
         : " refused on this page.");
+  }
+
+  // Separate from the privacy receipt. These numbers came from wrappers in
+  // the page's own main world, so the renderer preserves Rust's explicit
+  // page-reported caveat and never presents them as engine evidence.
+  function refreshFingerprintProbes() {
+    for (const id of [
+      "fingerprint-probe-label",
+      "fingerprint-probe-caveat",
+      "fingerprint-probe-audio",
+      "fingerprint-probe-canvas",
+      "fingerprint-probe-webgl",
+      "fingerprint-probe-element-measurement",
+      "fingerprint-probe-status",
+    ]) {
+      $(id).textContent = "";
+    }
+    rb("fingerprint_probe_activity")
+      .then(renderFingerprintProbes)
+      .catch(() => {});
+  }
+
+  function renderFingerprintProbes(reading) {
+    if (!reading || !reading.counts || !reading.surface_labels) return;
+    $("fingerprint-probe-label").textContent = reading.label || "";
+    $("fingerprint-probe-caveat").textContent = reading.caveat || "";
+    const rows = [
+      ["audio", "fingerprint-probe-audio"],
+      ["canvas", "fingerprint-probe-canvas"],
+      ["webgl", "fingerprint-probe-webgl"],
+      ["element_measurement", "fingerprint-probe-element-measurement"],
+    ];
+    for (const [surface, id] of rows) {
+      const count = reading.counts[surface];
+      const label = reading.surface_labels[surface];
+      if (typeof count !== "number" || typeof label !== "string") return;
+      // Zero is a reading, not absence: all four rows always render.
+      $(id).textContent =
+        label +
+        ": " +
+        String(count) +
+        (count === 1 ? " page-reported probe." : " page-reported probes.");
+    }
+    $("fingerprint-probe-status").textContent = reading.status_text || "";
   }
 
   // ---- from the privsurface draft ----
@@ -5280,8 +7448,8 @@
           "span",
           "item-sub",
           broken
-            ? "This tab's request filter could not be installed, so nothing is being recorded here. This is not a claim that the tab contacted nobody."
-            : "No requests recorded yet. Every host this tab contacts will appear here.",
+            ? i18nText("chrome-js-ledger-empty-broken", "No request record is available for this tab. This does not mean it contacted nobody.")
+            : i18nText("chrome-js-ledger-empty-ok", "No requests yet. Contacted hosts appear here."),
         ),
       );
       list.appendChild(li);
@@ -5313,21 +7481,46 @@
       const allowBtn = el(
         "button",
         "small",
-        already ? "Allowed" : "Allow while frozen",
+        already ? i18nText("chrome-js-ledger-allowed-button", "Allowed") : i18nText("chrome-js-ledger-allow-button", "Allow while frozen"),
       );
       allowBtn.type = "button";
       allowBtn.disabled = already;
       allowBtn.title =
-        "Let this host through even while the tab is frozen. Lasts until the tab closes.";
+        i18nText("chrome-js-ledger-allow-title", "Allow this host while frozen. Ends when the tab closes.");
       allowBtn.addEventListener("click", () => allowHost(rec.host));
       row.appendChild(allowBtn);
+
+      // THE AD-LIST EXCEPTION, if this tab holds one for this host.
+      //
+      // Its own label and its own sentence, deliberately not reusing the
+      // "Allowed" / "Ends when the tab closes" vocabulary a few pixels to its
+      // left. That button is the FREEZE override, a different consent with a
+      // different scope and a different end, and two per-host permissions in
+      // one panel wearing one set of words is how a user ends up believing
+      // they revoked something they did not.
+      //
+      // A read-out, not a control: it is removed by leaving the host or
+      // closing the tab, which the sentence says. There is no button here to
+      // undo it, because inventing a second revocation path that the engine
+      // side does not implement would be a control that lies.
+      if (adlistOverrideHost && rec.host === adlistOverrideHost) {
+        const chip = el("span", "item-chip",
+          i18nText("chrome-adlist-exception-button", "Ad list exception"));
+        // Not parameterized: i18nText takes no arguments, and the host is
+        // already this row's title a few pixels away, so repeating it in the
+        // tooltip buys nothing and would need the i18nSet path, which sets
+        // text content rather than an attribute.
+        chip.title = i18nText("chrome-adlist-exception-title",
+          "PATANYX is letting this tab reach this host past ad and tracker blocking. Ends when you leave it or close the tab.");
+        row.appendChild(chip);
+      }
       li.appendChild(row);
       list.appendChild(li);
     }
 
     $("ledger-foot").textContent = countsBlocked
-      ? "Requests counted as blocked never left this browser."
-      : "This list shows every host the tab contacted. On this platform the blocker does not report the requests it stops, so they are not counted here. Blocking still happens, it just cannot be counted.";
+      ? i18nText("chrome-js-ledger-foot-blocked", "Blocked requests never left this browser.")
+      : i18nText("chrome-js-ledger-foot-uncounted", "Contacted hosts only; this platform cannot count stopped requests.");
   }
 
   // ---- from the bookmarks draft ----
@@ -5338,7 +7531,7 @@
 
   // ---- from the bookmarks draft ----
   function fmtBytes(n) {
-    const units = ["B", "KB", "MB", "GB", "TB"];
+    const units = [i18nText("chrome-js-fmtbytes-b", "B"), i18nText("chrome-js-fmtbytes-kb", "KB"), i18nText("chrome-js-fmtbytes-mb", "MB"), i18nText("chrome-js-fmtbytes-gb", "GB"), i18nText("chrome-js-fmtbytes-tb", "TB")];
     let value = n;
     let i = 0;
     while (value >= 1024 && i < units.length - 1) {
@@ -5362,8 +7555,8 @@
     const saved = !!currentBookmark();
     btnBookmark.classList.toggle("is-active", saved);
     const label = saved
-      ? "This page is bookmarked. Open bookmarks"
-      : "Bookmark this page";
+      ? i18nText("chrome-js-bookmarks-star-saved", "This page is bookmarked. Open bookmarks")
+      : i18nText("chrome-js-palette-bookmark", "Bookmark this page");
     btnBookmark.title = label;
     btnBookmark.setAttribute("aria-label", label);
   }
@@ -5441,11 +7634,15 @@
     try {
       await reloadBookmarkState();
     } catch (e) {
-      toast("Saved, but the view could not refresh: " + friendly(e), true);
+      const detail = friendly(e);
+      i18nResolve(
+        "chrome-js-folders-refresh-failed",
+        { detail },
+        "Saved, but the view could not refresh: " + detail,
+      ).then((t) => toast(t, true));
       return;
     }
     renderFolderGrid();
-    renderBookmarks();
     renderBookmarkBar();
     renderBookmarksManager();
     updateStar();
@@ -5492,12 +7689,12 @@
         input.type = "text";
         input.maxLength = 40;
         input.value = folder.tag;
-        input.setAttribute("aria-label", "Rename folder");
+        input.setAttribute("aria-label", i18nText("chrome-js-folders-rename-aria", "Rename folder"));
         form.appendChild(input);
-        const save = el("button", "small", "Save");
+        const save = el("button", "small", i18nText("chrome-js-folders-save", "Save"));
         save.type = "submit";
         form.appendChild(save);
-        const cancel = el("button", "small", "Cancel");
+        const cancel = el("button", "small", i18nText("chrome-js-folders-cancel", "Cancel"));
         cancel.type = "button";
         cancel.addEventListener("click", () => {
           renamingFolder = null;
@@ -5531,16 +7728,16 @@
       // first opening it. Delete says plainly that it unfiles, never destroys.
       const actions = document.createElement("div");
       actions.className = "folder-actions";
-      const renameBtn = el("button", "small", "Rename");
+      const renameBtn = el("button", "small", i18nText("chrome-js-manager-rename", "Rename"));
       renameBtn.type = "button";
       renameBtn.addEventListener("click", () => {
         renamingFolder = folder.tag;
         renderFolderGrid();
       });
       actions.appendChild(renameBtn);
-      const delBtn = el("button", "small danger", "Delete folder");
+      const delBtn = el("button", "small danger", i18nText("chrome-js-folders-delete-folder", "Delete folder"));
       delBtn.type = "button";
-      delBtn.title = "Removes the folder. The bookmarks in it are kept.";
+      delBtn.title = i18nText("chrome-js-folders-delete-title", "Removes the folder. The bookmarks in it are kept.");
       delBtn.addEventListener("click", () => deleteFolder(folder.tag));
       actions.appendChild(delBtn);
       wrap.appendChild(actions);
@@ -5552,7 +7749,7 @@
           const li = document.createElement("li");
           li.className = "item-sub";
           li.textContent =
-            "Empty. Use Folders on any bookmark to file it here, or drag one in.";
+            i18nText("chrome-js-folders-empty-items", "Empty. Use Folders on any bookmark to file it here, or drag one in.");
           list.appendChild(li);
         }
         for (const item of folder.items) {
@@ -5577,9 +7774,9 @@
           li.appendChild(host);
           // Remove this one bookmark from this one folder. Its other folders
           // and the bookmark itself are untouched.
-          const unfile = el("button", "small", "Remove");
+          const unfile = el("button", "small", i18nText("chrome-js-folders-remove", "Remove"));
           unfile.type = "button";
-          unfile.title = "Remove from this folder. The bookmark is kept.";
+          unfile.title = i18nText("chrome-js-folders-unfile-title", "Remove from this folder. The bookmark is kept.");
           unfile.addEventListener("click", async () => {
             try {
               await rb("bookmark_folder_unfile", {
@@ -5610,13 +7807,13 @@
     if (!bookmarkItems.length) return;
     const head = document.createElement("h3");
     head.className = "section-head";
-    head.textContent = "All bookmarks";
+    head.textContent = i18nText("chrome-js-folders-source-head", "All bookmarks");
     grid.appendChild(head);
     const hint = document.createElement("p");
     hint.className = "panel-foot";
     hint.textContent = haveFolders
-      ? "Drag a bookmark onto a folder above, or use Folders on any bookmark in the Bookmark Manager."
-      : "Make a folder above, then file bookmarks into it from the Bookmark Manager.";
+      ? i18nText("chrome-js-folders-source-hint", "Drag a bookmark onto a folder above, or use Folders on any bookmark in the Bookmark Manager.")
+      : i18nText("chrome-js-folders-source-hint-none", "Make a folder above, then file bookmarks into it from the Bookmark Manager.");
     grid.appendChild(hint);
 
     const list = document.createElement("ul");
@@ -5633,7 +7830,13 @@
       if (Array.isArray(item.tags) && item.tags.length) {
         const inFolders = document.createElement("span");
         inFolders.className = "item-sub";
-        inFolders.textContent = "in " + item.tags.join(", ");
+        const folders = item.tags.join(", ");
+        i18nSet(
+          inFolders,
+          "chrome-js-folders-source-in",
+          { folders },
+          "in " + folders,
+        );
         li.appendChild(inFolders);
       }
       li.addEventListener("dragstart", (ev) => {
@@ -5671,7 +7874,7 @@
     if (errline) errline.hidden = true;
     if (!name) {
       if (errline) {
-        errline.textContent = "Type a folder name first.";
+        errline.textContent = i18nText("chrome-js-folders-new-empty", "Type a folder name first.");
         errline.hidden = false;
       }
       return;
@@ -5712,10 +7915,12 @@
 
   async function deleteFolder(name) {
     const ok = await askConfirm(
-      "Delete the folder “" +
-        name +
-        "”? The bookmarks in it are kept, just " +
-        "no longer filed under this folder.",
+      await i18nResolve(
+        "chrome-confirm-delete-folder",
+        { name },
+        "Delete the folder “" + name + "”? The bookmarks in it are kept, " +
+          "just no longer filed under this folder.",
+      ),
     );
     if (!ok) return;
     try {
@@ -5788,7 +7993,7 @@
     }
   });
 
-  // ---- set-aside shelves ----
+  // ---- shelves ----
   // A shelf stores title + URL only: no favicons, no scroll positions, no
   // cookies, no history. That is the privacy contract of the feature.
   $("set-aside").addEventListener("click", async () => {
@@ -5798,9 +8003,11 @@
       const r = await rb("shelf_create");
       const leftOut =
         r.left_out > 0
-          ? " " +
-            r.left_out +
-            " left out: ephemeral and internal pages stay open."
+          ? await i18nResolve(
+              "chrome-shelf-left-out",
+              { count: r.left_out },
+              " " + r.left_out + " left out: ephemeral and internal pages stay open.",
+            )
           : "";
       toast(r.name + "." + leftOut);
       await shelfRenderList();
@@ -5840,7 +8047,7 @@
     if (items.length === 0) {
       for (const list of lists) {
         list.textContent =
-          "No shelves. Set aside stores this window's tabs here.";
+          i18nText("chrome-js-shelves-empty", "No shelves. Shelve tabs to store them here.");
       }
       return;
     }
@@ -5910,18 +8117,12 @@
     const restore = document.createElement("button");
     restore.type = "button";
     restore.className = "small";
-    restore.textContent = "Restore";
+    restore.textContent = i18nText("chrome-js-shelves-restore", "Restore");
     restore.addEventListener("click", async () => {
       try {
         const r = await rb("shelf_restore", { id: shelf.id });
         if (r.opened < r.total) {
-          toast(
-            "Restored " +
-              r.opened +
-              " of " +
-              r.total +
-              " tabs. The shelf was kept.",
-          );
+          toast("Restored " + r.opened + "/" + r.total + " tabs. Shelf kept.");
         }
         // The shelf is KEPT on purpose: restore is never the destructive
         // step, so the row stays exactly as it was.
@@ -5934,7 +8135,7 @@
     const del = document.createElement("button");
     del.type = "button";
     del.className = "small";
-    del.textContent = "Delete";
+    del.textContent = i18nText("chrome-js-confirm-default-label", "Delete");
     del.addEventListener("click", async () => {
       // No confirm dialog: a shelf is small and recreatable, and confirm
       // dialogs train click-through. The row stays until the reply
@@ -5973,7 +8174,7 @@
     const edit = document.createElement("button");
     edit.type = "button";
     edit.className = "small";
-    edit.textContent = "Edit";
+    edit.textContent = i18nText("chrome-js-creds-edit", "Edit");
     edit.addEventListener("click", () => {
       if (editor) {
         editor.remove();
@@ -5985,13 +8186,13 @@
 
       const nameInput = document.createElement("input");
       nameInput.type = "text";
-      nameInput.placeholder = "Name";
+      nameInput.placeholder = i18nText("chrome-js-shelves-name-placeholder", "Name");
       nameInput.value = shelf.name || "";
       nameInput.maxLength = 120;
       form.appendChild(nameInput);
 
       const noteInput = document.createElement("textarea");
-      noteInput.placeholder = "Notes for this set, such as what it is for";
+      noteInput.placeholder = i18nText("chrome-js-shelves-note-placeholder", "Notes for this set, such as what it is for");
       noteInput.value = shelf.note || "";
       noteInput.maxLength = 2000;
       noteInput.rows = 3;
@@ -6001,11 +8202,11 @@
       buttons.className = "form-buttons";
       const save = document.createElement("button");
       save.type = "submit";
-      save.textContent = "Save";
+      save.textContent = i18nText("chrome-js-folders-save", "Save");
       buttons.appendChild(save);
       const cancel = document.createElement("button");
       cancel.type = "button";
-      cancel.textContent = "Cancel";
+      cancel.textContent = i18nText("chrome-js-folders-cancel", "Cancel");
       cancel.addEventListener("click", () => {
         form.remove();
         editor = null;
@@ -6050,14 +8251,14 @@
   async function refreshLibrary() {
     try {
       const st = await rb("store_status");
-      digestsReady = !!st.digests_ready;
       $("library-locked").hidden = !!st.open;
       $("library-content").hidden = !st.open;
       if (!st.open) {
+        clearLibrarySnapshotData();
         // A recorded open error is more useful than the generic line.
         $("library-locked-note").textContent = st.error
           ? friendly(new Error(st.error))
-          : "Bookmarks, the tabs you set aside and download records all unlock with your vault. PATANYX offers it when you start it on its own. Downloads that finish before you unlock are not recorded.";
+          : i18nText("chrome-js-library-locked-note", "Unlock the vault for bookmarks, shelved tabs, and download records. PATANYX offers this when started on its own. Downloads finished before unlock are not recorded.");
         return;
       }
       await Promise.all([
@@ -6071,6 +8272,19 @@
     } catch (e) {
       /* leave the panel as-is */
     }
+  }
+
+  function clearLibrarySnapshotData() {
+    bookmarkItems = [];
+    snapshotCheckResults.clear();
+    snapshotChecksPending.clear();
+    snapshotSelections.clear();
+    for (const id of ["bmm-list", "bmm-quick", "bmm-folders", "bmm-cards"]) {
+      const node = $(id);
+      if (node) node.textContent = "";
+    }
+    const caption = $("bmm-snapshots-caption");
+    if (caption) caption.hidden = true;
   }
 
   // ---- bookmark folder bar --------------------------------------------
@@ -6127,7 +8341,7 @@
       const empty = el(
         "span",
         "bmbar-empty",
-        "Tag a bookmark to make a folder",
+        i18nText("chrome-js-bmbar-empty", "Tag a bookmark to make a folder"),
       );
       bar.appendChild(empty);
       return;
@@ -6138,6 +8352,15 @@
       btn.className = "bmfolder";
       btn.setAttribute("aria-expanded", "false");
       btn.title = folder.items.length + " bookmarks tagged " + folder.tag;
+      if (currentUiLocale !== "en") {
+        i18nResolve(
+          "chrome-js-bmbar-folder-title",
+          { count: folder.items.length, tag: folder.tag },
+          folder.items.length + " bookmarks tagged " + folder.tag,
+        ).then((t) => {
+          btn.title = t;
+        });
+      }
       btn.textContent = folder.tag;
       btn.addEventListener("click", (ev) => {
         ev.stopPropagation();
@@ -6220,7 +8443,6 @@
   async function refreshBookmarks() {
     try {
       await reloadBookmarkState();
-      renderBookmarks();
       renderBookmarkBar();
       renderFolderGrid();
       renderBookmarksManager();
@@ -6405,8 +8627,12 @@
       const filtering = needle.length > 0 && bookmarkItems.length > 0;
       count.hidden = !filtering;
       if (filtering) {
-        count.textContent =
-          shown.length + " of " + bookmarkItems.length + " shown";
+        i18nSet(
+          count,
+          "chrome-js-bookmarks-search-count",
+          { shown: shown.length, total: bookmarkItems.length },
+          shown.length + " of " + bookmarkItems.length + " shown",
+        );
       }
     }
 
@@ -6418,24 +8644,33 @@
       );
       head.appendChild(el("span", "item-sub", item.url));
       li.appendChild(head);
-      li.appendChild(
-        el(
-          "div",
-          "item-sub",
-          item.has_digest
-            ? "Page snapshot from " + fmtTime(item.digest_recorded_at)
-            : "No page snapshot recorded",
-        ),
-      );
+      {
+        const sub = el("div", "item-sub", "");
+        if (item.has_digest) {
+          const when = fmtTime(item.digest_recorded_at);
+          i18nSet(
+            sub,
+            "chrome-js-bookmarks-snapshot-from",
+            { when },
+            "Page snapshot from " + when,
+          );
+        } else {
+          sub.textContent = i18nText("chrome-js-bookmarks-snapshot-none", "No page snapshot recorded");
+        }
+        li.appendChild(sub);
+      }
       // Tags, when there are any. One line, textContent like every other
       // field here; the store already lowercased and deduped them.
       if (Array.isArray(item.tags) && item.tags.length) {
-        li.appendChild(el("div", "item-sub", "Tags: " + item.tags.join(", ")));
+        const tags = item.tags.join(", ");
+        const tagsRow = el("div", "item-sub", "");
+        i18nSet(tagsRow, "chrome-js-bookmarks-tags", { tags }, "Tags: " + tags);
+        li.appendChild(tagsRow);
       }
 
       const row = el("div", "item-row");
 
-      const openBtn = el("button", "small", "Open");
+      const openBtn = el("button", "small", i18nText("chrome-js-bookmarks-open", "Open"));
       openBtn.type = "button";
       openBtn.addEventListener("click", async () => {
         try {
@@ -6462,12 +8697,12 @@
       // content — on a build where the integrity panel, on the same page,
       // read it and produced verdicts. One implementation now, and it is the
       // one that works.
-      const checkBtn = el("button", "small", "Open and check");
+      const checkBtn = el("button", "small", i18nText("chrome-js-bookmarks-open-check", "Open and check"));
       checkBtn.type = "button";
       checkBtn.disabled = !digestsReady;
       checkBtn.title = digestsReady
-        ? "Open this bookmark and compare the page against its recorded snapshot"
-        : "Change tracking needs the page's own bytes, which this platform cannot provide";
+        ? i18nText("chrome-js-bookmarks-check-title", "Open this bookmark and compare the page against its recorded snapshot")
+        : i18nText("chrome-js-bookmarks-check-unsupported", "Change tracking needs the page's own bytes, which this platform cannot provide");
       checkBtn.addEventListener("click", async () => {
         try {
           await rb("bookmark_open", { id: item.id });
@@ -6482,7 +8717,7 @@
       });
       row.appendChild(checkBtn);
 
-      const editBtn = el("button", "small", "Edit");
+      const editBtn = el("button", "small", i18nText("chrome-js-creds-edit", "Edit"));
       editBtn.type = "button";
       editBtn.addEventListener("click", () => {
         editingBookmark = item.id;
@@ -6497,7 +8732,7 @@
       });
       row.appendChild(editBtn);
 
-      const delBtn = el("button", "small danger", "Delete");
+      const delBtn = el("button", "small danger", i18nText("chrome-js-confirm-default-label", "Delete"));
       delBtn.type = "button";
       delBtn.addEventListener("click", async () => {
         if (
@@ -6547,7 +8782,7 @@
       }
       const url = $("bookmark-url").value.trim();
       if (!url) {
-        err.textContent = "Address is required.";
+        err.textContent = i18nText("chrome-js-bookmarkform-required", "Address is required.");
         return;
       }
       try {
@@ -6598,9 +8833,12 @@
   async function startScan(kind, onDone, onError) {
     let picked;
     try {
-      picked = await rb("file_pick_open", { title: "Choose an image" });
+      picked = await rb("file_pick_open", { title: i18nText("chrome-js-ocr-pick-title", "Choose an image") });
     } catch (e) {
-      onError(friendly(e));
+      // A refusal that arrives AFTER the UI precheck (the licence changed in
+      // between) must explain itself as a Premium refusal, not as the tab
+      // search's sentence that the shared error table maps the code to.
+      onError(e && e.message === "premium_required" ? premiumLockNote(premiumState) : friendly(e));
       return;
     }
     // Cancel is an answer, not a failure: leave everything exactly as it was.
@@ -6615,7 +8853,10 @@
         else onDone(data);
       });
     } catch (e) {
-      onError(friendly(e));
+      // A refusal that arrives AFTER the UI precheck (the licence changed in
+      // between) must explain itself as a Premium refusal, not as the tab
+      // search's sentence that the shared error table maps the code to.
+      onError(e && e.message === "premium_required" ? premiumLockNote(premiumState) : friendly(e));
     }
   }
 
@@ -6630,18 +8871,18 @@
     const note = $("recovery-scan-note");
     err.textContent = "";
     note.hidden = false;
-    note.textContent = "Reading the image...";
+    note.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
     startScan(
       "recovery",
       (data) => {
         if (!data.key) {
           note.textContent =
-            "No recovery key found in that image. A photo of the key wrapped over several lines reads best.";
+            i18nText("chrome-js-ocr-recovery-none", "No recovery key found in that image. A photo of the key wrapped over several lines reads best.");
           return;
         }
         $("recovery-input").value = data.key;
         note.textContent =
-          "Filled in from the image. Check it against your written copy before unlocking, because 6 and b look alike to a scanner.";
+          i18nText("chrome-js-ocr-recovery-filled", "Filled in from the image. Check it against your written copy before unlocking, because 6 and b look alike to a scanner.");
       },
       (msg) => {
         note.hidden = true;
@@ -6657,26 +8898,29 @@
     $("leakcheck-readwrap").hidden = true;
     $("leakcheck-text").hidden = true;
     $("leakcheck-text").textContent = "";
-    $("leakcheck-showtext").textContent = "Show what it read";
+    $("leakcheck-showtext").textContent = i18nText("chrome-js-leakcheck-show-text", "Show what it read");
   }
 
   $("leakcheck-showtext").addEventListener("click", () => {
     const pre = $("leakcheck-text");
     pre.hidden = !pre.hidden;
     $("leakcheck-showtext").textContent = pre.hidden
-      ? "Show what it read"
-      : "Hide what it read";
+      ? i18nText("chrome-js-leakcheck-show-text", "Show what it read")
+      : i18nText("chrome-js-leakcheck-hide-text", "Hide what it read");
     syncChromeInsets();
   });
 
-  $("leakcheck-pick").addEventListener("click", () => {
+  $("leakcheck-pick").addEventListener("click", async () => {
+    // Premium since launch; the recovery-key scan beside it is not.
+    await refreshPremium();
+    if (premiumBlocked()) return;
     const err = $("leakcheck-error");
     const status = $("leakcheck-status");
     const list = $("leakcheck-list");
     err.textContent = "";
     list.replaceChildren();
     leakTextReset();
-    status.textContent = "Reading the image...";
+    status.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
     startScan(
       "leaks",
       (data) => {
@@ -6691,15 +8935,17 @@
         if (!findings.length) {
           // "Nothing found" and "no text at all" are different answers and
           // the difference matters to someone about to post a screenshot.
-          status.textContent = data.regions
-            ? "Read " + data.regions + " line(s) and found nothing sensitive."
-            : "No readable text found in that image.";
+          if (data.regions) {
+            i18nSet(status, "chrome-leakcheck-clean", { count: data.regions },
+              "No listed clues found in " + data.regions + " line(s).");
+          } else {
+            status.textContent =
+              i18nText("chrome-js-leakcheck-no-text", "No readable text found in that image.");
+          }
           return;
         }
-        status.textContent =
-          "Found " +
-          findings.length +
-          " thing(s) worth checking before sharing:";
+        i18nSet(status, "chrome-leakcheck-found", { count: findings.length },
+          findings.length + " item(s) to check before sharing:");
         for (const f of findings) {
           const li = el("li", "entry");
           li.appendChild(el("strong", null, LEAK_TEXT[f.kind] || f.kind));
@@ -6718,26 +8964,174 @@
   //
   // The panel asks Rust to capture the page into memory, shows the capture
   // as an image served over the chrome protocol, and lets the user drag a
-  // rectangle to read. The drag happens ON THE IMAGE, so the rect maps to
-  // capture pixels with one ratio (naturalWidth / clientWidth) and no
-  // chrome-to-content coordinate arithmetic exists to get wrong.
+  // rectangle to read. The preview may be zoomed and scrolled, but the rect
+  // sent to Rust always names pixels in the capture PNG itself.
   //
   // premium_required is a STATE the panel shows (#region-premium stays up),
   // never only a toast -- same rule as the findtabs and switcher notes.
 
   const REGION_OPEN_PX = 500;
-  let regionCapture = null; // {token, w, h} of the capture on display
-  let regionDrag = null; // {x0, y0} in displayed-image pixels during a drag
+  const REGION_ZOOM_STEPS = [1, 1.25, 1.5, 2, 3, 4];
+  // Source dimensions name the native PNG Rust crops for OCR; preview
+  // dimensions name the bounded PNG the chrome is allowed to decode.
+  let regionCapture = null; // {token, w, h, previewW, previewH}
+  let regionZoom = 1; // multiplier on the width-fitted preview
+  // Text Capture and Deep Recall start from the same kind of page picture,
+  // so they share one persisted scope and one vocabulary. The event still
+  // decides the finished caption: a requested full page may honestly arrive
+  // as the viewport on an old WebView2 runtime.
+  const CAPTURE_SCOPES = ["full_page", "viewport"];
+  const CAPTURE_SCOPE_MIRRORS = [
+    { full_page: "region-scope-full", viewport: "region-scope-viewport" },
+    { full_page: "recall-scope-full", viewport: "recall-scope-viewport" },
+  ];
+  const VIEWPORT_PICTURE_SENTENCE =
+    "The picture is the part that was on screen.";
+  const FULL_PAGE_PICTURE_SENTENCE = "The picture is complete.";
+  const VIEWPORT_PREVIEW_SENTENCE =
+    VIEWPORT_PICTURE_SENTENCE +
+    " Nothing below it was captured, so there is nothing more to scroll to -- a scrollbar you see inside the picture is part of the page it shows.";
+  let captureScopeChoice = "full_page";
+
+  function markCaptureScope(scope) {
+    captureScopeChoice = CAPTURE_SCOPES.includes(scope) ? scope : "full_page";
+    for (const mirror of CAPTURE_SCOPE_MIRRORS) {
+      for (const name of CAPTURE_SCOPES) {
+        const chosen = name === captureScopeChoice;
+        $(mirror[name]).classList.toggle("active", chosen);
+        $(mirror[name]).setAttribute("aria-pressed", chosen ? "true" : "false");
+      }
+    }
+  }
+
+  async function refreshCaptureScope() {
+    try {
+      const r = await rb("capture_scope_get");
+      markCaptureScope(r && r.scope);
+    } catch (_) {
+      // A failed read leaves the last good selection on screen. On first
+      // load that is the compatibility default: full page.
+      markCaptureScope(captureScopeChoice);
+    }
+    return captureScopeChoice;
+  }
+
+  for (const mirror of CAPTURE_SCOPE_MIRRORS) {
+    for (const name of CAPTURE_SCOPES) {
+      $(mirror[name]).addEventListener("click", async () => {
+        try {
+          const r = await rb("capture_scope_set", { scope: name });
+          markCaptureScope(r && r.scope);
+        } catch (e) {
+          toast(friendly(e), true);
+        }
+      });
+    }
+  }
+  markCaptureScope(captureScopeChoice);
+
+  let regionDrag = null; // selection or pan gesture, in viewport CSS pixels
+
+  // THE COORDINATE-SPACE BOUNDARY. `rect` and `viewport` are CSS pixels in
+  // the visible stage; `pan` is CSS pixels scrolled through the RENDERED,
+  // BOUNDED preview; `previewToSource` is native-source pixels per preview
+  // pixel on each axis; `source` is the native capture PNG's pixel bounds.
+  // At zoom 1 the preview is fitted to viewport width. Only this pure
+  // function crosses from view space to SOURCE space, and its result is what
+  // ocr_region_scan uses to crop the original PNG bytes -- never pixels from
+  // the rendered preview.
+  function regionViewToSource({
+    zoom,
+    pan,
+    viewport,
+    source,
+    previewToSource,
+    rect,
+  }) {
+    const vw = Number(viewport.width);
+    const vh = Number(viewport.height);
+    const sw = Number(source.width);
+    const sh = Number(source.height);
+    const sx = Number(previewToSource.x);
+    const sy = Number(previewToSource.y);
+    const z = Number(zoom);
+    if (!(vw > 0 && vh > 0 && sw > 0 && sh > 0 && sx > 0 && sy > 0 && z > 0)) {
+      return { x: 0, y: 0, w: 0, h: 0 };
+    }
+    const previewWidth = sw / sx;
+    const previewHeight = sh / sy;
+    const previewScale = (vw / previewWidth) * z; // CSS px per preview pixel
+    const sourceScaleX = previewScale / sx; // CSS px per native source pixel
+    const sourceScaleY = previewScale / sy;
+    const rx0 = Math.min(Number(rect.x), Number(rect.x) + Number(rect.w));
+    const ry0 = Math.min(Number(rect.y), Number(rect.y) + Number(rect.h));
+    const rx1 = Math.max(Number(rect.x), Number(rect.x) + Number(rect.w));
+    const ry1 = Math.max(Number(rect.y), Number(rect.y) + Number(rect.h));
+    const px = Math.max(0, Number(pan.x) || 0);
+    const py = Math.max(0, Number(pan.y) || 0);
+    const clamp = (n, lo, hi) => Math.max(lo, Math.min(n, hi));
+    const left = clamp(px + clamp(rx0, 0, vw), 0, previewWidth * previewScale);
+    const top = clamp(py + clamp(ry0, 0, vh), 0, previewHeight * previewScale);
+    const right = clamp(px + clamp(rx1, 0, vw), 0, previewWidth * previewScale);
+    const bottom = clamp(
+      py + clamp(ry1, 0, vh),
+      0,
+      previewHeight * previewScale,
+    );
+    const x = clamp(Math.floor(left / sourceScaleX), 0, sw - 1);
+    const y = clamp(Math.floor(top / sourceScaleY), 0, sh - 1);
+    const x2 = clamp(Math.ceil(right / sourceScaleX), x, sw);
+    const y2 = clamp(Math.ceil(bottom / sourceScaleY), y, sh);
+    return { x, y, w: x2 - x, h: y2 - y };
+  }
+
+  // Deliberate small test seam: the gate calls the pure mapper without
+  // manufacturing browser layout or a wheel event.
+  window.__rb_region_view_to_source = regionViewToSource;
+
+  function regionZoomSet(next, anchor) {
+    const stage = $("region-stage");
+    const old = regionZoom;
+    regionZoom = Math.max(
+      REGION_ZOOM_STEPS[0],
+      Math.min(next, REGION_ZOOM_STEPS[REGION_ZOOM_STEPS.length - 1]),
+    );
+    const ax = anchor ? anchor.x : (stage.clientWidth || 0) / 2;
+    const ay = anchor ? anchor.y : (stage.clientHeight || 0) / 2;
+    const oldLeft = Number(stage.scrollLeft) || 0;
+    const oldTop = Number(stage.scrollTop) || 0;
+    $("region-img").style.width = Math.round(regionZoom * 100) + "%";
+    $("region-zoom-level").textContent = Math.round(regionZoom * 100) + "%";
+    // Keep the source point under the pointer (or viewport centre) still.
+    const change = regionZoom / old;
+    stage.scrollLeft = (oldLeft + ax) * change - ax;
+    stage.scrollTop = (oldTop + ay) * change - ay;
+  }
+
+  function regionZoomStep(dir, anchor) {
+    let at = REGION_ZOOM_STEPS.indexOf(regionZoom);
+    if (at < 0) at = 0;
+    regionZoomSet(
+      REGION_ZOOM_STEPS[
+        Math.max(0, Math.min(at + dir, REGION_ZOOM_STEPS.length - 1))
+      ],
+      anchor,
+    );
+  }
 
   function regionReset() {
     regionCapture = null;
     regionDrag = null;
+    $("region-zoom-controls").hidden = true;
     $("region-stage").hidden = true;
     $("region-selbox").hidden = true;
     $("region-result-wrap").hidden = true;
     $("region-scope").hidden = true;
     $("region-result").textContent = "";
     $("region-status").textContent = "";
+    regionZoomSet(1);
+    $("region-stage").scrollLeft = 0;
+    $("region-stage").scrollTop = 0;
     // Dropping the src releases the decoded image; the buffer itself is
     // freed by ocr_region_close when the panel closes.
     $("region-img").removeAttribute("src");
@@ -6745,6 +9139,10 @@
 
   async function regionStart() {
     regionReset();
+    // Wait for Rust's persisted answer before asking it to capture. This is
+    // what makes a remembered Keep workflow apply on the first capture after
+    // restart rather than only after the user touches the choice again.
+    await refreshCaptureScope();
     // Re-read the licence at the moment of use rather than trusting the
     // cached value the dimming is drawn from: the vault may have auto-locked
     // since the toolbar last refreshed, and acting on a stale "unlocked"
@@ -6759,7 +9157,7 @@
       return;
     }
     $("region-premium").hidden = true;
-    $("region-status").textContent = "Capturing the page...";
+    $("region-status").textContent = i18nText("chrome-js-region-capturing", "Capturing the page...");
     try {
       await rb("ocr_region_capture");
       // The outcome arrives as region_capture_ready; the reply only
@@ -6784,10 +9182,16 @@
     }
     if (!data.ok) {
       $("region-status").textContent =
-        ERROR_TEXT[data.error] || "The capture failed.";
+        ERROR_TEXT[data.error] || i18nText("chrome-js-region-capture-failed", "The capture failed.");
       return;
     }
-    regionCapture = { token: data.token, w: data.w, h: data.h };
+    regionCapture = {
+      token: data.token,
+      w: data.w,
+      h: data.h,
+      previewW: data.preview_w,
+      previewH: data.preview_h,
+    };
     // Relative URL, so the platform-specific chrome origin resolves it on
     // both engines. Cache-safe: every capture has a fresh token. Set as an
     // ATTRIBUTE so setting and removing are the same vocabulary.
@@ -6796,23 +9200,47 @@
       "/region-capture/" + data.token + ".png",
     );
     $("region-stage").hidden = false;
+    $("region-zoom-controls").hidden = false;
     $("region-scope").hidden = false;
+    const scopeSentence =
+      data.scope === "visible area"
+        ? VIEWPORT_PICTURE_SENTENCE
+        : data.scope === "full page"
+          ? FULL_PAGE_PICTURE_SENTENCE
+          : "";
     $("region-scope").textContent =
-      "Showing the " +
-      (data.scope || "capture") +
-      ". Drag a rectangle around the text to read.";
+      scopeSentence +
+      (scopeSentence ? " " : "") +
+      i18nText("chrome-js-region-drag-hint", "Zoom in, then drag around the text. Smaller selections read small text better. Shift-drag pans.");
     $("region-status").textContent = "";
     syncChromeInsets();
   }
 
-  // The drag state machine. Pointer events on the image only; a stray
-  // click (no meaningful drag) is ignored rather than scanned.
+  // The drag state machine. A plain left drag always selects. While zoomed,
+  // Shift+left-drag (or a middle-button drag) pans; scrollbars remain an
+  // ordinary second way to pan. A stray click is ignored rather than scanned.
   const regionImg = $("region-img");
+  const regionStage = $("region-stage");
   const regionSelbox = $("region-selbox");
 
+  function regionViewPoint(ev) {
+    const box = regionStage.getBoundingClientRect();
+    const x = Number.isFinite(ev.clientX)
+      ? ev.clientX - box.left - (regionStage.clientLeft || 0)
+      : ev.offsetX;
+    const y = Number.isFinite(ev.clientY)
+      ? ev.clientY - box.top - (regionStage.clientTop || 0)
+      : ev.offsetY;
+    return {
+      x: Math.max(0, Math.min(x, regionStage.clientWidth)),
+      y: Math.max(0, Math.min(y, regionStage.clientHeight)),
+    };
+  }
+
   function regionDisplayedRect(ev) {
-    const x1 = Math.max(0, Math.min(ev.offsetX, regionImg.clientWidth));
-    const y1 = Math.max(0, Math.min(ev.offsetY, regionImg.clientHeight));
+    const p = regionViewPoint(ev);
+    const x1 = p.x;
+    const y1 = p.y;
     const x = Math.min(regionDrag.x0, x1);
     const y = Math.min(regionDrag.y0, y1);
     return {
@@ -6823,37 +9251,75 @@
     };
   }
 
-  regionImg.addEventListener("pointerdown", (ev) => {
-    if (!regionCapture || ev.button !== 0) return;
-    regionDrag = { x0: ev.offsetX, y0: ev.offsetY };
-    regionImg.setPointerCapture(ev.pointerId);
-    regionSelbox.hidden = false;
+  regionStage.addEventListener("pointerdown", (ev) => {
+    if (!regionCapture) return;
+    const p = regionViewPoint(ev);
+    const wantsPan = regionZoom > 1 && (ev.button === 1 || ev.shiftKey);
+    if (wantsPan) {
+      regionDrag = {
+        kind: "pan",
+        x0: p.x,
+        y0: p.y,
+        left: regionStage.scrollLeft,
+        top: regionStage.scrollTop,
+      };
+      regionStage.classList.add("region-panning");
+    } else {
+      if (ev.button !== 0) return;
+      regionDrag = { kind: "select", x0: p.x, y0: p.y };
+      regionSelbox.hidden = false;
+    }
+    regionStage.setPointerCapture(ev.pointerId);
     ev.preventDefault();
   });
-  regionImg.addEventListener("pointermove", (ev) => {
+  regionStage.addEventListener("pointermove", (ev) => {
     if (!regionDrag) return;
+    if (regionDrag.kind === "pan") {
+      const p = regionViewPoint(ev);
+      regionStage.scrollLeft = regionDrag.left - (p.x - regionDrag.x0);
+      regionStage.scrollTop = regionDrag.top - (p.y - regionDrag.y0);
+      return;
+    }
     const r = regionDisplayedRect(ev);
-    regionSelbox.style.left = r.x + "px";
-    regionSelbox.style.top = r.y + "px";
+    // The box lives in scroll CONTENT coordinates; r is viewport-relative.
+    regionSelbox.style.left = regionStage.scrollLeft + r.x + "px";
+    regionSelbox.style.top = regionStage.scrollTop + r.y + "px";
     regionSelbox.style.width = r.w + "px";
     regionSelbox.style.height = r.h + "px";
   });
-  regionImg.addEventListener("pointerup", async (ev) => {
+  regionStage.addEventListener("pointerup", async (ev) => {
     if (!regionDrag || !regionCapture) return;
+    if (regionDrag.kind === "pan") {
+      regionDrag = null;
+      regionStage.classList.remove("region-panning");
+      return;
+    }
     const r = regionDisplayedRect(ev);
     regionDrag = null;
     regionSelbox.hidden = true;
     // A sub-3px drag is a click, and a click is not a selection.
     if (r.w < 3 || r.h < 3) return;
-    // One ratio per axis maps displayed pixels to capture pixels; clamping
-    // guards the right/bottom edge where rounding could land one past.
-    const sx = regionCapture.w / regionImg.clientWidth;
-    const sy = regionCapture.h / regionImg.clientHeight;
-    const x = Math.min(regionCapture.w - 1, Math.round(r.x * sx));
-    const y = Math.min(regionCapture.h - 1, Math.round(r.y * sy));
-    const w = Math.max(1, Math.min(regionCapture.w - x, Math.round(r.w * sx)));
-    const h = Math.max(1, Math.min(regionCapture.h - y, Math.round(r.h * sy)));
-    $("region-status").textContent = "Reading your selection...";
+    // The zoom/pan-aware pure mapper, which has its own tests. The older
+    // one-ratio-per-axis arithmetic this replaces could not express a zoomed
+    // or panned view at all.
+    const { x, y, w, h } = regionViewToSource({
+      zoom: regionZoom,
+      pan: { x: regionStage.scrollLeft, y: regionStage.scrollTop },
+      viewport: {
+        width: regionStage.clientWidth,
+        height: regionStage.clientHeight,
+      },
+      source: { width: regionCapture.w, height: regionCapture.h },
+      // THE LOSSY-PREVIEW BOUNDARY. Selection geometry crosses back to
+      // native pixels here; Rust still crops regionCapture's source PNG.
+      previewToSource: {
+        x: regionCapture.w / regionCapture.previewW,
+        y: regionCapture.h / regionCapture.previewH,
+      },
+      rect: r,
+    });
+    if (w < 1 || h < 1) return;
+    $("region-status").textContent = i18nText("chrome-js-region-reading", "Reading your selection...");
     try {
       const reply = await rb("ocr_region_scan", {
         capture: regionCapture.token,
@@ -6865,12 +9331,12 @@
       ocrPending.set(reply.token, (data) => {
         if (!data.ok) {
           $("region-status").textContent =
-            ERROR_TEXT[data.error] || "Could not read that selection.";
+            ERROR_TEXT[data.error] || i18nText("chrome-js-region-read-failed", "Could not read that selection.");
           return;
         }
         if (!data.text || !data.text.trim()) {
           $("region-status").textContent =
-            "No readable text in that selection. Try a larger area.";
+            i18nText("chrome-js-region-no-text", "No readable text in that selection. Try a larger area.");
           return;
         }
         $("region-status").textContent = "";
@@ -6889,25 +9355,52 @@
     }
   });
 
+  regionStage.addEventListener("pointercancel", () => {
+    regionDrag = null;
+    regionSelbox.hidden = true;
+    regionStage.classList.remove("region-panning");
+  });
+  regionStage.addEventListener(
+    "wheel",
+    (ev) => {
+      if (!regionCapture) return;
+      ev.preventDefault();
+      regionZoomStep(ev.deltaY < 0 ? 1 : -1, regionViewPoint(ev));
+    },
+    { passive: false },
+  );
+  $("region-zoom-in").addEventListener("click", () => regionZoomStep(1));
+  $("region-zoom-out").addEventListener("click", () => regionZoomStep(-1));
+
   $("region-copy").addEventListener("click", async () => {
     const text = $("region-result").textContent;
     try {
       await navigator.clipboard.writeText(text);
-      $("region-status").textContent = "Copied.";
+      $("region-status").textContent = i18nText("chrome-js-region-copied", "Copied.");
     } catch {
       // Select-and-copy still works on the visible text; say so instead of
       // failing silently.
       $("region-status").textContent =
-        "Clipboard is unavailable. Select the text above and copy it directly.";
+        i18nText("chrome-js-region-clipboard-unavailable", "Clipboard is unavailable. Select the text above and copy it directly.");
     }
   });
   $("region-again").addEventListener("click", regionStart);
+  $("region-capture").addEventListener("click", regionStart);
 
   registerPanel("region", {
     el: $("region-panel"),
     button: $("btn-ocr-region"),
     heightPx: REGION_OPEN_PX,
-    onOpen: regionStart,
+    onOpen: () => {
+      regionReset();
+      void refreshCaptureScope();
+      $("region-premium").hidden = true;
+      void refreshPremium().then(() => {
+        const blocked = premiumBlocked();
+        $("region-premium").hidden = !blocked;
+        if (blocked) syncChromeInsets();
+      });
+    },
     onClose: () => {
       regionReset();
       // Releases the in-memory capture. Fire-and-forget: failing to free
@@ -6927,6 +9420,55 @@
   // empty states say different things.
 
   let recallSearching = false;
+  // The Rust side has one decrypted slot, and this id is the chrome half of
+  // the same invariant. It lets delete distinguish the viewed row from any
+  // other row without guessing from the preview's current DOM position.
+  let recallPreviewRecordId = null;
+  // One viewer node and one Rust slot serve BOTH Deep Recall and Library
+  // snapshots. The owner tells list rebuilds which panel is responsible for
+  // closing it before detaching rows; it is not a second cache key.
+  let recallPreviewOwner = null; // "archive" | "snapshot" | null
+
+  function recallPreviewPark() {
+    // The preview starts here in the static markup. Returning the SAME node
+    // before a list rebuild keeps it attached and keeps all zoom, wheel and
+    // close listeners that were installed once at startup.
+    $("recall-panel").insertBefore($("recall-preview"), $("recall-query"));
+  }
+
+  function recallPreviewPlaceAfter(li) {
+    const list = li.parentNode;
+    const rows = Array.from(list.children);
+    const after = rows[rows.indexOf(li) + 1] || null;
+    list.insertBefore($("recall-preview"), after);
+  }
+
+  async function openStoredPicture(li, owner, stageCommand, item, onError) {
+    // Clear and retire the old token before asking Rust to decrypt the next
+    // record. Both record kinds therefore share the exact one-slot custody
+    // discipline, with no instant at which two pictures are staged.
+    await recallPreviewClose();
+    recallPreviewPlaceAfter(li);
+    try {
+      const r = await rb(stageCommand, { id: item.id });
+      $("recall-preview-img").setAttribute(
+        "src",
+        "/archive-picture/" + r.token + ".png",
+      );
+      recallPreviewRecordId = item.id;
+      recallPreviewOwner = owner;
+      const scope = $("recall-preview-scope");
+      const viewport = (item.scope || item.picture_scope) === "visible area";
+      scope.textContent = viewport ? VIEWPORT_PREVIEW_SENTENCE : "";
+      scope.hidden = !viewport;
+      $("recall-preview").hidden = false;
+      if (onError) onError("");
+      syncChromeInsets();
+    } catch (e) {
+      await recallPreviewClose();
+      if (onError) onError(friendly(e));
+    }
+  }
 
   function recallRow(item, snippets) {
     const li = el("li", "item");
@@ -6971,7 +9513,7 @@
         el(
           "div",
           "item-sub",
-          "No text was read from this picture. The page is saved and findable by title and address.",
+          i18nText("chrome-js-recall-row-no-text", "No text was read. Find by title or address."),
         ),
       );
     }
@@ -6984,40 +9526,48 @@
       // panel itself: "Where am I supposed to find the screenshots?" The
       // stage arm decrypts ONE record into a single slot; the token URL is
       // served by the chrome protocol, so no image bytes ride the IPC.
-      const view = el("button", "small", "View");
+      const view = el("button", "small", i18nText("chrome-js-recall-view", "View"));
       view.type = "button";
       view.addEventListener("click", async () => {
-        try {
-          const r = await rb("archive_picture_stage", { id: item.id });
-          const img = $("recall-preview-img");
-          // As an ATTRIBUTE, like the region panel: setting and removing
-          // are then the same vocabulary (removeAttribute in the close).
-          img.setAttribute("src", "/archive-picture/" + r.token + ".png");
-          $("recall-preview").hidden = false;
-          $("recall-status").textContent = "";
-          syncChromeInsets();
-        } catch (e) {
-          $("recall-status").textContent = friendly(e);
-        }
+        await openStoredPicture(
+          li,
+          "archive",
+          "archive_picture_stage",
+          item,
+          (message) => {
+            $("recall-status").textContent = message;
+          },
+        );
       });
       row.appendChild(view);
     }
-    const del = el("button", "small", "Delete");
+    const del = el("button", "small", i18nText("chrome-js-confirm-default-label", "Delete"));
     del.type = "button";
     del.addEventListener("click", async () => {
       if (
         !(await askConfirm(
-          "Delete this saved page and its picture? This cannot be undone.",
+          i18nText("chrome-js-recall-delete-confirm", "Delete this saved page and its picture? This cannot be undone."),
         ))
       ) {
         return;
       }
       try {
         await rb("archive_delete", { id: item.id });
-        // The record just deleted may be the one on screen. Rust cleared
-        // the slot with the delete; drop the chrome's reference too.
-        recallPreviewClose();
-        await recallRefresh();
+        if (recallPreviewRecordId === item.id) {
+          // Rust has already cleared this record's slot; the close also
+          // drops the decoded image and returns the preview to its home.
+          await recallPreviewClose();
+        }
+        // Do not rebuild the list here. In particular, deleting some OTHER
+        // row must not close or move the inline preview the reader is using.
+        // The command succeeded, so removing this exact row is authoritative.
+        li.parentNode.removeChild(li);
+        const left = Array.from($("recall-list").children).filter(
+          (child) => child !== $("recall-preview"),
+        ).length;
+        $("recall-empty").hidden = recallSearching || left > 0;
+        $("recall-none").hidden = !recallSearching || left > 0;
+        syncChromeInsets();
       } catch (e) {
         $("recall-status").textContent = friendly(e);
       }
@@ -7029,8 +9579,9 @@
 
   // Closes the preview and releases the decrypted bytes on the Rust side.
   // Blanking src first drops the chrome's reference; the clear wipes the
-  // slot, after which the old token URL is a 404 by design. fire-and-forget
-  // on the IPC: closing a picture must never be able to fail on screen.
+  // slot, after which the old token URL is a 404 by design. The returned
+  // promise lets View enforce close-then-stage; other close paths may ignore
+  // it because failure to free is not something the user can act on.
   function recallPreviewClose() {
     const img = $("recall-preview-img");
     img.removeAttribute("src");
@@ -7038,7 +9589,12 @@
     // should not have the next one open mid-page at some arbitrary level.
     recallZoomSet(0);
     $("recall-preview").hidden = true;
-    rb("archive_picture_clear").catch(() => {});
+    $("recall-preview-scope").textContent = "";
+    $("recall-preview-scope").hidden = true;
+    recallPreviewRecordId = null;
+    recallPreviewOwner = null;
+    recallPreviewPark();
+    return rb("archive_picture_clear").catch(() => {});
   }
 
   // REAL ZOOM, replacing the two-state Fit/Actual toggle that shipped first.
@@ -7060,7 +9616,7 @@
     if (!level) {
       wrap.classList.remove("zoomed");
       img.style.width = "";
-      $("recall-preview-level").textContent = "Fit";
+      $("recall-preview-level").textContent = i18nText("chrome-js-recall-zoom-fit", "Fit");
       return;
     }
     // NOT YET LOADED IS NOT ZOOMABLE, and it must not LOOK zoomed either.
@@ -7072,7 +9628,7 @@
     if (!natural) {
       wrap.classList.remove("zoomed");
       img.style.width = "";
-      $("recall-preview-level").textContent = "Fit";
+      $("recall-preview-level").textContent = i18nText("chrome-js-recall-zoom-fit", "Fit");
       return;
     }
     wrap.classList.add("zoomed");
@@ -7117,7 +9673,9 @@
       recallZoomSet(0);
       return;
     }
-    recallZoomSet(RECALL_ZOOM_STEPS[Math.min(next, RECALL_ZOOM_STEPS.length - 1)]);
+    recallZoomSet(
+      RECALL_ZOOM_STEPS[Math.min(next, RECALL_ZOOM_STEPS.length - 1)],
+    );
 
     const after = img.clientWidth || 1;
     stage.scrollLeft = fx * after - stage.clientWidth / 2;
@@ -7152,6 +9710,12 @@
 
   function recallRender(items, searching) {
     const list = $("recall-list");
+    // Search and refresh deliberately close an open preview. Parking first
+    // means clearing the list can never silently detach the one preview node.
+    // Delete is the exception above: it removes one known row without a
+    // rebuild, so deleting an unviewed row leaves the preview untouched.
+    if (recallPreviewRecordId !== null) recallPreviewClose();
+    else recallPreviewPark();
     list.textContent = "";
     $("recall-empty").hidden = searching || items.length > 0;
     $("recall-none").hidden = !searching || items.length > 0;
@@ -7180,18 +9744,19 @@
   }
 
   $("recall-save").addEventListener("click", async () => {
+    await refreshCaptureScope();
     await refreshPremium();
     if (premiumBlocked()) {
       $("recall-premium").hidden = false;
       syncChromeInsets();
       return;
     }
-    $("recall-status").textContent = "Capturing the page...";
+    $("recall-status").textContent = i18nText("chrome-js-region-capturing", "Capturing the page...");
     try {
       await rb("archive_save");
       // The outcome arrives as archive_saved: the reading takes about a
       // second, so the reply only confirms the capture started.
-      $("recall-status").textContent = "Reading the text...";
+      $("recall-status").textContent = i18nText("chrome-js-recall-reading", "Reading the text...");
     } catch (e) {
       $("recall-status").textContent = friendly(e);
     }
@@ -7207,7 +9772,7 @@
     if (openPanelName !== "tools" || $("recall-panel").hidden) return;
     if (!data.ok) {
       $("recall-status").textContent =
-        ERROR_TEXT[data.error] || "The page could not be saved.";
+        ERROR_TEXT[data.error] || i18nText("chrome-js-recall-save-failed", "The page could not be saved.");
       return;
     }
     // Two things can fall short of the whole page, and they are independent:
@@ -7230,16 +9795,39 @@
         " The page was long, so the text stops partway down; the picture is complete.";
     } else if (readShort) {
       shortfall =
-        " The page was long, so the text stops partway down, and the picture is the part that was on screen.";
+        " The page was long, so the text stops partway down, and " +
+        VIEWPORT_PICTURE_SENTENCE.slice(0, -1).toLowerCase() +
+        ".";
     } else if (!wholePage) {
-      shortfall = " The picture is the part that was on screen.";
+      shortfall = " " + VIEWPORT_PICTURE_SENTENCE;
     }
     // Says what was actually read, since "saved" alone hides the difference
     // between a page full of words and one the reader found nothing in.
-    $("recall-status").textContent =
-      data.words > 0
-        ? "Saved. " + data.words + " words read from this page." + shortfall
-        : "Saved. No text was read from this picture." + shortfall;
+    {
+      const status = $("recall-status");
+      status.textContent =
+        data.words > 0
+          ? "Saved. " + data.words + " words read from this page." + shortfall
+          : i18nText("chrome-js-recall-saved-notext", "Saved. No text was read from this picture.") + shortfall;
+      if (currentUiLocale !== "en") {
+        (async () => {
+          const sf =
+            readShort && wholePage
+              ? await i18nResolve("chrome-recall-short-whole", {}, shortfall)
+              : readShort
+                ? await i18nResolve("chrome-recall-short-partial", {}, shortfall)
+                : !wholePage
+                  ? await i18nResolve("chrome-recall-screen-only", {}, shortfall)
+                  : "";
+          status.textContent =
+            data.words > 0
+              ? await i18nResolve("chrome-recall-saved-words",
+                  { words: data.words, shortfall: sf }, status.textContent)
+              : await i18nResolve("chrome-recall-saved-notext",
+                  { shortfall: sf }, status.textContent);
+        })();
+      }
+    }
     recallRefresh();
   }
 
@@ -7267,6 +9855,11 @@
   async function recallTabShow() {
     $("recall-status").textContent = "";
     $("recall-premium").hidden = true;
+    // The disclosed placement is not a Premium entitlement. It stays
+    // reachable even when the first-party Recall controls explain that they
+    // are locked.
+    void refreshPartnerCard("partner-recall", "coveron");
+    void refreshCaptureScope();
     await refreshPremium();
     if (!premiumState.premium) {
       $("recall-premium").hidden = false;
@@ -7359,24 +9952,22 @@
   // how two mirrors of a setting start disagreeing, and a resolver this UI
   // names wrongly is a privacy claim the user cannot check from inside the
   // browser.
-  const DNS_MODES = ["system", "mullvad", "quad9"];
+  const DNS_MODES = ["system", "quad9"];
   const DNS_MIRRORS = [
     {
       system: "dns-system",
-      mullvad: "dns-mullvad",
       quad9: "dns-quad9",
       describe: "dns-describe",
       restart: "dns-restart",
     },
     {
       system: "dnsp-system",
-      mullvad: "dnsp-mullvad",
       quad9: "dnsp-quad9",
       describe: "dnsp-describe",
       restart: "dnsp-restart",
     },
   ];
-  const DNS_SHORT = { system: "System", mullvad: "Mullvad", quad9: "Quad9" };
+  const DNS_SHORT = { system: i18nText("chrome-js-dns-short-system", "System"), quad9: i18nText("chrome-js-dns-short-quad9", "Quad9") };
 
   const DNS_RESTART_NOTE =
     "Saved. This takes effect the next time you start PATANYX. The engine " +
@@ -7422,34 +10013,74 @@
     // be older than the Rust that answers it, and this should be unreachable --
     // but a chip claiming green for a resolver it cannot name would be the
     // worst failure this control has.
-    // A preferences file that exists and cannot be read. The mode shown is the
-    // DEFAULT, not the user's choice, and the default is plaintext DNS -- so
-    // someone who picked Mullvad or Quad9 is no longer on it. Said out loud in
-    // both mirrors of this control, because a silent revert of a protection is
-    // the failure this whole row exists to prevent.
-    for (const mirror of DNS_MIRRORS) {
-      const note = $(mirror.restart);
-      if (st.settings_unreadable) {
-        note.hidden = false;
-        note.textContent =
-          "Your settings file could not be read, so this reverted to System " +
-          "(unencrypted) DNS. Choose a resolver again to restore it.";
-      }
-    }
-
     const known = DNS_MODES.includes(st.mode);
-    const engaged = known && st.mode !== "system";
-    $("dns-label").textContent = "DNS";
+    // THE CHIP FOLLOWS THE RESOLVER THE ENGINE IS RUNNING, not the file.
+    // `applied` is what the engine was given at startup; `mode` is what the
+    // file says now, which is what the NEXT start gets. They differ after a
+    // choice (until restart) and after the file becomes unreadable under a
+    // running engine (the reply then carries the default while the engine
+    // still runs whatever it started with). Colouring the chip by `mode`
+    // would claim, after a Quad9 choice, an encryption not yet running, and
+    // after the file broke under a Quad9 engine, a plaintext state the
+    // engine is not in. A missing or unknown `applied` reads as not engaged:
+    // grey is the safe wrong.
+    const applied = DNS_MODES.includes(st.applied) ? st.applied : "system";
+    const engaged = applied !== "system";
+    $("dns-label").textContent = i18nText("chrome-js-dns-label", "DNS");
     $("btn-dns").classList.toggle("is-active", engaged);
+    // The tooltip speaks for NOW, so it names the applied resolver and says
+    // what is pending when the file differs. `describe` is the file's own
+    // sentence and belongs under the buttons, beside the choice it describes;
+    // shown here it claimed Quad9 over an engine still running System.
+    const pending = known && st.mode !== applied;
     $("btn-dns").title = known
-      ? "Who resolves the sites you visit: " +
-        (st.describe || DNS_SHORT[st.mode])
+      ? "Who resolves the sites you visit now: " +
+        DNS_SHORT[applied] +
+        (pending ? ". " + DNS_SHORT[st.mode] + " after the next restart." : ".")
       : "This build does not recognize the resolver that is set. Open this to " +
         "choose one.";
     for (const mirror of DNS_MIRRORS) {
       $(mirror.describe).textContent = st.describe || "";
+      // The buttons mark what the FILE says: the choice, which is what the
+      // next start gets. The chip above marks the engine. Both are true.
       for (const name of DNS_MODES) {
         $(mirror[name]).classList.toggle("active", known && st.mode === name);
+      }
+      // The file and the engine disagree: say so in both mirrors, unless the
+      // unreadable-file note already holds the line (it says more). And when
+      // they agree again -- a choice undone before any restart -- the note
+      // comes down, because nothing is pending.
+      const note = $(mirror.restart);
+      // A preferences file that exists and cannot be read. The mode in the
+      // reply is the DEFAULT, not the user's choice, and the default is
+      // plaintext DNS -- so someone who picked Quad9 is off it. WHEN they
+      // are off it depends on the engine: a file that broke under a running
+      // Quad9 engine loses it at the next start, a file that was already
+      // unreadable at launch means the engine is on System NOW. The two
+      // sentences differ in exactly that, because "from the next start"
+      // over an engine already on plaintext understates the exposure. Said
+      // out loud in both mirrors, because a silent revert of a protection
+      // is the failure this whole row exists to prevent. The note carries a
+      // state marker so a later healthy reply clears it; without one it
+      // outlived the condition it described.
+      if (st.settings_unreadable) {
+        note.hidden = false;
+        note.textContent =
+          applied === "system"
+            ? i18nText("chrome-dns-settings-unreadable", "Your settings file could not be read, so DNS is on System, unencrypted. If you had chosen Quad9, choose it again and restart.")
+            : i18nText("chrome-dns-settings-unreadable-pending", "Your settings file could not be read, so from the next start DNS falls back to System, unencrypted. If you had chosen Quad9, choose it again and restart.");
+        note.dataset.state = "unreadable";
+      } else if (known && st.mode !== applied) {
+        note.hidden = false;
+        note.textContent = DNS_RESTART_NOTE;
+        note.dataset.state = "restart-pending";
+      } else if (
+        note.dataset.state === "restart-pending" ||
+        note.dataset.state === "unreadable"
+      ) {
+        note.hidden = true;
+        note.textContent = "";
+        delete note.dataset.state;
       }
     }
   }
@@ -7488,7 +10119,7 @@
         if (r.applied === false) {
           note.hidden = false;
           note.textContent =
-            "Saved, but this browser engine version could not apply it.";
+            i18nText("chrome-js-theme-not-applied", "Saved, but this browser engine version could not apply it.");
         }
       } catch (e) {
         toast(friendly(e), true);
@@ -7682,7 +10313,7 @@
   //
   // ABSENT means top, deliberately: a failed read leaves the toolbar where
   // every build before this setting put it.
-  const TOOLBAR_PLACEMENTS = ["top", "left"];
+  const TOOLBAR_PLACEMENTS = ["top_left", "top_right", "left", "right"];
   // Source order of the movable buttons, captured before anything moves.
   // Restoring the top layout has to put them back in the order the markup
   // declared -- which is the order the toolbar gate asserts, and the order
@@ -7725,7 +10356,7 @@
     const bar = $("toolbar");
     const rail = $("sidebar");
     if (!bar || !rail) return;
-    if (placement === "left") {
+    if (placement === "left" || placement === "right") {
       for (const el of movableButtons()) rail.appendChild(el);
       rail.hidden = false;
       return;
@@ -7745,7 +10376,7 @@
 
   function wearToolbarPlacement(placement) {
     rememberToolbarOrder();
-    if (placement === "top") {
+    if (placement === "top_left") {
       delete document.documentElement.dataset.toolbarPlacement;
     } else {
       document.documentElement.dataset.toolbarPlacement = placement;
@@ -7755,17 +10386,14 @@
       const btn = $("placement-" + p);
       if (btn) btn.classList.toggle("active", p === placement);
     }
-    // The labels row below only applies to the top layout, and saying so is
+    // The labels row below only applies to a top layout, and saying so is
     // the difference between a setting that is scoped and one that looks
     // broken. The preference itself is untouched, so choosing Top again
     // gives back whatever was set.
-    const note = $("placement-note");
-    if (note) {
-      note.hidden = placement !== "left";
-      note.textContent =
-        placement === "left"
-          ? "Down the left, buttons are icons only. The choice below applies on top."
-          : "";
+    const vertical = placement === "left" || placement === "right";
+    for (const mode of TOOLBAR_LABEL_MODES) {
+      const choice = $("labels-" + mode);
+      if (choice) choice.disabled = vertical;
     }
     publishChromeMetric();
     syncChromeInsets();
@@ -7795,7 +10423,7 @@
 
   // THE TWO BUTTONS THAT ARRIVE LATE. update.js and integrity.js are
   // deferred scripts that append to #toolbar when they run, which may be
-  // after the placement has already been worn -- so in the left layout they
+  // after the placement has already been worn -- so in a side layout they
   // would land in a container that is not on screen in that layout, and be
   // invisible with no error. The observer sweeps anything that appears after
   // the break into the rail while the rail is the toolbar.
@@ -7879,6 +10507,10 @@
 
   function wireDnsChoice(id, mode) {
     $(id).addEventListener("click", async () => {
+      // A resolver click always returns the toolbar panel to resolver copy.
+      // This happens before IPC, so even a refused write cannot strand the
+      // user on an affiliate card while the resolver controls say otherwise.
+      showDnsPartner(false);
       try {
         await rb("dns_set", { mode });
         // Both mirrors get the note, because the user may have made the
@@ -7888,6 +10520,7 @@
           const note = $(mirror.restart);
           note.hidden = false;
           note.textContent = DNS_RESTART_NOTE;
+          note.dataset.state = "restart-pending";
         }
         await refreshDns();
       } catch (e) {
@@ -7901,31 +10534,42 @@
     }
   }
 
+  // This is a disclosure switch, deliberately NOT a fourth DNS mode. The
+  // resolver buttons keep their radio-like `.active` state; this button uses
+  // `aria-expanded` plus a different class so opening an affiliate card can
+  // never answer "which resolver am I using?" with "Managed VPN".
+  function showDnsPartner(show) {
+    $("dnsp-resolver-description").hidden = show;
+    $("dnsp-managed-vpn-description").hidden = !show;
+    const button = $("dnsp-managed-vpn");
+    button.classList.remove("active");
+    button.classList.toggle("disclosed", show);
+    button.setAttribute("aria-expanded", String(show));
+  }
+
+  $("managed-vpn-dns-framing").textContent =
+    "Managed VPNs add connection-wide privacy through separate paid providers. They work independently of PATANYX, so choosing one here won't change your browser or resolver settings.";
+  renderWireguardImport("managed-vpn-dns-wireguard");
+  $("dnsp-managed-vpn").addEventListener("click", () => {
+    showDnsPartner(true);
+    void refreshPartnerCards("partner-dns", ["nordvpn", "pia"]);
+  });
+
   // ---- the chosen resolver cannot be reached ------------------------------
   //
   // Rust decides whether this is true; the chrome only renders it. The copy is
   // HEDGED on purpose -- the browser genuinely cannot tell a blocking network
   // from a VPN that is still reconnecting, and a banner that overstates what it
   // knows teaches people to ignore banners.
-  const RESOLVER_NAMES = { mullvad: "Mullvad", quad9: "Quad9" };
-
   function applyResolverState(data) {
     const banner = $("resolver-warning");
     const show = !!(data && data.unreachable);
     if (show) {
-      const name = RESOLVER_NAMES[data.mode] || "your DNS service";
-      $("resolver-body").textContent =
-        "PATANYX cannot reach " +
-        name +
-        ", which you chose to resolve the sites you visit, so pages will not " +
-        "load until it can. This usually means the network is blocking it, " +
-        "which is common on hotel, airport and cafe WiFi before you sign in. " +
-        "It can also mean the connection is down, or a VPN is still " +
-        "reconnecting. To get online here: open DNS in the toolbar, choose " +
-        "System, and restart PATANYX. That sends your lookups to this network " +
-        "instead of to " +
-        name +
-        ", so change it back when you leave.";
+      // Composed in Rust (resolver_probe::banner_body) for BOTH producers,
+      // the probe event and the boot-time status reply, and rendered
+      // verbatim: this surface cannot word the fail-closed claim
+      // differently from the catalog.
+      $("resolver-body").textContent = data.body || "";
     }
     if (banner.hidden !== !show) {
       banner.hidden = !show;
@@ -7933,16 +10577,42 @@
     }
   }
 
+  // ---- the engine underneath is below the security floor -----------------
+  //
+  // One producer, the `engine_status` reply at boot, because the answer can
+  // only change between launches: the engine is loaded once per process, so
+  // a runtime that updates while PATANYX is open is still the old one until
+  // the next start. The body is composed in Rust (platform::engine_floor_body)
+  // and rendered verbatim, the same contract as the resolver banner.
+  function applyEngineState(data) {
+    const banner = $("engine-floor-warning");
+    const show = !!(data && data.below_floor);
+    if (show) {
+      $("engine-floor-body").textContent = data.body || "";
+    }
+    if (banner.hidden !== !show) {
+      banner.hidden = !show;
+      syncChromeInsets();
+    }
+  }
+  $("engine-floor-dismiss").addEventListener("click", () => {
+    $("engine-floor-warning").hidden = true;
+    syncChromeInsets();
+  });
+
   // ---- a scheduled check found something ---------------------------------
   //
   // NOTIFICATION ONLY. The banner never downloads or installs; "Show me" opens
-  // the Updates panel, where the accept has always lived. A browser that
-  // installed on its own would be a different product.
+  // the Updates panel, where the accept has always lived. (With automatic
+  // updates ON -- an explicit opt-in -- quiet releases install themselves at
+  // the NEXT LAUNCH, so this banner stays silent for them: announcing what
+  // needs nothing from the user is noise. A release that adds features is
+  // the one thing still worth a banner, in both modes.)
   function applyUpdateChecked(data) {
     const banner = $("update-banner");
-    // The updater's own snapshot. `state` and its values are a contract with
-    // updater.rs (status_json), pinned by tests there. TWO states are worth
-    // interrupting for, and for a while this listed only one:
+    // The updater's own snapshot. `state`, `kind` and `auto_apply` are a
+    // contract with updater.rs (status_json), pinned by tests there. TWO
+    // states are worth interrupting for:
     //
     //   offered  a new version exists and nothing has been fetched
     //   ready    it is already downloaded and verified, waiting on a restart
@@ -7953,16 +10623,77 @@
     // rather than across the top of the window.
     const state = data && data.state;
     const version = data && data.offered ? String(data.offered) : "";
-    const show = state === "offered" || state === "ready";
+    const feature = data && data.kind === "feature" && !(data && data.security);
+    const auto = !!(data && data.auto_apply);
+    // Auto mode: a quiet (maintenance/security) release will handle itself at
+    // the next launch -- no banner. A feature release always announces.
+    const show =
+      (state === "offered" || state === "ready") && (feature || !auto);
     if (show) {
-      $("update-banner-body").textContent =
-        state === "ready"
-          ? (version ? "Version " + version + " is " : "It is ") +
-            "downloaded and verified. Nothing has been installed: open " +
-            "Updates to see what changed and restart when it suits you."
-          : (version ? "Version " + version + " is ready to install. " : "") +
-            "Nothing has been downloaded yet. Open Updates to see what " +
-            "changed and decide.";
+      // The feature wording keeps the offered/ready split: in `offered`
+      // nothing has been downloaded, so "restart to get them" would name an
+      // action that installs nothing, and the self-install promise is false
+      // -- only a staged (`ready`) release can apply itself at a launch.
+      const body = $("update-banner-body");
+      if (feature) {
+        if (state === "ready") {
+          // KEY SELECTION, not sentence building. The ternary that used to
+          // live inside these fallbacks was flattened into the catalog when
+          // the strings were extracted, so each value carried BOTH subjects
+          // ("Version  adds An update adds ...") and no { $version } at all
+          // -- invisible in English, broken in every other locale. Same
+          // -version / -plain split the non-feature branch below already
+          // uses.
+          if (auto) {
+            if (version) {
+              i18nSet(body, "chrome-update-feature-ready-auto-version", { version },
+                "Version " + version + " adds new features, downloaded and " +
+                  "verified. Restart from the Updates panel to get them; " +
+                  "otherwise it installs on its own in about a week.");
+            } else {
+              i18nSet(body, "chrome-update-feature-ready-auto-plain", {},
+                "An update adds new features, downloaded and verified. " +
+                  "Restart from the Updates panel to get them; otherwise it " +
+                  "installs on its own in about a week.");
+            }
+          } else if (version) {
+            i18nSet(body, "chrome-update-feature-ready-version", { version },
+              "Version " + version + " adds new features, downloaded and " +
+                "verified. Restart from the Updates panel to get them.");
+          } else {
+            i18nSet(body, "chrome-update-feature-ready-plain", {},
+              "An update adds new features, downloaded and verified. " +
+                "Restart from the Updates panel to get them.");
+          }
+        } else if (version) {
+          i18nSet(body, "chrome-update-feature-offered-version", { version },
+            "Version " + version + " adds new features. Nothing has been " +
+              "downloaded yet. Open Updates to see what changed and decide.");
+        } else {
+          i18nSet(body, "chrome-update-feature-offered-plain", {},
+            "An update adds new features. Nothing has been downloaded yet. " +
+              "Open Updates to see what changed and decide.");
+        }
+      } else if (state === "ready") {
+        if (version) {
+          i18nSet(body, "chrome-update-ready-version", { version },
+            "Version " + version + " is downloaded and verified. Nothing " +
+              "has been installed: open Updates to see what changed and " +
+              "restart when it suits you.");
+        } else {
+          i18nSet(body, "chrome-update-ready-plain", {},
+            "It is downloaded and verified. Nothing has been installed: " +
+              "open Updates to see what changed and restart when it suits you.");
+        }
+      } else if (version) {
+        i18nSet(body, "chrome-update-offered-version", { version },
+          "Version " + version + " is ready to install. Nothing has been " +
+            "downloaded yet. Open Updates to see what changed and decide.");
+      } else {
+        i18nSet(body, "chrome-update-offered-plain", {},
+          "Nothing has been downloaded yet. Open Updates to see what " +
+            "changed and decide.");
+      }
     }
     if (banner.hidden !== !show) {
       banner.hidden = !show;
@@ -8024,15 +10755,30 @@
   // it is wrong, the rule is the only thing that tells them what to report.
   let blockedHost = null;
 
+  let blockedTabId = null;
+  let blockedPendingId = null;
+  // The notice belongs to one blocked navigation in one tab. When that tab
+  // reports a status for a different site, the navigation it described is
+  // over and the notice comes down; Rust refuses the stale click anyway.
+  function retireBlockedOnNavigation(st) {
+    if (blockedTabId === null || !st || st.id !== blockedTabId) return;
+    // Rust's word, not a guess from the origin: the tab stays on the page
+    // that ATTEMPTED the blocked navigation, so comparing hosts hid a valid
+    // notice and left a stale one up (review round 2). The status carries
+    // the pending id Rust holds for this tab; cleared or replaced means
+    // this notice is over.
+    if (st.blocked_pending !== blockedPendingId) hideBlocked();
+  }
+
   function applyNavigationBlocked(data) {
     if (!data || !data.host) return;
     blockedHost = data.host;
-    const rule =
-      data.rule && data.rule !== data.host
-        ? " It matched the rule " +
-          data.rule +
-          ", which also covers its subdomains."
-        : "";
+    // The tab that was blocked, from the host's event. The override used to
+    // go to whichever tab was ACTIVE when the button was clicked, so a
+    // background tab could solicit an exception for an unrelated one
+    // (pentest F-006). Rust re-checks this id against that tab's own record.
+    blockedTabId = typeof data.tab_id === "number" ? data.tab_id : null;
+    blockedPendingId = typeof data.pending_id === "number" ? data.pending_id : null;
     // "REPORTED FOR", NOT "KNOWN TO". The list is built from two public
     // sources and neither warrants the stronger verb: Phishing.Database is
     // community-collected reports, and phishunt publishes automated
@@ -8045,13 +10791,16 @@
     // the two feeds merge into one set of 16-byte hashes with no room for a
     // source tag, so the banner cannot tell which list matched. One honest
     // sentence for the whole list is the alternative to a false one.
-    $("blocked-body").textContent =
-      "PATANYX did not open " +
-      data.host +
-      " because it has been reported for phishing or malware." +
-      rule +
-      " If you believe this is wrong, you can open it anyway. That applies " +
-      "to this tab only and ends when you close it.";
+    // Machine-readable: the rule clause is present exactly when a broader
+    // rule than the host itself matched. The gate asserts this, not words.
+    $("blocked-body").dataset.rule =
+      data.rule && data.rule !== data.host ? data.rule : "";
+    // The body arrives COMPOSED from Rust (catalog message, Fluent args),
+    // and is rendered verbatim -- this surface can never word the refusal
+    // differently from the catalog, and a translation of it never passes
+    // through this file. The comment above about "reported for", not
+    // "known to", now guards chrome-blocked-body in en.ftl.
+    $("blocked-body").textContent = data.body || "";
     const banner = $("blocked-warning");
     if (banner.hidden) {
       banner.hidden = false;
@@ -8060,6 +10809,8 @@
   }
 
   function hideBlocked() {
+    blockedTabId = null;
+    blockedPendingId = null;
     const banner = $("blocked-warning");
     if (!banner.hidden) {
       banner.hidden = true;
@@ -8067,16 +10818,117 @@
     }
   }
 
+  // A gesture is bound to the notice it STARTED on. Between the press and
+  // the click a background tab's blocked event can replace the notice under
+  // the same button; the click used to read whatever was current and send
+  // consent for the newcomer (pentest F-006, review round 2). The press
+  // snapshots the notice; the click sends only if it is still the same one.
+  let blockedArmed = null;
+  function armBlocked() {
+    blockedArmed =
+      blockedHost && blockedTabId !== null && blockedPendingId !== null
+        ? { host: blockedHost, tab_id: blockedTabId, pending_id: blockedPendingId }
+        : null;
+  }
+  $("blocked-allow").addEventListener("pointerdown", armBlocked);
+  // True between the press and the release of a keyboard activation. The
+  // click handler uses it to tell "no press was observable" -- assistive and
+  // scripted activation, which is allowed to fall back to the notice on
+  // screen -- apart from "the press happened and its snapshot was already
+  // spent", which must not fall back to anything.
+  let blockedKeyHeld = false;
+  $("blocked-allow").addEventListener("keydown", (ev) => {
+    // Native button activation starts at keydown too. Enter clicks as its
+    // default action and Space clicks on keyup, leaving time for another
+    // tab's notice to replace this one before the click arrives.
+    if (ev.key !== "Enter" && ev.key !== " " && ev.key !== "Spacebar") return;
+    if (ev.repeat) {
+      // AUTO-REPEAT IS NOT A NEW GESTURE, and it took two goes to close.
+      // Returning early stopped the repeat re-snapshotting the newcomer, but
+      // it did not stop the repeat CLICKING: Enter's default action fires
+      // again on every repeat, the first click had already spent the
+      // snapshot, and the next one fell through to whatever notice was on
+      // screen by then -- so a held key still authorized a site the person
+      // never saw. Cancelling the default is what stops those clicks
+      // existing at all. A key held down is one press.
+      ev.preventDefault();
+      return;
+    }
+    blockedKeyHeld = true;
+    armBlocked();
+  });
+  // RELEASED IS RELEASED, WHEREVER THE KEYUP LANDS. Bound to the button
+  // alone, this flag could stick: Enter activation can hide the banner before
+  // the key comes up, and focus can move off the button mid-press, so the
+  // release never reached the listener and every later notice silently
+  // refused assistive and scripted activation (review round 3). The window
+  // sees the release whatever has focus, and losing focus ends the press too.
+  // Deliberately NOT cleared when a new notice arrives: a replacement notice
+  // must never be what ends the gesture that was meant for the old one.
+  const releaseBlockedKey = (ev) => {
+    if (ev && ev.type === "keyup" && ev.key !== "Enter" && ev.key !== " " && ev.key !== "Spacebar") {
+      return;
+    }
+    blockedKeyHeld = false;
+  };
+  window.addEventListener("keyup", releaseBlockedKey, true);
+  window.addEventListener("blur", releaseBlockedKey, true);
+  $("blocked-allow").addEventListener("blur", releaseBlockedKey);
   $("blocked-allow").addEventListener("click", async () => {
-    if (!blockedHost) return;
+    // Assistive and scripted activation can raise click with no observable
+    // press before it (review round 3, R-004). With no press-to-click gap to
+    // race, the notice on screen at the click IS the one activated.
+    const armed =
+      blockedArmed ||
+      // The fallback is for activation with no observable press. While a key
+      // IS down, a missing snapshot means this press already sent its one
+      // consent, so there is nothing here to fall back to -- belt beside the
+      // braces of cancelling the repeat above.
+      (!blockedKeyHeld && blockedHost && blockedTabId !== null && blockedPendingId !== null
+        ? { host: blockedHost, tab_id: blockedTabId, pending_id: blockedPendingId }
+        : null);
+    blockedArmed = null;
+    if (!armed) return;
+    if (armed.pending_id !== blockedPendingId || armed.tab_id !== blockedTabId || armed.host !== blockedHost) return;
     try {
-      await rb("blocklist_allow", { host: blockedHost });
+      await rb("blocklist_allow", armed);
       hideBlocked();
     } catch (e) {
       toast(friendly(e), true);
     }
   });
   $("blocked-dismiss").addEventListener("click", hideBlocked);
+
+  // Whether the tab button is currently carrying the interception mark.
+  // Module state because TWO things write that label and they must not fight:
+  // a status update, and a locale fill -- which reapplies every
+  // `data-msg-aria-label` in the document, including this button's static one,
+  // and so silently replaced the interception announcement with the plain
+  // name while interception was still live. With the banner gone this label is
+  // the only thing a screen reader gets outside the panel, so the fill has to
+  // recompute it rather than overwrite it.
+  //
+  // SHORT ON PURPOSE, and a decision rather than an oversight. Like the
+  // "Connection" line, this string stands alone with no certificate beside it,
+  // so the rule that put a qualifier on that line argues for one here too --
+  // and it is read by exactly the user that qualifier is for, since a CA name
+  // helps nobody who cannot see it. It stays short anyway: an accessible name
+  // is announced every time focus lands on the control, and a button in a row
+  // of ten that reads a two-sentence paragraph on every arrow key is worse for
+  // that user than a terse one. The name carries the condition; the panel the
+  // button opens carries the rest, qualifier included. Revisit if the panel
+  // ever stops being one keystroke away.
+  let tabButtonIntercepted = false;
+  function applyTabButtonLabel() {
+    $("btn-tab").setAttribute(
+      "aria-label",
+      tabButtonIntercepted
+        ? i18nText("chrome-js-tab-aria-intercepted",
+            "Tab Activity. This connection is being intercepted.",
+          )
+        : i18nText("chrome-js-tab-aria-plain", "Tab Activity"),
+    );
+  }
 
   // ---- plain-HTTP warning ----
   // Driven by tab_status (`insecure_pending`), never by an event of its own:
@@ -8115,13 +10967,11 @@
     // and then could not be continued past, and a userinfo URL rendered an
     // attacker-chosen string as the name of the site being warned about.
     // One value, computed once, on the side that decides.
-    $("insecure-body").textContent =
-      "PATANYX did not open " +
-      shownHost +
-      " because the connection is plain HTTP, not encrypted. Anything you " +
-      "send or receive on this site, including passwords, can be read or " +
-      "changed by anyone on the path. You can continue anyway; that applies " +
-      "to this site in this tab only and ends when you close the tab.";
+    i18nSet($("insecure-body"), "chrome-insecure-body", { host: shownHost },
+      "PATANYX did not open " + shownHost +
+        " because HTTP is not encrypted. Anyone on the path can read or change " +
+        "data. Continue anyway for this site and tab until " +
+        "the tab closes.");
     if (banner.hidden) {
       banner.hidden = false;
       syncChromeInsets();
@@ -8163,6 +11013,132 @@
     }
   });
 
+  // ---- the ad-list hold -------------------------------------------------
+  //
+  // What the banner is CURRENTLY describing. Echoed back on the click so Rust
+  // can refuse one that answers a banner the user is no longer looking at.
+  //
+  // Unlike the plain-HTTP warning this carries a pending id and a tab id, and
+  // that is not symmetry for its own sake: the insecure banner is read from
+  // the ACTIVE tab and cannot outlive the tab being looked at, while this one
+  // is rendered per tab from an async status push, so a tab switch can land
+  // between the paint and the click. Without the id a click would answer
+  // whichever banner happens to be current and could consent to a host the
+  // user never read.
+  let adlistShown = null;
+  // The host this tab may currently reach past the list, or null. Rendered as
+  // a chip in Tab Activity.
+  let adlistOverrideHost = null;
+
+  function hideAdlist() {
+    const banner = $("adlist-warning");
+    if (!banner.hidden) {
+      banner.hidden = true;
+      syncChromeInsets();
+    }
+  }
+
+  function applyAdlistPending(pending, tabId) {
+    const banner = $("adlist-warning");
+    if (!pending || !pending.host || !pending.id) {
+      adlistShown = null;
+      hideAdlist();
+      return;
+    }
+    // THE HOST RUST COMPUTED, never one parsed here. The plain-HTTP warning
+    // shipped that defect: this file's regex kept the whole authority while
+    // state.rs stripped the port and userinfo, so the two disagreed, every
+    // host:port URL became uncontinuable, and a userinfo URL rendered an
+    // attacker-chosen string as the name of the site. One value, computed
+    // once, on the side that decides.
+    adlistShown = { id: pending.id, host: pending.host, tabId };
+    // A non-GET top-level navigation cannot be replayed: consent resumes a
+    // URL and a URL has no body. The copy says so before the click rather
+    // than letting the user find out after it.
+    //
+    // Two explicit calls rather than one whose message id is chosen by a
+    // ternary. The catalog scanner reads the id as a literal second argument,
+    // so a computed one is invisible to it: the string would render English in
+    // every locale and no gate would say so.
+    //
+    // WHERE THERE IS NO BUTTON, THERE IS NO BUTTON. On a backend that cannot
+    // except one host from the compiled list, Open anyway is REMOVED, not
+    // disabled: a greyed-out control invites the user to hunt for the way to
+    // enable it, and there is not one. Rust decides, through
+    // `adlist_can_allow`, so the chrome cannot offer an action the engine has
+    // no path for.
+    const canAllow = pending.can_allow === true;
+    $("adlist-allow").hidden = !canAllow;
+    const post = pending.method && pending.method !== "GET";
+    if (!canAllow) {
+      i18nSet($("adlist-body"), "chrome-adlist-body-no-exception", { host: pending.host },
+        "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. That list is built for the requests pages make in the background, so a site you typed yourself can end up on it. On Linux there is no way to open a single site past the list. You can turn blocking off in the Privacy panel, which turns it off for every site until you turn it back on.");
+    } else if (post) {
+      i18nSet($("adlist-body"), "chrome-adlist-body-post", { host: pending.host },
+        "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. Your form was not sent, and Open anyway will not send it: it loads the address without what you typed. That applies to " + pending.host + " in this tab only and ends when you leave it or close the tab. Nothing else on the list is unblocked.");
+    } else {
+      i18nSet($("adlist-body"), "chrome-adlist-body", { host: pending.host },
+        "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. That list is built for the requests pages make in the background, so a site you typed yourself can end up on it. You can open it anyway; that applies to " + pending.host + " in this tab only and ends when you leave it or close the tab. Nothing else on the list is unblocked.");
+    }
+    if (banner.hidden) {
+      banner.hidden = false;
+      syncChromeInsets();
+    }
+  }
+
+  $("adlist-allow").addEventListener("click", async () => {
+    const shown = adlistShown;
+    if (!shown) return;
+    const allow = $("adlist-allow");
+    const dismiss = $("adlist-dismiss");
+    allow.disabled = true;
+    dismiss.disabled = true;
+    try {
+      // Everything sent here is a CONFIRMATION of what was displayed, never a
+      // selection. No value the chrome can put in this call names a URL that
+      // was not already pending, which is what stops it becoming an
+      // open-anything primitive.
+      const res = await rb("adlist_allow", {
+        tab_id: shown.tabId,
+        pending_id: shown.id,
+        host: shown.host,
+      });
+      if (res && res.status) applyTabStatus(res.status);
+      else hideAdlist();
+    } catch (e) {
+      toast(friendly(e), true);
+    } finally {
+      allow.disabled = false;
+      dismiss.disabled = false;
+    }
+  });
+
+  $("adlist-dismiss").addEventListener("click", async () => {
+    const shown = adlistShown;
+    if (!shown) return;
+    try {
+      const st = await rb("adlist_dismiss", {
+        tab_id: shown.tabId,
+        pending_id: shown.id,
+      });
+      if (st) applyTabStatus(st);
+      else hideAdlist();
+    } catch (e) {
+      // A refusal is NOT "hide". Rust refuses a stale dismissal precisely
+      // because a NEWER pending exists for this tab, and hiding here took
+      // that newer banner down with its explanation and actions until the
+      // next status happened to arrive (review R-005, round 2). Only "there
+      // is nothing pending" means there is nothing to show.
+      const code = String((e && e.message) || e);
+      // ...and only the banner THIS reply answers. A reply for tab 1's old
+      // dismissal must not touch tab 2's banner, whatever the code says
+      // (review R-004, round 3): compare what is displayed now with what was
+      // displayed when this click was made.
+      const same = adlistShown && adlistShown.id === shown.id && adlistShown.tabId === shown.tabId;
+      if (code === "adlist_no_pending" && same) hideAdlist();
+    }
+  });
+
   $("resolver-retry").addEventListener("click", async () => {
     const button = $("resolver-retry");
     button.disabled = true;
@@ -8187,46 +11163,54 @@
   // "Failed" is the load-bearing case. A setting the engine refused must read
   // as refused, never be quietly omitted, because the whole point of tracking
   // SettingState is that a protection nobody confirmed is not a protection.
-  const ENGINE_LABELS = {
-    script_setting: "JavaScript setting",
-    smartscreen_off: "SmartScreen reporting off",
-    tracking_prevention: "Engine tracking prevention",
-    navigation_tracking: "Navigation tracking",
-    autofill_off: "Engine autofill and password store off",
-    // The storage promise, asked of the engine rather than assumed. This row
-    // is why the panel can say "ephemeral" at all: until it read back, the
-    // browser reported the mode it had REQUESTED, so a tab whose in-private
-    // flag never took still displayed as keeping nothing.
-    ephemeral_confirmed: "Ephemeral storage for this tab",
-    // Process-wide, and the one row here that is not about this tab. "REFUSED"
-    // means the browser fell back to the engine's default environment and lost
-    // its hardened startup arguments along with crash-report suppression.
-    hardened_environment: "Hardened engine environment",
-    // Process-wide. "REFUSED" means the OS would not tell this process when
-    // the workstation locks, so the vault stays open behind a locked screen
-    // until the inactivity timer catches it.
-    session_lock_registered: "Lock vault when the screen locks",
-    // Whether THIS tab's autofill save/fill channel actually registered.
-    // "REFUSED" here means the Passwords section in Tab Activity cannot
-    // offer or accept a fill for this tab no matter what the vault holds --
-    // the same "what the engine confirmed, not what was requested" rule as
-    // every other row above.
-    content_script_registered: "Login autofill script installed",
-    // Process-wide and MEASURED, not read back off an API: a background
-    // thread completes a real SOCKS5 greeting against the loopback tunnel
-    // front and reads the tunnel's own status before this says "confirmed".
-    // "REFUSED" before the vault unlocks usually means the port is
-    // deliberately accepting nothing -- the browser refusing to leak, not
-    // (only) something broken. "not attempted" here means the user chose
-    // no tunnel, and the special case in renderEngineConfirmed says so
-    // instead of claiming "not applicable on this engine".
-    tunnel: "Tunnel carrying this browser's traffic",
-  };
-  const ENGINE_STATE_TEXT = {
-    applied: "confirmed by the engine",
-    failed: "REFUSED by the engine",
-    not_attempted: "not applicable on this engine",
-  };
+  let ENGINE_LABELS;
+  rebuildOnLocaleFill(() => {
+    ENGINE_LABELS = {
+      script_setting: i18nText("chrome-js-engine-script-setting", "JavaScript setting"),
+      smartscreen_off: i18nText("chrome-js-engine-smartscreen-off", "SmartScreen reporting off"),
+      tracking_prevention: i18nText("chrome-js-engine-tracking-prevention", "Engine tracking prevention"),
+      navigation_tracking: i18nText("chrome-js-engine-navigation-tracking", "Navigation tracking"),
+      autofill_off: i18nText("chrome-js-engine-autofill-off", "Engine autofill and password store off"),
+      // The storage promise, asked of the engine rather than assumed. This row
+      // is why the panel can say "ephemeral" at all: until it read back, the
+      // browser reported the mode it had REQUESTED, so a tab whose in-private
+      // flag never took still displayed as keeping nothing.
+      ephemeral_confirmed: i18nText("chrome-js-engine-ephemeral-confirmed", "Ephemeral storage for this tab"),
+      // Process-wide, and the one row here that is not about this tab. "REFUSED"
+      // means the browser fell back to the engine's default environment and lost
+      // its hardened startup arguments along with crash-report suppression.
+      hardened_environment: i18nText("chrome-js-engine-hardened-environment", "Hardened engine environment"),
+      // Process-wide. "REFUSED" means the OS would not tell this process when
+      // the workstation locks, so the vault stays open behind a locked screen
+      // until the inactivity timer catches it.
+      session_lock_registered: i18nText("chrome-js-engine-session-lock-registered", "Lock vault when the screen locks"),
+      // Whether THIS tab's autofill save/fill channel actually registered.
+      // "REFUSED" here means the Passwords section in Tab Activity cannot
+      // offer or accept a fill for this tab no matter what the vault holds --
+      // the same "what the engine confirmed, not what was requested" rule as
+      // every other row above.
+      content_script_registered: i18nText("chrome-js-engine-content-script-registered", "Login autofill script installed"),
+      // Process-wide and MEASURED, not read back off an API: a background
+      // thread completes a real SOCKS5 greeting against the loopback tunnel
+      // front and reads the tunnel's own status before this says "confirmed".
+      // "REFUSED" before the vault unlocks usually means the port is
+      // deliberately accepting nothing -- the browser refusing to leak, not
+      // (only) something broken. "not attempted" here means the user chose
+      // no tunnel, and the special case in renderEngineConfirmed says so
+      // instead of claiming "not applicable on this engine".
+      tunnel: i18nText("chrome-js-engine-tunnel", "Tunnel carrying this browser's traffic"),
+    };
+  });
+  let ENGINE_STATE_TEXT;
+  rebuildOnLocaleFill(() => {
+    ENGINE_STATE_TEXT = {
+      strict: i18nText("chrome-js-engine-strict", "Strict, confirmed by the engine"),
+      balanced: i18nText("chrome-js-engine-balanced", "Balanced, confirmed by the engine"),
+      applied: i18nText("chrome-js-engine-state-applied", "confirmed by the engine"),
+      failed: i18nText("chrome-js-engine-state-failed", "REFUSED by the engine"),
+      not_attempted: i18nText("chrome-js-engine-state-not-attempted", "not applicable on this engine"),
+    };
+  });
 
   function renderEngineConfirmed(st) {
     const list = $("engine-list");
@@ -8249,7 +11233,7 @@
       // a case per key.
       const stateText =
         key === "tunnel" && value === "not_attempted"
-          ? "off (no tunnel chosen)"
+          ? i18nText("chrome-js-tunnel-report-not-attempted", "off (no tunnel chosen)")
           : ENGINE_STATE_TEXT[value] || value;
       li.appendChild(
         el("span", value === "failed" ? "error" : "muted", " " + stateText),
@@ -8276,41 +11260,64 @@
       // the label as the second argument made it a class name and left the
       // element empty, so the row rendered as a bare "REFRESH FAILED" with
       // nothing saying what had failed.
-      li.appendChild(el("strong", null, "Malicious-site list"));
+      li.appendChild(el("strong", null, i18nText("chrome-js-engine-blocklist-label", "Malicious-site list")));
       const count =
         blocklistHosts === null
           ? ""
           : ", " + blocklistHosts.toLocaleString() + " sites blocked";
-      if (blocklistFailure !== null) {
-        li.appendChild(
-          el(
-            "span",
-            "error",
+      // English paints synchronously from the same composition as always;
+      // other locales recompose through the catalog (count and reason as
+      // sub-messages so their punctuation is translatable too), patching
+      // the span when the bridge answers -- the i18nSet seam, hand-rolled
+      // because two sub-resolves feed the final message.
+      const failed = blocklistFailure !== null;
+      const span = failed
+        ? el("span", "error",
             " REFRESH FAILED. Still blocking with the list already" +
-              " downloaded" +
-              count +
-              (blocklistFailure ? " (" + blocklistFailure + ")" : ""),
-          ),
-        );
-      } else {
-        li.appendChild(el("span", "muted", " up to date" + count));
+              " downloaded" + count +
+              (blocklistFailure ? " (" + blocklistFailure + ")" : ""))
+        : el("span", "muted", " up to date" + count);
+      li.appendChild(span);
+      if (currentUiLocale !== "en") {
+        (async () => {
+          const countnote =
+            blocklistHosts === null
+              ? ""
+              : await i18nResolve("chrome-engine-blocklist-count",
+                  { count: blocklistHosts, formatted: blocklistHosts.toLocaleString() },
+                  count);
+          if (failed) {
+            const reasonnote = blocklistFailure
+              ? await i18nResolve("chrome-engine-blocklist-reason",
+                  { reason: blocklistFailure }, " (" + blocklistFailure + ")")
+              : "";
+            span.textContent = await i18nResolve("chrome-engine-blocklist-failed",
+              { countnote, reasonnote }, span.textContent);
+          } else {
+            span.textContent = await i18nResolve("chrome-engine-blocklist-ok",
+              { countnote }, span.textContent);
+          }
+        })();
       }
       list.appendChild(li);
     }
   }
 
-  const LEAK_TEXT = {
-    email: "Email address",
-    possible_card: "Possible payment card number",
-    long_number: "Long number",
-    api_token: "Possible API key or token",
-    private_key: "Private key header",
-    ipv4: "IP address",
-    // Says what was done to the text, not what the text is. Every other label
-    // here names a kind of secret; this one names the reason you did not
-    // notice it.
-    hidden_text: "Hidden: too faint to see",
-  };
+  let LEAK_TEXT;
+  rebuildOnLocaleFill(() => {
+    LEAK_TEXT = {
+      email: i18nText("chrome-js-leakcheck-email", "Email address"),
+      possible_card: i18nText("chrome-js-leakcheck-possible-card", "Possible payment card number"),
+      long_number: i18nText("chrome-js-leakcheck-long-number", "Long number"),
+      api_token: i18nText("chrome-js-leakcheck-api-token", "Possible API key or token"),
+      private_key: i18nText("chrome-js-leakcheck-private-key", "Private key header"),
+      ipv4: i18nText("chrome-js-leakcheck-ipv4", "IP address"),
+      // Says what was done to the text, not what the text is. Every other label
+      // here names a kind of secret; this one names the reason you did not
+      // notice it.
+      hidden_text: i18nText("chrome-js-leakcheck-hidden-text", "Hidden: too faint to see"),
+    };
+  });
 
   // Capability probe. Both controls stay hidden unless the models are
   // actually installed AND the platform can show a file chooser, because a
@@ -8357,10 +11364,23 @@
       // `supported` is false wherever encrypted DNS does not exist, and there
       // is no banner to restore in that case.
       if (st && st.supported) {
-        applyResolverState({ unreachable: !!st.showing, mode: st.mode });
+        applyResolverState({ unreachable: !!st.showing, mode: st.mode, body: st.body });
       }
     } catch (e) {
       console.error("resolver_status failed:", e);
+    }
+  })();
+
+  // Is the engine underneath one with a known, exploited bug. Asked once,
+  // here, because the engine cannot change while the process lives. A
+  // failed reply leaves the banner hidden: unknown is not treated as unsafe
+  // (platform::EngineInfo says why), and a banner raised on an IPC hiccup
+  // would be a false alarm about the one thing this banner must be right on.
+  (async () => {
+    try {
+      applyEngineState(await rb("engine_status"));
+    } catch (e) {
+      console.error("engine_status failed:", e);
     }
   })();
 
@@ -8412,32 +11432,32 @@
       li.appendChild(head);
 
       const row = el("div", "item-row");
-      const verifyBtn = el("button", "small", "Verify");
+      const verifyBtn = el("button", "small", i18nText("chrome-js-downloads-verify", "Verify"));
       verifyBtn.type = "button";
       const result = el("span", "item-sub", "");
       verifyBtn.addEventListener("click", async () => {
         verifyBtn.disabled = true;
         result.className = "item-sub";
-        result.textContent = "Checking...";
+        result.textContent = i18nText("chrome-js-downloads-checking", "Checking...");
         try {
           const r = await rb("download_verify", { id: item.id });
           if (!r.record_ok) {
             result.className = "error";
             result.textContent =
-              "This record has been altered. It no longer matches what this browser wrote.";
+              i18nText("chrome-js-downloads-verify-altered", "This record has been altered. It no longer matches what this browser wrote.");
           } else if (r.file === "match") {
             result.textContent =
-              "Unchanged: byte-identical to what was downloaded.";
+              i18nText("chrome-js-downloads-verify-unchanged", "Unchanged: byte-identical to what was downloaded.");
           } else if (r.file === "differs") {
             result.className = "error";
             result.textContent =
-              "The file on disk differs from what was downloaded.";
+              i18nText("chrome-js-downloads-verify-differs", "The file on disk differs from what was downloaded.");
           } else if (r.file === "missing") {
             result.textContent =
-              "File not found in the downloads folder. Was it moved, renamed, or deleted?";
+              i18nText("chrome-js-downloads-verify-missing", "File not found in the downloads folder. Was it moved, renamed, or deleted?");
           } else {
             result.className = "error";
-            result.textContent = "The file could not be read.";
+            result.textContent = i18nText("chrome-js-downloads-verify-unreadable", "The file could not be read.");
           }
         } catch (e) {
           result.className = "error";
@@ -8453,12 +11473,12 @@
       // a button whose only outcome is "add a contact first" is a button
       // that should not be there yet.
       if (downloadCompareAvailable && chatContacts.length > 0) {
-        const askBtn = el("button", "small", "Ask a contact");
+        const askBtn = el("button", "small", i18nText("chrome-js-downloads-ask-contact", "Ask a contact"));
         askBtn.type = "button";
         askBtn.setAttribute("data-premium", "1");
         askBtn.setAttribute(
           "title",
-          "Compare this download with a contact's copy",
+          i18nText("chrome-js-downloads-ask-title", "Compare this download with a contact's copy"),
         );
         const picker = el("select", "small");
         for (const contact of chatContacts) {
@@ -8472,7 +11492,7 @@
           if (premiumBlocked()) return;
           const target = compareSlot(item.id);
           target.className = "item-sub";
-          target.textContent = "Asking...";
+          target.textContent = i18nText("chrome-js-downloads-asking", "Asking...");
           // Claimed BEFORE the request so an answer that arrives while the
           // await is still settling has a row to land in.
           compareAwaiting = item.id;
@@ -8513,10 +11533,10 @@
   let chatContacts = [];
 
   const DOWNLOAD_COMPARE_CAVEATS = [
-    "This compares what two people were served. It cannot tell you whether either copy is safe.",
-    "It trusts your contact to report honestly what they downloaded.",
-    "Different versions, per-platform builds and stale mirrors all produce different files innocently.",
-    "Matching hashes mean the server treated you both alike, nothing more.",
+    i18nText("chrome-js-compare-caveat-scope", "This compares what two people were served. It cannot tell you whether either copy is safe."),
+    i18nText("chrome-js-compare-caveat-trust", "It trusts your contact to report honestly what they downloaded."),
+    i18nText("chrome-js-compare-caveat-versions", "Different versions, per-platform builds and stale mirrors all produce different files innocently."),
+    i18nText("chrome-js-compare-caveat-match", "Matching hashes mean the server treated you both alike, nothing more."),
   ];
 
   function compareSlot(id) {
@@ -8549,7 +11569,7 @@
     slot.appendChild(line);
     if (!data.byte_len_equal) {
       slot.appendChild(
-        el("div", "item-sub", "The two files are also different sizes."),
+        el("div", "item-sub", i18nText("chrome-js-compare-size-diff", "The two files are also different sizes.")),
       );
     }
     if (data.recorded_gap_seconds > 0) {
@@ -8578,16 +11598,19 @@
     return Math.round(seconds / 86400) + " days";
   }
 
-  const DOWNLOAD_COMPARE_NOTES = {
-    no_download:
-      "Your contact has no record of downloading from this address. That is not evidence of anything.",
-    record_untrusted:
-      "Your contact's own record of that download failed its integrity check, so their copy's fingerprint cannot be trusted for this comparison.",
-    unsupported: "Your contact's build cannot answer this.",
-    bad_message: "Your contact's answer could not be read.",
-    unexpected:
-      "An answer arrived for a comparison this browser did not ask for. Nothing was compared.",
-  };
+  let DOWNLOAD_COMPARE_NOTES;
+  rebuildOnLocaleFill(() => {
+    DOWNLOAD_COMPARE_NOTES = {
+      no_download:
+        i18nText("chrome-js-compare-note-no-download", "Your contact has no record of downloading from this address. That is not evidence of anything."),
+      record_untrusted:
+        i18nText("chrome-js-compare-note-record-untrusted", "Your contact's own record of that download failed its integrity check, so their copy's fingerprint cannot be trusted for this comparison."),
+      unsupported: i18nText("chrome-js-compare-note-unsupported", "Your contact's build cannot answer this."),
+      bad_message: i18nText("chrome-js-compare-note-bad-message", "Your contact's answer could not be read."),
+      unexpected:
+        i18nText("chrome-js-compare-note-unexpected", "An answer arrived for a comparison this browser did not ask for. Nothing was compared."),
+    };
+  });
 
   function renderCompareNote(data) {
     const slot = compareAwaiting ? compareSlot(compareAwaiting) : null;
@@ -8618,10 +11641,10 @@
       const line = $("bk-recovery-status");
       if (st && st.has_recovery) {
         line.textContent =
-          "Recovery: this vault has a recovery key, the one shown once and meant for paper. It is the only way in if the passphrase is forgotten, and a passphrase change does not affect it.";
+          i18nText("chrome-js-backup-recovery-status", "Recovery key saved. It was shown once and belongs on paper. It is the only way in if you forget the passphrase, and passphrase changes do not affect it.");
       } else {
         line.textContent =
-          "Recovery: this vault has NO recovery key. If the passphrase is forgotten, the contents are unrecoverable by you, by us, by anyone. Exports do not change that; they are encrypted under a passphrase too.";
+          i18nText("chrome-js-backup-no-recovery-status", "No recovery key. If you forget the passphrase, nobody can recover this vault. Encrypted exports do not help without their passphrase.");
       }
       // The offer to fix it, next to the sentence describing the problem. This
       // line stated the gap for as long as it has existed and there was
@@ -8643,13 +11666,19 @@
       // the export in afterwards -- a write that "succeeds" into a place
       // nobody can reach is worse than being asked where to put it.
       const choice = !!(st && st.file_choice);
+      // The IMPORT picker asked the same arm at chrome load, when the vault
+      // is always locked and the arm refuses, so it stayed hidden forever on
+      // every platform (launch sweep F-001). This is the first moment the
+      // answer exists; hand it to the import form too.
+      importFileChoice = st && st.file_choice;
+      importModeAppliers.forEach((apply) => apply());
       $("bk-exp-pick").hidden = !choice;
       $("bk-plain-pick").hidden = !choice;
       $("bk-exp-dest").readOnly = choice;
       $("bk-plain-dest").readOnly = choice;
       if (choice) {
-        $("bk-exp-dest").placeholder = "No location chosen yet";
-        $("bk-plain-dest").placeholder = "No location chosen yet";
+        $("bk-exp-dest").placeholder = i18nText("chrome-js-backup-no-location-placeholder", "No location chosen yet");
+        $("bk-plain-dest").placeholder = i18nText("chrome-js-backup-no-location-placeholder", "No location chosen yet");
       } else {
         // Pre-fill only empty fields — never overwrite something the user
         // typed.
@@ -8683,11 +11712,11 @@
       }
     },
   });
-  // ONE panel for everything saved. Bookmarks, the tabs you set aside and
-  // download records were three tabs in a separate Library; they are now
-  // three views of this one, chosen from its sidebar. The panel keeps the
-  // id and the toolbar button it always had, so nothing that points at the
-  // Library has to learn a new name.
+  // ONE panel for everything saved. Bookmarks, the tabs you shelved and
+  // download records were three tabs in a separate Library; the sidebar and
+  // Partnerships header control now select views of this one manager. The
+  // panel keeps the id and toolbar button it always had, so nothing that
+  // points at the Library has to learn a new name.
   registerPanel("library", {
     el: $("bookmarks-panel"),
     button: $("btn-library"),
@@ -8697,6 +11726,10 @@
     // limit -- it stays where it is because that is what the manager needs.
     heightPx: 720,
     onOpen: refreshLibrary,
+    // The shared saved-picture viewer may currently be parked after a
+    // snapshot row. Closing Library must drop its decoded image and wipe the
+    // same Rust staging slot Deep Recall uses.
+    onClose: recallPreviewClose,
   });
 
   // ---- the bookmarks manager ---------------------------------------------
@@ -8709,7 +11742,8 @@
   // every drag target also has a click path, because drag is invisible to a
   // keyboard and it did nothing at all for the first person who tried it.
   // The Folders button on each row is how a bookmark is filed.
-  let managerSelected = "all"; // "all" | "quick" | "unfiled" | a folder name
+  // "all" | "quick" | "snapshots" | "partnerships" | "unfiled" | a folder name
+  let managerSelected = "all";
   let managerQuery = "";
   let managerSort = "newest"; // "newest" | "oldest" | "title"
   const managerSelection = new Set(); // bookmark ids ticked for batch actions
@@ -8727,7 +11761,6 @@
   // pair's checkbox is disabled, so one toggle cannot fire twice while a
   // different folder stays live; each call is atomic server-side anyway.
   const folderOpsPending = new Set();
-
   // Letter tiles: the only icon this chrome is allowed. No images and no
   // network -- the CSP forbids both, and fetching a site's icon would
   // disclose the whole bookmark list to the sites in it. One letter, on a
@@ -8770,8 +11803,68 @@
     return makeTile(tileHostKey(url));
   }
 
+  function orderedQuickAccess(items) {
+    // Ordered positions come first, ascending. Bookmarks without a manual
+    // position follow in their existing list order. The first drag sends ALL
+    // visible ids, so it assigns every current tile and never scrambles the
+    // untouched remainder of a partly ordered, older store.
+    return items
+      .map((item, index) => ({ item, index }))
+      .filter((entry) => entry.item.quick_access === true)
+      .sort((a, b) => {
+        const aOrder = Number.isInteger(a.item.quick_access_order)
+          ? a.item.quick_access_order
+          : null;
+        const bOrder = Number.isInteger(b.item.quick_access_order)
+          ? b.item.quick_access_order
+          : null;
+        if (aOrder !== null && bOrder !== null) {
+          return aOrder - bOrder || a.index - b.index;
+        }
+        if (aOrder !== null) return -1;
+        if (bOrder !== null) return 1;
+        return a.index - b.index;
+      })
+      .map((entry) => entry.item);
+  }
+
   function managerPinned() {
-    return bookmarkItems.filter((b) => b.quick_access === true);
+    return orderedQuickAccess(bookmarkItems);
+  }
+
+  // Pure, so the manager gate can pin the reorder calculation without
+  // teaching its deliberately small DOM stub browser layout. `afterTarget`
+  // is decided by which half of the hovered tile the pointer occupies.
+  function reorderQuickAccessIds(ids, draggedId, targetId, afterTarget) {
+    if (
+      draggedId === targetId ||
+      ids.indexOf(draggedId) < 0 ||
+      ids.indexOf(targetId) < 0
+    ) {
+      return ids.slice();
+    }
+    const next = ids.filter((id) => id !== draggedId);
+    const target = next.indexOf(targetId);
+    next.splice(target + (afterTarget ? 1 : 0), 0, draggedId);
+    return next;
+  }
+
+  function managerSnapshots() {
+    const urls = new Set();
+    return bookmarkItems.filter((bookmark) => {
+      if (bookmark.has_digest !== true || urls.has(bookmark.url)) return false;
+      urls.add(bookmark.url);
+      return true;
+    });
+  }
+
+  function managerSnapshotCount() {
+    return managerSnapshots().reduce(
+      (count, bookmark) =>
+        count +
+        (Array.isArray(bookmark.snapshots) ? bookmark.snapshots.length : 1),
+      0,
+    );
   }
 
   function managerUnfiled() {
@@ -8790,8 +11883,12 @@
   // what is left. Selection is by id, so none of the three can lose a tick.
   function managerVisibleItems() {
     let items;
-    if (managerSelected === "quick") {
+    const quickView = managerSelected === "quick";
+    const snapshotsView = managerSelected === "snapshots";
+    if (quickView) {
       items = managerPinned();
+    } else if (snapshotsView) {
+      items = managerSnapshots();
     } else if (managerSelected === "unfiled") {
       items = managerUnfiled();
     } else if (managerSelected === "all") {
@@ -8801,18 +11898,35 @@
     }
     const needle = managerQuery.trim().toLowerCase();
     if (needle) {
-      // A live query ranks by match strength instead of the dropdown
-      // sort: "most likely what was meant" is the better order while
-      // someone is typing, and the dropdown takes the order back the
-      // moment the box is cleared.
-      const scored = [];
-      for (const item of items) {
-        const score = bookmarkMatchScore(item, needle);
-        if (score !== null) scored.push({ item, score });
+      if (quickView || snapshotsView) {
+        items = items.filter(
+          (item) => bookmarkMatchScore(item, needle) !== null,
+        );
+      } else {
+        // A live query ranks by match strength instead of the dropdown
+        // sort: "most likely what was meant" is the better order while
+        // someone is typing, and the dropdown takes the order back the
+        // moment the box is cleared.
+        const scored = [];
+        for (const item of items) {
+          const score = bookmarkMatchScore(item, needle);
+          if (score !== null) scored.push({ item, score });
+        }
+        scored.sort((a, b) => b.score - a.score);
+        return scored.map((entry) => entry.item);
       }
-      scored.sort((a, b) => b.score - a.score);
-      return scored.map((entry) => entry.item);
     }
+    if (snapshotsView) {
+      // A snapshot view is a recency lookup: keep the newest recorded
+      // snapshot first, independent of the general bookmark sort control.
+      items.sort(
+        (a, b) => (b.digest_recorded_at || 0) - (a.digest_recorded_at || 0),
+      );
+      return items;
+    }
+    // Quick Access is itself a user-chosen ordering. The general manager
+    // sort control must not make its filter view disagree with the tile row.
+    if (quickView) return items;
     if (managerSort === "title") {
       items.sort((a, b) =>
         String(a.title || a.url || "").localeCompare(
@@ -8832,6 +11946,59 @@
   // Rendered from EVERY pinned bookmark, never from the filtered list: the
   // sidebar, the search box and the sort must not be able to take it away.
   // That is the whole point of pinning something.
+  function quickAccessDomIds(grid) {
+    return Array.from(grid.children || [])
+      .map((tile) => tile.dataset && tile.dataset.bookmarkId)
+      .filter(Boolean);
+  }
+
+  function putQuickAccessDomInOrder(grid, ids) {
+    const byId = new Map(
+      Array.from(grid.children || []).map((tile) => [
+        tile.dataset && tile.dataset.bookmarkId,
+        tile,
+      ]),
+    );
+    for (const id of ids) {
+      const tile = byId.get(id);
+      if (tile) grid.appendChild(tile);
+    }
+  }
+
+  function previewQuickAccessReorder(grid, targetTile, ev) {
+    const ids = quickAccessDomIds(grid);
+    const box = targetTile.getBoundingClientRect();
+    const pointer = typeof ev.clientX === "number" ? ev.clientX : box.left;
+    const after = pointer >= box.left + box.width / 2;
+    const next = reorderQuickAccessIds(
+      ids,
+      draggedBookmarkId,
+      targetTile.dataset.bookmarkId,
+      after,
+    );
+    putQuickAccessDomInOrder(grid, next);
+    return next;
+  }
+
+  async function persistQuickAccessOrder(ids, focusId) {
+    try {
+      await rb("bookmark_quick_access_reorder", { ids });
+    } catch (e) {
+      // A preview is only DOM state. Put the authoritative cached order back
+      // immediately when the store refuses the write.
+      renderManagerQuick();
+      toast(friendly(e), true);
+      return;
+    }
+    await refreshOrganizerAfterWrite();
+    if (focusId) {
+      const tile = Array.from($("bmm-quick").children || []).find(
+        (candidate) => candidate.dataset.bookmarkId === focusId,
+      );
+      if (tile) tile.focus();
+    }
+  }
+
   function renderManagerQuick() {
     const grid = $("bmm-quick");
     if (!grid) return;
@@ -8842,7 +12009,10 @@
     for (const item of pinned) {
       const tile = el("button", "bmm-quick-item");
       tile.type = "button";
-      tile.title = item.url;
+      tile.setAttribute("draggable", "true");
+      tile.dataset.bookmarkId = item.id;
+      tile.title =
+        item.url + " -- Drag or use Left/Right arrow keys to reorder";
       tile.appendChild(makeLetterTile(item.url));
       tile.appendChild(
         el("span", "bmm-quick-name", item.title || hostOf(item.url)),
@@ -8855,6 +12025,56 @@
           toast(friendly(e), true);
         }
       });
+      tile.addEventListener("dragstart", (ev) => {
+        draggedBookmarkId = item.id;
+        tile.classList.add("dragging");
+        if (ev.dataTransfer) {
+          ev.dataTransfer.effectAllowed = "move";
+          // Some engines require a payload to begin dragging. It is a fixed
+          // word only: the id stays in the module flag and never crosses in
+          // text/plain, where dropping into another app could disclose it.
+          ev.dataTransfer.setData("text/plain", "bookmark");
+        }
+      });
+      tile.addEventListener("dragover", (ev) => {
+        const ids = quickAccessDomIds(grid);
+        if (
+          !draggedBookmarkId ||
+          ids.indexOf(draggedBookmarkId) < 0 ||
+          draggedBookmarkId === item.id
+        ) {
+          return;
+        }
+        ev.preventDefault();
+        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+        previewQuickAccessReorder(grid, tile, ev);
+      });
+      tile.addEventListener("drop", (ev) => {
+        const ids = quickAccessDomIds(grid);
+        if (!draggedBookmarkId || ids.indexOf(draggedBookmarkId) < 0) return;
+        ev.preventDefault();
+        const next = previewQuickAccessReorder(grid, tile, ev);
+        draggedBookmarkId = null;
+        persistQuickAccessOrder(next);
+      });
+      tile.addEventListener("dragend", () => {
+        draggedBookmarkId = null;
+        for (const candidate of grid.querySelectorAll(".dragging")) {
+          candidate.classList.remove("dragging");
+        }
+      });
+      tile.addEventListener("keydown", (ev) => {
+        if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+        const ids = quickAccessDomIds(grid);
+        const from = ids.indexOf(item.id);
+        const to = from + (ev.key === "ArrowLeft" ? -1 : 1);
+        if (from < 0 || to < 0 || to >= ids.length) return;
+        ev.preventDefault();
+        const next = ids.slice();
+        [next[from], next[to]] = [next[to], next[from]];
+        putQuickAccessDomInOrder(grid, next);
+        persistQuickAccessOrder(next, item.id);
+      });
       grid.appendChild(tile);
     }
   }
@@ -8864,8 +12084,13 @@
     if (!nav) return;
     nav.textContent = "";
     const entries = [
-      { key: "all", label: "All bookmarks", count: bookmarkItems.length },
-      { key: "quick", label: "Quick Access", count: managerPinned().length },
+      { key: "all", label: i18nText("chrome-js-folders-source-head", "All bookmarks"), count: bookmarkItems.length },
+      { key: "quick", label: i18nText("chrome-js-manager-sidebar-quick", "Quick Access"), count: managerPinned().length },
+      {
+        key: "snapshots",
+        label: i18nText("chrome-js-manager-sidebar-snapshots", "Snapshots"),
+        count: managerSnapshotCount(),
+      },
     ];
     for (const folder of allFolders()) {
       entries.push({
@@ -8877,7 +12102,7 @@
     }
     entries.push({
       key: "unfiled",
-      label: "Unfiled",
+      label: i18nText("chrome-js-manager-sidebar-unfiled", "Unfiled"),
       count: managerUnfiled().length,
     });
     // The other two things this panel now holds. Below the folders and
@@ -8886,13 +12111,13 @@
     // drop targets.
     entries.push({
       key: "shelves",
-      label: "Sets of tabs",
+      label: i18nText("chrome-js-manager-sidebar-shelves", "Tab Shelf"),
       count: shelfCount(),
       separated: true,
     });
     entries.push({
       key: "downloads",
-      label: "Downloads",
+      label: i18nText("chrome-js-manager-sidebar-downloads", "Downloads"),
       count: downloadItems.length,
     });
 
@@ -8952,12 +12177,12 @@
         input.type = "text";
         input.maxLength = 40;
         input.value = managerSelected;
-        input.setAttribute("aria-label", "Rename folder");
+        input.setAttribute("aria-label", i18nText("chrome-js-folders-rename-aria", "Rename folder"));
         form.appendChild(input);
-        const save = el("button", "small", "Save");
+        const save = el("button", "small", i18nText("chrome-js-folders-save", "Save"));
         save.type = "submit";
         form.appendChild(save);
-        const cancel = el("button", "small", "Cancel");
+        const cancel = el("button", "small", i18nText("chrome-js-folders-cancel", "Cancel"));
         cancel.type = "button";
         cancel.addEventListener("click", () => {
           managerRenamingFolder = null;
@@ -8983,16 +12208,16 @@
           managerSelected + " (" + folderMembers(managerSelected).length + ")",
         ),
       );
-      const rename = el("button", "small", "Rename");
+      const rename = el("button", "small", i18nText("chrome-js-manager-rename", "Rename"));
       rename.type = "button";
       rename.addEventListener("click", () => {
         managerRenamingFolder = managerSelected;
         renderBookmarksManager();
       });
       bar.appendChild(rename);
-      const del = el("button", "small danger", "Delete folder");
+      const del = el("button", "small danger", i18nText("chrome-js-folders-delete-folder", "Delete folder"));
       del.type = "button";
-      del.title = "Removes the folder. The bookmarks in it are kept.";
+      del.title = i18nText("chrome-js-folders-delete-title", "Removes the folder. The bookmarks in it are kept.");
       const target = managerSelected;
       del.addEventListener("click", () => managerDeleteFolder(target));
       bar.appendChild(del);
@@ -9027,12 +12252,12 @@
         input.type = "text";
         input.maxLength = 40;
         input.value = folder.tag;
-        input.setAttribute("aria-label", "Rename folder");
+        input.setAttribute("aria-label", i18nText("chrome-js-folders-rename-aria", "Rename folder"));
         form.appendChild(input);
-        const save = el("button", "small", "Save");
+        const save = el("button", "small", i18nText("chrome-js-folders-save", "Save"));
         save.type = "submit";
         form.appendChild(save);
-        const cancel = el("button", "small", "Cancel");
+        const cancel = el("button", "small", i18nText("chrome-js-folders-cancel", "Cancel"));
         cancel.type = "button";
         cancel.addEventListener("click", () => {
           managerRenamingFolder = null;
@@ -9064,16 +12289,19 @@
       card.appendChild(head);
 
       const actions = el("div", "bmm-card-actions");
-      const rename = el("button", "small", "Rename");
+      const rename = el("button", "small", i18nText("chrome-js-manager-rename", "Rename"));
       rename.type = "button";
       rename.addEventListener("click", () => {
         managerRenamingFolder = folder.tag;
         renderBookmarksManager();
       });
       actions.appendChild(rename);
-      const del = el("button", "small danger", "Delete folder");
+      const del = el("button", "small danger", i18nText("chrome-js-folders-delete-folder", "Delete folder"));
       del.type = "button";
-      del.title = "Removes the folder. The bookmarks in it are kept.";
+      // Named for machines too, so the gate clicks the ACTION rather than
+      // the English label.
+      del.dataset.action = "delete-folder";
+      del.title = i18nText("chrome-js-folders-delete-title", "Removes the folder. The bookmarks in it are kept.");
       del.addEventListener("click", () => managerDeleteFolder(folder.tag));
       actions.appendChild(del);
       card.appendChild(actions);
@@ -9081,9 +12309,110 @@
     }
   }
 
+  function rememberSnapshotCheck(data, errorCode) {
+    const id = data && data.bookmark_id;
+    if (!id) return;
+    snapshotChecksPending.delete(id);
+    snapshotCheckResults.set(id, {
+      snapshot_id: data.snapshot_id || snapshotSelections.get(id) || null,
+      data: errorCode ? null : data,
+      error: errorCode ? friendly({ message: errorCode }) : null,
+    });
+    if (managerSelected === "snapshots") renderManagerList();
+  }
+
+  function appendPassageGroup(parent, label, passages, className) {
+    if (!Array.isArray(passages) || !passages.length) return;
+    parent.appendChild(el("div", "bmm-diff-label", label));
+    for (const passage of passages) {
+      const passageEl = el("div", "bmm-diff-passage", passage);
+      passageEl.classList.add(className);
+      parent.appendChild(passageEl);
+    }
+  }
+
+  function renderSnapshotCheckResult(item, snapshotId) {
+    const wrap = el("div", "bmm-snapshot-result");
+    const remembered = snapshotCheckResults.get(item.id);
+    if (!remembered || remembered.snapshot_id !== snapshotId) {
+      wrap.hidden = true;
+      return wrap;
+    }
+    if (remembered.error) {
+      wrap.classList.add("error");
+      wrap.appendChild(el("div", "bmm-snapshot-verdict", remembered.error));
+      return wrap;
+    }
+    const data = remembered.data || {};
+    let headline;
+    // The similarity branch is the only one carrying an argument, so it paints
+    // through i18nSet on its own node; the other two are whole sentences.
+    const pct =
+      typeof data.similarity === "number"
+        ? Math.round(data.similarity * 100)
+        : 0;
+    if (data.verdict === "identical") {
+      headline = i18nText("chrome-js-snapshot-identical", "Matches this snapshot.");
+    } else if (data.verdict === "structure_differs") {
+      headline = i18nText("chrome-js-snapshot-structure", "The words match; the page markup changed.");
+    } else {
+      headline = null;
+    }
+    const verdictEl = el("div", "bmm-snapshot-verdict", headline || "");
+    if (headline === null) {
+      i18nSet(verdictEl, "chrome-js-snapshot-similarity", { pct },
+        "The visible text changed; about " + pct + "% still matches.");
+    }
+    wrap.appendChild(verdictEl);
+    const evidence = data.text_comparison || {};
+    if (evidence.available !== true) {
+      wrap.appendChild(
+        el(
+          "div",
+          "bmm-diff-note",
+          "Text comparison is unavailable for this snapshot because it was saved before this browser started keeping snapshot text.",
+        ),
+      );
+      return wrap;
+    }
+    appendPassageGroup(wrap, "Removed", evidence.removed, "removed");
+    appendPassageGroup(wrap, "Added", evidence.added, "added");
+    if (
+      (!Array.isArray(evidence.removed) || evidence.removed.length === 0) &&
+      (!Array.isArray(evidence.added) || evidence.added.length === 0)
+    ) {
+      wrap.appendChild(
+        el("div", "bmm-diff-note", i18nText("chrome-js-diff-none", "No visible-text passages changed.")),
+      );
+    }
+    if (evidence.output_trimmed === true) {
+      wrap.appendChild(
+        el(
+          "div",
+          "bmm-diff-note",
+          "The diff was trimmed to keep this result readable.",
+        ),
+      );
+    }
+    if (
+      evidence.saved_text_trimmed === true ||
+      evidence.current_text_trimmed === true
+    ) {
+      wrap.appendChild(
+        el(
+          "div",
+          "bmm-diff-note",
+          "The page text reached the 100,000-character snapshot limit, so this diff covers the stored portion.",
+        ),
+      );
+    }
+    return wrap;
+  }
+
   function managerRow(item) {
     const li = el("li", "bmm-row");
     li.setAttribute("draggable", "true");
+    let selectedSnapshot = null;
 
     const tick = document.createElement("input");
     tick.type = "checkbox";
@@ -9101,6 +12430,51 @@
     const meta = el("div", "bmm-meta");
     meta.appendChild(el("span", "bmm-title", item.title || hostOf(item.url)));
     meta.appendChild(el("span", "bmm-url", item.url));
+    if (managerSelected === "snapshots" && item.has_digest === true) {
+      const snapshots = Array.isArray(item.snapshots) ? item.snapshots : [];
+      // Hold the node rather than reaching for meta.lastChild: the element is
+      // ours already, and lastChild is one more assumption about the DOM.
+      const takenEl = el("div", "item-sub", "");
+      i18nSet(takenEl, "chrome-js-snapshot-taken", { when: fmtTime(item.digest_recorded_at) },
+        "Page snapshot from " + fmtTime(item.digest_recorded_at));
+      meta.appendChild(takenEl);
+      meta.appendChild(
+        el(
+          "div",
+          "item-sub",
+          snapshots.length +
+            (snapshots.length === 1 ? " saved snapshot" : " saved snapshots"),
+        ),
+      );
+      const picker = document.createElement("select");
+      picker.className = "bmm-snapshot-picker";
+      picker.setAttribute(
+        "aria-label",
+        "Saved snapshot for " + (item.title || item.url),
+      );
+      let selected = snapshotSelections.get(item.id);
+      if (!snapshots.some((snapshot) => snapshot.id === selected)) {
+        selected = snapshots.length ? snapshots[0].id : "";
+        snapshotSelections.set(item.id, selected);
+      }
+      for (const snapshot of snapshots) {
+        const option = document.createElement("option");
+        option.value = snapshot.id;
+        option.textContent = fmtTime(snapshot.recorded_at);
+        picker.appendChild(option);
+      }
+      picker.value = selected;
+      selectedSnapshot =
+        snapshots.find((snapshot) => snapshot.id === selected) || null;
+      picker.addEventListener("change", () => {
+        snapshotSelections.set(item.id, picker.value);
+        renderManagerList();
+      });
+      meta.appendChild(picker);
+      if (!selectedSnapshot || selectedSnapshot.has_picture !== true) {
+        meta.appendChild(el("div", "item-sub", i18nText("chrome-js-snapshot-picture-none", "Picture unavailable.")));
+      }
+    }
     li.appendChild(meta);
 
     if (Array.isArray(item.tags) && item.tags.length) {
@@ -9112,7 +12486,47 @@
 
     const actions = el("div", "bmm-actions");
 
-    const foldersBtn = el("button", "small", "Folders");
+    if (managerSelected === "snapshots" && item.has_digest === true) {
+      if (selectedSnapshot && selectedSnapshot.has_picture === true) {
+        const view = el("button", "small", i18nText("chrome-js-manager-view-picture", "View picture"));
+        view.type = "button";
+        view.addEventListener("click", async () => {
+          await openStoredPicture(
+            li,
+            "snapshot",
+            "snapshot_picture_stage",
+            selectedSnapshot,
+            (message) => {
+              if (message) toast(message, true);
+            },
+          );
+        });
+        actions.appendChild(view);
+      }
+      const check = el("button", "small", i18nText("chrome-js-manager-check-changes", "Check for changes"));
+      check.type = "button";
+      check.disabled = snapshotChecksPending.has(item.id);
+      check.addEventListener("click", async () => {
+        const snapshotId = snapshotSelections.get(item.id);
+        snapshotChecksPending.add(item.id);
+        snapshotCheckResults.delete(item.id);
+        renderManagerList();
+        try {
+          await rb("integrity_check_bookmark", {
+            id: item.id,
+            snapshot_id: snapshotId,
+          });
+        } catch (error) {
+          rememberSnapshotCheck(
+            { bookmark_id: item.id, snapshot_id: snapshotId },
+            error && error.message ? error.message : String(error),
+          );
+        }
+      });
+      actions.appendChild(check);
+    }
+
+    const foldersBtn = el("button", "small", i18nText("chrome-js-manager-folders-button", "Folders"));
     foldersBtn.type = "button";
     foldersBtn.setAttribute(
       "aria-expanded",
@@ -9130,11 +12544,11 @@
     });
     actions.appendChild(foldersBtn);
 
-    const pin = el("button", "small", item.quick_access ? "Unpin" : "Pin");
+    const pin = el("button", "small", item.quick_access ? i18nText("chrome-js-manager-unpin", "Unpin") : i18nText("chrome-js-manager-pin", "Pin"));
     pin.type = "button";
     pin.title = item.quick_access
-      ? "Remove from Quick Access"
-      : "Put this in Quick Access at the top";
+      ? i18nText("chrome-js-manager-pin-title-off", "Remove from Quick Access")
+      : i18nText("chrome-js-manager-pin-title-on", "Put this in Quick Access at the top");
     pin.addEventListener("click", async () => {
       try {
         await rb("bookmark_quick_access_set", {
@@ -9151,7 +12565,7 @@
 
     // Edit lived only on the old flat rows. Without it here a bookmark's
     // address and name would become uneditable once that list went away.
-    const edit = el("button", "small", "Edit");
+    const edit = el("button", "small", i18nText("chrome-js-creds-edit", "Edit"));
     edit.type = "button";
     edit.addEventListener("click", () => {
       editingBookmark = item.id;
@@ -9166,19 +12580,19 @@
     });
     actions.appendChild(edit);
 
-    const copy = el("button", "small", "Copy URL");
+    const copy = el("button", "small", i18nText("chrome-js-manager-copy-url", "Copy URL"));
     copy.type = "button";
     copy.addEventListener("click", async () => {
       try {
         await navigator.clipboard.writeText(item.url);
-        toast("Address copied.");
+        toast(i18nText("chrome-js-manager-address-copied", "Address copied."));
       } catch (e) {
         toast(friendly(e), true);
       }
     });
     actions.appendChild(copy);
 
-    const open = el("button", "small", "Open");
+    const open = el("button", "small", i18nText("chrome-js-bookmarks-open", "Open"));
     open.type = "button";
     open.addEventListener("click", async () => {
       try {
@@ -9190,7 +12604,7 @@
     });
     actions.appendChild(open);
 
-    const del = el("button", "small danger", "Delete");
+    const del = el("button", "small danger", i18nText("chrome-js-confirm-default-label", "Delete"));
     del.type = "button";
     del.addEventListener("click", async () => {
       const ok = await askConfirm(
@@ -9209,6 +12623,12 @@
     actions.appendChild(del);
 
     li.appendChild(actions);
+
+    if (managerSelected === "snapshots" && item.has_digest === true) {
+      li.appendChild(
+        renderSnapshotCheckResult(item, snapshotSelections.get(item.id)),
+      );
+    }
 
     li.addEventListener("dragstart", (ev) => {
       draggedBookmarkId = item.id;
@@ -9233,15 +12653,24 @@
   function renderManagerList() {
     const list = $("bmm-list");
     if (!list) return;
+    if (recallPreviewOwner === "snapshot") recallPreviewClose();
     list.textContent = "";
     const items = managerVisibleItems();
+    const snapshotCaption = $("bmm-snapshots-caption");
+    snapshotCaption.textContent =
+      "A snapshot keeps hashes, visible text, and a picture of the page when capture succeeds. Check for changes compares the page as it is now with what you saved.";
+    snapshotCaption.hidden = managerSelected !== "snapshots";
     const empty = $("bmm-empty");
     if (empty) {
       empty.hidden = items.length > 0;
       if (!items.length) {
-        empty.textContent = bookmarkItems.length
-          ? "Nothing here matches."
-          : "No bookmarks yet. Add one above, or use the bookmark button on a page.";
+        if (managerSelected === "snapshots" && !managerSnapshots().length) {
+          empty.textContent = i18nText("chrome-js-manager-empty-snapshots", "No snapshots yet. Open Integrity, then save one in Page integrity.");
+        } else {
+          empty.textContent = bookmarkItems.length
+            ? i18nText("chrome-js-manager-empty-match", "Nothing here matches.")
+            : i18nText("chrome-js-manager-empty-none", "No bookmarks yet. Add one above, or use the bookmark button on a page.");
+        }
       }
     }
     for (const item of items) list.appendChild(managerRow(item));
@@ -9259,11 +12688,11 @@
 
     const folderNames = allFolders().map((f) => f.tag);
     const pick = document.createElement("select");
-    pick.setAttribute("aria-label", "Folder for the selected bookmarks");
+    pick.setAttribute("aria-label", i18nText("chrome-js-manager-batch-pick-aria", "Folder for the selected bookmarks"));
     if (!folderNames.length) {
       const opt = document.createElement("option");
       opt.value = "";
-      opt.textContent = "No folders yet";
+      opt.textContent = i18nText("chrome-js-manager-batch-no-folders", "No folders yet");
       pick.appendChild(opt);
       pick.disabled = true;
     }
@@ -9284,25 +12713,25 @@
       return b;
     };
 
-    mk("Add to folder", () => {
+    mk(i18nText("chrome-js-manager-batch-add", "Add to folder"), () => {
       if (!pick.value) return;
       runBatch(ids, (id) =>
         rb("bookmark_folder_file", { id, folder: pick.value }),
       );
     });
-    mk("Remove from folder", () => {
+    mk(i18nText("chrome-js-manager-batch-remove", "Remove from folder"), () => {
       if (!pick.value) return;
       runBatch(ids, (id) =>
         rb("bookmark_folder_unfile", { id, folder: pick.value }),
       );
     });
-    mk("Pin", () =>
+    mk(i18nText("chrome-js-manager-pin", "Pin"), () =>
       runBatch(ids, (id) => rb("bookmark_quick_access_set", { id, on: true })),
     );
-    mk("Unpin", () =>
+    mk(i18nText("chrome-js-manager-unpin", "Unpin"), () =>
       runBatch(ids, (id) => rb("bookmark_quick_access_set", { id, on: false })),
     );
-    mk("Delete", async () => {
+    mk(i18nText("chrome-js-confirm-default-label", "Delete"), async () => {
       const ok = await askConfirm(
         "Delete " +
           ids.length +
@@ -9313,7 +12742,7 @@
       if (!ok) return;
       runBatch(ids, (id) => rb("bookmark_delete", { id }));
     });
-    const clear = el("button", "small", "Clear selection");
+    const clear = el("button", "small", i18nText("chrome-js-manager-batch-clear", "Clear selection"));
     clear.type = "button";
     clear.disabled = managerBatchBusy;
     clear.addEventListener("click", () => {
@@ -9342,10 +12771,11 @@
     for (const id of failed) managerSelection.add(id);
     managerBatchBusy = false;
     if (failed.length) {
-      toast(
+      i18nResolve(
+        "chrome-js-batch-partial-failure",
+        { failed: failed.length, total: ids.length },
         failed.length + " of " + ids.length + " could not be changed.",
-        true,
-      );
+      ).then((t) => toast(t, true));
     }
     closeFoldersPopover();
     await refreshOrganizerAfterWrite();
@@ -9396,7 +12826,7 @@
     const names = allFolders().map((f) => f.tag);
     if (!names.length) {
       pop.appendChild(
-        el("div", "bmm-pop-row", "No folders yet. Make one below."),
+        el("div", "bmm-pop-row", i18nText("chrome-js-manager-popover-no-folders", "No folders yet. Make one below.")),
       );
     }
     for (const name of names) {
@@ -9420,10 +12850,10 @@
     const input = document.createElement("input");
     input.type = "text";
     input.maxLength = 40;
-    input.placeholder = "New folder";
-    input.setAttribute("aria-label", "New folder name");
+    input.placeholder = i18nText("chrome-js-manager-popover-new-placeholder", "New folder");
+    input.setAttribute("aria-label", i18nText("chrome-js-manager-popover-new-aria", "New folder name"));
     form.appendChild(input);
-    const add = el("button", "small", "Add");
+    const add = el("button", "small", i18nText("chrome-js-manager-popover-add", "Add"));
     add.type = "submit";
     form.appendChild(add);
     form.addEventListener("submit", (ev) => {
@@ -9500,7 +12930,12 @@
       // The FOLDER WAS created even though the filing failed. Refresh anyway
       // or it exists on disk and is invisible here, which reads as the whole
       // action having failed.
-      toast("Folder made, but filing failed: " + friendly(e), true);
+      const detail = friendly(e);
+      i18nResolve(
+        "chrome-js-folders-file-failed",
+        { detail },
+        "Folder made, but filing failed: " + detail,
+      ).then((t) => toast(t, true));
       await refreshOrganizerAfterWrite();
       return;
     }
@@ -9529,9 +12964,12 @@
 
   async function managerDeleteFolder(name) {
     const ok = await askConfirm(
-      "Delete the folder “" +
-        name +
-        "”? The bookmarks in it are kept, just no longer filed under it.",
+      await i18nResolve(
+        "chrome-manager-delete-folder",
+        { name },
+        "Delete the folder “" + name + "”? The bookmarks in it are kept, " +
+          "just no longer filed under it.",
+      ),
     );
     if (!ok) return;
     try {
@@ -9556,7 +12994,7 @@
     if (errline) errline.hidden = true;
     if (!url) {
       if (errline) {
-        errline.textContent = "Type an address first.";
+        errline.textContent = i18nText("chrome-js-manager-add-empty", "Type an address first.");
         errline.hidden = false;
       }
       return;
@@ -9570,7 +13008,7 @@
       if (errline) {
         errline.textContent =
           e && String(e.message) === "bad_args"
-            ? "That is not an address this browser can open."
+            ? i18nText("chrome-js-manager-add-bad-args", "That is not an address this browser can open.")
             : friendly(e);
         errline.hidden = false;
       }
@@ -9597,6 +13035,8 @@
     if (
       managerSelected !== "all" &&
       managerSelected !== "quick" &&
+      managerSelected !== "snapshots" &&
+      managerSelected !== "partnerships" &&
       managerSelected !== "unfiled" &&
       managerSelected !== "shelves" &&
       managerSelected !== "downloads" &&
@@ -9612,13 +13052,31 @@
         ? "downloads"
         : managerSelected === "shelves"
           ? "shelves"
-          : "bookmarks";
+          : managerSelected === "partnerships"
+            ? "partnerships"
+            : "bookmarks";
     const top = $("bmm-bookmarks-top");
-    if (top) top.hidden = view !== "bookmarks";
+    if (top) top.hidden = view !== "bookmarks" && view !== "partnerships";
+    const tools = $("bmm-bookmark-tools");
+    if (tools) tools.hidden = view !== "bookmarks";
+    const partnershipsButton = $("btn-partnerships");
+    if (partnershipsButton) {
+      const selected = view === "partnerships";
+      partnershipsButton.classList.toggle("active", selected);
+      partnershipsButton.setAttribute("aria-pressed", String(selected));
+    }
+    const sort = $("bmm-sort");
+    if (sort) {
+      // Snapshot recency and Quick Access's manual positions are each the
+      // view's purpose, so disable unrelated bookmark sort choices there.
+      sort.disabled =
+        managerSelected === "snapshots" || managerSelected === "quick";
+    }
     for (const [name, id] of [
       ["bookmarks", "bmm-view-bookmarks"],
       ["shelves", "bmm-view-shelves"],
       ["downloads", "bmm-view-downloads"],
+      ["partnerships", "bmm-view-partnerships"],
     ]) {
       const node = $(id);
       if (node) node.hidden = view !== name;
@@ -9630,9 +13088,22 @@
     renderManagerCards();
     renderManagerList();
     renderManagerBatch();
+    if (view === "partnerships") void refreshPartnerLibrary();
     // LAST, and always: the popover is re-anchored to the rebuilt rows. Any
     // path that re-renders without this leaves it pointing at a detached node.
     syncFoldersPopover();
+  }
+
+  if ($("btn-partnerships")) {
+    $("partner-library-framing").textContent =
+      "Services PATANYX partners with. Each is labeled where it appears, " +
+      "and PATANYX may earn a commission.";
+    $("btn-partnerships").addEventListener("click", () => {
+      managerSelected =
+        managerSelected === "partnerships" ? "all" : "partnerships";
+      closeFoldersPopover();
+      renderBookmarksManager();
+    });
   }
 
   if ($("bmm-add")) {
@@ -9667,7 +13138,7 @@
       if (errline) errline.hidden = true;
       if (!name) {
         if (errline) {
-          errline.textContent = "Type a folder name first.";
+          errline.textContent = i18nText("chrome-js-folders-new-empty", "Type a folder name first.");
           errline.hidden = false;
         }
         return;
@@ -9709,7 +13180,7 @@
         const folderList = allFolders();
         const folders = Array.isArray(folderList) ? folderList.length : 0;
         if (!marks && !folders) {
-          toast("There are no bookmarks or folders to delete.");
+          toast(i18nText("chrome-js-manager-delete-all-none", "There are no bookmarks or folders to delete."));
           return;
         }
         const what = [
@@ -9717,12 +13188,16 @@
           folders === 1 ? "1 folder" : `${folders} folders`,
         ].join(" and ");
         const ok = await askConfirm(
-          `Permanently delete ${what}? This also removes their tags, their ` +
-            `Quick Access pins, and the page snapshots kept for change ` +
-            `checks. It cannot be undone, and PATANYX has no bookmark ` +
-            `export to restore from. Your set-aside tabs, downloads and ` +
-            `archived pages are not affected.`,
-          "Delete everything",
+          await i18nResolve(
+            "chrome-js-manager-delete-all-confirm",
+            { what },
+            `Permanently delete ${what}? This also removes their tags, their ` +
+              `Quick Access pins, and the page snapshots kept for change ` +
+              `checks. It cannot be undone, and PATANYX has no bookmark ` +
+              `export to restore from. Your shelved tabs, downloads and ` +
+              `archived pages are not affected.`,
+          ),
+          i18nText("chrome-js-manager-delete-all-label", "Delete everything"),
         );
         if (!ok) return;
         let removed;
@@ -9738,10 +13213,13 @@
         await refreshOrganizerAfterWrite();
         const n = (removed && removed.bookmarks) || 0;
         const f = (removed && removed.folders) || 0;
-        toast(
-          `Deleted ${n === 1 ? "1 bookmark" : n + " bookmarks"} and ` +
-            `${f === 1 ? "1 folder" : f + " folders"}.`,
-        );
+        const bookmarksText = n === 1 ? "1 bookmark" : n + " bookmarks";
+        const foldersText = f === 1 ? "1 folder" : f + " folders";
+        i18nResolve(
+          "chrome-js-manager-deleted-toast",
+          { bookmarks: bookmarksText, folders: foldersText },
+          `Deleted ${bookmarksText} and ${foldersText}.`,
+        ).then((t) => toast(t));
       });
     }
     $("bmm-new-folder").addEventListener("keydown", (ev) => {
@@ -9790,20 +13268,33 @@
       // Named plainly. An About panel that renders empty looks like a broken
       // build, and someone reading it is often trying to find out what build
       // they have in order to report exactly that.
-      $("about-build").textContent =
-        "Could not read this build's details: " + friendly(e);
+      const detail = friendly(e);
+      i18nSet(
+        $("about-build"),
+        "chrome-js-about-read-failed",
+        { detail },
+        "Could not read this build's details: " + detail,
+      );
       return;
     }
     if (!info) return;
 
     $("about-title").textContent = "About " + (info.name || "PATANYX");
-    $("about-build").textContent =
+    const buildSummary =
       (info.name || "PATANYX") +
       " version " +
-      (info.version || "unknown") +
+      (info.version || i18nText("chrome-js-about-version-fallback", "unknown")) +
       ", rendering with " +
-      (info.engine || "the system web engine") +
+      (info.engine || i18nText("chrome-js-about-engine-fallback", "the system web engine")) +
+      // The runtime version, every field, because "which engine am I
+      // actually running" is the question that decides whether a published
+      // engine fix has reached this machine. Rust sends "unknown" when it
+      // could not tell, and that word is worth showing too.
+      (info.engine_version ? " " + info.engine_version : "") +
       ".";
+    $("about-build").textContent = info.build_warning
+      ? info.build_warning + ". " + buildSummary
+      : buildSummary;
 
     // Built with createElement and textContent, never markup. The copy crosses
     // the IPC boundary like everything else and this page holds the vault, so
@@ -9870,6 +13361,17 @@
       body.appendChild(el("p", "about-para", info.disclosure));
     }
 
+    // Sponsorship is its own About section, after both the Premium/affiliate
+    // business-model paragraph and the build disclosure. It is not a Premium
+    // call to action. Rust supplies every word; chrome supplies only the fixed
+    // target NAME when the reader chooses the button.
+    const support = $("about-support");
+    $("about-support-head").textContent = info.support_head || "";
+    $("about-support-copy").textContent = info.support || "";
+    $("about-support-open").textContent = info.support_label || "";
+    $("about-support-open").hidden = false;
+    support.hidden = !(info.support_head && info.support && info.support_label);
+
     $("about-license-line").textContent =
       (info.name || "PATANYX") +
       " is free and open-source software, licensed under the " +
@@ -9881,13 +13383,20 @@
     const n = Number(info.package_count) || 0;
     $("about-third-party-line").textContent =
       n > 0
-        ? "This build is made with " +
-          n.toLocaleString() +
-          " third-party open-source packages."
-        : "This build's third-party inventory could not be counted.";
+        ? n.toLocaleString() +
+          " third-party open-source packages in this build."
+        : i18nText("chrome-js-about-third-party-failed", "This build's third-party inventory could not be counted.");
 
     aboutLoaded = true;
   }
+
+  $("about-support-open").addEventListener("click", async () => {
+    try {
+      await rb("sponsorship_open", { sponsorship: "patanyx" });
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+  });
 
   /// Show/hide a block of text, with the button naming what the NEXT press
   /// does. Shared by the licence and the third-party sections so the two
@@ -9901,7 +13410,7 @@
       const opening = text.hidden;
       if (opening && load) {
         button.disabled = true;
-        button.textContent = "Loading…";
+        button.textContent = i18nText("chrome-js-about-loading", "Loading…");
         try {
           await load();
         } catch (e) {
@@ -9921,16 +13430,16 @@
   wireDisclosure(
     "about-license-toggle",
     "about-license-text",
-    "Show the full license",
-    "Hide the license",
+    i18nText("chrome-js-about-show-license", "Show the full license"),
+    i18nText("chrome-js-about-hide-license", "Hide the license"),
     null,
   );
 
   wireDisclosure(
     "about-third-party-toggle",
     "about-third-party-text",
-    "Show third-party licenses",
-    "Hide third-party licenses",
+    i18nText("chrome-js-about-show-third-party", "Show third-party licenses"),
+    i18nText("chrome-js-about-hide-third-party", "Hide third-party licenses"),
     // Fetched on FIRST open and kept. Roughly 300 KB of licence text for the
     // Windows build: worth not sending every time the About panel is opened,
     // and worth not re-sending once it has been.
@@ -9978,7 +13487,7 @@
       const data = await rb("diagnostics_get");
       await navigator.clipboard.writeText(diagnosticsReportOf(data));
       $("diag-result").hidden = false;
-      $("diag-result").textContent = "Copied to clipboard.";
+      $("diag-result").textContent = i18nText("chrome-js-diagnostics-copied", "Copied to clipboard.");
     } catch (e) {
       toast(friendly(e), true);
     }
@@ -9987,7 +13496,7 @@
   wireSavePicker(
     "diag-pick",
     "diag-dest",
-    "Save the diagnostic report",
+    i18nText("chrome-js-diagnostics-pick-title", "Save the diagnostic report"),
     "patanyx-diagnostics.json",
   );
 
@@ -9995,13 +13504,18 @@
     $("diag-result").hidden = true;
     const dest = $("diag-dest").value.trim();
     if (!dest) {
-      toast("Choose or type a destination first.", true);
+      toast(i18nText("chrome-js-diagnostics-dest-empty", "Choose or type a destination first."), true);
       return;
     }
     try {
       await rb("diagnostics_export", { dest });
       $("diag-result").hidden = false;
-      $("diag-result").textContent = "Saved to " + dest + ".";
+      i18nSet(
+        $("diag-result"),
+        "chrome-js-diagnostics-saved",
+        { dest },
+        "Saved to " + dest + ".",
+      );
     } catch (e) {
       toast(friendly(e), true);
     }

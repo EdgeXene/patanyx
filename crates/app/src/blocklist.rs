@@ -1,8 +1,8 @@
 //! Known-malicious hosts, and the decision to refuse them.
 //!
 //! This is the protection for users who never open a settings panel. Choosing
-//! Mullvad or Quad9 already refuses malicious domains at the resolver, but that
-//! is opt-in and Windows-only; SmartScreen is off; and until now the browser's
+//! Quad9 already refuses malicious domains at the resolver, but that is
+//! opt-in and Windows-only; SmartScreen is off; and until now the browser's
 //! own answer was a matching engine ([`HostSet`], built and tested in 882c3ce)
 //! that nothing ever constructed. A user on default settings had strictly less
 //! malware protection than stock Edge.
@@ -105,7 +105,16 @@ fn set() -> Arc<HostSet> {
     if let Some(existing) = ACTIVE.read().ok().and_then(|g| g.clone()) {
         return existing;
     }
-    let loaded = match std::env::var_os(PATH_ENV) {
+    // DEBUG BUILDS ONLY. In a shipped binary this variable was honoured too,
+    // so a process launched with it pointing at an empty file ran with an
+    // EMPTY malicious-host set and no fallback (pentest F-010). A probe
+    // override is a test tool; a consumer binary must not carry a knob that
+    // switches its protection off from the environment.
+    #[cfg(not(debug_assertions))]
+    let override_path: Option<std::ffi::OsString> = None;
+    #[cfg(debug_assertions)]
+    let override_path = std::env::var_os(PATH_ENV);
+    let loaded = match override_path {
         Some(path) => match std::fs::read_to_string(&path) {
             Ok(text) => HostSet::from_lines(&text),
             // A named-but-unreadable override is a configuration mistake during a
@@ -135,6 +144,14 @@ fn set() -> Arc<HostSet> {
 /// Verbatim rather than re-derived: this is the exact byte sequence the
 /// running browser matches against, so a published file produced this way
 /// cannot disagree with what installs actually use.
+///
+/// DEBUG BUILDS ONLY, matching its one caller. It writes to a caller-chosen
+/// path with no validation, which is a publishing tool's privilege and an
+/// arbitrary-file-write primitive in a consumer binary (security assessment
+/// 2026-08-28, R6). the publisher runs the debug binary, so
+/// the publisher is unaffected. Gated here as well as at the call site so the
+/// release build carries neither the flag nor the function.
+#[cfg(debug_assertions)]
 pub fn write_bundled(dest: &std::path::Path) -> std::io::Result<usize> {
     std::fs::write(dest, BUNDLED)?;
     Ok(BUNDLED.len() / 16)

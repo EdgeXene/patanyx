@@ -90,8 +90,9 @@ use std::process::ExitCode;
 
 use ed25519_dalek::{Signer, SigningKey};
 use patanyx_update::{
-    hex, verify_blocklist_manifest, verify_manifest, TrustedKeys, SIGNING_DOMAIN,
-    SIGNING_DOMAIN_BLOCKLIST,
+    hex, verify_advisory_manifest, verify_blocklist_manifest, verify_manifest,
+    verify_model_manifest, TrustedKeys, SIGNING_DOMAIN, SIGNING_DOMAIN_ADVISORY,
+    SIGNING_DOMAIN_BLOCKLIST, SIGNING_DOMAIN_MODELS,
 };
 
 fn main() -> ExitCode {
@@ -101,10 +102,20 @@ fn main() -> ExitCode {
         ["keygen", out, "release"] => keygen(Path::new(out), KeyPurpose::Release),
         ["keygen", out, "blocklist"] => keygen(Path::new(out), KeyPurpose::Blocklist),
         ["keygen", out, "licence"] => keygen(Path::new(out), KeyPurpose::Licence),
+        ["keygen", out, "models"] => keygen(Path::new(out), KeyPurpose::Models),
+        ["keygen", out, "advisory"] => keygen(Path::new(out), KeyPurpose::Advisory),
+        ["sign-advisory", key, payload, rest @ ..] => {
+            advisory_bounds(rest).and_then(|b| sign_advisory(Path::new(key), Path::new(payload), b))
+        }
+        ["verify-advisory", envelope, key_hex, rest @ ..] => {
+            advisory_bounds(rest).and_then(|b| verify_advisory(Path::new(envelope), key_hex, b))
+        }
         ["sign", key, payload] => sign(Path::new(key), Path::new(payload)),
         ["sign-all", key, rest @ ..] => sign_all(Path::new(key), rest),
         ["verify", envelope, key_hex] => verify(Path::new(envelope), key_hex),
         ["sign-blocklist", key, payload] => sign_blocklist(Path::new(key), Path::new(payload)),
+        ["sign-models", key, payload] => sign_models(Path::new(key), Path::new(payload)),
+        ["verify-models", envelope, key_hex] => verify_models(Path::new(envelope), key_hex),
         ["verify-blocklist", envelope, key_hex] => {
             verify_blocklist(Path::new(envelope), key_hex)
         }
@@ -140,7 +151,26 @@ patanyx-sign -- publisher tooling for the signed update channel
   verify <envelope.json> <key-hex> check an update envelope as the browser does
 
   sign-blocklist   <key-file> <payload.json>  sign a BLOCKLIST payload
+  sign-models      <key-file> <payload.json>  sign a LANGUAGE PACK payload
+  verify-models    <envelope.json> <key-hex>  check a pack envelope
   verify-blocklist <envelope.json> <key-hex>  check a blocklist envelope
+
+  keygen <out-key-file> advisory   generate an ENGINE ADVISORY keypair
+  sign-advisory    <key-file> <payload.json> --baseline <a.b.c.d> [--now <unix>]
+                                   sign an ENGINE ADVISORY: the warning-only
+                                   WebView2 threshold. Its own domain and its
+                                   own key list (ADVISORY_KEYS); it can raise
+                                   a banner and nothing else. --baseline is
+                                   REQUIRED: the client's plausibility bounds
+                                   (major window, future timestamp) are
+                                   applied against it before anything is
+                                   emitted, so an implausible document is a
+                                   signing refusal, never a fleet of refusals.
+  verify-advisory  <envelope.json> <key-hex> [--baseline <a.b.c.d>] [--now <unix>]
+                                   check an advisory envelope. Without
+                                   --baseline this checks SIGNATURE AND SCHEMA
+                                   ONLY and says so; with it, the client's
+                                   bounds are applied as well.
 
 Update and blocklist manifests are signed under DIFFERENT domains and are not
 interchangeable. Signing a blocklist with `sign` produces a manifest the
@@ -271,6 +301,34 @@ fn keygen(out: &Path, purpose: KeyPurpose) -> Result<(), String> {
             println!("Losing it ends minting under this key id; leaking it lets");
             println!("anyone mint tokens every shipped browser accepts.");
         }
+        KeyPurpose::Models => {
+            println!("Paste this into MODEL_KEYS in crates/app/src/updater.rs:");
+            println!();
+            println!("    const MODEL_KEYS: &[&str] =");
+            println!("        &[\"{}\"];", hex::encode(verifying.as_bytes()));
+            println!();
+            println!("This key signs LANGUAGE PACK manifests and nothing else. It may");
+            println!("live on the publishing server, like the blocklist key: a stolen");
+            println!("model key buys a wrong language pack, which a corrected pack");
+            println!("repairs -- while a stolen release key buys arbitrary code on");
+            println!("every install. Keep those costs separate by keeping the keys");
+            println!("separate.");
+        }
+        KeyPurpose::Advisory => {
+            println!("Paste this into ADVISORY_KEYS in crates/app/src/updater.rs:");
+            println!();
+            println!("    const ADVISORY_KEYS: &[&str] =");
+            println!("        &[\"{}\"];", hex::encode(verifying.as_bytes()));
+            println!();
+            println!("This key signs ENGINE ADVISORIES and nothing else: a warning-only");
+            println!("WebView2 threshold the browser raises its banner at. It may live on");
+            println!("the publishing server beside the blocklist key, because the worst a");
+            println!("stolen advisory key buys is a false banner on Windows until the key");
+            println!("is dropped from ADVISORY_KEYS in a release -- the client keeps");
+            println!("advisory floors under the key that signed them, so revoking the key");
+            println!("removes them. It must NEVER appear in PUBLISHER_KEYS, BLOCKLIST_KEYS");
+            println!("or MODEL_KEYS; a unit test asserts the sets are disjoint.");
+        }
         KeyPurpose::Blocklist => {
             println!("Paste this into BLOCKLIST_KEYS in crates/app/src/updater.rs:");
             println!();
@@ -301,6 +359,15 @@ enum KeyPurpose {
     Licence,
     Release,
     Blocklist,
+    /// The LANGUAGE PACK feed. Decided 2026-08-31: its own key,
+    /// authorising model-feed artifacts only. Never reuse the release,
+    /// blocklist or licence key -- the whole point is that losing one cannot
+    /// buy the others' authority.
+    Models,
+    /// The ENGINE ADVISORY: warning-only WebView2 threshold, signed hourly by
+    /// an unattended monitor. Same server-side terms as the blocklist key,
+    /// and the same rule: never any other list.
+    Advisory,
 }
 
 /// Owner-only permissions on the key file.
@@ -541,6 +608,247 @@ fn sign_blocklist(key_path: &Path, payload_path: &Path) -> Result<(), String> {
     println!(
         "{}",
         String::from_utf8(bytes).map_err(|e| format!("envelope is not utf-8: {e}"))?
+    );
+    Ok(())
+}
+
+/// Sign a LANGUAGE PACK payload.
+///
+/// A third signer rather than a flag on the others, matching the verifiers it
+/// pairs with: each hard-wires its own domain, so signing in the wrong class
+/// is a visibly wrong command instead of an argument nobody reads.
+fn sign_models(key_path: &Path, payload_path: &Path) -> Result<(), String> {
+    let signing = read_signing_key(key_path)?;
+    let payload = fs::read_to_string(payload_path)
+        .map_err(|e| format!("reading {}: {e}", payload_path.display()))?;
+    let payload = payload.trim().to_string();
+
+    let mut message = Vec::with_capacity(SIGNING_DOMAIN_MODELS.len() + payload.len());
+    message.extend_from_slice(SIGNING_DOMAIN_MODELS);
+    message.extend_from_slice(payload.as_bytes());
+    let signature = signing.sign(&message);
+
+    let envelope = serde_json::json!({
+        "v": 1,
+        "payload": payload,
+        "sig": hex::encode(&signature.to_bytes()),
+    });
+    let bytes = serde_json::to_vec_pretty(&envelope)
+        .map_err(|e| format!("serialising the envelope: {e}"))?;
+
+    // THE SELF-CHECK IS THE POINT OF SIGNING THROUGH THIS TOOL. A malformed
+    // pair, a non-https url, a zero size or a truncated hash fails HERE, at
+    // the desk of whoever is publishing, rather than in front of every user
+    // whose translation then cannot start.
+    let keys = TrustedKeys::new(vec![signing.verifying_key()])
+        .map_err(|e| format!("the key derived from {} is not usable: {e}", key_path.display()))?;
+    let manifest = verify_model_manifest(&bytes, &keys).map_err(|e| {
+        format!(
+            "REFUSING TO EMIT: the browser would reject this pack manifest -- {e}\n\
+             Nothing was written. Fix {} and sign again.",
+            payload_path.display()
+        )
+    })?;
+
+    eprintln!(
+        "verified: pack {} ({} bytes) -> {}",
+        manifest.pair(),
+        manifest.size(),
+        manifest.url()
+    );
+    println!(
+        "{}",
+        String::from_utf8(bytes).map_err(|e| format!("envelope is not utf-8: {e}"))?
+    );
+    Ok(())
+}
+
+/// The client's plausibility inputs, from the command line.
+///
+/// `--baseline a.b.c.d` is the compiled WebView2 floor the bounds are judged
+/// against (the client judges against ITS compiled constant; the publisher
+/// passes the floor it knows the fleet carries). `--now <unix>` overrides
+/// the clock, for tests and for signing a document with a deliberate
+/// timestamp; the default is the system clock.
+struct AdvisoryBounds {
+    baseline: Option<[u32; 4]>,
+    now: u64,
+}
+
+fn advisory_bounds(args: &[&str]) -> Result<AdvisoryBounds, String> {
+    let mut bounds = AdvisoryBounds {
+        baseline: None,
+        now: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0),
+    };
+    let mut it = args.iter();
+    while let Some(flag) = it.next() {
+        match *flag {
+            "--baseline" => {
+                let text = it.next().ok_or("--baseline needs a.b.c.d")?;
+                let parts: Vec<u32> = text
+                    .split('.')
+                    .map(|p| p.parse::<u32>().map_err(|_| format!("--baseline {text:?} is not four decimal fields")))
+                    .collect::<Result<_, _>>()?;
+                if parts.len() != 4 {
+                    return Err(format!("--baseline {text:?} must be exactly four fields"));
+                }
+                bounds.baseline = Some([parts[0], parts[1], parts[2], parts[3]]);
+            }
+            "--now" => {
+                let text = it.next().ok_or("--now needs a unix timestamp")?;
+                bounds.now = text.parse().map_err(|_| format!("--now {text:?} is not a number"))?;
+            }
+            other => return Err(format!("unknown argument {other:?}")),
+        }
+    }
+    Ok(bounds)
+}
+
+/// Sign an ENGINE ADVISORY payload.
+///
+/// Fourth signer, fourth hard-wired domain. The payload is small and closed:
+///
+/// ```json
+/// {"engine":"webview2","floor":"152.0.4191.66","published_at":1757570000,
+///  "reason":"CVE-2026-87491"}
+/// ```
+///
+/// The self-check runs the browser's own advisory verifier, so a three-field
+/// floor, another engine name, a zero timestamp or a control character in
+/// the reason fails HERE and nothing is written. THE CLIENT'S PLAUSIBILITY
+/// BOUNDS ARE APPLIED TOO, against the `--baseline` the caller names: a
+/// floor more than `ADVISORY_MAX_MAJOR_AHEAD` majors past it, or a
+/// `published_at` further ahead of `--now` than the client tolerates, is a
+/// signing refusal. `--baseline` is required for exactly that reason -- a
+/// signer that could not apply the client's policy would let a publisher
+/// mistake become a fleet-wide refusal discovered by users.
+fn sign_advisory(
+    key_path: &Path,
+    payload_path: &Path,
+    bounds: AdvisoryBounds,
+) -> Result<(), String> {
+    let Some(baseline) = bounds.baseline else {
+        return Err("sign-advisory requires --baseline <a.b.c.d>: the compiled WebView2 floor \
+                    the client's plausibility bounds are judged against"
+            .to_string());
+    };
+    let signing = read_signing_key(key_path)?;
+    let payload = fs::read_to_string(payload_path)
+        .map_err(|e| format!("reading {}: {e}", payload_path.display()))?;
+    let payload = payload.trim().to_string();
+
+    let mut message = Vec::with_capacity(SIGNING_DOMAIN_ADVISORY.len() + payload.len());
+    message.extend_from_slice(SIGNING_DOMAIN_ADVISORY);
+    message.extend_from_slice(payload.as_bytes());
+    let signature = signing.sign(&message);
+
+    let envelope = serde_json::json!({
+        "v": 1,
+        "payload": payload,
+        "sig": hex::encode(&signature.to_bytes()),
+    });
+    let bytes = serde_json::to_vec_pretty(&envelope)
+        .map_err(|e| format!("serialising the envelope: {e}"))?;
+
+    let keys = TrustedKeys::new(vec![signing.verifying_key()])
+        .map_err(|e| format!("the key derived from {} is not usable: {e}", key_path.display()))?;
+    let manifest = verify_advisory_manifest(&bytes, &keys).map_err(|e| {
+        format!(
+            "REFUSING TO EMIT: the browser would reject this engine advisory -- {e}\n\
+             Nothing was written. Fix {} and sign again.",
+            payload_path.display()
+        )
+    })?;
+    manifest.check_plausible(&baseline, bounds.now).map_err(|e| {
+        format!(
+            "REFUSING TO EMIT: a client compiled at {} would reject this engine advisory as \
+             implausible -- {e}\nNothing was written. Fix {} and sign again.",
+            join4(&baseline),
+            payload_path.display()
+        )
+    })?;
+
+    eprintln!(
+        "verified: engine advisory webview2 {} ({}) published_at {} key {} -- signature, \
+         schema and client bounds against baseline {}",
+        join4(manifest.webview2()),
+        manifest.reason(),
+        manifest.published_at(),
+        hex::encode(manifest.verified_by()),
+        join4(&baseline)
+    );
+    println!(
+        "{}",
+        String::from_utf8(bytes).map_err(|e| format!("envelope is not utf-8: {e}"))?
+    );
+    Ok(())
+}
+
+/// Check a published engine advisory.
+///
+/// Signature and schema always; the client's plausibility bounds only when
+/// `--baseline` names the compiled floor to judge against, and the output
+/// says which of the two checks ran. "accepted" without a baseline means the
+/// bytes are authentic and well formed, NOT that every client will act on
+/// them: a client whose compiled floor is more than the major window behind
+/// keeps its own floor.
+fn verify_advisory(
+    envelope_path: &Path,
+    key_hex: &str,
+    bounds: AdvisoryBounds,
+) -> Result<(), String> {
+    let bytes =
+        fs::read(envelope_path).map_err(|e| format!("reading {}: {e}", envelope_path.display()))?;
+    let keys = TrustedKeys::from_hex(&[key_hex])
+        .map_err(|e| format!("the verifying key is not usable: {e}"))?;
+    let manifest = verify_advisory_manifest(&bytes, &keys)
+        .map_err(|e| format!("the browser would REJECT this engine advisory: {e}"))?;
+    let scope = match bounds.baseline {
+        Some(baseline) => {
+            manifest.check_plausible(&baseline, bounds.now).map_err(|e| {
+                format!(
+                    "signature and schema verify, but a client compiled at {} would REJECT this \
+                     engine advisory as implausible: {e}",
+                    join4(&baseline)
+                )
+            })?;
+            format!("signature, schema and client bounds against baseline {}", join4(&baseline))
+        }
+        None => "SIGNATURE AND SCHEMA ONLY -- client plausibility bounds not checked \
+                 (pass --baseline <a.b.c.d> to apply them)"
+            .to_string(),
+    };
+    println!(
+        "accepted: engine advisory webview2 {}\n  reason:       {}\n  published_at: {}\n  key:          {}\n  checked:      {}",
+        join4(manifest.webview2()),
+        manifest.reason(),
+        manifest.published_at(),
+        hex::encode(manifest.verified_by()),
+        scope
+    );
+    Ok(())
+}
+
+fn join4(v: &[u32; 4]) -> String {
+    format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3])
+}
+
+/// Check a published pack envelope exactly as the browser will.
+fn verify_models(envelope_path: &Path, key_hex: &str) -> Result<(), String> {
+    let bytes =
+        fs::read(envelope_path).map_err(|e| format!("reading {}: {e}", envelope_path.display()))?;
+    let keys = TrustedKeys::from_hex(&[key_hex])
+        .map_err(|e| format!("the verifying key is not usable: {e}"))?;
+    let manifest = verify_model_manifest(&bytes, &keys)
+        .map_err(|e| format!("the browser would REJECT this pack manifest: {e}"))?;
+    println!(
+        "OK: pack {} ({} bytes) -> {}",
+        manifest.pair(),
+        manifest.size(),
+        manifest.url()
     );
     Ok(())
 }

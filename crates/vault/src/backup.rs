@@ -171,6 +171,47 @@ fn fresh_backup_path(vault_path: &Path) -> Result<PathBuf, BackupError> {
     .into())
 }
 
+/// Remove EVERY backup of this vault. Called after a passphrase rotation: each
+/// backup on disk is a byte copy of a file under the OLD passphrase, so the
+/// UI's "the old passphrase no longer works" was false for up to five files
+/// beside the vault (pentest F-002). The next ordinary save recreates one
+/// under the new passphrase.
+pub fn retire_backups(vault_path: &Path) -> Result<(), BackupError> {
+    // EVERYTHING wearing the backup prefix, not only the stamped files
+    // prune_backups counts: an interrupted backup write leaves a complete
+    // ciphertext as `<name>.bak-<stamp>.tmp` (atomic_write syncs before it
+    // renames), and that file opens with the old passphrase just the same.
+    let dir = vault_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let prefix = format!("{}{BACKUP_SUFFIX}", vault_file_name(vault_path)?);
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.starts_with(prefix.as_str()) {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+    }
+    // The deletions must reach the platter before "retired" is reported:
+    // a power cut after the unlinks but before the directory is written
+    // back would resurrect an old-passphrase file (review round 3, R-003).
+    // Directory fsync is a Unix notion; Windows has no equivalent to call.
+    #[cfg(unix)]
+    {
+        let dir_path = vault_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        fs::File::open(dir_path)?.sync_all()?;
+    }
+    Ok(())
+}
+
 fn prune_backups(vault_path: &Path, max_backups: usize) -> Result<(), BackupError> {
     let dir = vault_path
         .parent()
@@ -584,8 +625,31 @@ impl Vault {
         // exactly like unlock.
         let index = matched.ok_or(VaultError::AuthFailed)?;
         let new_slot = self.build_slot(SlotKind::Passphrase, new.as_bytes(), &[])?;
+        // ROLLBACK-SAFE, and WITHOUT a backup of the old file. The slot used
+        // to be replaced and then saved with no way back: a failed save left
+        // memory under the new passphrase and disk under the old, and the
+        // next successful save silently committed a change the UI had
+        // reported as failed (pentest F-004). And the ordinary save copies
+        // the old file to a backup first, which after a rotation is a
+        // complete vault under the passphrase the user just retired
+        // (pentest F-002).
+        let old_slot = self.slots_ref()[index].clone();
         self.replace_slot(index, new_slot);
-        self.save()
+        if let Err(e) = self.save_inner(false) {
+            self.replace_slot(index, old_slot);
+            return Err(e);
+        }
+        // Retirement failing is NOT success: the rotation is committed and
+        // consistent, but a file the old passphrase opens is still beside the
+        // vault. Reported as its own outcome, never swallowed into
+        // last_backup_error where the next ordinary save would erase it.
+        match retire_backups(&self.path) {
+            Ok(()) => {
+                self.last_backup_error = None;
+                Ok(())
+            }
+            Err(e) => Err(VaultError::BackupsRetained(e.to_string())),
+        }
     }
 
     /// Mint a recovery key for a vault that has none, and return it once.
@@ -657,6 +721,79 @@ impl Vault {
 
 #[cfg(test)]
 mod tests {
+    fn rekey_path(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("patanyx-vault-rekey-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("vault.rbv")
+    }
+    fn backups_of(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let prefix = format!("{}{BACKUP_SUFFIX}", path.file_name().unwrap().to_str().unwrap());
+        let mut v: Vec<std::path::PathBuf> = std::fs::read_dir(path.parent().unwrap()).unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(&prefix)))
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// Pentest F-002. A rotation leaves NO backup that the old passphrase
+    /// opens, and creates none of its own.
+    #[test]
+    fn a_passphrase_rotation_retires_every_old_passphrase_backup() {
+        let path = rekey_path("retire");
+        let (mut vault, _rk) = crate::Vault::create(&path, "old-pass").unwrap();
+        vault.save().unwrap();
+        vault.save().unwrap();
+        assert!(!backups_of(&path).is_empty(), "precondition: backups exist under the old passphrase");
+        // An interrupted backup write: a complete old-passphrase ciphertext
+        // under a .tmp name, which the stamped-only pruning walked past.
+        let leftover = path.with_file_name(format!("vault.rbv{BACKUP_SUFFIX}1700000000000.tmp"));
+        std::fs::copy(&path, &leftover).unwrap();
+        vault.change_passphrase("old-pass", "new-pass").unwrap();
+        assert!(backups_of(&path).is_empty(), "a backup under the old passphrase survived the rotation");
+        assert!(!leftover.exists(), "a .tmp backup under the old passphrase survived the rotation");
+        drop(vault); // one process per vault: release before reopening
+        let reopened = crate::Vault::unlock(&path, "new-pass");
+        assert!(reopened.is_ok(), "the new passphrase must open the vault");
+        drop(reopened);
+        assert!(crate::Vault::unlock(&path, "old-pass").is_err(), "the old passphrase still opens the vault");
+    }
+
+    /// Review R-001. If a backup cannot be removed, the rotation is still
+    /// committed (new passphrase opens the vault) but it is reported as
+    /// BackupsRetained, never as plain success.
+    #[test]
+    fn a_rotation_that_cannot_retire_a_backup_says_so() {
+        let path = rekey_path("retained");
+        let (mut vault, _rk) = crate::Vault::create(&path, "old-pass").unwrap();
+        vault.save().unwrap();
+        // A directory wearing a backup's name: remove_file refuses it.
+        let stuck = path.with_file_name(format!("vault.rbv{BACKUP_SUFFIX}1"));
+        std::fs::create_dir(&stuck).unwrap();
+        let outcome = vault.change_passphrase("old-pass", "new-pass");
+        assert!(matches!(outcome, Err(crate::VaultError::BackupsRetained(_))), "got {outcome:?}");
+        drop(vault);
+        assert!(crate::Vault::unlock(&path, "new-pass").is_ok(), "the rotation must still be committed");
+        let _ = std::fs::remove_dir(&stuck);
+    }
+
+    /// Pentest F-004. A rotation whose save fails leaves memory AND disk under
+    /// the old passphrase: the next ordinary save must not commit the new one.
+    #[test]
+    fn a_failed_rotation_rolls_the_slot_back() {
+        let path = rekey_path("rollback");
+        let (mut vault, _rk) = crate::Vault::create(&path, "old-pass").unwrap();
+        vault.fail_next_save_for_test();
+        assert!(vault.change_passphrase("old-pass", "new-pass").is_err(), "the injected failure must surface");
+        vault.save().unwrap();
+        drop(vault);
+        let reopened = crate::Vault::unlock(&path, "old-pass");
+        assert!(reopened.is_ok(), "the failed rotation was committed by a later save");
+        drop(reopened);
+        assert!(crate::Vault::unlock(&path, "new-pass").is_err());
+    }
+
     use super::*;
     use std::fs;
     use std::path::Path;
@@ -1235,9 +1372,16 @@ mod tests {
         });
         let err = crate::Vault::parse_payload(&serde_json::to_vec(&plaintext).unwrap())
             .expect_err("a newer schema must be refused");
+        // The message must name BOTH numbers and must NOT suggest damage: a
+        // reader has to be able to tell "use your other build" from "your
+        // vault may be lost" without help.
+        let text = format!("{err}");
+        assert!(text.contains("newer PATANYX"), "got {text}");
+        let newer = format!("schema {}", crate::model::SCHEMA_VERSION + 1);
+        assert!(text.contains(&newer), "must name what it found: {text}");
         assert!(
-            format!("{err}").contains("unsupported payload schema"),
-            "got {err}"
+            !text.contains("damaged") && !text.contains("invalid"),
+            "must not imply the file is broken: {text}"
         );
         assert_eq!(
             std::fs::read(&path).unwrap(),

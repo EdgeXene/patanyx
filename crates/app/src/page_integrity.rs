@@ -50,7 +50,10 @@ use crate::state::AppState;
 /// cause (page still loading).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PageBytesError {
-    /// No main resource at all (e.g. about:blank).
+    /// No SERVER document at all: about:blank, or the tab is showing the
+    /// adlist placeholder this binary loaded in place of a refused page
+    /// (both platforms exclude it; Windows by response nonce, Linux by
+    /// byte identity).
     NoMainResource,
     /// Resource exceeded patanyx-integrity's input cap.
     TooLarge,
@@ -87,6 +90,9 @@ enum Pending {
         url: String,
         baseline: ContentDigest,
         baseline_fetched_at: u64,
+        baseline_text: Option<String>,
+        baseline_text_trimmed: bool,
+        target: CheckTarget,
     },
     MarkSeen {
         url: String,
@@ -137,6 +143,27 @@ enum Pending {
     },
 }
 
+#[derive(Clone)]
+enum CheckTarget {
+    Active,
+    Bookmark {
+        bookmark_id: String,
+        snapshot_id: String,
+        temporary_tab_id: Option<u64>,
+    },
+}
+
+impl CheckTarget {
+    fn temporary_tab_id(&self) -> Option<u64> {
+        match self {
+            CheckTarget::Bookmark {
+                temporary_tab_id, ..
+            } => *temporary_tab_id,
+            CheckTarget::Active => None,
+        }
+    }
+}
+
 #[cfg(feature = "chat")]
 impl Pending {
     fn is_corroboration(&self) -> bool {
@@ -153,6 +180,13 @@ impl Pending {
 pub struct IntegrityState {
     next_token: u64,
     pending: HashMap<u64, Pending>,
+    /// Bookmark-row checks whose temporary background tab is still loading,
+    /// keyed by that tab id. They move into `pending` only after LoadFinished.
+    waiting_checks: HashMap<u64, Pending>,
+    /// Hashes/text waiting for the native page capture that will optionally
+    /// accompany them. One slot matches capture::CAPTURE_IN_FLIGHT: a second
+    /// snapshot may save without a picture, but can never replace this one.
+    snapshot_capture: Option<SnapshotDraft>,
     /// Requests WE sent, keyed by peer hash, so a reply can be turned into a
     /// verdict. Memory only: nothing is stored, so a locked vault or a
     /// restarted app simply forgets a comparison was ever asked.
@@ -170,12 +204,22 @@ impl Default for IntegrityState {
         Self {
             next_token: 0,
             pending: HashMap::new(),
+            waiting_checks: HashMap::new(),
+            snapshot_capture: None,
             #[cfg(feature = "chat")]
             pending_corroborations: HashMap::new(),
             #[cfg(feature = "chat")]
             pending_changes: HashMap::new(),
         }
     }
+}
+
+struct SnapshotDraft {
+    url: String,
+    bookmark_id: String,
+    digest: ContentDigest,
+    visible_text: String,
+    fetched_at: u64,
 }
 
 impl IntegrityState {
@@ -220,24 +264,32 @@ fn bookmark_id_for(state: &AppState, url: &str) -> Option<String> {
 fn stored_snapshot(state: &AppState, url: &str) -> Option<(String, ContentDigest, u64)> {
     let store = state.store.as_ref()?;
     let bookmark = store.bookmarks().iter().find(|b| b.url == url)?;
-    let recorded = bookmark.digest.as_ref()?;
-    Some((
-        bookmark.id.clone(),
-        recorded.digest.clone(),
-        recorded.recorded_at,
-    ))
+    let recorded = store.page_snapshot_for(&bookmark.id, None).ok()??;
+    Some((bookmark.id.clone(), recorded.digest, recorded.recorded_at))
 }
 
 fn save_snapshot(
     state: &mut AppState,
     bookmark_id: &str,
     digest: &ContentDigest,
-    _fetched_at: u64,
-) -> Result<(), &'static str> {
-    // `mark_seen` stamps its own `recorded_at`, so the caller's fetch time is
-    // deliberately not threaded through — one clock, owned by the store.
+    visible_text: &str,
+    picture: Option<(&[u8], &'static str)>,
+) -> Result<patanyx_store::PageSnapshot, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
     let store = state.store.as_mut().ok_or("not_unlocked")?;
-    store.mark_seen(bookmark_id, digest.clone()).map_err(|_| "io")
+    match picture {
+        Some((png, scope)) => store.save_page_snapshot_with_picture(
+            bookmark_id,
+            digest.clone(),
+            visible_text,
+            png,
+            scope,
+        ),
+        None => store.save_page_snapshot(bookmark_id, digest.clone(), visible_text),
+    }
+    .map_err(|_| "io")
 }
 
 // ---------------------------------------------------------------------------
@@ -266,7 +318,6 @@ fn tab_url_for_normalized(state: &AppState, want_normalized: &str) -> Option<Str
     })
 }
 
-#[cfg(feature = "chat")]
 fn tab_webview_for_url<'a>(state: &'a AppState, typed_url: &str) -> Option<&'a wry::WebView> {
     // Note: `tab.url` / `tab.webview` field names assumed.
     state
@@ -337,37 +388,209 @@ fn emit_op_error(state: &AppState, op: &'static str, code: &'static str) {
 /// can disable and EXPLAIN a control the platform cannot honour, exactly
 /// like `network_blocking_supported`.
 pub fn ipc_status(state: &mut AppState) -> Result<Value, &'static str> {
+    let snapshots = if state.vault.is_some() {
+        bookmark_id_for(state, &state.active_url())
+            .and_then(|id| state.store.as_ref()?.page_snapshots_for(&id).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(|snapshot| {
+                json!({
+                    "id": snapshot.id,
+                    "recorded_at": snapshot.recorded_at,
+                    "text_available": snapshot.text.is_some(),
+                    "text_trimmed": snapshot.text_trimmed,
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     Ok(json!({
         "supported": crate::platform::page_bytes_supported(),
         "chat": cfg!(feature = "chat"),
         "active_url": state.active_url(),
+        "snapshots": snapshots,
     }))
 }
 
 /// `integrity_check` — compare the active page against the snapshot stored
 /// with its bookmark. The verdict arrives as a `page_check_result` event.
-pub fn ipc_check(state: &mut AppState) -> Result<Value, &'static str> {
+pub fn ipc_check(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
     let url = state.active_url();
     // Two distinct refusals, because the user-facing next step differs:
     // bookmark the page vs. save a snapshot for a bookmark that has none.
     bookmark_id_for(state, &url).ok_or("not_bookmarked")?;
-    let (_id, baseline, baseline_fetched_at) =
-        stored_snapshot(state, &url).ok_or("no_snapshot")?;
+    let bookmark_id = bookmark_id_for(state, &url).ok_or("not_bookmarked")?;
+    let selected = args.get("snapshot_id").and_then(Value::as_str);
+    let snapshot = state
+        .store
+        .as_ref()
+        .ok_or("not_unlocked")?
+        .page_snapshot_for(&bookmark_id, selected)
+        .map_err(|_| "io")?
+        .ok_or("no_snapshot")?;
     begin_fetch_for_active(
         state,
         Pending::Check {
             url,
-            baseline,
-            baseline_fetched_at,
+            baseline: snapshot.digest,
+            baseline_fetched_at: snapshot.recorded_at,
+            baseline_text: snapshot.text,
+            baseline_text_trimmed: snapshot.text_trimmed,
+            target: CheckTarget::Active,
         },
     )?;
     Ok(json!({}))
+}
+
+/// `integrity_check_bookmark` — the Library-row entry point. It resolves the
+/// bookmark and chosen baseline through the unlocked encrypted store, then
+/// reads engine-received bytes from an already loaded tab at that exact URL.
+/// It never re-fetches with a second HTTP stack and never injects script.
+pub fn ipc_check_bookmark(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
+    let bookmark_id = args
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .ok_or("not_bookmarked")?
+        .to_string();
+    let selected = args.get("snapshot_id").and_then(Value::as_str);
+    let (url, snapshot) = resolve_bookmark_target(
+        state.store.as_ref().ok_or("not_unlocked")?,
+        &bookmark_id,
+        selected,
+    )?;
+    if !crate::platform::page_bytes_supported() {
+        return Err("unsupported");
+    }
+    if tab_webview_for_url(state, &url).is_some() {
+        let target = CheckTarget::Bookmark {
+            bookmark_id,
+            snapshot_id: snapshot.id.clone(),
+            temporary_tab_id: None,
+        };
+        let token = state.integrity.issue(Pending::Check {
+            url: url.clone(),
+            baseline: snapshot.digest,
+            baseline_fetched_at: snapshot.recorded_at,
+            baseline_text: snapshot.text,
+            baseline_text_trimmed: snapshot.text_trimmed,
+            target,
+        });
+        let proxy = state.proxy();
+        let webview = tab_webview_for_url(state, &url).ok_or("fetch_failed")?;
+        crate::platform::request_main_resource_bytes(webview, token, &proxy);
+    } else {
+        if !crate::state::is_allowed_content_url(&url) {
+            return Err("fetch_failed");
+        }
+        if state.tabs.len() >= crate::state::MAX_TABS {
+            return Err("fetch_failed");
+        }
+        let tab_id = state.new_tab(&url, false).map_err(|_| "fetch_failed")?;
+        state.integrity.waiting_checks.insert(
+            tab_id,
+            Pending::Check {
+                url,
+                baseline: snapshot.digest,
+                baseline_fetched_at: snapshot.recorded_at,
+                baseline_text: snapshot.text,
+                baseline_text_trimmed: snapshot.text_trimmed,
+                target: CheckTarget::Bookmark {
+                    bookmark_id,
+                    snapshot_id: snapshot.id,
+                    temporary_tab_id: Some(tab_id),
+                },
+            },
+        );
+    }
+    Ok(json!({}))
+}
+
+/// Continue a Library check after its temporary engine tab finishes loading.
+/// This is the same byte source active-tab comparison uses; the temporary tab
+/// merely gives the bookmark URL an engine-owned main resource to read.
+pub fn on_tab_load_state(state: &mut AppState, tab_id: u64, loading: bool) {
+    if loading {
+        return;
+    }
+    let Some(purpose) = state.integrity.waiting_checks.remove(&tab_id) else {
+        return;
+    };
+    if state.vault.is_none() {
+        let _ = state.close_tab(tab_id);
+        return;
+    }
+    let target = match &purpose {
+        Pending::Check { target, .. } => target.clone(),
+        _ => return,
+    };
+    if !state.tabs.iter().any(|tab| tab.id == tab_id) {
+        emit_check_error(state, &target, "fetch_failed");
+        return;
+    }
+    let token = state.integrity.issue(purpose);
+    let proxy = state.proxy();
+    let Some(webview) = state
+        .tabs
+        .iter()
+        .find(|tab| tab.id == tab_id)
+        .map(|tab| &tab.webview)
+    else {
+        state.integrity.pending.remove(&token);
+        emit_check_error(state, &target, "fetch_failed");
+        return;
+    };
+    crate::platform::request_main_resource_bytes(webview, token, &proxy);
+}
+
+pub fn on_tab_closed(state: &mut AppState, tab_id: u64) {
+    let mut interrupted = Vec::new();
+    if let Some(Pending::Check { target, .. }) = state.integrity.waiting_checks.remove(&tab_id) {
+        interrupted.push(target);
+    }
+    state.integrity.pending.retain(|_, purpose| {
+        if let Pending::Check { target, .. } = purpose {
+            if target.temporary_tab_id() == Some(tab_id) {
+                interrupted.push(target.clone());
+                return false;
+            }
+        }
+        true
+    });
+    for target in interrupted {
+        emit_check_error(state, &target, "fetch_failed");
+    }
+}
+
+fn resolve_bookmark_target(
+    store: &patanyx_store::Store,
+    bookmark_id: &str,
+    snapshot_id: Option<&str>,
+) -> Result<(String, patanyx_store::PageSnapshot), &'static str> {
+    let bookmark = store
+        .get_bookmark(bookmark_id)
+        .ok_or("not_bookmarked")?;
+    let snapshot = store
+        .page_snapshot_for(bookmark_id, snapshot_id)
+        .map_err(|_| "io")?
+        .ok_or("no_snapshot")?;
+    Ok((bookmark.url.clone(), snapshot))
 }
 
 /// `integrity_mark_seen` — digest the active page and store the result as
 /// the bookmark's baseline ("this is what I saw"). Confirmed by a
 /// `page_marked_seen` event.
 pub fn ipc_mark_seen(state: &mut AppState) -> Result<Value, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
     let url = state.active_url();
     let bookmark_id = bookmark_id_for(state, &url).ok_or("not_bookmarked")?;
     begin_fetch_for_active(state, Pending::MarkSeen { url, bookmark_id })?;
@@ -468,7 +691,19 @@ pub fn handle_event(state: &mut AppState, event: IntegrityEvent) {
                     url,
                     baseline,
                     baseline_fetched_at,
-                } => finish_check(state, url, baseline, baseline_fetched_at, result),
+                    baseline_text,
+                    baseline_text_trimmed,
+                    target,
+                } => finish_check(
+                    state,
+                    url,
+                    baseline,
+                    baseline_fetched_at,
+                    baseline_text,
+                    baseline_text_trimmed,
+                    target,
+                    result,
+                ),
                 Pending::MarkSeen { url, bookmark_id } => {
                     finish_mark_seen(state, url, bookmark_id, result)
                 }
@@ -526,37 +761,197 @@ pub fn handle_event(state: &mut AppState, event: IntegrityEvent) {
 }
 
 fn finish_check(
-    state: &AppState,
+    state: &mut AppState,
     url: String,
     baseline: ContentDigest,
     baseline_fetched_at: u64,
+    baseline_text: Option<String>,
+    baseline_text_trimmed: bool,
+    target: CheckTarget,
     result: Result<Vec<u8>, PageBytesError>,
 ) {
+    if let Some(tab_id) = target.temporary_tab_id() {
+        let _ = state.close_tab(tab_id);
+    }
+    // Snapshot text is vault data. A lock between the click and the engine's
+    // asynchronous answer turns the answer into a quiet drop: no diff and no
+    // stored passage is emitted into the locked chrome document.
+    if state.vault.is_none() {
+        return;
+    }
     let bytes = match result {
         Ok(bytes) => bytes,
-        Err(e) => return emit_op_error(state, "check", bytes_error_code(&e)),
+        Err(e) => {
+            return emit_check_error(
+                state,
+                &target,
+                match &target {
+                    CheckTarget::Active => bytes_error_code(&e),
+                    CheckTarget::Bookmark { .. } => "fetch_failed",
+                },
+            )
+        }
     };
     // digest() fails only on oversize input, and the platform layer already
     // caps at the same limit — this is defence in depth, not a live path.
     let fresh = match digest(&bytes) {
         Ok(fresh) => fresh,
-        Err(_) => return emit_op_error(state, "check", "too_long"),
+        Err(_) => return emit_check_error(state, &target, "too_long"),
+    };
+    let fresh_text = match patanyx_integrity::visible_text(&bytes) {
+        Ok(text) => text,
+        Err(_) => return emit_check_error(state, &target, "too_long"),
     };
     let (verdict, similarity) = match compare(&baseline, &fresh) {
         IntegrityVerdict::Identical => ("identical", None),
         IntegrityVerdict::StructureDiffers => ("structure_differs", None),
         IntegrityVerdict::TextDiffers { similarity } => ("text_differs", Some(similarity)),
     };
-    state.emit(
-        "page_check_result",
-        json!({
-            "url": url,
-            "verdict": verdict,
-            "similarity": similarity,
-            "baseline_fetched_at": baseline_fetched_at,
-            "checked_at": now_secs(),
-        }),
+    let evidence = text_evidence(
+        baseline_text.as_deref(),
+        baseline_text_trimmed,
+        &fresh_text,
     );
+    let mut payload = json!({
+        "url": url,
+        "verdict": verdict,
+        "similarity": similarity,
+        "baseline_fetched_at": baseline_fetched_at,
+        "checked_at": now_secs(),
+        "text_comparison": evidence,
+    });
+    match target {
+        CheckTarget::Active => state.emit("page_check_result", payload),
+        CheckTarget::Bookmark {
+            bookmark_id,
+            snapshot_id,
+            ..
+        } => {
+            payload["bookmark_id"] = json!(bookmark_id);
+            payload["snapshot_id"] = json!(snapshot_id);
+            state.emit("bookmark_check_result", payload);
+        }
+    }
+}
+
+fn emit_check_error(state: &AppState, target: &CheckTarget, code: &'static str) {
+    match target {
+        CheckTarget::Active => emit_op_error(state, "check", code),
+        CheckTarget::Bookmark {
+            bookmark_id,
+            snapshot_id,
+            ..
+        } => state.emit(
+            "bookmark_check_error",
+            json!({
+                "bookmark_id": bookmark_id,
+                "snapshot_id": snapshot_id,
+                "code": code,
+            }),
+        ),
+    }
+}
+
+const MAX_DIFF_PASSAGES: usize = 20;
+const MAX_DIFF_PASSAGE_CHARS: usize = 500;
+
+/// Human-sized sentence passages. Visible text is whitespace-normalized by
+/// the integrity crate, so line boundaries no longer exist; sentence
+/// boundaries are the least noisy honest granularity. Very long/no-punctuation
+/// runs are split every 40 words to keep one passage from becoming a wall.
+fn passages(text: &str) -> Vec<String> {
+    let mut sentences = Vec::new();
+    let mut current = String::new();
+    let mut words = 0usize;
+    for word in text.split_whitespace() {
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+        words += 1;
+        let sentence_end = word
+            .chars()
+            .last()
+            .is_some_and(|ch| matches!(ch, '.' | '!' | '?'));
+        if sentence_end || words >= 40 {
+            sentences.push(std::mem::take(&mut current));
+            words = 0;
+        }
+    }
+    if !current.is_empty() {
+        sentences.push(current);
+    }
+    sentences
+}
+
+fn multiset_difference(left: &[String], right: &[String]) -> Vec<String> {
+    let mut counts = std::collections::HashMap::<&str, usize>::new();
+    for passage in right {
+        *counts.entry(passage.as_str()).or_default() += 1;
+    }
+    let mut difference = Vec::new();
+    for passage in left {
+        match counts.get_mut(passage.as_str()) {
+            Some(remaining) if *remaining > 0 => *remaining -= 1,
+            _ => difference.push(passage.clone()),
+        }
+    }
+    difference
+}
+
+fn bounded_passages(passages: Vec<String>, max: usize, trimmed: &mut bool) -> Vec<String> {
+    if passages.len() > max {
+        *trimmed = true;
+    }
+    passages
+        .into_iter()
+        .take(max)
+        .map(|passage| {
+            if passage.chars().count() > MAX_DIFF_PASSAGE_CHARS {
+                *trimmed = true;
+                passage.chars().take(MAX_DIFF_PASSAGE_CHARS).collect()
+            } else {
+                passage
+            }
+        })
+        .collect()
+}
+
+fn text_evidence(saved: Option<&str>, saved_text_trimmed: bool, fresh: &str) -> Value {
+    let Some(saved) = saved else {
+        return json!({ "available": false });
+    };
+    let saved_passages = passages(saved);
+    let fresh_capped: String = fresh
+        .chars()
+        .take(patanyx_store::SNAPSHOT_TEXT_MAX_CHARS)
+        .collect();
+    let fresh_text_trimmed = fresh.chars().count() > patanyx_store::SNAPSHOT_TEXT_MAX_CHARS;
+    let fresh_passages = passages(&fresh_capped);
+    let removed_all = multiset_difference(&saved_passages, &fresh_passages);
+    let added_all = multiset_difference(&fresh_passages, &saved_passages);
+    let both = !removed_all.is_empty() && !added_all.is_empty();
+    let removed_max = if both {
+        MAX_DIFF_PASSAGES / 2
+    } else {
+        MAX_DIFF_PASSAGES
+    };
+    let added_max = if both {
+        MAX_DIFF_PASSAGES - removed_max
+    } else {
+        MAX_DIFF_PASSAGES
+    };
+    let mut output_trimmed = false;
+    let removed = bounded_passages(removed_all, removed_max, &mut output_trimmed);
+    let added = bounded_passages(added_all, added_max, &mut output_trimmed);
+    json!({
+        "available": true,
+        "removed": removed,
+        "added": added,
+        "output_trimmed": output_trimmed,
+        "saved_text_trimmed": saved_text_trimmed,
+        "current_text_trimmed": fresh_text_trimmed,
+    })
 }
 
 fn finish_mark_seen(
@@ -573,11 +968,82 @@ fn finish_mark_seen(
         Ok(digest) => digest,
         Err(_) => return emit_op_error(state, "mark_seen", "too_long"),
     };
-    let now = now_secs();
-    match save_snapshot(state, &bookmark_id, &digest, now) {
-        Ok(()) => state.emit("page_marked_seen", json!({ "url": url, "fetched_at": now })),
+    let visible_text = match patanyx_integrity::visible_text(&bytes) {
+        Ok(text) => text,
+        Err(_) => return emit_op_error(state, "mark_seen", "too_long"),
+    };
+    let draft = SnapshotDraft {
+        url,
+        bookmark_id,
+        digest,
+        visible_text,
+        fetched_at: now_secs(),
+    };
+
+    // The integrity evidence is ready before the optional picture. If the
+    // shared capture slot is busy, the tab moved, or there is no capturable
+    // webview, commit that evidence immediately and report the picture as
+    // unavailable instead of turning an image issue into lost change data.
+    let capturable = state.active_url() == draft.url
+        && crate::capture::refuse_capture(&draft.url).is_none()
+        && state.active_webview().is_some();
+    if !capturable
+        || crate::capture::CAPTURE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        commit_snapshot(state, draft, None);
+        return;
+    }
+    state.capture_intent = crate::capture::CaptureIntent::Snapshot;
+    let scope = crate::prefs::load().capture_scope.capture_scope();
+    state.integrity.snapshot_capture = Some(draft);
+    // `capturable` proved this exists and the active URL has not changed.
+    let webview = state.active_webview().expect("capturable webview");
+    crate::platform::capture_page(webview, &state.proxy(), scope);
+}
+
+fn commit_snapshot(
+    state: &mut AppState,
+    draft: SnapshotDraft,
+    picture: Option<(&[u8], crate::capture::CaptureScope)>,
+) {
+    // A lock between either engine answer and this commit destroys the draft
+    // rather than writing or emitting vault data behind the gate.
+    if state.vault.is_none() {
+        return;
+    }
+    let stored = save_snapshot(
+        state,
+        &draft.bookmark_id,
+        &draft.digest,
+        &draft.visible_text,
+        picture.map(|(png, scope)| (png, crate::capture::scope_label(scope))),
+    );
+    match stored {
+        Ok(snapshot) => state.emit(
+            "page_marked_seen",
+            json!({
+                "url": draft.url,
+                "fetched_at": draft.fetched_at,
+                "picture_available": snapshot.has_picture,
+                "picture_scope": snapshot.picture_scope,
+            }),
+        ),
         Err(code) => emit_op_error(state, "mark_seen", code),
     }
+}
+
+/// Finish the optional picture half of a snapshot. `None` covers capture,
+/// validation, and WP-Z bounding failures; all take the same non-fatal path.
+pub fn finish_snapshot_picture(
+    state: &mut AppState,
+    result: Result<Vec<u8>, &'static str>,
+    scope: crate::capture::CaptureScope,
+) {
+    crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
+    let Some(draft) = state.integrity.snapshot_capture.take() else {
+        return;
+    };
+    commit_snapshot(state, draft, result.ok().as_deref().map(|png| (png, scope)));
 }
 
 // ---------------------------------------------------------------------------
@@ -852,6 +1318,46 @@ pub fn on_transport_down(state: &mut AppState) {
     }
     #[cfg(not(feature = "chat"))]
     let _ = state;
+}
+
+/// Drop every local snapshot operation at the vault boundary. In particular,
+/// a `Check` owns cloned stored text while the engine read is in flight; that
+/// text must not survive a lock or later produce a chrome event.
+pub fn on_vault_locked(state: &mut AppState) {
+    // This may hold freshly derived hashes/text while a native picture is
+    // being bounded. Drop it before the lock event can repaint the chrome.
+    state.integrity.snapshot_capture = None;
+    let mut temporary_tabs = state
+        .integrity
+        .waiting_checks
+        .values()
+        .filter_map(|purpose| match purpose {
+            Pending::Check { target, .. } => target.temporary_tab_id(),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    state.integrity.waiting_checks.clear();
+    let remove = state
+        .integrity
+        .pending
+        .iter()
+        .filter_map(|(token, purpose)| match purpose {
+            Pending::Check { target, .. } => {
+                temporary_tabs.extend(target.temporary_tab_id());
+                Some(*token)
+            }
+            Pending::MarkSeen { .. } => Some(*token),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for token in remove {
+        state.integrity.pending.remove(&token);
+    }
+    temporary_tabs.sort_unstable();
+    temporary_tabs.dedup();
+    for tab_id in temporary_tabs {
+        let _ = state.close_tab(tab_id);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1294,6 +1800,62 @@ fn emit_change_error(state: &AppState, code: &'static str) {
         "change_compare_error",
         json!({ "op": "change_compare", "code": code }),
     );
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    use super::*;
+
+    fn page(words: &str) -> ContentDigest {
+        patanyx_integrity::digest(format!("<p>{words}</p>").as_bytes()).unwrap()
+    }
+
+    #[test]
+    fn bookmark_targeted_compare_resolves_the_named_record_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.rbs");
+        let mut store = patanyx_store::Store::create_with_params(&path, "pw", 8192, 1, 1).unwrap();
+        let alpha = store.add_bookmark("https://alpha.test/", "Alpha").unwrap();
+        let beta = store.add_bookmark("https://beta.test/", "Beta").unwrap();
+        let alpha_saved = store
+            .save_page_snapshot(&alpha, page("alpha saved words"), "Alpha saved words.")
+            .unwrap();
+        let beta_saved = store
+            .save_page_snapshot(&beta, page("beta saved words"), "Beta saved words.")
+            .unwrap();
+
+        let (url, selected) =
+            resolve_bookmark_target(&store, &beta, Some(&beta_saved.id)).unwrap();
+        assert_eq!(url, "https://beta.test/");
+        assert_eq!(selected.id, beta_saved.id);
+        assert_eq!(selected.digest, page("beta saved words"));
+        assert_eq!(
+            resolve_bookmark_target(&store, &beta, Some(&alpha_saved.id)),
+            Err("no_snapshot"),
+            "a snapshot for another bookmark URL must not resolve"
+        );
+    }
+
+    #[test]
+    fn pre_text_snapshot_reports_unavailable_instead_of_an_empty_diff() {
+        let evidence = text_evidence(None, false, "Fresh visible text.");
+        assert_eq!(evidence["available"], json!(false));
+        assert!(evidence.get("added").is_none());
+        assert!(evidence.get("removed").is_none());
+    }
+
+    #[test]
+    fn sentence_diff_reports_known_added_and_removed_passages() {
+        let evidence = text_evidence(
+            Some("Keep this sentence. Remove this passage. Shared ending!"),
+            false,
+            "Keep this sentence. Add this passage. Shared ending!",
+        );
+        assert_eq!(evidence["available"], json!(true));
+        assert_eq!(evidence["removed"], json!(["Remove this passage."]));
+        assert_eq!(evidence["added"], json!(["Add this passage."]));
+        assert_eq!(evidence["output_trimmed"], json!(false));
+    }
 }
 
 /// One shape for the matrix, so the chrome never assembles a claim. `text`

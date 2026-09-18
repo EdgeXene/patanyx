@@ -59,7 +59,7 @@ const TAB_STATUS = {
   interception: "registered",
   script_setting: "applied",
   smartscreen_off: "applied",
-  tracking_prevention: "applied",
+  tracking_prevention: "strict",
   navigation_tracking: "applied",
   autofill_off: "applied",
   ephemeral_confirmed: "applied",
@@ -122,6 +122,20 @@ check("every row names its setting and its state", () => {
     text.includes("confirmed by the engine"),
     "no row rendered its state text",
   );
+});
+
+check("tracking prevention names the engine level in force", () => {
+  for (const level of ["strict", "balanced"]) {
+    const rows = rowsAfter({ ...TAB_STATUS, tracking_prevention: level });
+    const row = rows.find((r) =>
+      rowText(r).includes("Engine tracking prevention"),
+    );
+    assert(row, `the ${level} tracking-prevention state lost its row`);
+    assert(
+      rowText(row).includes(level === "strict" ? "Strict" : "Balanced"),
+      `the diagnostic row did not name ${level}: ${rowText(row)}`,
+    );
+  }
 });
 
 check("a REFUSED setting is shown as refused, not omitted", () => {

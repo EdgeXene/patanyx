@@ -16,7 +16,26 @@
 # practice, one machine's habit. Same lesson as smoke.sh silently running a
 # stale binary: a check nobody else can run is not a check.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "GATE FAIL: required tool '$1' was not found; install it to run chrome-js-gate" >&2
+    exit 127
+  }
+}
+
+# Keep this list explicit: a missing test runner or one of the utilities used
+# by the negative controls should fail before the suite starts, by name.
+for tool in node find sort mktemp cp rm grep sed awk; do
+  need "$tool"
+done
+
+script_dir=${BASH_SOURCE[0]%/*}
+cd "$script_dir/.."
+
+echo "=== gate 0: content pages have no wry window.ipc bootstrap ==="
+node scripts/content-ipc-gate.js
+echo
 
 CHROME=crates/app/src/chrome
 export HTML_PATH="$CHROME/index.html"
@@ -145,6 +164,22 @@ else
 fi
 
 echo
+echo "=== gate 1i18n: the locale fill applier ==="
+# Guarded the same way as every subject-bearing gate: if the markers are
+# ever stripped from index.html, this gate must fail rather than vanish.
+if [ -f scripts/i18n-fill-gate.js ]; then
+  if ! grep -q 'data-msg' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/i18n-fill-gate.js exists but index.html carries" >&2
+    echo "  no data-msg markers; the catalog wiring was removed and this" >&2
+    echo "  gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/i18n-fill-gate.js
+else
+  echo "  (no i18n fill gate in this tree)"
+fi
+
+echo
 echo "=== gate 1g: the tunnel panel and its fail-closed banner ==="
 # Same guard shape as the resolver gate above: a gate whose subject can be
 # renamed out from under it disappears silently and still exits 0.
@@ -221,6 +256,20 @@ if [ -f scripts/engine-confirmed-gate.js ]; then
   node scripts/engine-confirmed-gate.js
 else
   echo "  (no engine-confirmed gate in this tree)"
+fi
+
+echo
+echo "=== gate 1e2: WebView2 tracking-prevention choice ==="
+if [ -f scripts/tracking-prevention-gate.js ]; then
+  if ! grep -q 'id="tracking-prevention-choice"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/tracking-prevention-gate.js exists but index.html" >&2
+    echo "  has no tracking-prevention row; the control was removed and this" >&2
+    echo "  gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/tracking-prevention-gate.js
+else
+  echo "  (no tracking-prevention gate in this tree)"
 fi
 
 echo
@@ -352,6 +401,26 @@ else
 fi
 
 echo
+echo "=== gate 1l2: engine-below-floor banner ==="
+# The only thing that tells a Windows user the runtime underneath still
+# carries an exploited engine bug, for the days until Evergreen delivers the
+# fix. Pinned in both directions: it must appear on `below_floor`, render the
+# Rust-composed body verbatim, and stay hidden on a clean runtime AND on a
+# failed reply, because a false alarm on an IPC hiccup would teach people to
+# dismiss the one that matters.
+if [ -f scripts/engine-floor-gate.js ]; then
+  if ! grep -q 'engine-floor-warning' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/engine-floor-gate.js exists but index.html has" >&2
+    echo "  no engine-floor banner; it was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/engine-floor-gate.js
+else
+  echo "  (no engine-floor gate in this tree)"
+fi
+
+echo
 echo "=== gate 1k2: the address bar never decodes a hostname ==="
 # A homograph domain is defeated here by an OMISSION -- nothing prettifies the
 # URL, so a Cyrillic lookalike arrives and is shown as xn--. That is strong
@@ -454,22 +523,23 @@ else
 fi
 
 # fingerprint_divergence.js runs in the same page world but holds a SESSION TOKEN, so its
-# bar is higher than autofill's: no OUTBOUND channel AT ALL, because it carries
-# a per-session token. fetch/XMLHttpRequest/import are forbidden outright.
+# bar is higher than autofill's: its only outbound data is a delayed batch of
+# four integer probe counts. fetch/XMLHttpRequest/import remain forbidden.
 #
-# postMessage is the one nuance. The CSP fallback (the Worker wrapper) hands the
+# postMessage has two nuances. The CSP fallback (the Worker wrapper) hands the
 # page a facade over a worker THE PAGE ITSELF created, and forwards the page's
 # own messages to it -- real.postMessage(...). That is not a channel out of the
 # page: the token never reaches a worker, whose shim carries only the canvas
 # seed (the worker gate proves the token is absent from the shim source). So
 # postMessage is allowed ONLY as a method call on a local receiver, and is still
-# banned as a bare/implicit call or on any page-reachable global (self, window,
-# parent, top, opener) -- those WOULD carry data out of the page.
+# banned as a bare/implicit call or directly on self/window/parent/top/opener.
+# The two nested native host bridges are exercised and schema-checked by
+# fingerprint-probe-gate.js below.
 DIVERGENCE_SCRIPT="crates/app/src/content_scripts/fingerprint_divergence.js"
 if [ -f "$DIVERGENCE_SCRIPT" ]; then
   if grep -nE '\b(fetch|XMLHttpRequest|import)\s*\(' "$DIVERGENCE_SCRIPT"; then
-    echo "GATE FAIL: $DIVERGENCE_SCRIPT opened a channel -- it carries the" >&2
-    echo "  divergence session token and must have no way to send anything" >&2
+    echo "GATE FAIL: $DIVERGENCE_SCRIPT opened a network/module channel --" >&2
+    echo "  the only permitted outbound data is the fixed probe-count batch" >&2
     exit 1
   fi
   if grep -nE '(^|[^.[:alnum:]_$])postMessage[[:space:]]*\(|\b(self|window|parent|top|opener)\.postMessage[[:space:]]*\(' "$DIVERGENCE_SCRIPT"; then
@@ -478,7 +548,7 @@ if [ -f "$DIVERGENCE_SCRIPT" ]; then
     echo "  allowed; the token-bearing script must not send data out of the page" >&2
     exit 1
   fi
-  echo "  ok  no fetch/XMLHttpRequest/import; postMessage only forwards to a worker in $DIVERGENCE_SCRIPT"
+  echo "  ok  no fetch/XMLHttpRequest/import or bare/global postMessage in $DIVERGENCE_SCRIPT"
 
   # Same lesson as autofill: greps prove absence, only running it proves the
   # noise exists, is deterministic per site, and never stacks.
@@ -495,6 +565,11 @@ if [ -f "$DIVERGENCE_SCRIPT" ]; then
   # and read the mask off), and every non-classic case must fall back to an
   # unwrapped worker rather than a broken or mismatched one.
   node scripts/divergence-worker-gate.js
+
+  # The count-only exception above is narrow and live: drive all four main-
+  # world surfaces, inspect the delayed message, and open Tab Activity through
+  # its real button so dead reporting/rendering call sites fail.
+  node scripts/fingerprint-probe-gate.js
 fi
 
 echo
@@ -513,6 +588,41 @@ if [ -f scripts/blocked-banner-gate.js ]; then
   node scripts/blocked-banner-gate.js
 else
   echo "  (no blocked-banner gate in this tree)"
+fi
+
+echo
+echo "=== gate 1n2: the held-page (ad and tracker list) banner ==="
+# Sixteen checks on consent, dismissal, tab switching and the Linux
+# no-override rendering. Passing when run by hand protected nothing: no
+# runner invoked it (review R-004, round 5). Same guard shape as 1n.
+if [ -f scripts/adlist-banner-gate.js ]; then
+  if ! grep -q 'id="adlist-allow"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/adlist-banner-gate.js exists but index.html has" >&2
+    echo "  no #adlist-allow; the banner was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/adlist-banner-gate.js
+else
+  echo "  (no adlist-banner gate in this tree)"
+fi
+
+echo
+echo "=== gate 1n3: a dropped availability reply at startup (cookie controls) ==="
+# Loads chrome.js ONCE with the first privacy_get rejecting and proves the
+# cookie controls recover from the next tab_status. Written for the Linux
+# readiness review (2026-09-15, R-001) and, like the banner gate before it,
+# invoked by nothing until the launch sweep found it (2026-09-16).
+if [ -f scripts/cookie-availability-recovery-gate.js ]; then
+  if ! grep -q 'id="btn-forget-all-cookies"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/cookie-availability-recovery-gate.js exists but" >&2
+    echo "  index.html has no #btn-forget-all-cookies; the control was removed" >&2
+    echo "  and this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/cookie-availability-recovery-gate.js
+else
+  echo "  (no cookie-availability gate in this tree)"
 fi
 
 echo
@@ -569,12 +679,28 @@ else
 fi
 
 echo
-echo "=== gate 2: no innerHTML in the chrome ==="
-if grep -rn "innerHTML" "$CHROME"; then
-  echo "GATE FAIL: innerHTML in the chrome webview - it holds IPC and the vault" >&2
+echo "=== gate 2: no innerHTML in chrome code ==="
+node scripts/innerhtml-code-gate.js "$CHROME"
+
+# Both directions, through the exact scanner above. A detector that can only
+# pass is decoration; a detector that reads comments makes its own rule
+# impossible to document. Keep the real failure output visible in every run.
+innerhtml_probe="$(mktemp -d)"
+trap 'rm -rf "$innerhtml_probe"' EXIT INT TERM
+printf 'const x = {}; x.innerHTML = y;\n' > "$innerhtml_probe/real.js"
+if planted_output="$(node scripts/innerhtml-code-gate.js "$innerhtml_probe" 2>&1)"; then
+  echo "GATE FAIL: a real innerHTML assignment passed the code-only scanner" >&2
   exit 1
 fi
-echo "  none"
+echo "  real-code failure proof:"
+printf '%s\n' "$planted_output" | sed 's/^/    /'
+printf '// innerHTML is forbidden here\n/* innerHTML stays forbidden. */\n' \
+  > "$innerhtml_probe/comment.js"
+rm "$innerhtml_probe/real.js"
+echo "  comment-only pass proof:"
+node scripts/innerhtml-code-gate.js "$innerhtml_probe" | sed 's/^/    /'
+rm -rf "$innerhtml_probe"
+trap - EXIT INT TERM
 
 echo
 echo "=== gate 3: every form has a submit handler ==="
@@ -711,6 +837,39 @@ else
 fi
 
 echo
+echo "=== gate 1s1: disclosed partner cards are reached from every placement ==="
+# The renderer once shipped with no host, data source or call site. Drive all
+# three real panel-open paths so deleting one makes this gate fail, and pin the
+# human disclosure plus identifier-only IPC at the rendered buttons.
+if [ -f scripts/partner-gate.js ]; then
+  for host in partner-tunnel partner-vault partner-recall; do
+    if ! grep -q "id=\"$host\"" "$CHROME/index.html"; then
+      echo "GATE FAIL: scripts/partner-gate.js exists but index.html has" >&2
+      echo "  no #$host; a partner placement was removed and this gate" >&2
+      echo "  would silently stop exercising it" >&2
+      exit 1
+    fi
+  done
+  node scripts/partner-gate.js
+else
+  echo "  (no partner-card gate in this tree)"
+fi
+
+echo
+echo "=== gate 1s2: About sponsorship uses a compiled target identifier ==="
+if [ -f scripts/sponsorship-gate.js ]; then
+  if ! grep -q 'id="about-support-open"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/sponsorship-gate.js exists but About has no" >&2
+    echo "  #about-support-open; the call site vanished and this gate would" >&2
+    echo "  otherwise test only dead support code" >&2
+    exit 1
+  fi
+  node scripts/sponsorship-gate.js
+else
+  echo "  (no About sponsorship gate in this tree)"
+fi
+
+echo
 echo "=== gate 1t: per-site divergence claims only registration ==="
 # The proof line reports that a script was INSTALLED in this tab. It is not
 # evidence any site was fooled, and a tab keeps what it started with, so the
@@ -770,4 +929,53 @@ else
 fi
 
 echo
+echo "=== gate 1v: the translation panel a user operates ==="
+# The branch's headline feature had NO DOM gate. The i18n gates cover its
+# strings and translator-isolation-gate.sh covers the engine's origin; the
+# panel itself was untested, and both defects this pins were found by driving
+# it by hand rather than by any check.
+if [ -f scripts/translate-panel-gate.js ]; then
+  if ! grep -q 'id="translate-source"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/translate-panel-gate.js exists but index.html" >&2
+    echo "  has no #translate-source; the panel was removed and this gate" >&2
+    echo "  would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/translate-panel-gate.js
+else
+  echo "  (no translate panel gate in this tree)"
+fi
+
+echo
+echo "=== gate 1u: TLS interception, after the banner was removed ==="
+# Interception used to be announced by a full-width banner. It was removed
+# because it asserted decryption without showing the certificate it reasoned
+# from, so every classify_issuer collision was the browser stating something
+# untrue about the user's connection. What remains is the red mark on the Tab
+# Activity pill, that pill's accessible name, and three lines in the panel --
+# and a survey on the day the banner went found that NOT ONE of them had a
+# test. Removing the banner would have left the whole feature with no tested
+# surface and this suite still green.
+if [ -f scripts/interception-ui-gate.js ]; then
+  if ! grep -q 'id="btn-tab"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/interception-ui-gate.js exists but index.html" >&2
+    echo "  has no #btn-tab; the pill carrying the only ambient interception" >&2
+    echo "  signal was removed and this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/interception-ui-gate.js
+else
+  echo "  (no interception gate in this tree)"
+fi
+
+echo
 echo "CHROME JS OK"
+
+echo
+echo "=== gate 3: the string catalog tells the truth ==="
+# The whole i18n stack, wired here so a release run cannot skip it: catalog
+# sync (markup, JS, claims manifest, en-XA freshness, bare-literal tripwire)
+# and the pseudo-locale coverage scan that fails on any NEW string a feature
+# added without going through the catalog.
+bash scripts/i18n-gate.sh
+bash scripts/pseudo-locale-gate.sh

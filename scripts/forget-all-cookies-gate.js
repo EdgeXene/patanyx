@@ -85,6 +85,36 @@ new Function(fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8"))();
 // Open the privacy panel through its REAL toolbar button, so the panel's own
 // onOpen runs (that is where the confirmation and the result line are reset)
 // and the copy arrives the way it does in the product, via privacy_get.
+// Gives the PER-SITE control a real origin. Without one, `btn-site-forget` is
+// disabled whatever the platform flag says, and an assertion that it is
+// disabled passes for the wrong reason -- which is exactly what the first
+// version of the check below did (R-002). Same shape as
+// scripts/site-forget-gate.js's statusEvent.
+function siteStatus(origin) {
+  global.window.__rb_event({
+    event: "tab_status",
+    data: {
+      freeze_phase: "loaded",
+      freeze_enforcement: "inactive",
+      profile: "persistent",
+      origin,
+      tls: "normal",
+      freeze_enforced: true,
+      network_blocking_supported: true,
+      ledger_counts_blocked: true,
+      blocked_total: 0,
+      interception: "registered",
+      script_setting: "applied",
+      smartscreen_off: "applied",
+      tracking_prevention: "strict",
+      navigation_tracking: "applied",
+      autofill_off: "applied",
+      ephemeral_confirmed: "applied",
+      hardened_environment: "applied",
+    },
+  });
+}
+
 async function openPrivacyPanel(status) {
   global.rbResolve.privacy_get = privacyStatus(status);
   global.$("btn-privacy")._fire("click");
@@ -299,6 +329,114 @@ check("a refusal never looks like a success", async () => {
     "the confirm button stayed disabled after a refusal, so the user cannot " +
       "retry once they have opened an ordinary tab",
   );
+  await closePrivacyPanel();
+});
+
+// A backend that cannot clear cookies (WebKitGTK in 1.0.0, whose platform
+// calls are stubs that never ask the engine) must not offer an ENABLED
+// control. The flag and the sentence both come from Rust
+// (cookie_control::available / unavailable_intro); this pins that the button
+// is disabled and that Rust's wording, not the enabled copy, is what lands on
+// screen (Linux readiness review, 2026-09-15).
+check("where the backend cannot clear cookies, the control is disabled and says so", async () => {
+  // A REAL ORIGIN FIRST. `btn-site-forget` is disabled whenever there is no
+  // site, so without this the per-site assertions below would pass even if the
+  // platform flag were ignored entirely (R-002).
+  siteStatus("example.com");
+  await flush();
+  assert(
+    global.$("btn-site-forget").disabled === false,
+    "precondition failed: with an origin and an available backend the per-site " +
+      "control must be live, or the checks below prove nothing",
+  );
+
+  await openPrivacyPanel({
+    cookie_clear_available: false,
+    cookie_clear_unavailable_intro: "MARKER-UNAVAILABLE this control is turned off.",
+  });
+  assert(
+    global.$("btn-forget-all-cookies").disabled === true,
+    "the browser-wide clear stayed enabled on a backend that cannot perform it",
+  );
+  assert(
+    global.$("pv-forget-all-desc").textContent ===
+      "MARKER-UNAVAILABLE this control is turned off.",
+    "the intro did not switch to Rust's unavailable wording: " +
+      JSON.stringify(global.$("pv-forget-all-desc").textContent),
+  );
+  assert(
+    global.$("btn-site-forget").disabled === true,
+    "the per-site control stayed enabled on a backend that cannot perform it, " +
+      "with a valid origin set",
+  );
+  assert(
+    global.$("tab-forget-desc").textContent.includes("not available on this platform"),
+    "the per-site description did not say why it is off: " +
+      JSON.stringify(global.$("tab-forget-desc").textContent),
+  );
+  await closePrivacyPanel();
+
+  // ...and an ordinary backend gets BOTH controls back, so the flag is read on
+  // every status rather than latched by the first one that disabled it.
+  await openPrivacyPanel();
+  siteStatus("example.com");
+  await flush();
+  assert(
+    global.$("btn-forget-all-cookies").disabled === false,
+    "the browser-wide control stayed disabled after an available backend reported in",
+  );
+  assert(
+    global.$("btn-site-forget").disabled === false,
+    "the per-site control stayed disabled after an available backend reported in",
+  );
+  assert(
+    global.$("pv-forget-all-desc").textContent === COPY.intro,
+    "the enabled intro did not come back",
+  );
+  await closePrivacyPanel();
+});
+
+// An action the backend has just said it cannot do must not be left actionable.
+//
+// REOPENING THE PANEL IS NOT THE PATH: the privacy panel's own onOpen already
+// hides forget-all-confirm before it refreshes, so a test that reopens proves
+// nothing about this fix. The real sequence is a LATE reply -- the panel is
+// open, the user opens the confirmation, and the privacy status that says the
+// backend cannot clear arrives after that (R-003). Reproduced here by holding
+// the privacy_get promise open and resolving it by hand.
+check("a late unavailable reply retires a confirmation that is already open", async () => {
+  let release;
+  global.rbResolve.privacy_get = new Promise((resolve) => {
+    release = resolve;
+  });
+  global.$("btn-privacy")._fire("click");
+  await flush();
+
+  // The reply has not landed, so availability is still unknown. Open the
+  // confirmation the way a user would.
+  global.$("btn-forget-all-cookies").disabled = false;
+  global.$("btn-forget-all-cookies")._fire("click");
+  await flush();
+  assert(
+    global.$("forget-all-confirm").hidden === false,
+    "precondition failed: the confirmation did not open while the reply was pending",
+  );
+
+  release(privacyStatus({
+    cookie_clear_available: false,
+    cookie_clear_unavailable_intro: "MARKER-UNAVAILABLE",
+  }));
+  await flush();
+
+  assert(
+    global.$("forget-all-confirm").hidden === true,
+    "a confirmation stayed open after a late reply said the backend cannot clear cookies",
+  );
+  assert(
+    global.$("btn-forget-all-cookies").disabled === true,
+    "the control stayed enabled after a late reply said the backend cannot clear cookies",
+  );
+  delete global.rbResolve.privacy_get;
   await closePrivacyPanel();
 });
 

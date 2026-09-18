@@ -49,6 +49,14 @@ docker run --rm --privileged -v "$PWD":/src -e FEATURES "$IMAGE" bash -c '
   appstreamcli validate --no-net --explain \
     /src/packaging/flatpak/io.edgexene.Patanyx.metainfo.xml
 
+  # The toolchain archive this manifest unpacks is the ONLY thing that decides
+  # which compiler builds the Flatpak: there is no rustup in the sandbox and
+  # cargo is called by absolute path, so rust-toolchain.toml cannot reach it.
+  # check-cargo-sources.py below verifies the crate sources and has never
+  # looked at the toolchain, which is how the archive sat a release behind the
+  # pin while every gate stayed green.
+  /src/scripts/toolchain-pin-gate.sh
+
   # The offline build vendors every crate from cargo-sources.json, which is
   # GENERATED from Cargo.lock by a script needing network and two Python
   # packages -- so nobody regenerates it casually, and drift is silent.
@@ -174,13 +182,41 @@ PYEOF
     echo "  this guard would have silently checked nothing" >&2
     exit 1
   }
-  # NEVER shorten to the bare word "Premium": the public build's About copy
-  # contains it, and this grep must fail only on the title markers.
-  markers="$(grep -acE "Premium \+ relay|Premium \(LAN chat only\)" "$binary" || true)"
+  # NO APOSTROPHES ANYWHERE BELOW, NOT EVEN IN A COMMENT. Every line here
+  # lives inside the bash -c argument opened at the top of this file, which
+  # is single-quoted, so one apostrophe CLOSES that quote and turns the rest
+  # of this gate into outer-shell code. Not hypothetical: an English
+  # possessive sat in this comment and did exactly that, and bash -n on this
+  # file reported an unexpected EOF at the closing quote.
+  #
+  # THE MARKER IS THE ATTRIBUTION HEADER, NOT THE WINDOW TITLE. The title
+  # "PATANYX Nabu-X" is fourteen bytes, so rustc builds it at runtime from two
+  # eight-byte immediate moves instead of storing it, and it never appears as
+  # contiguous bytes in the binary for grep to find. about.rs selects
+  # linux-chat.txt or linux.txt on cfg(feature = "chat"), so this header
+  # tracks the compiled feature by construction and is always in .rdata.
+  # build-windows.sh matches the same string; see its longer note.
+  #
+  # THE UNLOCKED ARM WAS SPELLED "licence" AND MATCHED NOTHING. The marker in
+  # the binary is about.rs::UNLOCKED_BUILD_MARKER, which says "license" -- the
+  # American spelling the copy rule requires. That mattered more here than
+  # anywhere else: `premium-unlocked` REPLACES the whole window title, so an
+  # unlocked build carries neither chat marker, and this arm was the only
+  # thing standing between a license-bypass build and the public bundle.
+  # It is asserted against the source below so a future edit to the constant
+  # breaks this gate loudly instead of silently disarming it again.
+  unlocked_marker="UNLOCKED TEST BUILD: Premium forced on; no license checked"
+  if ! grep -qF "$unlocked_marker" /src/crates/app/src/about.rs; then
+    echo "GATE FAIL: UNLOCKED_BUILD_MARKER in about.rs no longer matches the" >&2
+    echo "  string this gate greps for. Update both together, or the public" >&2
+    echo "  bundle check silently stops covering premium-unlocked builds." >&2
+    exit 1
+  fi
+  markers="$(grep -acE "PATANYX-Nabu-X for |$unlocked_marker" "$binary" || true)"
   if [ -z "${FEATURES:-}" ]; then
     if [ "${markers:-0}" -gt 0 ]; then
-      echo "GATE FAIL: the PUBLIC bundle carries a chat title marker; it was" >&2
-      echo "  built with chat compiled in. Check FEATURES in the environment." >&2
+      echo "GATE FAIL: the PUBLIC bundle carries a non-public Nabu-X title marker;" >&2
+      echo "  it was built with chat or premium-unlocked compiled in." >&2
       exit 1
     fi
     echo "  public build: no chat marker present"
@@ -223,7 +259,7 @@ PYEOF
   #     inside the bundle and the app id -- not a name anyone reads.
   mkdir -p /src/dist
   bundle_name="PATANYX.flatpak"
-  [ -n "${FEATURES:-}" ] && bundle_name="PATANYX-Premium.flatpak"
+  [ -n "${FEATURES:-}" ] && bundle_name="PATANYX-Nabu-X.flatpak"
   flatpak build-bundle /build/fp-repo "/src/dist/$bundle_name" \
     io.edgexene.Patanyx master
   echo "bundle: $(sha256sum "/src/dist/$bundle_name")"

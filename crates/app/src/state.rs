@@ -1,5 +1,6 @@
 //! Shared application state. All mutation happens on the event-loop thread.
 
+
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -90,10 +91,28 @@ pub fn is_allowed_content_url(url: &str) -> bool {
     // Deliberately additive: `host_of` still decides everything else,
     // including which non-http schemes are refused, so nothing that was
     // denied before becomes allowed now.
-    if let Ok(parsed) = url::Url::parse(url) {
-        if parsed.host_str() == Some(platform::CHROME_RESERVED_HOST) {
-            return false;
+    match url::Url::parse(url) {
+        Ok(parsed) => {
+            // Normalised the same way `host_of` normalises, because this parser
+            // preserves a trailing dot verbatim and the constant has none.
+            let parsed_host = parsed
+                .host_str()
+                .map(|h| h.trim_end_matches('.').to_ascii_lowercase());
+            if parsed_host.as_deref() == Some(platform::CHROME_RESERVED_HOST) {
+                return false;
+            }
         }
+        // FAIL CLOSED, and this arm is the point. It used to be absent: a URL the
+        // strict parser REJECTED skipped the veto entirely and left `host_of` to
+        // decide alone -- so the way past the second parser was not to satisfy it
+        // but to break it. An input the two parsers cannot even agree is a URL is
+        // not one to resolve in the attacker's favour.
+        //
+        // This can only DENY more than before. Non-http schemes do not reach it
+        // (`host_of` returns None for them and they are refused below either way),
+        // so what it refuses is a malformed http(s) URL -- which no engine should
+        // be loading as the trusted origin regardless.
+        Err(_) => return false,
     }
     match host_of(url) {
         // Compared case-insensitively; `host_of` has already lowercased.
@@ -121,7 +140,13 @@ pub fn is_allowed_content_url(url: &str) -> bool {
 /// Both of those are false-ALLOW directions, which is why they are handled
 /// here rather than left to fail closed.
 pub(crate) fn host_of(url: &str) -> Option<String> {
-    let cleaned: String = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+    // Tab, LF and CR are stripped because the engines strip them. The REST of the
+    // C0 range and DEL are stripped for a different reason: they are not legal in a
+    // host at all, so an engine either rejects the URL or drops them, and either way
+    // a name that differs from the reserved one only by a control character must not
+    // read here as an unrelated host. Collapsing toward the reserved name is the safe
+    // direction -- it can only cause a DENY.
+    let cleaned: String = url.chars().filter(|c| !c.is_ascii_control()).collect();
     let lower = cleaned.to_ascii_lowercase();
     let rest = lower
         .strip_prefix("http://")
@@ -139,6 +164,20 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
         Some(end) => &host_port[..=end],
         None => host_port.split(':').next().unwrap_or(""),
     };
+    // A TRAILING DOT NAMES THE SAME HOST. `rbchrome.localhost.` is the
+    // root-anchored spelling of `rbchrome.localhost` and the engines resolve it to
+    // that origin, but every comparison in this file is against the undotted
+    // constant, so the dotted spelling read as an unrelated name and was ALLOWED
+    // (security assessment 2026-08-28). It defeated two layers at once, which is
+    // why the trim belongs here rather than at either call site: the content
+    // predicate, `classify_uri`'s reserved-origin request filter (the subframe
+    // backstop, which exists precisely because subframes skip the navigation
+    // allowlist), the blocklist matcher and the ledger all derive their host from
+    // this one function, so one spelling in means one spelling everywhere.
+    //
+    // An IPv6 literal keeps its brackets and never ends in a dot, so the trim is a
+    // no-op there. A bare `.` trims to empty and is refused below, as it should be.
+    let host = host.trim_end_matches('.');
     if host.is_empty() {
         None
     } else {
@@ -179,6 +218,648 @@ pub(crate) fn login_offer_origin(sender: &str, tab: Option<&str>) -> Option<Stri
     Some(sender_host)
 }
 
+/// What a login submission should produce, once the tab and origin checks
+/// have passed.
+///
+/// Pure, and separated from `note_login_submitted` for the same reason
+/// `login_offer_origin` above is: `AppState` owns live webviews, so no unit
+/// test can build one, and a decision left inside it is a decision nothing can
+/// drive. The dispatcher that calls this stays deliberately trivial.
+///
+/// THE CASE THIS EXISTS FOR is `NoticeLocked`. Before it, a submission with a
+/// locked vault returned early and told the user NOTHING -- the doc comment
+/// said "silently drops the submission" -- so a person logged in, no save
+/// offer appeared, and there was no way to learn why. The vault auto-locks on
+/// a timer, so this is reachable without the user doing anything at all.
+///
+/// `Silent` keeps its silence on purpose in the no-vault case. Someone who has
+/// never created a vault has not opted into password saving, and telling them
+/// to unlock something that does not exist is the exact mistake a copy review
+/// caught in the autofill row a day earlier. `vault.is_none()` alone cannot
+/// tell "locked" from "never created"; that is why `vault_exists` is a
+/// separate input here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoginSubmitOutcome {
+    /// The vault is open and does not already hold this: stash the pending
+    /// save and raise the save banner.
+    Offer,
+    /// The vault ALREADY holds this exact credential, which is what happens
+    /// every time a saved password is autofilled and submitted. Asking to
+    /// save it again is asking a question whose answer is already on disk.
+    AlreadySaved,
+    /// A vault exists and is LOCKED. Save nothing, tell the user why.
+    NoticeLocked,
+    /// Nothing happened and nothing is said.
+    Silent,
+}
+
+/// Whether the vault already holds the credential being submitted.
+///
+/// Split out of the dispatcher so the JOIN is testable. Both halves of this
+/// question were covered before it existed -- the vault's comparison and the
+/// outcome table -- and the line connecting them was covered by nothing, so
+/// passing a literal `false` here would have restored the bug with every test
+/// still green. That exact shape has been the most common defect in this
+/// work, so it gets a function rather than a line.
+///
+/// `None` (a locked vault) is false: nothing was compared, and the locked
+/// case is decided before this matters.
+pub(crate) fn already_stored(
+    vault: Option<&Vault>,
+    origin: &str,
+    username: &str,
+    password: &str,
+) -> bool {
+    vault.is_some_and(|vault| {
+        vault.has_matching_credential(username, password, |stored| {
+            crate::psl::same_site(stored, origin)
+        })
+    })
+}
+
+pub(crate) fn login_submit_outcome(
+    unlocked: bool,
+    vault_exists: bool,
+    already_saved: bool,
+) -> LoginSubmitOutcome {
+    if unlocked {
+        // Checked before anything else about the vault, because an open vault
+        // that already holds this has nothing to ask.
+        if already_saved {
+            return LoginSubmitOutcome::AlreadySaved;
+        }
+        return LoginSubmitOutcome::Offer;
+    }
+    if !vault_exists {
+        return LoginSubmitOutcome::Silent;
+    }
+    LoginSubmitOutcome::NoticeLocked
+}
+
+/// How long after one locked-vault notice before another may be shown.
+///
+/// MUST EXCEED THE NOTIFICATION'S OWN LIFETIME (`TOAST_MS` in chrome.js). That is
+/// the whole property: a cooldown longer than the toast means two of these can
+/// never be on screen at once, however many submissions arrive.
+///
+/// It has to be time-based, and nothing page-driven may reset it. An earlier
+/// draft cleared the suppression on navigation, and a review pointed out that
+/// a hostile page can simply submit, reload the same host, and submit again --
+/// `document.addEventListener("submit", ...)` in autofill.js has no
+/// `isTrusted` check, and the native bridge can be called directly regardless,
+/// so the page controls how often this code runs. It does not control the
+/// clock.
+pub(crate) const LOCKED_SAVE_NOTICE_COOLDOWN: Duration = Duration::from_secs(30);
+
+/// Whether enough time has passed since the last locked-vault notice.
+pub(crate) fn locked_save_notice_due(last: Option<Instant>, now: Instant) -> bool {
+    match last {
+        None => true,
+        Some(last) => now.duration_since(last) >= LOCKED_SAVE_NOTICE_COOLDOWN,
+    }
+}
+
+/// Claim the notice slot if it is due, STAMPING it in the same step.
+///
+/// The decision and the write have to live together. When they did not -- a
+/// `due()` predicate here and the assignment up in the dispatcher -- deleting
+/// the assignment made every submission emit a notice while all three tests
+/// stayed green, because each tested one half and nothing tested the join.
+/// Passing the slot in by reference is what lets a test drive the real
+/// sequence instead of two predicates that never meet.
+pub(crate) fn take_locked_save_notice(last: &mut Option<Instant>, now: Instant) -> bool {
+    if !locked_save_notice_due(*last, now) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// One page-translation session, owned by the tab it belongs to.
+///
+/// LIVES IN RUST, NOT IN THE PAGE. The chrome UI never names a tab or a URL
+/// when it asks for a translation; it sends a language and Rust acts on the
+/// ACTIVE tab, holding the URL itself. That is the argument-less command
+/// discipline the insecure-continue arms already use, and it is why a
+/// compromised chrome origin cannot point translation at a page of its
+/// choosing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TranslationSession {
+    /// The pair the user picked, already validated against the shipped set.
+    /// Never a free-form string: it reaches a model path later, and a
+    /// validated enum-like value is what keeps that from becoming an
+    /// injection point.
+    pub pair: &'static str,
+    /// The SOURCE language code (the pair's `from`), held so the corruption
+    /// guard can check the page's actual script against it. Registry-owned
+    /// `&'static str`, like `pair`.
+    pub source: &'static str,
+    /// The cumulative script tally of every batch seen this run, for the
+    /// corruption guard. Judged as a whole, not per batch.
+    pub script_counts: crate::detect::ScriptCounts,
+    pub phase: TranslationPhase,
+    /// When this session last visibly ADVANCED: created, an extract arrived,
+    /// a patch landed, a pack finished. The stall deadline measures from
+    /// here, not from the start -- a long page is many batches of honest
+    /// work, and a deadline on total age would kill exactly the pages the
+    /// batching exists to serve.
+    pub last_progress: std::time::Instant,
+    /// For each string actually SENT, where it sat in the batch the page
+    /// delivered. A mixed-language page has nodes the source model must not
+    /// see, so the batch is filtered -- and the engine numbers its output
+    /// against what it was GIVEN, while the page numbers its nodes against
+    /// the document. Without this map the two disagree by however many nodes
+    /// were skipped, and a patch lands on the wrong paragraph.
+    pub batch_map: Vec<usize>,
+    /// How many document nodes this batch COVERED, filtered or not. The next
+    /// offset advances by this, never by the sent length.
+    pub batch_span: usize,
+    /// Translatable nodes in the whole document, as the page counted them.
+    /// The denominator for the panel's percentage; None until the page says.
+    pub doc_total: Option<usize>,
+    /// What the RUNNING translator document says it is: the asset revision it
+    /// was served with, and the linear memory the engine actually got.
+    /// Diagnostic only -- nothing branches on either.
+    pub engine_asset_rev: Option<String>,
+    pub engine_heap_bytes: Option<u64>,
+    /// Script census of the last batch the engine was handed. Counts only.
+    pub engine_last_input: Option<Value>,
+    /// Identifies THIS run of the session to the page.
+    ///
+    /// The page keeps a node map per extraction, and a patch names indices
+    /// into it. If the user cancels and clicks again on the same page, the URL
+    /// has not changed -- so the URL alone cannot tell the second run's
+    /// patches from the first's, and a late reply from run 1 could address
+    /// nodes run 2 collected. The token makes the runs distinguishable, and
+    /// the page drops anything that does not match its current one.
+    pub token: u64,
+    /// What the page sent up, held until the engine has taken it.
+    ///
+    /// PAGE TEXT LIVES HERE AND NOWHERE ELSE ON THE HOST, and it is cleared
+    /// the moment the translation is handed back. It is not logged, not
+    /// written to disk, and not carried into any other structure -- the whole
+    /// point of on-device translation is that this text never becomes a record
+    /// of what the user was reading.
+    pub batch: Vec<String>,
+    /// Whether this batch has been submitted to the engine, so a tick does not
+    /// submit it twice.
+    pub submitted: bool,
+    /// Index the CURRENT batch starts at, as the page reported it.
+    ///
+    /// The page indexes its node map absolutely and this is where the batch in
+    /// hand sits inside it, so a patch built here addresses the right nodes
+    /// even though the host only ever holds one batch at a time.
+    pub offset: usize,
+    /// Whether the page said it has more text after this batch.
+    pub more: bool,
+    /// Running total of nodes actually put back across every batch of this
+    /// run. `translation_patched` reports it; a per-batch count would reset to
+    /// a small number at the end of a long page and read as a failure.
+    pub patched_total: usize,
+    /// THE PAGE THIS CONSENT WAS GIVEN FOR.
+    ///
+    /// Consent attaches to the page the user was reading when they clicked,
+    /// so a session is only meaningful while the tab still shows that page.
+    /// Recording the URL here makes a stale session INERT rather than merely
+    /// unlikely: `session_is_current` refuses it, so forgetting to clear one
+    /// on navigation is a leak of memory, not a translation of a page nobody
+    /// asked about.
+    ///
+    /// That distinction is the whole reason this field exists. The explicit
+    /// clear in `on_url_changed` is hygiene; correctness must not depend on
+    /// remembering to write it, because nothing in the test suite can
+    /// construct a Tab to check that it is still there.
+    pub page: String,
+}
+
+/// Whether a session still belongs to what the tab is showing.
+///
+/// Pure, and separated out precisely so it CAN be tested: `Tab` owns a live
+/// `WebView`, so no unit test can build one, and any rule expressed only
+/// inside a method on Tab is a rule nothing verifies.
+/// Whether one extractor message may be accepted.
+///
+/// PURE, and separated out for the same reason `session_is_current` is: `Tab`
+/// owns a live `WebView`, so a rule expressed only inside a method on it is a
+/// rule nothing verifies. This is where "never automatic" is actually
+/// enforced -- not in the UI, which a compromised page cannot reach anyway,
+/// but here, where text arriving from a page with no session is dropped.
+///
+/// `session_page` is what the user consented to; `tab_url` is where the tab is
+/// NOW; `href` is where the page CLAIMS to be. All three must agree. The page
+/// supplies only the last one, which is exactly why it is checked against the
+/// two it does not control rather than trusted.
+pub fn extract_is_acceptable(
+    session_page: Option<&str>,
+    tab_url: &str,
+    kind: &str,
+    href: &str,
+) -> bool {
+    if kind != "extract" {
+        return false;
+    }
+    let Some(page) = session_page else {
+        // No session: nobody asked. A page may post whenever it likes; this
+        // is the line that makes that pointless.
+        return false;
+    };
+    session_is_current(page, tab_url) && page == href
+}
+
+/// Whether an extraction belongs to the session run that is currently live.
+///
+/// SEPARATE FROM THE URL CHECK because they answer different questions. The
+/// URL asks "is this the page consent was given for"; this asks "is this THIS
+/// run". A user who cancels and clicks Translate again on the same page passes
+/// the first and must fail the second for run 1's late reply -- otherwise a
+/// stale batch is filed against run 2's node map, and the indices in it mean
+/// something else entirely.
+///
+/// The token is compared AS THE PAGE SENT IT, a string, with no parsing. A
+/// page can put any string in that field; the only one that gets anywhere is
+/// the exact decimal the host chose, and refusing to parse means there is no
+/// "42abc" or " 42" or "+42" to be lenient about.
+pub fn extract_token_matches(session_token: Option<u64>, claimed: Option<&str>) -> bool {
+    match (session_token, claimed) {
+        (Some(token), Some(claimed)) => claimed == token.to_string(),
+        // No session, or a message that names no run: refused. Both are the
+        // shape of a page posting unprompted.
+        _ => false,
+    }
+}
+
+/// Encodes a string as a JavaScript string LITERAL for a fixed call wrapper.
+///
+/// THE RULE THIS ENFORCES: untrusted text never rides as code. Page text
+/// crosses into the translator document exactly once, as the argument of
+/// `window.__translator.translate(...)`, and it must arrive as a string that
+/// the engine parses -- never as source that it runs.
+///
+/// `serde_json` already escapes quotes, backslashes and control characters, so
+/// the output is a valid JS string literal on every engine we ship. The two
+/// extra characters handled here are U+2028 LINE SEPARATOR and U+2029
+/// PARAGRAPH SEPARATOR: both are legal unescaped inside a JSON string and were
+/// illegal inside a JavaScript string literal before ES2019. WebKitGTK 2.50 and
+/// current WebView2 are both far past that, so this is not fixing a live bug --
+/// it is refusing to make correctness here depend on a language revision, when
+/// the input is text scraped from a hostile page and the cost is two
+/// replacements.
+pub fn js_string(json: &str) -> String {
+    // QUOTED, not merely escaped. An earlier version returned the payload
+    // unchanged, which made the call site read
+    // `translate({"id":"1","texts":[...]})` -- a JS OBJECT LITERAL, not a
+    // string. The document's `JSON.parse` then received an object, coerced it
+    // to "[object Object]" and threw. The engine probe caught it on the first
+    // run against a real pack.
+    //
+    // That was also the security bug hiding behind the cosmetic one: the whole
+    // point of this function is that page text arrives as DATA. Interpolating
+    // it into an object literal puts it in source position, where the only
+    // thing standing between a hostile page and this document is how well
+    // serde_json happens to escape. Quoting makes it a string literal, which
+    // is what the doc comment above always claimed.
+    let quoted = serde_json::to_string(json).unwrap_or_else(|_| "\"\"".to_string());
+    quoted
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// Maps a failure key reported by the translator document onto one this
+/// product knows.
+///
+/// AN ALLOWLIST, NOT A PASS-THROUGH. The key reaches the panel and is looked up
+/// in the message catalog, so an unrecognised one would render as a missing
+/// string in front of the user. Matching against the set the document is known
+/// to produce means a document that ever reported something else -- a future
+/// edit, a partially-loaded script -- degrades to a generic failure the panel
+/// can actually say, instead of a blank.
+///
+/// It is also the narrower door: the translator document is ours, but it is the
+/// one place in this feature that has touched a language pack's bytes, and
+/// nothing it says needs to be taken on trust when a fixed list will do.
+fn translation_failure_key(reported: &str) -> &'static str {
+    match reported {
+        "translate-engine-failed" => "translate-engine-failed",
+        "translate-engine-aborted" => "translate-engine-aborted",
+        "translate-pack-failed" => "translate-pack-failed",
+        "translate-timeout" => "translate-timeout",
+        "translate-no-pack" => "translate-no-pack",
+        "translate-patch-failed" => "translate-patch-failed",
+        // Pack delivery. Three outcomes a user can act on differently: the
+        // network was unreachable (try later), the bytes could not be trusted
+        // (something is wrong, and it is not their fault), or the disk refused
+        // (free some space). `langpack::PackError::key` produces exactly these.
+        "translate-pack-unreachable" => "translate-pack-unreachable",
+        "translate-pack-untrusted" => "translate-pack-untrusted",
+        "translate-pack-storage" => "translate-pack-storage",
+        // Detection outcomes. Script mismatch is the corruption guard firing;
+        // source-unknown is "we could not tell and you gave no source";
+        // pair-unavailable is "no model exists for that direction"; busy is
+        // "another translation is running".
+        "translate-script-mismatch" => "translate-script-mismatch",
+        "translate-source-unknown" => "translate-source-unknown",
+        "translate-pair-unavailable" => "translate-pair-unavailable",
+        "translate-busy" => "translate-busy",
+        _ => "translate-failed",
+    }
+}
+
+/// Whether the corruption guard refuses this batch for the chosen source.
+///
+/// PURE so it can be proved without a browser: given the source language and
+/// the page's first batch, does the page's script POSITIVELY contradict the
+/// source? Only a clear mismatch refuses (the Greek-into-an-en-model incident);
+/// an ambiguous or same-script page proceeds on the user's explicit choice.
+/// The whole safety property of this cluster lives in this one boolean.
+/// Whether the CUMULATIVE script tally of a session so far is a clear mismatch
+/// with the chosen source.
+///
+/// Cumulative, not per-batch, because a red-team pass showed a per-batch check
+/// is defeated by chopping incompatible text into sub-threshold batches. The
+/// caller folds each batch into `counts` and asks this after every one; the
+/// verdict is about the whole page seen so far, so tiny batches accumulate and
+/// a late foreign quote on an otherwise-clean page does not false-refuse.
+/// Whether a pair may be fetched or used at this entitlement level.
+///
+/// THE WHOLE TIER RULE, in one pure function, because the three places that
+/// need it cannot themselves be unit-tested: they hang off an `AppState` that
+/// owns live WebViews. Extracting the decision means the RULE is covered
+/// exhaustively against the real registry (see the tests below) even though
+/// its call sites are not, and the three sites cannot drift apart.
+///
+/// An unknown token is permitted here: it has already failed
+/// `validate_translation_pair` at every caller, and answering "denied" for a
+/// token that does not exist would confuse a real refusal with a typo.
+pub(crate) fn tier_allows(pair: &str, premium_active: bool) -> bool {
+    match crate::languages::pair_by_token(pair) {
+        Some(row) => tier_allows_row(row.tier, premium_active),
+        // An unknown token is not the tier gate's business: every caller has
+        // already refused it, and answering "denied" would report a typo as a
+        // licensing problem.
+        None => true,
+    }
+}
+
+/// The gate itself, over a tier rather than a token.
+///
+/// SPLIT OUT SO IT STAYS TESTED WITH ZERO PREMIUM LANGUAGES IN THE PRODUCT.
+/// Both gate tests used to prove themselves non-vacuous by finding a real
+/// tier-2 row, so the moment OPUS-MT became free (2026-09-01) they failed --
+/// not because the gate broke, but because the product stopped carrying
+/// anything for it to refuse. A security boundary that is only tested while
+/// some product decision happens to exercise it is one bad quarter from being
+/// untested, so the rule is proven here, exhaustively, on its own.
+pub(crate) fn tier_allows_row(tier: u8, premium_active: bool) -> bool {
+    tier < 2 || premium_active
+}
+
+/// Where an engine result lands in the PAGE's node map.
+///
+/// Three coordinate systems meet here and getting them wrong scrambles a page
+/// into itself, so the arithmetic is a pure function with tests rather than a
+/// line buried in a handler:
+///   * `i` numbers what was SENT to the engine (post-filter),
+///   * `map` gives each sent item its index in the batch the page delivered,
+///   * `offset` is where that batch starts in the document.
+///
+/// Returns None for an index the map cannot name -- dropped, never clamped: a
+/// patch aimed at a node we cannot identify is not a patch.
+fn patch_index(i: usize, map: &[usize], offset: usize) -> Option<u64> {
+    let in_batch = *map.get(i)?;
+    u64::try_from(in_batch.checked_add(offset)?).ok()
+}
+
+fn script_refuses(counts: &crate::detect::ScriptCounts) -> bool {
+    crate::detect::verify(counts) == crate::detect::Verdict::ScriptMismatch
+}
+
+/// How often an in-flight translation is polled.
+///
+/// The engine reports no progress, so this is the resolution at which the
+/// panel can change. Fast enough that a short page feels immediate, slow
+/// enough that it is not waking the event loop for nothing during the seconds
+/// a long batch actually takes.
+const TRANSLATE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How long a session may sit with NOTHING advancing before it is failed.
+///
+/// Measured against `last_progress`, not session age, and suspended while a
+/// pack download for the session's pair is in flight (the download has its
+/// own progress feed and its own failure path). Without this, a page that
+/// never answered the extract request left "Getting ready" on screen forever,
+/// with no path out but navigating away -- it was found on hardware
+/// before any test did. Sized for a cold WebView2 boot plus a large pack
+/// loading from disk on a slow laptop, with margin.
+const TRANSLATE_STALL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether a page-supplied language string is a plausible BCP-47 tag.
+///
+/// Page-controlled, so it is validated as data before it can reach the badge:
+/// 2..=32 chars, ASCII letters/digits/hyphen only. This refuses bidi controls,
+/// zero-width characters and homoglyph attacks a red-team pass flagged -- not
+/// by stripping them, but by refusing anything that is not tag-shaped, because
+/// a value that needs stripping was never a language tag.
+fn is_plausible_lang_tag(s: &str) -> bool {
+    (2..=32).contains(&s.len())
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+pub fn session_is_current(session_page: &str, tab_url: &str) -> bool {
+    !session_page.is_empty() && session_page == tab_url
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum TranslationPhase {
+    /// Asked for; the engine and pack are not ready yet.
+    Preparing,
+    /// Engine ready, text moving.
+    Translating,
+    /// Finished for the page as it stood.
+    Done,
+    /// Fail CLOSED: the page is left untranslated and readable, never
+    /// half-patched. The string is a catalog key, not prose.
+    Failed(&'static str),
+}
+
+/// The pairs the CURRENT chrome offers.
+///
+/// TEMPORARY, and narrower on purpose than what this build can validate: the
+/// legacy panel knows one label ("Spanish") and offering a token it cannot
+/// name would put a raw identifier in front of the user. The Translation-tab
+/// rework replaces this with `packs_status` built from installed languages;
+/// until then this list is what `translation_status` advertises, while
+/// validation below accepts the whole PUBLISHED registry.
+pub const TRANSLATION_PAIRS: &[&str] = &["en-es"];
+
+/// Resolves an incoming pair token to the PUBLISHED registry, returning the
+/// STATIC token so nothing downstream can be holding a borrowed
+/// attacker-shaped value.
+///
+/// An allowlist rather than a parse, exactly as before -- only the list grew:
+/// it is now `languages::PAIRS`, generated from Mozilla's published model
+/// records (a pair enters it only with a complete stable model set), instead
+/// of a hand-kept one-element array. The token still ends up selecting a URL
+/// path and a directory name, so membership -- never shape -- is the test.
+///
+/// PUBLISHED is not INSTALLED: this answers "does such a model exist to
+/// fetch", and the pack directory answers "is it on this machine". The two
+/// predicates carry different failure keys.
+pub fn validate_translation_pair(candidate: &str) -> Option<&'static str> {
+    crate::languages::pair_by_token(candidate).map(|p| p.token)
+}
+
+/// One of the four coarse fingerprint surfaces shown in Tab Activity.
+/// Nothing below this granularity crosses the content boundary: no method
+/// name, pixel, sample, rectangle, or WebGL parameter value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FingerprintSurface {
+    Audio,
+    Canvas,
+    WebGl,
+    ElementMeasurement,
+}
+
+impl FingerprintSurface {
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "audio" => Some(Self::Audio),
+            "canvas" => Some(Self::Canvas),
+            "webgl" => Some(Self::WebGl),
+            "element_measurement" => Some(Self::ElementMeasurement),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FingerprintProbeCounts {
+    pub(crate) audio: u64,
+    pub(crate) canvas: u64,
+    pub(crate) webgl: u64,
+    pub(crate) element_measurement: u64,
+}
+
+impl FingerprintProbeCounts {
+    fn add(&mut self, surface: FingerprintSurface, count: u64) {
+        let slot = match surface {
+            FingerprintSurface::Audio => &mut self.audio,
+            FingerprintSurface::Canvas => &mut self.canvas,
+            FingerprintSurface::WebGl => &mut self.webgl,
+            FingerprintSurface::ElementMeasurement => &mut self.element_measurement,
+        };
+        *slot = slot.saturating_add(count);
+    }
+}
+
+/// Strict decoder shared by both engine channels.
+///
+/// `deny_unknown_fields` is load-bearing: a hostile page can post anything,
+/// but the event loop will only ever receive a fixed surface name and an
+/// integer delta. Four entries is the complete legitimate batch and the JS
+/// safe-integer ceiling prevents a lossy number becoming an exact Rust claim.
+pub(crate) fn fingerprint_probe_report(
+    value: &serde_json::Value,
+) -> Option<Vec<(FingerprintSurface, u64)>> {
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Report {
+        kind: String,
+        counts: Vec<Delta>,
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Delta {
+        surface: String,
+        count: u64,
+    }
+
+    const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
+    let report: Report = serde_json::from_value(value.clone()).ok()?;
+    if report.kind != "fingerprint_probe_counts"
+        || report.counts.is_empty()
+        || report.counts.len() > 4
+    {
+        return None;
+    }
+    let mut seen = [false; 4];
+    let mut out = Vec::with_capacity(report.counts.len());
+    for delta in report.counts {
+        if delta.count == 0 || delta.count > MAX_SAFE_INTEGER {
+            return None;
+        }
+        let surface = FingerprintSurface::parse(&delta.surface)?;
+        let index = match surface {
+            FingerprintSurface::Audio => 0,
+            FingerprintSurface::Canvas => 1,
+            FingerprintSurface::WebGl => 2,
+            FingerprintSurface::ElementMeasurement => 3,
+        };
+        if seen[index] {
+            return None;
+        }
+        seen[index] = true;
+        out.push((surface, delta.count));
+    }
+    Some(out)
+}
+
+#[cfg(test)]
+mod fingerprint_probe_report_tests {
+    use super::{fingerprint_probe_report, FingerprintSurface};
+    use serde_json::json;
+
+    #[test]
+    fn accepts_only_fixed_surface_names_and_integer_deltas() {
+        let report = fingerprint_probe_report(&json!({
+            "kind": "fingerprint_probe_counts",
+            "counts": [
+                { "surface": "audio", "count": 14 },
+                { "surface": "canvas", "count": 3 },
+                { "surface": "webgl", "count": 1 },
+                { "surface": "element_measurement", "count": 40 }
+            ]
+        }))
+        .expect("valid report");
+        assert_eq!(
+            report,
+            vec![
+                (FingerprintSurface::Audio, 14),
+                (FingerprintSurface::Canvas, 3),
+                (FingerprintSurface::WebGl, 1),
+                (FingerprintSurface::ElementMeasurement, 40),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_content_unknown_surfaces_and_non_integer_counts() {
+        for bad in [
+            json!({
+                "kind": "fingerprint_probe_counts",
+                "counts": [{ "surface": "canvas", "count": 1, "pixels": [1, 2] }]
+            }),
+            json!({
+                "kind": "fingerprint_probe_counts",
+                "counts": [{ "surface": "canvas", "count": 1.5 }]
+            }),
+            json!({
+                "kind": "fingerprint_probe_counts",
+                "counts": [{ "surface": "webgl_parameter", "count": 1 }]
+            }),
+            json!({
+                "kind": "fingerprint_probe_counts",
+                "counts": [
+                    { "surface": "audio", "count": 1 },
+                    { "surface": "audio", "count": 1 }
+                ]
+            }),
+        ] {
+            assert!(fingerprint_probe_report(&bad).is_none(), "accepted {bad}");
+        }
+    }
+}
+
 pub struct Tab {
     pub id: u64,
     /// Platform handle for the tab's view: the GTK container on unix, a
@@ -192,9 +873,21 @@ pub struct Tab {
     /// Whether this tab was BUILT ephemeral (quarantine profile). Recorded
     /// at construction because the policy is fixed once the WebContext
     /// exists, and features that must respect the ephemeral contract (a
-    /// set-aside shelf must never remember one) need the per-tab fact, not
+    /// shelf must never remember one) need the per-tab fact, not
     /// the browser-wide policy of the moment.
     pub ephemeral: bool,
+    /// The malicious-list host this tab was last blocked on, set when the
+    /// host emits navigation_blocked for it and consumed by blocklist_allow.
+    /// The override must name the tab AND match this, so a banner raised by
+    /// one tab cannot be spent on another (pentest F-006).
+    pub blocked_pending: std::cell::RefCell<Option<(u64, String)>>,
+    /// Whether the ad and tracker list is applied to THIS tab: the preset it
+    /// was built with (private and quarantine tabs block regardless of the
+    /// browser-wide switch), then whatever set_privacy last applied to every
+    /// tab. Read where a held-page event is consumed: the browser-wide value
+    /// was wrong for a private tab opened while blocking was off, and the
+    /// hold was silently dropped (review R-002, round 6).
+    pub block_ads: bool,
     /// Whether a Fingerprint Divergence script was actually built for this
     /// tab, recorded at construction.
     ///
@@ -206,6 +899,53 @@ pub struct Tab {
     /// tab opened before the pref last changed, since neither engine can
     /// re-register a live view's scripts.
     pub divergence_registered: bool,
+    /// The tab's translation session, if the user started one.
+    ///
+    /// Per TAB and not per browser: two tabs can be mid-translation in
+    /// different languages, and the consent the user gave attached to one
+    /// page. Cleared on navigation -- see `on_url_changed`.
+    pub translation: Option<TranslationSession>,
+    /// How many text nodes the page's extractor has handed up for the CURRENT
+    /// session. Observed, not predicted: it counts what actually arrived and
+    /// was accepted, which is the only number worth showing a user.
+    pub translation_extracted: usize,
+    /// How many nodes the last translation actually put back.
+    ///
+    /// SEPARATE FROM `translation_extracted` because the two differ for real
+    /// reasons and the difference is the interesting number: the engine drops
+    /// blank strings, and the page skips any node it changed since it was
+    /// read. A gap between them is a page that moved underneath the
+    /// translation, not an error.
+    pub translation_patched: usize,
+    /// The page's DECLARED language (html lang attr), reported by the content
+    /// script's tier-1 signal. Drives the badge only; never page text. `None`
+    /// until a page declares one, and it never gates translation -- it is a
+    /// hint, and the source dropdown overrides it.
+    pub detected_lang: Option<String>,
+    /// The pair this tab keeps translating as the user browses.
+    ///
+    /// SET BY A FINISHED TRANSLATION, never by the browser's own initiative:
+    /// the user's click on Translate is the consent, and this carries that
+    /// consent to the NEXT page in the same tab when that page declares the
+    /// same source language. Cleared by Show original and by Cancel, because
+    /// both are the user saying stop. It never downloads anything: a page
+    /// whose pack is missing is simply not translated, since a network
+    /// contact still requires a click.
+    pub translate_continue: Option<&'static str>,
+    /// True while this tab's first navigation is held behind the process-wide
+    /// saved-profile wipe. More than the first tab can be waiting: a second
+    /// tab opened while the asynchronous clear runs must not race past it and
+    /// recreate exactly the half-wiped session this gate exists to prevent.
+    initial_navigation_pending: bool,
+    /// A close requested while the startup wipe owns this WebView is delayed
+    /// until its completion callback runs. WebView2 is allowed to omit that
+    /// callback if the WebView is closed, which would otherwise strand every
+    /// other pending tab behind the process-wide gate forever.
+    close_after_session_wipe: bool,
+    /// Counts claimed by the document-start divergence wrappers in this tab.
+    /// These are deliberately kept apart from the engine-owned request
+    /// ledger: page code can reach the same message channel and forge them.
+    fingerprint_probes: FingerprintProbeCounts,
     history: Vec<String>,
     history_index: Option<usize>,
     /// Set when `load_url` originates from back/forward/reload so the
@@ -237,9 +977,42 @@ pub struct Tab {
     /// rewritten faster than a person can read it -- see
     /// `INSECURE_BANNER_STABILITY` and `note_insecure_navigation`.
     insecure_pending_at: Option<Instant>,
+    /// The held-page banner and the per-tab ad-list consent behind it.
+    ///
+    /// Per tab and gone with the tab, like the two override sets above. The
+    /// state machine is pure and lives in `adlist_consent`; this is where it
+    /// is kept and the engines reach it.
+    adlist: crate::adlist_consent::AdlistConsent,
 }
 
 impl Tab {
+    /// Release a first navigation held behind the startup profile wipe.
+    ///
+    /// The URL is read at release time. If the publisher typed a different
+    /// address while the engine was clearing, `queue_or_navigate` replaced
+    /// the original value and this opens the address they most recently
+    /// asked for; it never starts an early navigation merely because the UI
+    /// was already responsive.
+    fn finish_initial_navigation(&mut self) {
+        if !self.initial_navigation_pending {
+            return;
+        }
+        self.initial_navigation_pending = false;
+        if self.close_after_session_wipe {
+            return;
+        }
+        let _ = platform::load_initial_url(&self.webview, self.id, &self.url);
+    }
+
+    fn queue_or_navigate(&mut self, url: &str) -> Result<(), &'static str> {
+        if self.initial_navigation_pending {
+            self.url.clear();
+            self.url.push_str(url);
+            return Ok(());
+        }
+        self.webview.load_url(url).map_err(|_| "io")
+    }
+
     pub fn record_history(&mut self, url: String) {
         if self.suppress_history {
             self.suppress_history = false;
@@ -301,7 +1074,9 @@ impl Tab {
 /// The zoom steps, matching what mainstream browsers offer. Multiplicative
 /// steps rather than fixed increments, so each press is the same perceived
 /// change at any level.
-const ZOOM_STEPS: &[f64] = &[0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0];
+const ZOOM_STEPS: &[f64] = &[
+    0.5, 0.67, 0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0,
+];
 
 /// The nearest entry in [`ZOOM_STEPS`] to a factor the engine reports.
 ///
@@ -657,15 +1432,22 @@ fn build_tab(
     // ---- content webview: no custom protocol, no IPC, no script eval ----
     //
     // The initial URL is NOT set here. It travels to `build_content` and
-    // each backend applies it where its blocking is already in place: on
-    // the builder for WebKitGTK, after handler registration for WebView2,
-    // whose `build_as_child` would otherwise navigate before the request
-    // filter exists.
+    // each backend applies it only after its handlers are in place and the
+    // asynchronous saved-profile wipe has completed. Giving either builder a
+    // URL would let its construction start a navigation before those gates.
     // Built through the platform factory, not `WebViewBuilder::new()`: on
     // Windows that is where the WebView2 user-data directory is attached, and
     // it has to be attached at CONSTRUCTION (wry 0.55.1 has no
     // `with_web_context` setter). See platform::new_webview_builder.
     let builder = platform::new_webview_builder()
+        // Developer tools, and ONLY on content. Set here rather than in the
+        // shared factory so it can never depend on which builder call comes
+        // last: the privileged chrome is built from the same factory and sets
+        // its own `false` (release) in main.rs, and a reader should not have
+        // to reason about ordering to know the boundary holds. Nothing
+        // private lives in a page, and every browser lets a user inspect the
+        // page in front of them.
+        .with_devtools(true)
         // PURE ALLOWLIST. This must not be the source of the displayed URL.
         //
         // wry's navigation handler carries no frame information and is never
@@ -802,7 +1584,7 @@ fn build_tab(
     // rather than unwinds. A page could reach that on purpose.
     //
     // The caller decides what to do instead; nothing here can.
-    let (webview, view) =
+    let (webview, view, initial_navigation_pending) =
         platform::build_content(
             hosts,
             builder,
@@ -831,7 +1613,17 @@ fn build_tab(
         url: url.to_string(),
         title: String::new(),
         ephemeral: policy.ephemeral,
+        blocked_pending: std::cell::RefCell::new(None),
+        block_ads: policy.block_ads,
         divergence_registered: divergence_built,
+        translation: None,
+        translation_extracted: 0,
+        translation_patched: 0,
+        detected_lang: None,
+        translate_continue: None,
+        initial_navigation_pending,
+        close_after_session_wipe: false,
+        fingerprint_probes: FingerprintProbeCounts::default(),
         history: Vec::new(),
         history_index: None,
         suppress_history: false,
@@ -840,6 +1632,7 @@ fn build_tab(
         insecure_override,
         insecure_pending: None,
         insecure_pending_at: None,
+        adlist: crate::adlist_consent::AdlistConsent::default(),
     })
 }
 
@@ -1067,6 +1860,54 @@ fn check_download_file_in(dir: &Path, filename: &str, sha256: &[u8; 32]) -> File
 }
 
 pub struct AppState {
+    /// The string catalog. English-only until the locale setting exists;
+    /// lives here because resolution is per-call on the UI thread and a
+    /// locale change must repaint everything (see i18n.rs on why there is
+    /// no cache anywhere).
+    pub i18n: crate::i18n::I18n,
+    /// Bumped on every accepted locale change; rides every fill snapshot so
+    /// the chrome can refuse a stale one instead of painting a mixed-language
+    /// UI out of a race.
+    pub locale_generation: u64,
+    /// Bumped on every translation START, and never reused.
+    ///
+    /// PER BROWSER RATHER THAN PER TAB, deliberately: a token that restarted
+    /// at 1 in each tab would collide across tabs, and the value's whole job
+    /// is to be unmistakable. Wrapping is not a concern at one per user click.
+    translation_seq: u64,
+    /// The hidden translator webview, built on first use and kept afterwards.
+    /// `None` until somebody translates something; see `translator()`.
+    translator: Option<WebView>,
+    /// Live while a translation is in flight. Dropping it stops the poll
+    /// thread, which is what keeps an idle browser from ticking.
+    translate_polling: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The last batch a page sent up, kept for the debug self-test only.
+    ///
+    /// DEBUG BUILDS ONLY, and this is not a formality: it is a copy of what
+    /// the user was reading, and a release binary must not hold one for a
+    /// moment longer than translating it requires. The live path clears
+    /// `session.batch` the instant the translation is handed back; this field
+    /// exists so a self-test can SEE what came up, and it is compiled out of
+    /// anything that ships.
+    #[cfg(debug_assertions)]
+    last_extracted: Vec<String>,
+    /// The pair currently downloading, if any. One at a time: two concurrent
+    /// 36 MB downloads for the same profile would be the same bytes twice.
+    /// Packs currently downloading, keyed by token, each with (bytes_so_far,
+    /// total). Generalised from a single Option when explicit Install arrived:
+    /// installing a language fetches BOTH directions, and a translate-triggered
+    /// download can run beside a user-initiated one. Single-flight is now
+    /// per-token, not global.
+    pack_downloads: std::collections::BTreeMap<&'static str, (u64, Option<u64>)>,
+    /// Why a pack download STOPPED, per pair, kept until that pair is tried
+    /// again.
+    ///
+    /// Without this the key died at `on_pack_installed`: only a translation
+    /// waiting on that exact pair consumed it, and every other route -- a
+    /// user's Install click above all -- dropped it on the floor. A download
+    /// that failed and one still running then rendered identically, which is
+    /// to say not at all. Reported, not swallowed.
+    pack_failures: std::collections::BTreeMap<&'static str, &'static str>,
     pub vault: Option<Vault>,
     pub vault_path: PathBuf,
     /// Bookmark/provenance store. Session-lifetime BY DESIGN: it opens
@@ -1113,6 +1954,8 @@ pub struct AppState {
     tab_scan_skipped_quarantine: usize,
     /// Monotonically increasing; never reused even after tabs close.
     next_tab_id: u64,
+    /// Ids for blocked-navigation banners (see note_navigation_blocked).
+    blocked_pending_seq: u64,
     /// Platform host areas (chrome/content containers on unix, the parent
     /// window on Windows).
     pub hosts: platform::Hosts,
@@ -1131,6 +1974,11 @@ pub struct AppState {
     /// not disturb the left one, and the sidebar is present whether or not a
     /// panel is open.
     chrome_left: i32,
+    /// Width the chrome is using down the RIGHT edge, in logical pixels.
+    /// The independent mirror of `chrome_left`: panels can change the top
+    /// inset without disturbing either side, and only one toolbar strip is
+    /// normally non-zero.
+    chrome_right: i32,
     /// The top inset of the CLOSED chrome, remembered across a panel.
     ///
     /// `chrome_height` holds whatever the chrome last asked for, which while
@@ -1208,6 +2056,13 @@ pub struct AppState {
     /// be replayed.
     pub picked_paths: std::collections::VecDeque<(u64, PathBuf)>,
     pub next_pick_token: u64,
+    /// An activation or release result that arrived while the vault was
+    /// LOCKED. It used to be dropped, which for a release meant the server
+    /// had freed the slot while this vault kept its receipt: Premium came
+    /// back at the next unlock on a device the server no longer counted.
+    /// Replayed by `activation::replay_pending` right after the next unlock
+    /// evaluation. In memory only: a process exit in between still loses it.
+    pub pending_activation_event: Option<crate::activation::ActivationEvent>,
     /// What the capture currently in flight is FOR. Written by the IPC arm
     /// that set `CAPTURE_IN_FLIGHT`, read once by `on_capture_done`. A single
     /// value is enough because the in-flight flag admits one capture at a
@@ -1234,6 +2089,12 @@ pub struct AppState {
     /// writes it (dropping this) or `cred_save_dismiss`/a navigation/a tab
     /// switch clears it unwritten. See `note_login_submitted`.
     pending_save: Option<PendingSave>,
+    /// When the locked-vault save notice was last shown, for the cooldown.
+    /// A single global timestamp, NOT a per-tab or per-origin map: the notice
+    /// names no site, so there is nothing to key it by, and a review showed a
+    /// remembered (tab, origin) pair cannot enforce "once per pair" anyway
+    /// once submissions from two tabs interleave.
+    last_locked_save_notice: Option<Instant>,
     /// PDF renders in flight, keyed by destination path, valued by the URL
     /// they were started from. The engine answers asynchronously and the tab
     /// may have navigated by then, so the source URL cannot be re-read at
@@ -1514,6 +2375,33 @@ impl AppState {
         smoke_mode: bool,
     ) -> Self {
         Self {
+            // The stored locale, with the two failure modes kept apart on
+            // purpose (BootstrapError's docs carry the ruling): an UNKNOWN
+            // tag -- a prefs file from a build that carried more locales --
+            // falls back to English with an id-free log, while a compiled
+            // catalog failing validation is a build defect and panics, in a
+            // build the i18n tests already fail.
+            i18n: match crate::i18n::I18n::bootstrap(&crate::prefs::load().ui_locale) {
+                Ok(l10n) => l10n,
+                Err(crate::i18n::BootstrapError::UnknownLocale) => {
+                    // The tag itself stays out of the log: it is a stored
+                    // user preference, and ids-not-values applies to it too.
+                    eprintln!("i18n: stored locale unknown to this build; using en");
+                    crate::i18n::I18n::bootstrap("en")
+                        .expect("the embedded English catalog is valid")
+                }
+                Err(crate::i18n::BootstrapError::InvalidCatalog(why)) => {
+                    panic!("compiled catalog invalid: {why}")
+                }
+            },
+            locale_generation: 1,
+            translation_seq: 0,
+            translator: None,
+            translate_polling: None,
+            #[cfg(debug_assertions)]
+            last_extracted: Vec::new(),
+            pack_downloads: std::collections::BTreeMap::new(),
+            pack_failures: std::collections::BTreeMap::new(),
             vault: None,
             vault_path: Vault::default_path(),
             store: None,
@@ -1529,6 +2417,7 @@ impl AppState {
             tab_scan: None,
             tab_scan_skipped_quarantine: 0,
             next_tab_id: 1,
+            blocked_pending_seq: 0,
             hosts,
             proxy,
             chrome,
@@ -1541,6 +2430,7 @@ impl AppState {
             // exists when the chrome measures it, one round trip after boot,
             // the same way it learns the strip's height.
             chrome_left: 0,
+            chrome_right: 0,
             chrome_arrangement: platform::ChromeLayout::Strip,
             privacy: platform::TabPolicy::default(),
             // Defaults to "opened on its own"; `main` sets it from the
@@ -1550,6 +2440,7 @@ impl AppState {
             probe_started: false,
             ping_count: 0,
             picked_paths: std::collections::VecDeque::new(),
+            pending_activation_event: None,
             next_pick_token: 1,
             capture_intent: crate::capture::CaptureIntent::SaveFile,
             smoke_second_ping_requested: false,
@@ -1559,6 +2450,7 @@ impl AppState {
             #[cfg(feature = "chat")]
             download_compare: crate::download_compare::DownloadCompareState::default(),
             pending_save: None,
+            last_locked_save_notice: None,
             pending_pdf: std::collections::HashMap::new(),
             #[cfg(feature = "chat")]
             chat: crate::chat_panel::ChatState::default(),
@@ -1591,9 +2483,7 @@ impl AppState {
         let supported = self
             .tabs
             .get(self.active)
-            .map(|t| {
-                platform::engine_settings(&t.view).permissions_registered == "applied"
-            })
+            .map(|t| platform::engine_settings(&t.view).permissions_registered == "applied")
             .unwrap_or(false);
         let site = normalize_origin(origin);
         // ALL FOUR KINDS, ALWAYS, for whatever site the tab is on -- not just
@@ -1687,7 +2577,6 @@ impl AppState {
         (self.autolock_secs > 0).then(|| Duration::from_secs(self.autolock_secs))
     }
 
-
     /// When the event loop next needs to wake for the vault: the warning if it
     /// has not been raised yet, otherwise the lock itself.
     ///
@@ -1719,6 +2608,31 @@ impl AppState {
     }
 
     /// Push an unsolicited event to the chrome UI.
+    /// Resolve every chrome marker key in the CURRENT locale and push one
+    /// fill snapshot, tagged with the generation. One event, all 450-odd
+    /// strings: atomic by construction, so a race between two switches can
+    /// only ever paint one locale, never a mixture -- the chrome refuses
+    /// any snapshot that is not strictly newer than the last it applied.
+    ///
+    /// English pushes too when asked (a switch BACK to en is a normal fill
+    /// whose content equals the golden markup; the sync gate guarantees
+    /// that equality). What never happens is a push on an ENGLISH STARTUP:
+    /// the caller gates that, and zero-runtime-fill for English stays true.
+    pub fn push_locale_fill(&self, locale: &str) {
+        let mut messages = serde_json::Map::new();
+        for key in crate::i18n::CHROME_MSG_KEYS {
+            messages.insert((*key).to_string(), Value::from(self.i18n.text(key)));
+        }
+        self.emit(
+            "ui_locale_fill",
+            json!({
+                "generation": self.locale_generation,
+                "locale": locale,
+                "messages": messages,
+            }),
+        );
+    }
+
     pub fn emit(&self, event: &str, data: Value) {
         let payload = json!({ "event": event, "data": data });
         let _ = self
@@ -1726,30 +2640,45 @@ impl AppState {
             .evaluate_script(&format!("window.__rb_event({payload});"));
     }
 
-    /// A page capture finished (or failed) in the engine. Validate, let the
-    /// user choose where it goes, write it, and say what happened -- all on
-    /// the UI thread, like every other picker flow. A cancelled picker is a
+    /// A page capture finished (or failed) in the engine. Validate cheaply,
+    /// let the user choose where it goes, write it, and say what happened.
+    /// Windows full-page parse/decode/validation ran on its capture worker;
+    /// picker and state changes remain here. A cancelled picker is a
     /// changed mind, not an error: no file, no toast.
     pub fn on_capture_done(&mut self, ev: crate::capture::CaptureEvent) {
-        // Whatever happens below, the next capture may start. The intent is
-        // read alongside and reset for the same reason the flag is cleared:
-        // a stale intent must not survive into an unrelated later capture.
-        crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
         let intent = self.capture_intent;
         self.capture_intent = crate::capture::CaptureIntent::SaveFile;
+        // Snapshot pictures still have to pass through the row-streaming
+        // 8 MP bound. Keep the shared capture slot busy until that worker
+        // returns so a second snapshot cannot replace its one pending draft.
+        if intent != crate::capture::CaptureIntent::Snapshot {
+            crate::capture::CAPTURE_IN_FLIGHT
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+        }
         // The scope the capture ACTUALLY had, from the path that produced
         // it -- not a compile-time guess about the platform. On Windows those
         // differ whenever the full-page call could not be issued.
         let scope = ev.scope;
-        let bytes = match ev.png.and_then(|bytes| {
-            crate::capture::validate_capture_bytes(&bytes).map(|()| bytes)
-        }) {
+        let bytes = match ev
+            .png
+            .and_then(|bytes| crate::capture::validate_capture_bytes(&bytes).map(|()| bytes))
+        {
             Ok(bytes) => bytes,
             Err(code) => {
                 match intent {
                     crate::capture::CaptureIntent::SaveFile => {
                         let text = match code {
                             "no_capture_page" => "Nothing to capture on this page.".to_string(),
+                            // MARKETING PASS (WP-AH): new engine-failure copy.
+                            "capture_engine_failed" => {
+                                "The page could not be captured; nothing was saved.".to_string()
+                            }
+                            // MARKETING PASS (WP-AH): new decode/format copy.
+                            "capture_decode_failed" => {
+                                "The capture was not a readable PNG; nothing was saved.".to_string()
+                            }
+                            // MARKETING PASS (WP-AH): changed actionable size-refusal copy.
+                            "capture_too_large" => "This page is too large to capture whole. Try a smaller window or a zoomed-in selection.".to_string(),
                             _ => "The capture failed; nothing was saved.".to_string(),
                         };
                         self.emit("toast", json!({ "text": text, "error": true }));
@@ -1766,31 +2695,30 @@ impl AppState {
                     crate::capture::CaptureIntent::Archive => {
                         self.emit("archive_saved", json!({ "ok": false, "error": code }));
                     }
+                    crate::capture::CaptureIntent::Snapshot => {
+                        crate::page_integrity::finish_snapshot_picture(self, Err(code), scope);
+                    }
                 }
                 return;
             }
         };
         if intent == crate::capture::CaptureIntent::Region {
-            match crate::capture::stash_region(bytes) {
-                Ok((token, width, height)) => {
-                    self.emit(
-                        "region_capture_ready",
-                        json!({
-                            "ok": true,
-                            "token": token,
-                            "w": width,
-                            "h": height,
-                            "scope": crate::capture::scope_label(scope),
-                        }),
-                    );
-                }
-                Err(code) => {
-                    self.emit(
-                        "region_capture_ready",
-                        json!({ "ok": false, "error": code }),
-                    );
-                }
-            }
+            // A long-page decode and resize would merely replace the old UI
+            // parse stall with a new one. Prepare the bounded preview on a
+            // worker and return only its token and dimensions to this loop.
+            let proxy = self.proxy();
+            std::thread::spawn(move || {
+                let result = crate::capture::stash_region(bytes);
+                let _ = proxy.send_event(UserEvent::RegionCapturePrepared { result, scope });
+            });
+            return;
+        }
+        if intent == crate::capture::CaptureIntent::Snapshot {
+            let proxy = self.proxy();
+            std::thread::spawn(move || {
+                let result = crate::capture::bounded_picture_png(&bytes);
+                let _ = proxy.send_event(UserEvent::SnapshotPicturePrepared { result, scope });
+            });
             return;
         }
         if intent == crate::capture::CaptureIntent::Archive {
@@ -1827,6 +2755,38 @@ impl AppState {
                         "text": "Could not write the capture to that location.",
                         "error": true,
                     }),
+                );
+            }
+        }
+    }
+
+    /// Publishes a bounded region preview prepared off the UI thread. Source
+    /// dimensions deliberately keep the original `w`/`h` wire names; the
+    /// preview dimensions are additional mapping inputs, never OCR bounds.
+    pub fn on_region_capture_prepared(
+        &mut self,
+        result: Result<(u64, u32, u32, u32, u32), &'static str>,
+        scope: crate::capture::CaptureScope,
+    ) {
+        match result {
+            Ok((token, width, height, preview_width, preview_height)) => {
+                self.emit(
+                    "region_capture_ready",
+                    json!({
+                        "ok": true,
+                        "token": crate::capture::token_wire(token),
+                        "w": width,
+                        "h": height,
+                        "preview_w": preview_width,
+                        "preview_h": preview_height,
+                        "scope": crate::capture::scope_label(scope),
+                    }),
+                );
+            }
+            Err(code) => {
+                self.emit(
+                    "region_capture_ready",
+                    json!({ "ok": false, "error": code }),
                 );
             }
         }
@@ -1944,7 +2904,13 @@ impl AppState {
             &self.chrome,
             active,
             self.chrome_height,
+            // What the chrome measures with no panel open. The Windows
+            // Overlay branch lays the page out against THIS rather than
+            // against `chrome_height`, so a modal neither moves the page nor
+            // leaves a band when the strip changes underneath it.
+            self.closed_chrome_height,
             self.chrome_left,
+            self.chrome_right,
             self.chrome_arrangement,
         );
     }
@@ -1989,7 +2955,7 @@ impl AppState {
         // "fix" would itself have been a 32px jump -- the same defect, one
         // third the size, and harder to see.
         if leaving_cover {
-            self.chrome_height = self.closed_chrome_height.max(0);
+            self.chrome_height = self.chrome_insets().leaving_cover().top;
             platform::set_chrome_height(&self.hosts, self.chrome_height);
         }
         self.relayout();
@@ -2008,28 +2974,69 @@ impl AppState {
         self.chrome_height
     }
 
-    /// Both axes at once: what the chrome is using along the top, and down
-    /// the left.
+    /// All three chrome insets at once: top, left and right.
     ///
-    /// One entry point rather than two setters, because the two numbers
-    /// describe one rectangle and applying them separately means laying out
-    /// twice -- once with a top that matches and a left that does not. That
+    /// One entry point rather than three setters, because the values describe
+    /// one rectangle and applying them separately means laying out repeatedly
+    /// -- once with a top that matches and a side that does not. That
     /// intermediate frame is exactly the class of defect the stale-height
     /// guard above exists to stop, and it would be back the first time
-    /// switching layout changed both numbers together.
-    pub fn set_chrome_insets(&mut self, top: i32, left: i32) {
-        self.chrome_height = top;
-        self.chrome_left = left;
-        // Only a STRIP reports the closed chrome. While a panel is open the
-        // top inset is the panel's height, and remembering that as "closed"
-        // is what would put the page back under a 700px card.
-        if matches!(self.chrome_arrangement, platform::ChromeLayout::Strip) {
-            self.closed_chrome_height = top;
+    /// switching layout changed multiple insets together.
+    pub fn set_chrome_insets(&mut self, top: i32, left: i32, right: i32) {
+        // KEEPS the closed strip it already had. A caller with only three
+        // numbers is changing the sides or restoring a height, not telling us
+        // what a closed strip measures, and treating its `top` as the strip
+        // was a real regression: `toolbar_placement_set` calls this with
+        // `chrome_height()`, which is the PANEL's height while a modal is
+        // open, so switching placement back to Top mid-modal wrote the panel
+        // height into the closed strip and pushed the page down until the
+        // chrome remeasured. Only the chrome states a strip, and it does that
+        // through `set_chrome_insets_with_strip`.
+        //
+        // `None` is the whole point of this method. It is not shorthand for
+        // `Some(top)`, and `platform::chrome_inset_tests` fails if it ever
+        // becomes that again.
+        self.apply_chrome_insets(top, left, right, None);
+    }
+
+    /// The same, with the closed strip's height stated rather than inferred.
+    ///
+    /// The chrome sends both numbers because only it knows which is which:
+    /// `top` is whatever must be given room right now, `strip` is what the
+    /// chrome measures when no panel is open. Inferring the second from the
+    /// arrangement was an ordering bug, because a panel's height can arrive
+    /// before the arrangement that explains it.
+    pub fn set_chrome_insets_with_strip(&mut self, top: i32, left: i32, right: i32, strip: i32) {
+        self.apply_chrome_insets(top, left, right, Some(strip));
+    }
+
+    /// The four numbers as they are currently held.
+    fn chrome_insets(&self) -> platform::ChromeInsets {
+        platform::ChromeInsets {
+            top: self.chrome_height,
+            left: self.chrome_left,
+            right: self.chrome_right,
+            strip: self.closed_chrome_height,
         }
+    }
+
+    /// The one body both setters share.
+    ///
+    /// The decision about what `stated: None` means lives in
+    /// `platform::ChromeInsets::applied`, where it can be tested as a sequence
+    /// without a window. This method is only the plumbing that follows it.
+    fn apply_chrome_insets(&mut self, top: i32, left: i32, right: i32, stated: Option<i32>) {
+        let next = self.chrome_insets().applied(top, left, right, stated);
+        self.chrome_height = next.top;
+        self.chrome_left = next.left;
+        self.chrome_right = next.right;
+        self.closed_chrome_height = next.strip;
         // unix: moves the content overlay's insets (GTK repacks itself).
-        // Windows: no-op, the relayout() below applies both numbers.
-        platform::set_chrome_height(&self.hosts, top);
-        platform::set_chrome_left(&self.hosts, left);
+        // Windows: no-op, the relayout() below applies all three values.
+        platform::set_chrome_height(&self.hosts, next.top);
+        platform::set_chrome_strip(&self.hosts, next.strip);
+        platform::set_chrome_left(&self.hosts, next.left);
+        platform::set_chrome_right(&self.hosts, next.right);
         self.relayout();
     }
 
@@ -2125,11 +3132,27 @@ impl AppState {
     }
 
     pub fn close_tab(&mut self, id: u64) -> Result<(), &'static str> {
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+            if tab.blocked_pending.borrow().is_some() {
+                self.emit("navigation_blocked_retired", json!({ "tab_id": id }));
+            }
+        }
         let index = self
             .tabs
             .iter()
             .position(|tab| tab.id == id)
             .ok_or("not_found")?;
+        crate::page_integrity::on_tab_closed(self, id);
+
+        // Keep the WebView that owns the asynchronous engine clear alive.
+        // Closing it can suppress the completion callback, leaving the
+        // process gate in Running and every newer tab permanently blank.
+        // The event-loop remains responsive; only destruction of this blank
+        // pending tab waits for the clear's result.
+        if self.tabs[index].initial_navigation_pending {
+            self.tabs[index].close_after_session_wipe = true;
+            return Ok(());
+        }
         let was_active = index == self.active;
 
         // A live cross-tab scan keeps the closing tab's row: a still-pending
@@ -2192,7 +3215,10 @@ impl AppState {
             self.active = index.min(self.tabs.len() - 1);
         }
         if was_active {
-            platform::show_tab(&self.tabs[self.active].view, &self.tabs[self.active].webview);
+            platform::show_tab(
+                &self.tabs[self.active].view,
+                &self.tabs[self.active].webview,
+            );
             self.relayout();
         }
         self.emit_tabs_changed();
@@ -2213,6 +3239,44 @@ impl AppState {
         self.set_active(index);
         self.emit_tabs_changed();
         Ok(())
+    }
+
+    /// Reorders the strip by stable tab id while preserving the active tab's
+    /// identity. The complete-permutation check happens before the Vec is
+    /// touched, so a stale or malformed chrome snapshot cannot partly move
+    /// tabs or make a later id name a different page.
+    pub fn reorder_tabs(&mut self, ids: &[u64]) -> Result<Vec<u64>, &'static str> {
+        let active_id = self
+            .tabs
+            .get(self.active)
+            .map(|tab| tab.id)
+            .ok_or("bad_args")?;
+        let current: BTreeSet<u64> = self.tabs.iter().map(|tab| tab.id).collect();
+        let requested: BTreeSet<u64> = ids.iter().copied().collect();
+        if ids.len() != self.tabs.len() || requested.len() != ids.len() || requested != current {
+            return Err("bad_args");
+        }
+
+        // Validation above proves every lookup in this loop succeeds exactly
+        // once. MAX_TABS is 32, so the simple removal pass is clearer than an
+        // auxiliary ownership map and its quadratic bound is immaterial.
+        let mut old = std::mem::take(&mut self.tabs);
+        let mut reordered = Vec::with_capacity(old.len());
+        for id in ids {
+            let index = old
+                .iter()
+                .position(|tab| tab.id == *id)
+                .expect("validated tab permutation lost an id");
+            reordered.push(old.remove(index));
+        }
+        self.tabs = reordered;
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active_id)
+            .expect("validated tab permutation lost the active tab");
+        self.emit_tabs_changed();
+        Ok(self.tabs.iter().map(|tab| tab.id).collect())
     }
 
     /// Selects a tab by position, ignoring an out-of-range index.
@@ -2330,6 +3394,21 @@ impl AppState {
         }
     }
 
+    /// Opens the engine's developer tools on the ACTIVE CONTENT TAB.
+    ///
+    /// Aimed explicitly rather than left to the engine's own F12 handling:
+    /// the key is resolved natively (see `shortcuts`), so whichever webview
+    /// held focus, the inspector opens on the page the user is looking at.
+    /// The privileged chrome webview is built with devtools disabled in
+    /// release builds and stays that way -- this method has no way to reach
+    /// it, which is the point.
+    pub fn open_active_devtools(&self) {
+        let Some(webview) = self.active_webview() else {
+            return;
+        };
+        platform::open_devtools(webview);
+    }
+
     /// Replaces the browser-wide privacy policy and applies it to every open
     /// tab, so a toggle takes effect on what the user is already looking at
     /// rather than only on the next tab they open.
@@ -2338,10 +3417,56 @@ impl AppState {
     /// its view is built, and pretending otherwise would claim a tab had no
     /// on-disk profile when it still did.
     pub fn set_privacy(&mut self, policy: platform::TabPolicy) {
+        // Turning ad blocking OFF dismisses every held page. The banner tells
+        // the user to do exactly this, and with the filters gone the hold's
+        // reason is gone: leaving the pending up meant the real page loaded
+        // under a banner still saying it did not open, with instructions to
+        // disable blocking that was already disabled (review R-004, round 2).
+        if !policy.block_ads {
+            for tab in &mut self.tabs {
+                tab.adlist.clear_pending();
+            }
+        }
         self.privacy = policy;
-        for tab in &self.tabs {
+        for tab in &mut self.tabs {
+            tab.block_ads = self.privacy.block_ads;
             platform::apply_policy(&tab.webview, &tab.view, &self.privacy);
         }
+    }
+
+    /// Applies WebView2's profile-level tracking-prevention choice to every
+    /// profile represented by an open tab. Ordinary tabs share one profile;
+    /// ephemeral tabs may not, so walking the live tabs is deliberate rather
+    /// than assuming the active tab's profile is the only one in use.
+    ///
+    /// Returns true only when every live profile read back the requested
+    /// level. New tabs independently apply the persisted preference during
+    /// hardening, so this runtime path and the next-tab path converge.
+    pub fn set_tracking_prevention(
+        &mut self,
+        level: crate::prefs::TrackingPreventionLevel,
+    ) -> bool {
+        use crate::platform::TrackingPreventionState;
+
+        let mut attempted = false;
+        let mut all_confirmed = true;
+        for tab in &self.tabs {
+            attempted = true;
+            let confirmed = platform::set_tracking_prevention(&tab.webview, &tab.view, level);
+            let matches = matches!(
+                (level, confirmed),
+                (
+                    crate::prefs::TrackingPreventionLevel::Strict,
+                    TrackingPreventionState::Strict
+                ) | (
+                    crate::prefs::TrackingPreventionLevel::Balanced,
+                    TrackingPreventionState::Balanced
+                )
+            );
+            all_confirmed &= matches;
+        }
+        self.emit_tab_status();
+        attempted && all_confirmed
     }
 
     /// The policy plus what this ENGINE can actually enforce. The UI needs
@@ -2355,6 +3480,12 @@ impl AppState {
         // instead of by nobody. Assembled, not phrased -- see that module.
         let copy = crate::cookie_control::forget_all_copy();
         json!({
+            // Whether the cookie-clearing controls can do anything on this
+            // backend. False on WebKitGTK in 1.0.0, where the platform calls
+            // are stubs; the chrome disables both controls and shows
+            // `cookie_clear_unavailable_intro` instead of the enabled copy.
+            "cookie_clear_available": crate::cookie_control::available(),
+            "cookie_clear_unavailable_intro": crate::cookie_control::unavailable_intro(),
             "block_ads": self.privacy.block_ads,
             "freeze_after_load": self.privacy.freeze_after_load,
             "javascript": self.privacy.javascript,
@@ -2405,6 +3536,7 @@ impl AppState {
                 "ephemeral_confirmed": "not_attempted",
                 "hardened_environment": "not_attempted",
                 "session_lock_registered": "not_attempted",
+                "translation": { "active": false },
                 // Same degraded default as everything else in this
                 // unreachable arm; the measured value lives in the tab arm.
                 "tunnel": "not_attempted",
@@ -2430,6 +3562,26 @@ impl AppState {
             // empty label with nothing behind it.
             "origin": host_of(&tab.url),
             "tls": platform::tls_state(&tab.webview, &tab.view),
+            // The certificate issuer, DISPLAY ONLY, for the Info tab's "Issued
+            // by" row. Null when there is no TLS or the engine cannot read one
+            // (every Windows build, honestly). Never an input to a decision.
+            "tls_issuer": platform::tls_issuer(&tab.webview, &tab.view),
+            // Whether THIS page was loaded over plain HTTP -- a fact a privacy
+            // browser should state plainly in the Info tab ("not encrypted"),
+            // distinct from `insecure_pending`, which is the mid-navigation
+            // interstitial rather than a settled property of the loaded page.
+            "page_insecure": platform::page_insecure(&tab.view),
+            // The declared-language badge hint. Null unless the page declared a
+            // language; a hint the source dropdown overrides, never a gate.
+            "detected_lang": tab.detected_lang,
+            // The active tab's translation state rides WITH tab status, so
+            // the panel and the toolbar chip repaint on navigation and on
+            // every phase change. Before this, renderTranslate ran only from
+            // the user's own three clicks: navigate off a translated page and
+            // the panel kept claiming "This page is translated" about a page
+            // that was never touched -- the host knew, and the page was
+            // never told. Third instance of that defect class in this file.
+            "translation": self.translation_status().unwrap_or_else(|_| json!({ "active": false })),
             // Capability flags ride along so the UI can disable (and
             // explain) a control the running platform cannot honour, instead
             // of offering a switch that does nothing.
@@ -2501,6 +3653,29 @@ impl AppState {
             // The plain-HTTP URL the navigation handler is holding for THIS
             // tab, or null. The chrome renders the warning from this field
             // alone, so it follows the active tab and never a stale event.
+            // The held page, or null. Carries the pending id because this
+            // banner survives a tab switch and a click must name the banner
+            // it answers; and `can_allow`, because a backend with no way to
+            // except a host must not be offered a button it cannot honour.
+            // THE TAB'S ID, because the held-page banner is answered by tab AND
+            // pending id, and the chrome takes the tab id from here. It was
+            // absent: the chrome sent `undefined`, JSON dropped the field, and
+            // both IPC arms rejected every click as bad_args, so Open anyway
+            // never worked. The DOM gate's fixture had invented the field and
+            // passed thirteen checks over a button that could not (review R-001,
+            // round 2). Pinned by the smoke run, which reads the real status.
+            "id": tab.id,
+            "adlist_pending": tab.adlist.pending().map(|p| serde_json::json!({
+                "id": p.id,
+                "host": p.host,
+                "method": p.method,
+                "can_allow": crate::adlist_consent::CAN_ALLOW,
+            })),
+            "adlist_override_host": tab.adlist.override_host(),
+            // The blocked-site notice this tab is showing, if any: the chrome
+            // keeps its notice up exactly while this matches the id it was
+            // given, and takes it down when Rust has cleared or replaced it.
+            "blocked_pending": tab.blocked_pending.borrow().as_ref().map(|(id, _)| *id),
             "insecure_pending": tab.insecure_pending.as_deref(),
             // THE HOST, COMPUTED HERE, because the chrome computing its own
             // put two parsers on the same string and they disagreed. The
@@ -2578,7 +3753,10 @@ impl AppState {
             return;
         };
         let level = tab.zoom_step(dir);
-        self.emit("zoom_changed", json!({ "percent": (level * 100.0).round() }));
+        self.emit(
+            "zoom_changed",
+            json!({ "percent": (level * 100.0).round() }),
+        );
     }
 
     /// The engine zoomed a tab by itself -- a keypad shortcut, or Ctrl+scroll.
@@ -2593,7 +3771,10 @@ impl AppState {
         self.tabs[index].note_engine_zoom(factor);
         if index == self.active {
             let level = self.tabs[index].zoom_level();
-            self.emit("zoom_changed", json!({ "percent": (level * 100.0).round() }));
+            self.emit(
+                "zoom_changed",
+                json!({ "percent": (level * 100.0).round() }),
+            );
         }
     }
 
@@ -2628,6 +3809,1442 @@ impl AppState {
         Ok(self.active_tab_status())
     }
 
+    /// Receives one extractor message from a content page.
+    ///
+    /// EVERYTHING HERE IS UNTRUSTED. It was assembled by a script running in a
+    /// hostile document, so this is the one place it is parsed, and it is
+    /// parsed against a shape rather than trusted to be one.
+    ///
+    /// Four things are refused outright, and each has a reason rather than
+    /// being defensive habit:
+    ///   - a tab that no longer exists (a late message from a closed tab);
+    ///   - a tab with no live translation session (nobody asked, so nothing
+    ///     is accepted -- this is where "never automatic" is actually
+    ///     enforced, not in the UI);
+    ///   - a message whose `href` is not the page the session was consented
+    ///     for (the page navigated, so the consent died with it);
+    ///   - anything that is not the one shape this path accepts.
+    pub fn on_content_translate(&mut self, id: u64, raw: &str) {
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(raw) else {
+            return;
+        };
+        let href = value.get("href").and_then(Value::as_str).unwrap_or_default();
+        let kind = value.get("kind").and_then(Value::as_str).unwrap_or_default();
+
+        // TIER-1 DETECTION: the page declared its language. This carries NO
+        // page text -- only the html lang attribute -- so it needs no session
+        // and no consent: it is the same class of fact as the URL, which the
+        // host already has. Stored for the badge; it never gates translation.
+        // A late or repeated signal simply overwrites, which is correct: a page
+        // that changes its lang attribute has changed its answer.
+        if kind == "detected" {
+            let lang = value.get("lang").and_then(Value::as_str).unwrap_or_default();
+            // Only when the signalling page is still the one on screen, so a
+            // stale message from a navigated-away page cannot relabel this tab.
+            // AND only if it is a plausible language tag: a page controls this
+            // string, so bidi overrides, zero-width characters and other
+            // control junk must never reach the badge UI. A BCP-47 tag is ASCII
+            // letters, digits and hyphens; anything else is refused rather than
+            // sanitised, because a tag that needs sanitising is not a tag.
+            // Declared attribute first; failing that, the page-side letter
+            // count's script name, resolved only where it names exactly one
+            // supported language (see language_for_script_name). Both are
+            // page-controlled hints: the dropdown overrides them and the
+            // cumulative script guard still judges the real text.
+            // Resolved HERE, once, to a registry code -- "el-GR" becomes
+            // "el", "zh-CN" becomes "zh-Hans" -- so every consumer (the
+            // prefill, the hint, continuation) compares codes and none of
+            // them re-derives a primary subtag. The old split-the-tag
+            // approach cut "zh-CN" to "zh", which names NO registry language
+            // (Chinese is two: zh-Hans and zh-Hant), so a Chinese page that
+            // declared itself perfectly was treated as undetected.
+            let resolved: Option<String> = if !lang.is_empty() && is_plausible_lang_tag(lang) {
+                crate::detect::registry_code_for_tag(lang)
+            } else {
+                None
+            }
+            .or_else(|| {
+                value
+                    .get("script")
+                    .and_then(Value::as_str)
+                    .and_then(crate::detect::language_for_script_name)
+            })
+            .map(str::to_string);
+            let (Some(resolved), true) =
+                (resolved, session_is_current(href, &self.tabs[index].url))
+            else {
+                return;
+            };
+            let lang = resolved.as_str();
+            {
+                self.tabs[index].detected_lang = Some(lang.to_string());
+                self.emit_tab_status();
+                // CONTINUATION, triggered by the page's own declaration and
+                // nothing else. The user translated a page in this language
+                // in this tab; the new page says it is the same language; so
+                // the standing choice applies. Declared-lang only -- a page
+                // that declares nothing waits for a click, which is stated in
+                // the panel as an honest limit rather than worked around by
+                // reading page text unasked.
+                if index == self.active {
+                    let code = lang.to_string();
+                    self.maybe_continue_translation(index, &code);
+                }
+            }
+            return;
+        }
+
+        let tab = &self.tabs[index];
+        // A session is required, and it must be for THIS page. A page that
+        // posts unprompted -- which any page can, since this runs in its own
+        // JS context -- gets its text dropped here.
+        if !extract_is_acceptable(
+            tab.translation.as_ref().map(|s| s.page.as_str()),
+            &tab.url,
+            kind,
+            href,
+        ) {
+            return;
+        }
+        // THE TOKEN, checked separately from the URL because they answer
+        // different questions. The URL says "is this the page consent was
+        // given for"; the token says "is this THIS run of the session". A user
+        // who cancels and clicks again on the same page passes the first check
+        // and must still fail the second for run 1's late reply.
+        if !extract_token_matches(
+            tab.translation.as_ref().map(|s| s.token),
+            value.get("session").and_then(Value::as_str),
+        ) {
+            return;
+        }
+        let batch: Vec<&str> = match value.get("batch").and_then(Value::as_array) {
+            Some(items) => items.iter().filter_map(Value::as_str).collect(),
+            None => return,
+        };
+        let batch: Vec<String> = batch.into_iter().map(str::to_string).collect();
+        #[cfg(debug_assertions)]
+        {
+            self.last_extracted = batch.clone();
+        }
+        let offset_u64 = value.get("offset").and_then(Value::as_u64).unwrap_or(0);
+        let more = value.get("more").and_then(Value::as_bool).unwrap_or(false);
+        // Page-supplied and therefore bounded: a document cannot have more
+        // translatable nodes than the extractor's own ceiling allows, and a
+        // wild value would only distort a percentage, never a patch.
+        let doc_total = value
+            .get("total")
+            .and_then(Value::as_u64)
+            .filter(|t| *t > 0 && *t <= 1_000_000)
+            .map(|t| t as usize);
+
+        // OFFSET ORDERING, ENFORCED, AND COMPARED AS u64. The offset is
+        // attacker-controlled JSON. A red-team pass showed that trusting it lets
+        // a page skip the guard (a non-zero offset first) or corrupt accounting
+        // (a huge offset). A reconciliation pass added the 32-bit note: casting
+        // to usize BEFORE comparing lets a value congruent mod 2^32 pass on a
+        // 32-bit target, so the comparison is done in u64. The offset MUST equal
+        // what the host has accepted so far -- first batch 0, each continuation
+        // exactly where the last left off -- else the message is dropped.
+        let expected_offset = self.tabs[index].translation_extracted as u64;
+        if offset_u64 != expected_offset {
+            return;
+        }
+        let offset = offset_u64 as usize; // safe: equals translation_extracted
+        self.tabs[index].translation_extracted = offset.saturating_add(batch.len());
+
+        // THE CORRUPTION GUARD, ON EVERY BATCH -- not just the first.
+        //
+        // The whole reason the rework exists: an en-source model fed Greek
+        // emitted mangled Greek that got written into a live page. Checking only
+        // the first batch was a red-team CRITICAL: a page could send a tiny or
+        // mixed probe that returned Unknown, then send incompatible text in a
+        // LATER batch that reached the engine unchecked. Now every batch is
+        // checked before it is queued for translation, so wrong-script text
+        // never reaches the engine no matter how the page splits it.
+        //
+        // ONLY A POSITIVE SCRIPT MISMATCH REFUSES. "Unknown" -- too little text,
+        // or a Latin page against a Latin source that script cannot
+        // disambiguate -- proceeds on the user's explicit source choice, which
+        // the dropdown exists to resolve. A clear incompatible script, or a
+        // substantial incompatible SHARE across several scripts, is refused.
+        // The check runs before any pack is fetched on the first batch, so the
+        // common case costs no download and leaves the page untouched; a
+        // refusal on a later batch stops further translation (earlier batches
+        // stay as translated -- readable, never corrupted).
+        // Fold this batch into the session's running tally, then judge the
+        // WHOLE page seen so far. A clear mismatch refuses the session; the
+        // first batch catches the common case before any pack is fetched, and a
+        // later batch that tips the cumulative tally into mismatch stops
+        // further translation (earlier batches stay as translated -- readable,
+        // never corrupted).
+        if let Some(session) = self.tabs[index].translation.as_mut() {
+            session.script_counts.add_batch(&batch);
+            // The document's translatable-node count, as the page counted it.
+            // Kept from whichever batch reports it; a page that rewrites
+            // itself mid-run can revise it upward and the panel follows.
+            if let Some(t) = doc_total {
+                session.doc_total = Some(t);
+            }
+        }
+        // PER NODE, NOT PER PAGE. The cumulative verdict answers "may this
+        // page be translated at all"; it cannot answer "may this NODE be
+        // sent", and a real page often needs the second question. A language
+        // reader prints Macedonian and its English translation in one
+        // document: the page tally lands near half foreign, trips the
+        // incompatible-share ceiling, and the whole page is refused -- so the
+        // reader gets nothing, on a page that is half exactly what they asked
+        // for. Filtering instead sends the Macedonian and leaves the English
+        // alone, which is what a reader of that page wants.
+        //
+        // The corruption guard is NOT weakened by this. The incident it exists
+        // for -- an en-source model fed Greek -- has every node fail the same
+        // check, so the filtered batch comes out empty and the refusal below
+        // still fires. What changed is that "some of this page is foreign" and
+        // "this page is the wrong language" are no longer the same answer.
+        let (sent, map): (Vec<String>, Vec<usize>) = {
+            let Some(session) = self.tabs[index].translation.as_ref() else {
+                return;
+            };
+            let mut sent = Vec::new();
+            let mut map = Vec::new();
+            for (i, text) in batch.iter().enumerate() {
+                if session.script_counts.text_is_expected(text) {
+                    sent.push(text.clone());
+                    map.push(i);
+                }
+            }
+            (sent, map)
+        };
+        // Nothing on this page belongs to the source the user chose. THAT is a
+        // script mismatch; a page merely containing some foreign text is not.
+        if sent.is_empty() {
+            let refuses = self.tabs[index]
+                .translation
+                .as_ref()
+                .map(|ssn| script_refuses(&ssn.script_counts))
+                .unwrap_or(false);
+            if refuses {
+                self.fail_translation(index, "translate-script-mismatch");
+                return;
+            }
+            // Too little text to judge and nothing to send: ask for the next
+            // batch rather than ending the run on an inconclusive one.
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                session.batch = Vec::new();
+                session.batch_map = Vec::new();
+                session.batch_span = batch.len();
+                session.offset = offset;
+                session.more = more;
+                session.last_progress = std::time::Instant::now();
+            }
+            self.request_next_batch(index);
+            return;
+        }
+
+        if let Some(session) = self.tabs[index].translation.as_mut() {
+            session.batch_span = batch.len();
+            session.batch = sent;
+            session.batch_map = map;
+            session.submitted = false;
+            session.offset = offset;
+            session.more = more;
+            session.phase = TranslationPhase::Translating;
+            session.last_progress = std::time::Instant::now();
+        }
+        self.emit_tab_status();
+        // From here it is the engine's turn. The tick drives boot, pack load
+        // and translation in that order, reading the translator document
+        // rather than assuming any of them finished.
+        self.start_translate_poller();
+    }
+
+    /// Builds the hidden translator webview, once, on first use.
+    ///
+    /// LAZY ON PURPOSE. It costs a WebView2/WebKitGTK instance and, once a
+    /// pack is loaded, a couple of hundred megabytes of wasm heap. A user who
+    /// never translates anything must never pay that, which means it cannot be
+    /// created at startup no matter how much simpler that would be.
+    ///
+    /// OWN ORIGIN, OWN DATA STORE, OWN PROTOCOL HANDLER -- `build_translator`
+    /// and `serve_translator`, never `serve_chrome`. Phase 0 measured what a
+    /// shared origin leaks (storage both ways on WebView2, IndexedDB and
+    /// cross-session localStorage on WebKitGTK, and `serve_chrome` answering
+    /// screen captures and decrypted archive pages), which is why this is a
+    /// separate arrangement rather than another chrome window.
+    fn translator(&mut self) -> Option<&WebView> {
+        if self.translator.is_none() {
+            let builder = platform::new_translator_webview_builder()
+                // THE DOCUMENT URL CARRIES THE REVISION TOO, and that is the
+                // whole point rather than a flourish. Versioning only the
+                // SCRIPT urls cannot bootstrap: the document that carries the
+                // new script urls is itself cached, so a stale copy is served,
+                // it references the old unversioned scripts, and they are
+                // served from cache as well. The eviction never begins.
+                //
+                // Four builds reached a tester and produced byte-identical
+                // wrong output while the code changed underneath them, because
+                // the entry point never changed. Changing it is what makes
+                // every asset below it reachable again.
+                .with_url(&format!(
+                    "{}?v={}",
+                    platform::TRANSLATE_URL,
+                    crate::asset_revision()
+                ))
+                .with_custom_protocol(
+                    platform::TRANSLATE_SCHEME.to_string(),
+                    move |_id, request: wry::http::Request<Vec<u8>>| {
+                        crate::serve_translator(&request)
+                    },
+                );
+            match platform::build_translator(&self.hosts, builder) {
+                Ok(view) => self.translator = Some(view),
+                Err(_) => {
+                    // Degrade, never crash. The session fails with a named
+                    // reason on the next tick and the panel says so.
+                    return None;
+                }
+            }
+        }
+        self.translator.as_ref()
+    }
+
+    /// Starts the poll loop if it is not already running.
+    ///
+    /// RUNS ONLY WHILE THERE IS WORK. The flag it shares with the thread is
+    /// cleared by the first tick that finds nothing in flight, and the thread
+    /// exits on seeing that. A browser sitting idle does not tick, which
+    /// matters more than it sounds: this wakes the event loop, and a permanent
+    /// timer in a privacy browser is a permanent reason for the machine not to
+    /// sleep.
+    /// Asks the page for the batch AFTER the one just handled.
+    ///
+    /// Its own method because two callers need it and they must not drift: the
+    /// normal continuation after a patch lands, and the case where an entire
+    /// batch was filtered out as foreign -- a mixed page can easily produce a
+    /// run of English nodes between two Macedonian ones, and stopping there
+    /// would translate the top of the page and quietly abandon the rest.
+    fn request_next_batch(&mut self, index: usize) {
+        let Some((token, next_offset, more)) = self.tabs[index]
+            .translation
+            .as_ref()
+            .map(|s| (s.token, s.offset + s.batch_span, s.more))
+        else {
+            return;
+        };
+        if !more {
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                session.phase = TranslationPhase::Done;
+            }
+            self.emit_tab_status();
+            return;
+        }
+        let cmd = json!({
+            "cmd": "extract",
+            "session": token.to_string(),
+            "offset": next_offset,
+            "limitNodes": EXTRACT_MAX_NODES,
+            "limitChars": EXTRACT_MAX_CHARS,
+        });
+        let tab = &self.tabs[index];
+        if platform::deliver_translation(&tab.webview, &tab.view, cmd.to_string()) {
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                session.phase = TranslationPhase::Translating;
+                session.last_progress = std::time::Instant::now();
+            }
+        } else {
+            self.fail_translation(index, "translate-patch-failed");
+        }
+        self.emit_tab_status();
+    }
+
+    fn start_translate_poller(&mut self) {
+        if self.translate_polling.is_some() {
+            return;
+        }
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        self.translate_polling = Some(alive.clone());
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            while alive.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(TRANSLATE_POLL_INTERVAL);
+                if proxy.send_event(UserEvent::TranslateTick).is_err() {
+                    // The event loop is gone; so is the browser.
+                    break;
+                }
+            }
+        });
+    }
+
+    fn stop_translate_poller(&mut self) {
+        if let Some(alive) = self.translate_polling.take() {
+            alive.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Finds the one session currently waiting on the engine.
+    ///
+    /// ONE AT A TIME. The engine is a single hidden document with one loaded
+    /// pack, so two tabs translating at once would have them fighting over
+    /// which pack is resident. The second tab waits; it does not fail, and it
+    /// does not silently swap the pack out from under the first.
+    fn translating_tab(&self) -> Option<usize> {
+        self.tabs
+            .iter()
+            .position(|t| {
+                matches!(
+                    t.translation.as_ref().map(|s| &s.phase),
+                    // Preparing is IN FLIGHT: a session waiting for the page
+                    // to answer its extract request must be ticked too, or
+                    // the stall deadline below can never fire for exactly the
+                    // stuck state it exists to end.
+                    Some(TranslationPhase::Preparing) | Some(TranslationPhase::Translating)
+                )
+            })
+    }
+
+    /// One step. Reads the translator rather than assuming its state.
+    pub fn on_translate_tick(&mut self) {
+        let Some(index) = self.translating_tab() else {
+            // Nothing in flight: stop ticking rather than spinning forever.
+            self.stop_translate_poller();
+            return;
+        };
+        let Some(session) = self.tabs[index].translation.as_ref() else {
+            self.stop_translate_poller();
+            return;
+        };
+        let (token, submitted) = (session.token, session.submitted);
+        let pair = session.pair;
+        let preparing = matches!(session.phase, TranslationPhase::Preparing);
+        let stalled = session.last_progress.elapsed() >= TRANSLATE_STALL_DEADLINE;
+        // THE STALL DEADLINE. Not while a pack for this pair is downloading:
+        // that wait has its own progress feed, and its failure already fails
+        // the session through on_pack_installed.
+        if stalled && !self.pack_downloads.contains_key(pair) {
+            self.fail_translation(index, "translate-timeout");
+            return;
+        }
+        // Waiting on the page's extract reply: nothing to ask the engine yet.
+        if preparing {
+            return;
+        }
+        let proxy = self.proxy.clone();
+        let Some(view) = self.translator() else {
+            self.fail_translation(index, "translate-engine-failed");
+            return;
+        };
+        // A job already with the engine: ask for its result. Otherwise ask
+        // what the document is ready for.
+        let script = if submitted {
+            format!(
+                "window.__translator.result({})",
+                js_string(&json!({ "id": token.to_string() }).to_string())
+            )
+        } else {
+            "window.__translator.status()".to_string()
+        };
+        let _ = view.evaluate_script_with_callback(&script, move |raw| {
+            // `raw` is the JSON-encoded return value, so it is a JSON STRING
+            // containing our JSON. Unwrapped once here and parsed in the
+            // handler, which is the single place that reads this shape.
+            let inner = serde_json::from_str::<String>(&raw).unwrap_or(raw);
+            let _ = if submitted {
+                proxy.send_event(UserEvent::TranslateResult(token, inner))
+            } else {
+                proxy.send_event(UserEvent::TranslateEngine(inner))
+            };
+        });
+    }
+
+    /// The translator document said what it is ready for. Advance it.
+    pub fn on_translate_engine(&mut self, json: &str) {
+        let Some(index) = self.translating_tab() else {
+            return;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
+            return;
+        };
+        let phase = value.get("phase").and_then(Value::as_str).unwrap_or("");
+        let loaded_pair = value.get("pair").and_then(Value::as_str).unwrap_or("");
+        // THE INSTRUMENT. Which copy of translator.js is running, and how much
+        // linear memory it got. Four builds produced byte-identical wrong
+        // output while the code changed underneath them, and nothing could
+        // distinguish a stale script from a correct one computing a wrong
+        // answer. Recorded on the session so the panel can show it: a fact a
+        // person can read beats another round of inference.
+        {
+            let rev = value
+                .get("assetRev")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let heap = value.get("heapBytes").and_then(Value::as_u64);
+            // The census of what crossed into the engine. Counts only -- the
+            // text itself never leaves the translator document.
+            let census = value.get("lastInput").cloned();
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                if !rev.is_empty() {
+                    session.engine_asset_rev = Some(rev);
+                }
+                if heap.is_some() {
+                    session.engine_heap_bytes = heap;
+                }
+                if let Some(c) = census {
+                    if !c.is_null() {
+                        session.engine_last_input = Some(c);
+                    }
+                }
+            }
+        }
+        let (pair, token) = {
+            let Some(session) = self.tabs[index].translation.as_mut() else {
+                return;
+            };
+            // AN ENGINE THAT ANSWERS IS ALIVE, and that is what the stall
+            // deadline is entitled to measure. Booting, loading a 74 MiB
+            // tier-2 pack, or grinding through a batch are all SLOW, not
+            // stuck, and every one of them answers this poll. Marking only on
+            // finished batches made the deadline a work-rate limit: it killed
+            // correct Latin translations at sixty seconds because OPUS-MT is
+            // about eleven times slower than the Mozilla students and a
+            // 200-node batch simply takes longer than that. Silence is the
+            // only symptom worth failing on.
+            session.last_progress = std::time::Instant::now();
+            (session.pair, session.token)
+        };
+
+        if phase == "failed" {
+            // The document's own error KEY, forwarded as-is: it is a catalog
+            // key by construction (see translator.js), never prose, so it can
+            // reach the panel and be rendered in the user's language.
+            let key = value
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("translate-engine-failed")
+                .to_string();
+            self.fail_translation(index, &key);
+            return;
+        }
+        // Still booting or still loading: nothing to do but wait for the next
+        // tick. Reporting progress here would mean guessing at a percentage
+        // the engine does not provide.
+        if phase == "boot" || phase == "loading-engine" || phase == "loading-pack" {
+            return;
+        }
+        if phase == "engine-ready" || (phase == "ready" && loaded_pair != pair) {
+            // THE PACK HAS TO EXIST BEFORE THE ENGINE IS ASKED FOR IT. A
+            // missing one is the NORMAL first-run state, not an error: no
+            // language model ships in the installer, by ruling, so the first
+            // translation into any language downloads one.
+            let root = crate::pack_root().to_path_buf();
+            if !crate::langpack::installed(&root, pair) {
+                self.start_pack_download(pair);
+                return;
+            }
+            // FROM AND TO RIDE ALONGSIDE THE TOKEN, from the registry row.
+            // The translator document used to derive them by byte-slicing the
+            // token (slice(0,2)/(3,5)), which is silently wrong for any
+            // longer subtag: "en-zh-Hans" sliced to from="en", to="h-". A
+            // token is not self-delimiting, so components travel as data and
+            // nothing anywhere splits one.
+            let Some(row) = crate::languages::pair_by_token(pair) else {
+                // Unreachable while sessions are built from validated pairs;
+                // refuse rather than slice if that ever changes.
+                self.fail_translation(index, "translate-failed");
+                return;
+            };
+            // ONE PRECISION FOR EVERY PACK, AND IT IS THE ONE THAT WORKS ON
+            // THE PLATFORM MOST USERS RUN.
+            //
+            // OPUS-MT packs used int8shiftAlphaAll, on the spike's finding
+            // that uncalibrated int8 turned the ine-eng model into word
+            // salad. That was measured on WebKitGTK. On WebView2 the SAME
+            // pack, over the same channel, produced fluent English with no
+            // relation to the input -- a Macedonian article rendered as
+            // invented sentences, while a French page through a Mozilla pack
+            // (int8shiftAll) on that same build was near-perfect. Valid
+            // tokens, wrong arithmetic: the alphas path does not compute the
+            // same thing on the two engines, and the test hardware is
+            // the one that counts.
+            //
+            // Re-measured both ways on every converted pack after the vocab
+            // rebuild, and the premise no longer holds anyway: plain int8 is
+            // equal or BETTER on all of them. On Latin it keeps "Gallia",
+            // which the alphas path turned into "Galileo". So the calibration
+            // is not carrying quality here -- it was compensating for the
+            // misaligned vocabulary that has since been fixed.
+            //
+            // Alphas remain in the model files, ignored by this path. A pack
+            // that genuinely needs them would need its precision recorded
+            // per-pack in the catalog rather than inferred from `source`;
+            // nothing does today, and inferring it is what shipped a broken
+            // path to Windows.
+            let _ = row.source;
+            let gemm = "int8shiftAll";
+            let script = format!(
+                "window.__translator.loadPack({})",
+                js_string(
+                    &json!({
+                        "pair": pair, "from": row.from, "to": row.to,
+                        "gemm": gemm, "vocab": row.vocab,
+                    })
+                    .to_string()
+                )
+            );
+            if let Some(view) = self.translator() {
+                let _ = view.evaluate_script(&script);
+            }
+            return;
+        }
+        if phase == "ready" && loaded_pair == pair {
+            let Some(session) = self.tabs[index].translation.as_ref() else {
+                return;
+            };
+            if session.batch.is_empty() {
+                return;
+            }
+            // THE ONE CROSSING THAT CARRIES PAGE TEXT INTO THE ENGINE. A FIXED
+            // wrapper with a serde_json-encoded argument: the text is a string
+            // literal, never source. `js_string` additionally escapes U+2028
+            // and U+2029, which are legal in JSON and were illegal in JS string
+            // literals before ES2019 -- both engines are far past that, and it
+            // costs nothing to not depend on it.
+            let payload = json!({
+                "id": token.to_string(),
+                // The pair this text is FOR. The document checks it against
+                // what it actually has loaded -- this side's own check reads a
+                // status polled earlier and cannot see a pack swapped in
+                // since. Cheap, and being wrong means a page goes through
+                // another language's model.
+                "pair": pair,
+                "texts": session.batch,
+            })
+            .to_string();
+            let script = format!("window.__translator.translate({})", js_string(&payload));
+            if let Some(view) = self.translator() {
+                let _ = view.evaluate_script(&script);
+            }
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                session.submitted = true;
+            }
+        }
+    }
+
+    /// A job came back. Patch the page, or fail visibly.
+    pub fn on_translate_result(&mut self, job: u64, json: &str) {
+        let Some(index) = self.translating_tab() else {
+            return;
+        };
+        {
+            let Some(live) = self.tabs[index].translation.as_mut() else {
+                return;
+            };
+            // A result for a session that has been replaced or cancelled is
+            // dropped: the indices in it address a node map that no longer
+            // exists.
+            if live.token != job {
+                return;
+            }
+            // Liveness, for the same reason as the status handler above: the
+            // `pending` answer below returns early, and while a job is with
+            // the engine that is the ONLY answer arriving. Without this mark a
+            // translation that is running perfectly looks identical to one
+            // that died, and the deadline picked the wrong one.
+            live.last_progress = std::time::Instant::now();
+        }
+        let Some(session) = self.tabs[index].translation.as_ref() else {
+            return;
+        };
+        // THE PAGE MUST STILL BE THE ONE THIS TEXT CAME FROM.
+        //
+        // Navigation deliberately leaves the session alive -- that is hygiene,
+        // and `session_is_current` is what actually refuses stale work -- and
+        // EXTRACTION checks the url. Delivery did not: it validated the job
+        // token and posted the patch to the tab's CURRENT webview. A
+        // translation still in flight when the user navigated was therefore
+        // handed to whatever origin the tab now showed.
+        //
+        // Our own content script drops it, because the session id no longer
+        // matches. But any page can register the same native message listener
+        // and read the strings: that is the PREVIOUS page's translated text,
+        // its content, disclosed to an unrelated origin. Found by an
+        // independent audit on 2026-09-01 and reproduced against this handler
+        // before it was changed.
+        //
+        // The session is ended rather than deferred: it was consented for a
+        // page that is gone.
+        if !session_is_current(&session.page, &self.tabs[index].url) {
+            self.tabs[index].translation = None;
+            self.emit_tab_status();
+            return;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(json) else {
+            return;
+        };
+        if value.get("pending").and_then(Value::as_bool) == Some(true) {
+            return;
+        }
+        if let Some(key) = value.get("error").and_then(Value::as_str) {
+            let key = key.to_string();
+            self.fail_translation(index, &key);
+            return;
+        }
+        let Some(items) = value.get("items").and_then(Value::as_array) else {
+            self.fail_translation(index, "translate-failed");
+            return;
+        };
+        // Rebuilt rather than forwarded. The document returns {i, t} and the
+        // page expects {i, t}, but passing the engine's array straight through
+        // would let a future change in one shape reach the other without
+        // anybody noticing.
+        // ABSOLUTE INDICES. The engine numbers its output from zero within the
+        // batch it was given; the page numbers its node map across the whole
+        // document. Adding the batch's offset is what joins the two, and
+        // getting it wrong would patch run 2's translations onto run 1's
+        // paragraphs -- a page scrambled into itself, which is far worse than
+        // a page left untranslated.
+        let offset = session.offset;
+        let patch: Vec<Value> = items
+            .iter()
+            .filter_map(|item| {
+                let i = item.get("i").and_then(Value::as_u64)?;
+                let t = item.get("t").and_then(Value::as_str)?;
+                // Through the filter map FIRST, then into document space. An
+                // engine index addresses what was SENT; the page's node map
+                // addresses what was EXTRACTED, and skipped nodes sit between
+                // them. An out-of-range index is dropped rather than clamped:
+                // a patch aimed at a node we cannot name is not a patch.
+                let at = patch_index(i as usize, &session.batch_map, offset)?;
+                Some(json!({ "i": at, "t": t }))
+            })
+            .collect();
+        let count = patch.len();
+        let token = session.token;
+        let more = session.more;
+        // The SPAN, not the sent length: the next batch starts after every
+        // node this one covered, including the ones filtered out. Advancing by
+        // the sent length would re-extract the skipped nodes forever.
+        let next_offset = session.offset + session.batch_span;
+        let message = json!({
+            "cmd": "patch",
+            "session": token.to_string(),
+            "items": patch,
+        })
+        .to_string();
+        // SELF-TEST ONLY, debug builds only: the translated text itself, so a
+        // harness can judge a pack's OUTPUT rather than only that a patch
+        // landed. Release builds never log page text (the privacy promise);
+        // this is compiled out of them entirely.
+        #[cfg(all(debug_assertions, unix))]
+        if crate::translate_channel_probe::selftest_enabled() {
+            let texts: Vec<String> = patch
+                .iter()
+                .filter_map(|p| p.get("t").and_then(|t| t.as_str()).map(str::to_string))
+                .collect();
+            println!(
+                "{}",
+                json!({ "selftest_translations": texts.join(" | ") })
+            );
+        }
+        let tab = &self.tabs[index];
+        let delivered = platform::deliver_translation(&tab.webview, &tab.view, message);
+        if let Some(session) = self.tabs[index].translation.as_mut() {
+            // PAGE TEXT IS DROPPED THE MOMENT IT IS NO LONGER NEEDED. The
+            // batch has been translated and sent back; keeping it would mean
+            // the host holding a copy of what the user was reading for as long
+            // as the tab lives.
+            session.batch = Vec::new();
+            session.submitted = false;
+            session.patched_total += count;
+            session.last_progress = std::time::Instant::now();
+            session.phase = if delivered {
+                TranslationPhase::Done
+            } else {
+                TranslationPhase::Failed("translate-patch-failed")
+            };
+        }
+        // A page that finished translating is this tab's standing choice:
+        // the SAME language keeps translating as the user browses on, until
+        // Show original or Cancel says stop. Recorded only on success --
+        // a failed run must not become a standing order.
+        if delivered {
+            if let Some(pair) = self.tabs[index].translation.as_ref().map(|s| s.pair) {
+                self.tabs[index].translate_continue = Some(pair);
+            }
+        }
+        let total = self
+            .tabs[index]
+            .translation
+            .as_ref()
+            .map(|s| s.patched_total)
+            .unwrap_or(count);
+        self.tabs[index].translation_patched = total;
+
+        // MORE OF THE PAGE TO GO, so ask for it. A cap of 200 nodes was never
+        // meant to be where translation STOPS -- it is how much is read at a
+        // time, so a long article fills in progressively instead of freezing
+        // the panel for a minute. Without this the feature translated the top
+        // of a page and left the rest in English, which is not what the button
+        // says it does.
+        //
+        // Only when the last batch actually landed: continuing after a failed
+        // patch would read more of a page nobody is going to see.
+        if delivered && more {
+            let cmd = json!({
+                "cmd": "extract",
+                "session": token.to_string(),
+                "offset": next_offset,
+                "limitNodes": EXTRACT_MAX_NODES,
+                "limitChars": EXTRACT_MAX_CHARS,
+            });
+            let tab = &self.tabs[index];
+            if platform::deliver_translation(&tab.webview, &tab.view, cmd.to_string()) {
+                if let Some(session) = self.tabs[index].translation.as_mut() {
+                    session.phase = TranslationPhase::Translating;
+                }
+                self.emit_tab_status();
+                // The poller is already running; the next extraction arrives
+                // as a ContentTranslate and the machine turns again.
+                return;
+            }
+        }
+        self.stop_translate_poller();
+        self.emit_tab_status();
+    }
+
+    /// What the self-test needs to see, in one call.
+    ///
+    /// Debug builds only. Returns the active tab's translation phase, how many
+    /// nodes the last run patched, and the last batch a page sent up.
+    #[cfg(debug_assertions)]
+    pub fn selftest_snapshot(&self) -> (String, usize, Vec<String>) {
+        let phase = self
+            .tabs
+            .get(self.active)
+            .and_then(|t| t.translation.as_ref())
+            .map(|s| match &s.phase {
+                TranslationPhase::Preparing => "preparing".to_string(),
+                TranslationPhase::Translating => "translating".to_string(),
+                TranslationPhase::Done => "done".to_string(),
+                TranslationPhase::Failed(k) => format!("failed:{k}"),
+            })
+            .unwrap_or_else(|| "none".to_string());
+        let patched = self
+            .tabs
+            .get(self.active)
+            .map(|t| t.translation_patched)
+            .unwrap_or(0);
+        (phase, patched, self.last_extracted.clone())
+    }
+
+    /// Starts one pack download, on a thread, if one is not already running.
+    ///
+    /// OFF THE UI THREAD, because it is tens of megabytes over a network and
+    /// the event loop draws the window. The thread does the whole
+    /// fetch-verify-install and reports one result; nothing partial crosses
+    /// back, so there is no state here that can be half-updated.
+    ///
+    /// THE USER ALREADY CONSENTED. This runs only inside a session the user
+    /// started by clicking Translate and picking a language, and the panel says
+    /// a pack may download. Nothing here fetches speculatively or in advance.
+    fn start_pack_download(&mut self, pair: &'static str) {
+        // THE TIER GATE'S CHOKE POINT. Every pack download in the product
+        // starts here -- the user's Install, and the fetch a translation makes
+        // when its pack is missing -- so the entitlement check lives here
+        // rather than in each caller. A future third caller is gated by
+        // construction instead of by remembering. `install_language` still
+        // checks separately, because it must REPORT the refusal; this is the
+        // wall behind that door.
+        if !tier_allows(pair, crate::licence_control::premium_active()) {
+            return;
+        }
+        // Per-token single-flight: already fetching THIS pair, nothing to do.
+        // A different pair may fetch in parallel (the two directions of a
+        // language install, or a translate download beside a user install).
+        if self.pack_downloads.contains_key(pair) {
+            return;
+        }
+        // A fresh attempt is not the old attempt's failure.
+        self.pack_failures.remove(pair);
+        self.pack_downloads.insert(pair, (0, None));
+        let root = crate::pack_root().to_path_buf();
+        let proxy = self.proxy.clone();
+        let progress_proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            // THROTTLED AT THE SOURCE. The reader reports every 64 KiB, which
+            // is ~1,600 events for one large pack -- and each event costs a
+            // full packs_status rebuild (a disk stat per registry pair) plus
+            // a script evaluation into the chrome, which then re-renders the
+            // whole panel. Two simultaneous installs produced events faster
+            // than the main thread drained them and the BROWSER froze; it
+            // was found by not being able to click anything. Four
+            // updates a second is indistinguishable to a person reading a
+            // percentage, and the completion event below is unconditional,
+            // so the final state can never be missed.
+            let mut last_sent: Option<std::time::Instant> = None;
+            let failure = crate::langpack::install_with_progress(&root, pair, |got, total| {
+                let now = std::time::Instant::now();
+                let due = last_sent
+                    .is_none_or(|at| now.duration_since(at) >= std::time::Duration::from_millis(250));
+                if !due {
+                    return;
+                }
+                last_sent = Some(now);
+                let _ = progress_proxy.send_event(UserEvent::PackProgress(pair, got, total));
+            })
+            .err()
+            .map(|e| e.key());
+            let _ = proxy.send_event(UserEvent::PackInstalled(pair, failure));
+        });
+    }
+
+    /// Progress on an in-flight pack. Recorded for the panel; no logic hangs
+    /// off it, so a late or out-of-order event is harmless.
+    pub fn on_pack_progress(&mut self, pair: &'static str, got: u64, total: Option<u64>) {
+        if let Some(slot) = self.pack_downloads.get_mut(pair) {
+            *slot = (got, total);
+            self.emit_packs_status();
+        }
+    }
+
+    /// A pack download finished. Clears the in-flight slot, then either lets a
+    /// waiting translation proceed or just refreshes the packs panel.
+    pub fn on_pack_installed(&mut self, pair: &'static str, failure: Option<&'static str>) {
+        self.pack_downloads.remove(pair);
+        match failure {
+            Some(key) => self.pack_failures.insert(pair, key),
+            None => self.pack_failures.remove(pair),
+        };
+        self.emit_packs_status();
+        // A translation waiting on THIS pack: advance or fail it. A translation
+        // waiting on a DIFFERENT pack (the mapping hazard) must not be
+        // disturbed -- check the waiting session's pair before touching it.
+        if let Some(index) = self.translating_tab() {
+            let waiting_on = self.tabs[index]
+                .translation
+                .as_ref()
+                .map(|ssn| ssn.pair == pair)
+                .unwrap_or(false);
+            if waiting_on {
+                if let Some(key) = failure {
+                    self.fail_translation(index, key);
+                } else {
+                    if let Some(session) = self.tabs[index].translation.as_mut() {
+                        session.last_progress = std::time::Instant::now();
+                    }
+                    self.start_translate_poller();
+                }
+            }
+        }
+    }
+
+    /// Installs a language the user chose: BOTH directions that the registry
+    /// publishes (X-en and en-X), because a language is useful for reading
+    /// pages in it AND writing pages into it, and the UI offers it as one
+    /// choice. A one-directional language installs the one direction that
+    /// exists and the packs panel reports which directions it got.
+    pub fn install_language(&mut self, code: &str) -> Result<Value, &'static str> {
+        let code = crate::languages::LANGUAGES
+            .iter()
+            .find(|l| l.code == code)
+            .map(|l| l.code)
+            .ok_or("unknown_language")?;
+        // The pivot has no pack of its own: every pair is English-anchored, so
+        // "install English" would match the ENTIRE registry and start several
+        // gigabytes of downloads. English arrives with each language instead.
+        if code == "en" {
+            return Err("pivot_language");
+        }
+        // THE PREMIUM GATE, client-side by decision: the server serves
+        // anyone (the bytes are public upstream anyway, and gating there would
+        // attach an identity to a request that today discloses only a pair);
+        // the browser is where the tier is enforced. A tier-2 pair installs
+        // only while a Premium licence is ACTIVE on this device --
+        // licence_control::premium_active is the entire rule, same as every
+        // other premium feature.
+        let entitled = crate::licence_control::premium_active();
+        let mut started = 0;
+        let mut premium_blocked = 0;
+        for pair in crate::languages::PAIRS.iter() {
+            if pair.from == code || pair.to == code {
+                if !tier_allows(pair.token, entitled) {
+                    premium_blocked += 1;
+                    continue;
+                }
+                if crate::langpack::installed(&crate::pack_root(), pair.token) {
+                    continue;
+                }
+                self.start_pack_download(pair.token);
+                started += 1;
+            }
+        }
+        // Nothing started and something was withheld: the user asked for a
+        // language they are not entitled to, and silence would read as a bug.
+        if started == 0 && premium_blocked > 0 {
+            return Err("premium_language_required");
+        }
+        self.emit_packs_status();
+        self.packs_status()
+    }
+
+    /// Removes a language: both directions, from disk. A pack mid-download is
+    /// left to finish rather than racing its own writer; removing it then is a
+    /// second click.
+    pub fn remove_language(&mut self, code: &str) -> Result<Value, &'static str> {
+        let code = crate::languages::LANGUAGES
+            .iter()
+            .find(|l| l.code == code)
+            .map(|l| l.code)
+            .ok_or("unknown_language")?;
+        // Same reason as install: "remove English" would strip every pack.
+        if code == "en" {
+            return Err("pivot_language");
+        }
+        let root = crate::pack_root();
+        for pair in crate::languages::PAIRS.iter() {
+            if (pair.from == code || pair.to == code)
+                && !self.pack_downloads.contains_key(pair.token)
+            {
+                let _ = crate::langpack::remove(&root, pair.token);
+            }
+        }
+        self.emit_packs_status();
+        self.packs_status()
+    }
+
+    /// The packs panel's data: one row per language, with what is installed,
+    /// what is downloading (and how far), and the approximate size.
+    ///
+    /// NAMES ARE HOST-SUPPLIED DATA here, like ledger hostnames -- English
+    /// until a second locale exists, which is stated honestly in the UI rather
+    /// than pretended otherwise. Everything else is a fact about disk or the
+    /// registry.
+    pub fn packs_status(&self) -> Result<Value, &'static str> {
+        let root = crate::pack_root();
+        let entitled = crate::licence_control::premium_active();
+        let rows: Vec<Value> = crate::languages::LANGUAGES
+            .iter()
+            .map(|lang| {
+                // The two directions this language could have, and their state.
+                let mut directions = Vec::new();
+                let mut approx = 0u64;
+                for pair in crate::languages::PAIRS.iter() {
+                    if pair.from != lang.code && pair.to != lang.code {
+                        continue;
+                    }
+                    approx += pair.approx_bytes;
+                    let downloading = self.pack_downloads.get(pair.token).copied();
+                    directions.push(json!({
+                        "token": pair.token,
+                        "from": pair.from,
+                        "to": pair.to,
+                        "tier": pair.tier,
+                        "source": pair.source,
+                        "installed": crate::langpack::installed(&root, pair.token),
+                        "downloading": downloading.is_some(),
+                        "got": downloading.map(|(g, _)| g),
+                        "total": downloading.and_then(|(_, t)| t),
+                        "failed": self.pack_failures.get(pair.token).copied(),
+                    }));
+                }
+                // INSTALLED MEANS EVERY DIRECTION, not one of them.
+                //
+                // `any` was wrong in a way that stranded a language with no way
+                // out: a user with en-es from the old single-pair build saw
+                // Spanish marked Installed, so the row offered REMOVE and
+                // nothing else -- while es-en had never been fetched, leaving
+                // Spanish->English with no target and no control to fix it. The
+                // language looked complete and could not be used in the
+                // direction most people want.
+                //
+                // `partial` is reported alongside so the panel can say so and
+                // offer to finish the job; install_language already skips the
+                // directions that are present, so completing costs only what is
+                // missing.
+                let installed_count = directions
+                    .iter()
+                    .filter(|d| d["installed"].as_bool().unwrap_or(false))
+                    .count();
+                let all_installed = installed_count > 0 && installed_count == directions.len();
+                let partly_installed = installed_count > 0 && !all_installed;
+                let any_downloading = directions
+                    .iter()
+                    .any(|d| d["downloading"].as_bool().unwrap_or(false));
+                // FIRST failure, not a count: the row has space for one reason
+                // and every reason is actionable on its own.
+                let failed = directions
+                    .iter()
+                    .find_map(|d| d["failed"].as_str())
+                    .map(str::to_owned);
+                // A language is Premium when ANY direction it has is tier 2.
+                // The registry generator REFUSES to emit a mixed-tier language
+                // (a hard invariant, tested), so today every language is wholly
+                // one tier and `any` == `all`. `any` is nonetheless the correct
+                // reading: if that invariant were ever broken, this fails SAFE
+                // -- the row says Premium and the gate holds -- instead of
+                // presenting an ordinary Install that silently does half the
+                // job.
+                let premium = directions
+                    .iter()
+                    .any(|d| d["tier"].as_u64().unwrap_or(1) >= 2);
+                json!({
+                    "code": lang.code,
+                    "name": lang.name,
+                    "approx_bytes": approx,
+                    "installed": all_installed,
+                    "partial": partly_installed,
+                    "downloading": any_downloading,
+                    "failed": failed,
+                    "premium": premium,
+                    "directions": directions,
+                })
+            })
+            // A FREE INSTALL NEVER LEARNS THESE LANGUAGES EXIST. Filtered
+            // HERE rather than in the panel, so the rows do not cross to the
+            // chrome at all: a locked row advertising something that cannot be
+            // bought is an advert, not a feature, and a UI-only filter would
+            // still put the list one devtools inspection away.
+            //
+            // ONE EXCEPTION, and it is about not stranding data rather than
+            // about selling: a premium language that is ALREADY INSTALLED
+            // stays listed even unentitled, because a licence that lapses
+            // otherwise leaves tens of megabytes on disk with no control to
+            // remove them. It still cannot be USED -- translate_active_tab
+            // refuses tier 2 without a licence -- so what remains visible is
+            // a Remove button, not a feature.
+            .filter(|row| {
+                let premium = row["premium"].as_bool().unwrap_or(false);
+                let installed = row["installed"].as_bool().unwrap_or(false);
+                !premium || entitled || installed
+            })
+            .collect();
+        Ok(json!({
+            "languages": rows,
+            // The CLIENT-SIDE premium gate's current answer, so the panel can
+            // render a locked Install honestly instead of failing on click.
+            "premium_active": crate::licence_control::premium_active(),
+        }))
+    }
+
+    /// Remembers the target language for next time. Accepts only a code the
+    /// registry knows, so a stray value can never be written to prefs.
+    pub fn set_translate_target(&mut self, code: &str) -> Result<Value, &'static str> {
+        let code = crate::languages::LANGUAGES
+            .iter()
+            .find(|l| l.code == code)
+            .ok_or("unknown_language")?
+            .code;
+        let mut prefs = crate::prefs::load();
+        prefs.translate_target = code.to_string();
+        // A failed save is worth reporting: the user picked a default and it
+        // silently did not stick otherwise.
+        crate::prefs::save(&prefs).map_err(|_| "prefs_write_failed")?;
+        Ok(json!({ "target": code }))
+    }
+
+    /// Pushes packs_status to the chrome. Called whenever the set changes.
+    fn emit_packs_status(&self) {
+        if let Ok(status) = self.packs_status() {
+            self.emit("packs_status", status);
+        }
+    }
+
+    /// Ends a session with a named, renderable reason.
+    ///
+    /// FAIL CLOSED TO UNTRANSLATED. The page keeps whatever it already has and
+    /// nothing further is sent; a page stuck between two languages is worse
+    /// than one that was never touched.
+    fn fail_translation(&mut self, index: usize, key: &str) {
+        if let Some(session) = self.tabs[index].translation.as_mut() {
+            session.batch = Vec::new();
+            session.submitted = false;
+            session.phase = TranslationPhase::Failed(translation_failure_key(key));
+        }
+        self.stop_translate_poller();
+        self.emit_tab_status();
+    }
+
+    /// Applies this tab's standing translate-this-language choice to a page
+    /// that just DECLARED that language.
+    ///
+    /// Every refusal here is SILENT by design: this path was not asked for by
+    /// a click, so it must never put a failure banner on a page the user did
+    /// not ask to translate. The guards, in order: a standing choice exists;
+    /// the declared primary subtag matches the pair's source; no session is
+    /// already live for this page; and the pack is ON DISK -- an automatic
+    /// run must never start a network fetch, because a network contact still
+    /// requires a click. Whatever passes those runs through the same entry
+    /// path as a click, so the premium gate, the URL check and the script
+    /// guard all apply unchanged.
+    fn maybe_continue_translation(&mut self, index: usize, declared_primary: &str) {
+        let Some(pair) = self.tabs[index].translate_continue else {
+            return;
+        };
+        let Some(row) = crate::languages::pair_by_token(pair) else {
+            return;
+        };
+        if !declared_primary.eq_ignore_ascii_case(row.from) {
+            return;
+        }
+        // (The argument is a REGISTRY CODE now, resolved at the detected
+        // handler; the name survives from when it was a bare primary subtag.)
+        if let Some(session) = self.tabs[index].translation.as_ref() {
+            if session_is_current(&session.page, &self.tabs[index].url) {
+                return;
+            }
+        }
+        if !crate::langpack::installed(&crate::pack_root(), pair) {
+            return;
+        }
+        let _ = self.translate_active_tab(pair);
+    }
+
+    /// Starts a translation session on the ACTIVE tab.
+    ///
+    /// Takes a language pair and NOTHING ELSE, for the same reason
+    /// `forget_active_tab_cookies` takes no domain: the chrome UI has no
+    /// legitimate reason to name which page to translate, and refusing to
+    /// accept one stops this becoming a translate-any-tab primitive if the
+    /// chrome origin were ever compromised. The tab is whichever one the user
+    /// is looking at, and the URL is read here, not supplied.
+    pub fn translate_active_tab(&mut self, pair: &str) -> Result<Value, &'static str> {
+        // Validated to a STATIC token before it is stored. This value selects
+        // a model to load later; a free-form string reaching that path is the
+        // shape of an injection, so it is rejected here rather than sanitised
+        // downstream.
+        let pair = validate_translation_pair(pair).ok_or("unsupported_pair")?;
+        // THE PREMIUM GATE AT USE, not only at install. Install-gating alone
+        // let a lapsed licence keep translating with a tier-2 pack that is
+        // still on disk -- the one premium feature that would survive a lapse,
+        // when "LAPSED gates exactly like FREE" is the rule everywhere else.
+        // A tier-2 pair translates only while the licence is ACTIVE; the pack
+        // stays installed (removing someone's download on a lapse would be
+        // hostile), it simply cannot be USED until the licence is.
+        //
+        // This is also what bounds the one staleness the download path has:
+        // entitlement is sampled when a download STARTS, so a licence that
+        // lapses mid-download leaves the bytes on disk. They are unusable
+        // until the licence returns, which is the same place a lapse leaves
+        // every other premium feature.
+        if !tier_allows(pair, crate::licence_control::premium_active()) {
+            return Err("premium_language_required");
+        }
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        // Internal pages have nothing a user asked to read in another
+        // language, and translating one would mean pointing the machinery at
+        // our own UI.
+        if !is_translatable_url(&tab.url) {
+            return Err("not_translatable");
+        }
+        // NOTHING IS ASKED OF A PAGE THAT IS NOT LISTENING. On WebKitGTK this
+        // means a poll is parked; on Windows, that a document announced
+        // itself. Either way it is OBSERVED, not assumed, so a tab showing a
+        // PDF or an error page refuses here instead of appearing to start and
+        // then never finishing.
+        if !platform::translate_page_ready(&tab.view) {
+            return Err("page_not_ready");
+        }
+        self.translation_seq = self.translation_seq.wrapping_add(1);
+        let token = self.translation_seq;
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        // Source language for the script guard, from the registry row. A pair
+        // that resolved through validation always has a row; the fallback is
+        // "en" only so this cannot panic, and an unknown source degrades to
+        // "ask" in the detector rather than to a wrong verdict.
+        let source = crate::languages::pair_by_token(pair)
+            .map(|row| row.from)
+            .unwrap_or("en");
+        // Reset the per-page progress counters for the NEW run. The offset
+        // ordering check keys on translation_extracted, so a fresh session must
+        // start it at zero or its first batch (offset 0) would be rejected
+        // against a previous run's total.
+        tab.translation_extracted = 0;
+        tab.translation_patched = 0;
+        tab.translation = Some(TranslationSession {
+            pair,
+            source,
+            script_counts: crate::detect::ScriptCounts::new(source),
+            phase: TranslationPhase::Preparing,
+            last_progress: std::time::Instant::now(),
+            batch_map: Vec::new(),
+            batch_span: 0,
+            doc_total: None,
+            engine_asset_rev: None,
+            engine_heap_bytes: None,
+            engine_last_input: None,
+            page: tab.url.clone(),
+            token,
+            batch: Vec::new(),
+            submitted: false,
+            offset: 0,
+            more: false,
+            patched_total: 0,
+        });
+        // THE ONLY PLACE A PAGE IS EVER ASKED TO READ ITSELF. Reached only
+        // from a user's click on the tab they are looking at, with a URL this
+        // side read rather than accepted. The content script does nothing at
+        // all until this arrives.
+        let asked = platform::deliver_translation(
+            &tab.webview,
+            &tab.view,
+            json!({
+                "cmd": "extract",
+                "session": token.to_string(),
+                "limitNodes": EXTRACT_MAX_NODES,
+                "limitChars": EXTRACT_MAX_CHARS,
+            })
+            .to_string(),
+        );
+        if !asked {
+            // Fail CLOSED and fail VISIBLY: no session left behind, and a
+            // named failure the panel can render, rather than a spinner in
+            // front of a process that never started.
+            self.tabs[self.active].translation = None;
+            self.emit_tab_status();
+            return Err("page_not_ready");
+        }
+        // Tick from the very start: the poller is what carries the stall
+        // deadline, and a page that never answers the extract request is
+        // exactly the case that needs it.
+        self.start_translate_poller();
+        let status = self.translation_status();
+        self.emit_tab_status();
+        status
+    }
+}
+
+/// How much of a page is read in one extraction.
+///
+/// A FIRST BATCH, not a whole document. Phase 0 measured 40 sentences at
+/// between 2.2 s and 10.4 s on the test laptop depending on whether
+/// WebView2 was warm, so a 400-node page translated in one go is somewhere
+/// between twenty seconds and two minutes of nothing happening. Visible-first
+/// batching is the answer and it is not built yet; until it is, the cap is
+/// what stops the first honest attempt being an unresponsive one.
+const EXTRACT_MAX_NODES: usize = 200;
+/// Companion cap in characters, for a page of few but enormous nodes.
+const EXTRACT_MAX_CHARS: usize = 20_000;
+
+impl AppState {
+
+    /// What the panel renders. Reports the ACTIVE tab's session or none.
+    pub fn translation_status(&self) -> Result<Value, &'static str> {
+        let tab = self.tabs.get(self.active).ok_or("no_tab")?;
+        // A session whose page is no longer the one on screen is treated as
+        // absent, whether or not anything remembered to clear it.
+        let live = tab
+            .translation
+            .as_ref()
+            .filter(|s| session_is_current(&s.page, &tab.url));
+        Ok(match live {
+            None => json!({
+                "active": false,
+                "translatable": is_translatable_url(&tab.url),
+                "pairs": TRANSLATION_PAIRS,
+            }),
+            Some(session) => json!({
+                "active": true,
+                "translatable": true,
+                "pairs": TRANSLATION_PAIRS,
+                "pair": session.pair,
+                "phase": match &session.phase {
+                    TranslationPhase::Preparing => "preparing",
+                    TranslationPhase::Translating => "translating",
+                    TranslationPhase::Done => "done",
+                    TranslationPhase::Failed(_) => "failed",
+                },
+                "failure": match &session.phase {
+                    TranslationPhase::Failed(key) => json!(key),
+                    _ => Value::Null,
+                },
+                // How far through the DOCUMENT this run is: nodes patched
+                // against nodes the page says exist. Real progress, not a
+                // phase word -- a long page spends minutes in "Translating"
+                // and said nothing about how much was left.
+                "done_nodes": session.patched_total,
+                "total_nodes": session.doc_total,
+                "engine_asset_rev": session.engine_asset_rev,
+                "engine_heap_bytes": session.engine_heap_bytes,
+                "engine_last_input": session.engine_last_input,
+                // What the BUILD expects, so the panel can show agreement or
+                // disagreement rather than a number nobody can check.
+                "expected_asset_rev": crate::asset_revision(),
+                // A pack download for THIS session, so the panel can say
+                // "downloading, N%" instead of a phase word that names the
+                // wrong wait. Advisory, same feed as the packs list.
+                "downloading": self.pack_downloads.contains_key(session.pair),
+                "dl_got": self.pack_downloads.get(session.pair).map(|(g, _)| g),
+                "dl_total": self.pack_downloads.get(session.pair).and_then(|(_, t)| *t),
+            }),
+        })
+    }
+
+    /// Ends the active tab's session. Takes no argument, like the arms above.
+    ///
+    /// Cancelling must leave the page READABLE. Fail-closed for this feature
+    /// means untranslated, never half-patched -- a page stuck between two
+    /// languages is worse than one that was never touched.
+    /// Show original: put the page back to what it was before translation.
+    ///
+    /// Sends the page a `restore` command -- which walks its own retained
+    /// originals back into the nodes, engine-free and network-free, because
+    /// the originals never left the page -- and then ends the session. A later
+    /// re-translate is a fresh run: the host deliberately keeps no copy of the
+    /// page's text or its translations, so re-showing the translation means
+    /// re-doing it, which is the honest cost of not lingering user text.
+    ///
+    /// Only meaningful on a translated page; on anything else it is a no-op
+    /// that still answers with the current status so the UI stays in step.
+    pub fn restore_active_tab(&mut self) -> Result<Value, &'static str> {
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        // Show original is the user saying STOP for this tab, so the standing
+        // continue-in-this-language choice ends here too.
+        tab.translate_continue = None;
+        let was_translated = matches!(
+            tab.translation.as_ref().map(|s| &s.phase),
+            Some(TranslationPhase::Done)
+        );
+        if was_translated {
+            let _ = platform::deliver_translation(
+                &tab.webview,
+                &tab.view,
+                json!({
+                    "cmd": "restore",
+                    "session": tab.translation.as_ref().map(|s| s.token).unwrap_or(0).to_string(),
+                })
+                .to_string(),
+            );
+            tab.translation = None;
+        }
+        let status = self.translation_status();
+        self.emit_tab_status();
+        status
+    }
+
+    pub fn translation_cancel(&mut self) -> Result<Value, &'static str> {
+        let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
+        tab.translate_continue = None;
+        tab.translation = None;
+        // Tell the page to drop its node map. Best effort by design: the host
+        // has ALREADY forgotten the session on the line above, so a page that
+        // never hears this can achieve nothing with what it kept -- every
+        // later extraction from it is refused, and no patch will ever be sent.
+        // Asking is still right, because holding references to every text node
+        // of a page nobody is translating any more is a waste the user did not
+        // ask for.
+        let _ = platform::deliver_translation(
+            &tab.webview,
+            &tab.view,
+            json!({"cmd": "reset"}).to_string(),
+        );
+        let status = self.translation_status();
+        self.emit_tab_status();
+        status
+    }
+
     /// Deletes cookies for the active tab's own host -- and ONLY cookies.
     ///
     /// The host is read fresh from `Tab.url` at the moment of the call, never
@@ -2642,6 +5259,13 @@ impl AppState {
     /// one's. So this clears cookies alone, and the UI copy must say exactly
     /// that; see `forget_site_cookies`'s own doc for why.
     pub fn forget_active_tab_cookies(&self) -> Result<Value, &'static str> {
+        // Checked BEFORE the platform call, so a backend whose stub refuses
+        // without asking the engine can never reach `cookie_delete_failed`.
+        // That code's sentence blames the engine, and on this path the engine
+        // was never called.
+        if !crate::cookie_control::available() {
+            return Err("cookie_clear_unavailable");
+        }
         let tab = self.tabs.get(self.active).ok_or("no_tab")?;
         let host = host_of(&tab.url).ok_or("no_site")?;
         if platform::forget_site_cookies(&tab.webview, &host) {
@@ -2675,6 +5299,11 @@ impl AppState {
     /// with `no_persistent_tab` when every open tab is a quarantine one, which
     /// is an honest "there is nothing saved here to clear".
     pub fn forget_all_cookies(&self) -> Result<Value, &'static str> {
+        // Same order as the per-site call above, and for the same reason: the
+        // unavailable backend is not an engine refusal.
+        if !crate::cookie_control::available() {
+            return Err("cookie_clear_unavailable");
+        }
         let tab = self
             .tabs
             .iter()
@@ -2698,9 +5327,18 @@ impl AppState {
     /// nowhere else in this browser a save-password prompt could sensibly
     /// appear.
     ///
-    /// Silently drops the submission if the vault is locked: offering to
-    /// save into a vault the user has not opened is not this feature's job,
-    /// and there is no "unlock, then continue" flow here to build.
+    /// A LOCKED vault no longer drops the submission in silence. It saves
+    /// nothing -- the password is still never stored while the vault is shut,
+    /// and this function still ends without keeping it -- but it now says so,
+    /// because a user who logs in and sees nothing happen has no way to tell a
+    /// locked vault from a broken browser. A tester reported exactly that.
+    ///
+    /// The ORIGIN IS DERIVED BEFORE the vault is considered, and the order is
+    /// load-bearing: a submission with no recognizable origin would not have
+    /// produced a save offer even with the vault open, so the lock is not the
+    /// reason it failed and saying so would be wrong. The active-tab check
+    /// stays first for the reason it always had -- a background tab must not
+    /// raise UI for a page the user is not looking at.
     pub fn note_login_submitted(
         &mut self,
         tab_id: u64,
@@ -2708,16 +5346,49 @@ impl AppState {
         username: String,
         password: String,
     ) {
+        self.note_login_submitted_at(tab_id, source_url, username, password, Instant::now())
+    }
+
+    /// The clock is a parameter so the notice cooldown is testable without
+    /// sleeping, the same shape as `note_insecure_navigation_at`.
+    pub fn note_login_submitted_at(
+        &mut self,
+        tab_id: u64,
+        source_url: String,
+        username: String,
+        password: String,
+        now: Instant,
+    ) {
         if self.tabs.get(self.active).map(|t| t.id) != Some(tab_id) {
-            return;
-        }
-        if self.vault.is_none() {
             return;
         }
         let tab_url = self.tabs.iter().find(|t| t.id == tab_id).map(|t| t.url.clone());
         let Some(origin) = login_offer_origin(&source_url, tab_url.as_deref()) else {
             return;
         };
+        // Asked of the vault, which compares without handing the stored
+        // password out. A locked vault answers false and never reaches the
+        // question: `already_saved` only decides the unlocked case.
+        let already_saved = already_stored(self.vault.as_ref(), &origin, &username, &password);
+        match login_submit_outcome(
+            self.vault.is_some(),
+            Vault::exists(&self.vault_path),
+            already_saved,
+        ) {
+            LoginSubmitOutcome::AlreadySaved | LoginSubmitOutcome::Silent => return,
+            LoginSubmitOutcome::NoticeLocked => {
+                // `password` is dropped with this scope, exactly as it was
+                // when this path returned early and said nothing. Nothing is
+                // stored, and the event below carries no password, no
+                // username and no origin -- the sentence names no site, so
+                // the chrome needs none of it.
+                if take_locked_save_notice(&mut self.last_locked_save_notice, now) {
+                    self.emit("vault_locked_no_save", json!({}));
+                }
+                return;
+            }
+            LoginSubmitOutcome::Offer => {}
+        }
         self.pending_save = Some(PendingSave {
             tab_id,
             origin: origin.clone(),
@@ -2760,13 +5431,21 @@ impl AppState {
     /// rendered template never grows a field shaped like one of those.
     pub fn diagnostics_snapshot(&self) -> Value {
         let prefs = crate::prefs::load();
+        let mut recent_log = platform::recent_diagnostics();
+        recent_log.extend(crate::capture::recent_diagnostics());
         json!({
             "build": crate::about::ipc_info().unwrap_or_else(|_| json!({})),
             "tab_status": self.active_tab_status(),
-            "dns_mode": prefs.dns.as_str(),
+            // The resolver IN FORCE (what the engine was given at startup),
+            // and separately what the file says. On Linux nothing records
+            // one, so the first is System there, which is the truth: a
+            // report saying "quad9" would claim a protection never applied.
+            "dns_mode": crate::prefs::applied_dns().as_str(),
+            "dns_preference": prefs.dns.as_str(),
             "vault_autolock_secs": prefs.vault_autolock_secs,
             "update_status": crate::updater::status(),
-            "recent_log": platform::recent_diagnostics(),
+            "ocr": crate::ocr_support::diagnostics(),
+            "recent_log": recent_log,
         })
     }
 
@@ -2974,16 +5653,15 @@ impl AppState {
     /// second copy is what let the auto-lock and the explicit lock drift
     /// apart once already.
     pub fn lock_vault(&mut self) {
+        crate::page_integrity::on_vault_locked(self);
         self.vault = None; // dropping Vault zeroizes key material
-        // The store deliberately stays OPEN. The store crate's own docs say
-        // "Bookmarks survive a vault auto-lock; passwords do not" -- at a
-        // 300 s timeout a lock-step store would make bookmarks vanish
-        // mid-session and silently skip provenance for any download
-        // completing while locked. The store key is domain-separated from the
-        // vault key, so keeping it does not widen the vault's attack surface,
-        // and process exit drops it (Zeroizing) regardless. To flip this:
-        // add `self.store = None;` HERE and nowhere else, then invert the
-        // smoke assertion in ipc.rs and adjust the panel copy.
+        // The store deliberately stays resident for internal download
+        // provenance. It is NOT publicly open: `store_status` reports closed
+        // and every Library command routes through `ipc::store_open`, which
+        // refuses while `vault` is None. Keeping the domain-separated key
+        // here lets a download already in flight retain its provenance
+        // without leaving bookmarks or snapshot text readable; process exit
+        // drops it through Zeroizing regardless.
         //
         // The transport holds identities derived from the vault, so it has to
         // go down with it -- otherwise a locked vault keeps announcing the
@@ -3026,7 +5704,26 @@ impl AppState {
     ///
     /// Failure is recorded rather than propagated: a damaged bookmark file
     /// must not make the vault unusable, and the next unlock retries.
+    /// Beside the Library file while a profile import could not remove the
+    /// previous profile's Library. While it exists AND the old file exists,
+    /// no Store is opened: the marker outlives lock, unlock and restart, so
+    /// a matching passphrase cannot quietly reattach the old profile (review
+    /// round 3, R-002). It is cleared when the old file is gone.
+    pub fn library_replace_marker(&self) -> std::path::PathBuf {
+        let mut p = self.store_path.clone().into_os_string();
+        p.push(".replace-pending");
+        std::path::PathBuf::from(p)
+    }
+
     pub fn open_store(&mut self, passphrase: &str) {
+        let marker = self.library_replace_marker();
+        if marker.exists() {
+            if Store::exists(&self.store_path) {
+                self.detach_store_unreplaced();
+                return;
+            }
+            let _ = std::fs::remove_file(&marker);
+        }
         let opened = if Store::exists(&self.store_path) {
             Store::unlock(&self.store_path, passphrase)
         } else {
@@ -3084,7 +5781,10 @@ impl AppState {
 
     pub fn store_status(&self) -> Value {
         json!({
-            "open": self.store.is_some(),
+            // The encrypted store stays resident for internal download
+            // provenance, but the Library is vault-gated: its public status
+            // is closed whenever the vault is closed.
+            "open": self.vault.is_some() && self.store.is_some(),
             "error": self.store_error,
             // Whether this build can digest a page is one question with one
             // answer, and it lives with the code that does the digesting:
@@ -3130,8 +5830,10 @@ impl AppState {
     ///     fine on disk, but the downloads view promises a fingerprint for
     ///     every finished download, so `download_record_failed` is emitted
     ///     with reason `store_unavailable` and the UI names the exception.
-    ///     Note the store survives a vault LOCK by design (see `lock_vault`),
-    ///     so "locked" alone does NOT land here — recording still happens.
+    ///     The store remains resident across a vault lock for this internal
+    ///     write only; public Library IPC is still refused by `store_open`.
+    ///     Therefore "locked" alone does NOT land here — recording still
+    ///     happens without making bookmark or snapshot data readable.
     ///   * save failure: same event, reason `io` — otherwise the panel would
     ///     imply every download is fingerprinted when this one is not.
     ///
@@ -3188,7 +5890,10 @@ impl AppState {
         if self.find.stop(&mut self.find_gen) {
             platform::find_stop(&self.tabs[self.active].webview);
         }
-        platform::hide_tab(&self.tabs[self.active].view, &self.tabs[self.active].webview);
+        platform::hide_tab(
+            &self.tabs[self.active].view,
+            &self.tabs[self.active].webview,
+        );
         self.active = index;
         platform::show_tab(&self.tabs[index].view, &self.tabs[index].webview);
         // A freshly shown Windows tab may have stale bounds (created hidden,
@@ -3372,6 +6077,78 @@ impl AppState {
             .unwrap_or(0)
     }
 
+    /// Accept a validated batch for one live tab. Validation happens before
+    /// the event is constructed on both platforms; this layer only performs
+    /// saturating aggregation so even a forged flood cannot wrap to a small
+    /// and reassuring number.
+    pub fn note_fingerprint_probes(&mut self, tab_id: u64, deltas: &[(FingerprintSurface, u64)]) {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == tab_id) else {
+            return;
+        };
+        for (surface, count) in deltas {
+            tab.fingerprint_probes.add(*surface, *count);
+        }
+    }
+
+    /// The separate, explicitly untrusted Tab Activity reading. These words
+    /// live in Rust with the panel's other factual copy so the UI renderer
+    /// cannot accidentally collapse it into the privacy receipt.
+    pub fn fingerprint_probe_activity(&self) -> serde_json::Value {
+        const LABEL: &str = "Page-reported fingerprint probes";
+        const CAVEAT: &str = "Page-reported, not browser-observed. These counts describe probe calls reported by this page's main-world scripts; the page can omit or forge them, and worker probes are not included.";
+        const DISABLED: &str = "Fingerprint Divergence is not active in this tab.";
+        const CHANNEL_FAILED: &str =
+            "Probe reports are unavailable because the page-reporting channel did not register.";
+
+        let Some(tab) = self.tabs.get(self.active) else {
+            return json!({
+                "label": LABEL,
+                "caveat": CAVEAT,
+                "status": "unavailable",
+                "status_text": CHANNEL_FAILED,
+                "surface_labels": {
+                    "audio": "Audio",
+                    "canvas": "Canvas",
+                    "webgl": "WebGL/Graphics",
+                    "element_measurement": "Element measurement",
+                },
+                "counts": {
+                    "audio": 0,
+                    "canvas": 0,
+                    "webgl": 0,
+                    "element_measurement": 0,
+                },
+            });
+        };
+        let channel = platform::fingerprint_probe_reporting(&tab.view);
+        let (status, status_text) = if !tab.divergence_registered {
+            ("disabled", DISABLED)
+        } else if channel != "applied" {
+            ("unavailable", CHANNEL_FAILED)
+        } else {
+            ("active", "")
+        };
+        let counts = tab.fingerprint_probes;
+        json!({
+            "label": LABEL,
+            "caveat": CAVEAT,
+            "status": status,
+            "status_text": status_text,
+            "surface_labels": {
+                "audio": "Audio",
+                "canvas": "Canvas",
+                "webgl": "WebGL/Graphics",
+                "element_measurement": "Element measurement",
+            },
+            "counts": {
+                "audio": counts.audio,
+                "canvas": counts.canvas,
+                "webgl": counts.webgl,
+                "element_measurement": counts.element_measurement,
+            },
+        })
+    }
+
     /// Builds a tab under an explicit policy rather than the browser-wide one.
     /// A quarantine tab is the reason this exists: `ephemeral` and the initial
     /// JavaScript setting are fixed at construction, so they cannot be applied
@@ -3497,8 +6274,27 @@ impl AppState {
 
     pub fn navigate(&mut self, url: &str) -> Result<(), &'static str> {
         match self.tabs.get_mut(self.active) {
-            Some(tab) => tab.webview.load_url(url).map_err(|_| "io"),
+            Some(tab) => tab.queue_or_navigate(url),
             None => Err("not_found"),
+        }
+    }
+
+    /// Releases every tab built while the asynchronous once-per-process wipe
+    /// was running. Tabs built after the platform gate reaches Ready navigate
+    /// immediately and have `initial_navigation_pending == false`, so this is
+    /// idempotent and can never reload a live tab.
+    pub fn finish_session_wipe(&mut self) {
+        for tab in &mut self.tabs {
+            tab.finish_initial_navigation();
+        }
+        let delayed_closes = self
+            .tabs
+            .iter()
+            .filter(|tab| tab.close_after_session_wipe)
+            .map(|tab| tab.id)
+            .collect::<Vec<_>>();
+        for id in delayed_closes {
+            let _ = self.close_tab(id);
         }
     }
 
@@ -3533,10 +6329,64 @@ impl AppState {
         };
         self.tabs[index].url = url.clone();
         self.tabs[index].record_history(url.clone());
+        // The declared-language badge is a fact about the page that just left,
+        // so it clears on navigation. The new page re-declares (or does not),
+        // and a stale badge from the previous page must not linger.
+        self.tabs[index].detected_lang = None;
         // A navigation that went THROUGH answers any held-back one: the user
         // went somewhere else, or clicked Continue and this is that load.
         self.tabs[index].insecure_pending = None;
         self.tabs[index].insecure_pending_at = None;
+        // A blocked-site notice is about the navigation that was blocked.
+        // Once this tab has gone somewhere else, its id must spend nothing
+        // (review of pentest F-006): the click is refused as stale.
+        if self.tabs[index].blocked_pending.borrow_mut().take().is_some() {
+            // Background tabs get no tab_status on navigation, so the chrome
+            // is told outright (review round 3, R-005).
+            let tab_id = self.tabs[index].id;
+            self.emit("navigation_blocked_retired", json!({ "tab_id": tab_id }));
+        }
+        // THE HELD-PAGE LIFECYCLE, both halves, here because this is the
+        // main-frame navigation signal on both engines. The banner clears on a
+        // navigation away (a load of the held URL itself is the placeholder
+        // and is kept: see on_top_level_navigation). And the override ENDS
+        // when the top-level host changes -- the sentence the banner puts in
+        // front of the user -- which means the native side must be told to
+        // drop it too, or the request handler keeps exempting the host from a
+        // consent that is over. Neither hook had a caller until a review
+        // found that "Open anyway" never ended (R-001, R-004).
+        self.tabs[index].adlist.on_top_level_navigation(&url);
+        // A navigation with NO host -- about:blank is allowlisted and has none
+        // -- is still leaving the consented host, and was a hole: revocation
+        // only ran when a host could be parsed, so about:blank kept the
+        // override alive and a return to the listed host needed no new consent
+        // (review R-003, round 2).
+        let ended = match host_of(&url) {
+            Some(host) => self.tabs[index].adlist.on_committed_host(&host),
+            None => self.tabs[index].adlist.end_override(),
+        };
+        if ended {
+            platform::set_adlist_override(&self.tabs[index].view, None);
+        }
+        // Translation consent attaches to the PAGE the user asked about, so it
+        // dies here with the page. A new page is a new click; "never
+        // automatic" means never untriggered, and carrying a session across a
+        // navigation would translate something nobody asked about.
+        //
+        // THIS LINE IS HYGIENE, NOT CORRECTNESS, and that is deliberate.
+        //
+        // It used to be the only thing standing between a navigation and a
+        // session outliving the page it was consented for -- and nothing in
+        // the suite could verify it, because `Tab` owns a live `WebView` so no
+        // unit test can build one to drive a navigation. Deleting it broke
+        // nothing; I planted that defect and the whole battery stayed green.
+        //
+        // So the rule moved into the data. A session records the page it was
+        // given for, and `session_is_current` refuses one whose page is not
+        // what the tab now shows. Removing this line today leaks a struct
+        // until the tab closes; it does NOT translate a page nobody asked
+        // about. Both halves are proven by planted defect -- see
+        // `a_session_does_not_survive_the_page_it_was_given_for`.
         // The DOM state that produced any pending save offer for THIS tab is
         // gone the moment it navigates -- confirming it now would save under
         // whatever origin the tab happens to show next.
@@ -3621,6 +6471,146 @@ impl AppState {
 
     /// "Dismiss" on the plain-HTTP warning: the held-back URL is dropped and
     /// nothing is allowed. The tab stays where it was.
+    /// "Open anyway" on the held-page banner.
+    ///
+    /// Named by tab and by pending id rather than acting on the active tab,
+    /// because this banner is rendered per tab from an async push and a switch
+    /// can land between the paint and the click. Every value the chrome sends
+    /// CONFIRMS what it displayed; none of them selects anything, so no call
+    /// here can name a URL that was not already pending.
+    pub fn adlist_allow(
+        &mut self,
+        tab_id: u64,
+        pending_id: u64,
+        shown_host: &str,
+    ) -> Result<Value, &'static str> {
+        if !crate::adlist_consent::CAN_ALLOW {
+            return Err("adlist_no_exception");
+        }
+        let rules = platform::privacy::bundled_rules();
+        let idx = self
+            .tabs
+            .iter()
+            .position(|t| t.id == tab_id)
+            .ok_or("no_tab")?;
+        // Re-checked at the moment of use, never trusted from when the banner
+        // was raised: a list refresh in between must not leave an override
+        // standing for a host nothing would block.
+        let still_listed = self.tabs[idx]
+            .adlist
+            .pending()
+            .is_some_and(|p| rules.blocks_host(&p.host));
+        // Cloned BEFORE allow consumes it, so a navigation that fails to
+        // start can put back the exact record (id and method) the banner is
+        // still showing (review R-003, round 4).
+        let record = self.tabs[idx].adlist.pending().cloned();
+        let url = self.tabs[idx]
+            .adlist
+            .allow(pending_id, shown_host, still_listed)
+            .map_err(crate::adlist_consent::refusal_code)?;
+        let host = shown_host.to_ascii_lowercase();
+        platform::set_adlist_override(&self.tabs[idx].view, Some(host.clone()));
+        // If the navigation cannot even START, the consent was consumed for
+        // nothing: the user stays on the placeholder, the banner is gone, and
+        // the exception stands. The first draft discarded this Result and
+        // reported success (review R-005, round 3). Undo the grant, put the
+        // banner back so the click can be retried, and say what happened.
+        // A held URL WITH a fragment is resumed by reload, not by load_url.
+        // The placeholder already sits at that address, and Microsoft
+        // documents that Navigate to the current URL differing only in the
+        // fragment is a fragment navigation: no request, no document, the
+        // placeholder stays and the banner is gone (review R-002, round 5;
+        // engine behaviour not reproduced here, taken from the vendor
+        // documentation). history_reload re-requests the document; the
+        // request handler sees the override and lets the real page through,
+        // and the engine keeps the fragment. A tab whose first navigation
+        // has not happened yet has no placeholder to reload, so it queues.
+        //
+        // ONLY FOR A HELD GET. A reload re-issues the request that produced
+        // the current document, and for a held POST that is the POST, body
+        // and all, which the banner promised would not be sent (review
+        // R-001, round 6). A held POST with a fragment therefore resumes as
+        // a plain GET to the address WITHOUT its fragment: the address then
+        // differs from the placeholder's, so it is a real navigation, and
+        // a fragment is the lesser loss on a form action next to the body.
+        let was_post = record.as_ref().is_some_and(|r| r.method.eq_ignore_ascii_case("POST"));
+        let has_fragment = url.contains('#');
+        let resumed = if has_fragment && was_post {
+            let bare = url.split('#').next().unwrap_or(&url).to_string();
+            self.tabs[idx].queue_or_navigate(&bare)
+        } else if has_fragment && !self.tabs[idx].initial_navigation_pending {
+            self.tabs[idx].history_reload()
+        } else {
+            self.tabs[idx].queue_or_navigate(&url)
+        };
+        if let Err(reason) = resumed {
+            self.tabs[idx].adlist.end_override();
+            platform::set_adlist_override(&self.tabs[idx].view, None);
+            if let Some(record) = record {
+                self.tabs[idx].adlist.restore(record);
+            }
+            return Err(reason);
+        }
+        // The SAME shape insecure_allow returns, because the chrome reads
+        // `res.status` and treats anything else as "hide the banner". A bare
+        // status here made every successful allow take the hide branch, and a
+        // late reply from one tab could take down another tab's banner (R-007).
+        Ok(json!({ "allowed": host, "status": self.active_tab_status() }))
+    }
+
+    /// "Dismiss". Same id discipline: a stale click must not clear a banner
+    /// raised for something else.
+    pub fn adlist_dismiss(&mut self, tab_id: u64, pending_id: u64) -> Result<Value, &'static str> {
+        let tab = self
+            .tabs
+            .iter_mut()
+            .find(|t| t.id == tab_id)
+            .ok_or("no_tab")?;
+        tab.adlist
+            .dismiss(pending_id)
+            .map_err(crate::adlist_consent::refusal_code)?;
+        Ok(self.active_tab_status())
+    }
+
+    /// Raised by the engine adapters when a top-level navigation to a listed
+    /// host was refused. Returns the pending id so the adapter can tag the
+    /// placeholder load it is about to start.
+    /// An import could not remove the previous profile's Library file. No
+    /// Store is attached and the error names why, so store_open refuses
+    /// until the file is dealt with rather than reattaching the old profile.
+    pub fn detach_store_unreplaced(&mut self) {
+        self.store = None;
+        self.store_error = Some("library_not_replaced");
+    }
+
+    /// Records which host a tab was just blocked on and mints the id the
+    /// banner must hand back. A NEW blocked attempt replaces the id, so a
+    /// banner from an earlier attempt, even to the same host in the same
+    /// tab, spends nothing (design review of pentest F-006).
+    pub fn note_navigation_blocked(&mut self, tab_id: u64, host: &str) -> Option<u64> {
+        let tab = self.tabs.iter().find(|t| t.id == tab_id)?;
+        self.blocked_pending_seq = self.blocked_pending_seq.wrapping_add(1);
+        let id = self.blocked_pending_seq;
+        *tab.blocked_pending.borrow_mut() = Some((id, host.to_ascii_lowercase()));
+        Some(id)
+    }
+
+    pub fn adlist_hold(&mut self, tab_id: u64, url: &str, host: &str, method: &str) -> Option<u64> {
+        // Checked against the policy NOW, not when the engine queued the
+        // hold. Switching blocking off clears every pending (round 2), but a
+        // hold already queued behind that switch would raise a fresh banner
+        // telling the user to disable protection that was just disabled
+        // (review R-001, round 5). With blocking off there is no reason to
+        // hold anything. THIS TAB's policy, not the browser-wide one: a
+        // private tab blocks under its own preset while the switch is off,
+        // and its hold is real (review R-002, round 6).
+        let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
+        if !tab.block_ads {
+            return None;
+        }
+        Some(tab.adlist.raise(url, host, method))
+    }
+
     pub fn insecure_dismiss(&mut self) -> Result<Value, &'static str> {
         let tab = self.tabs.get_mut(self.active).ok_or("no_tab")?;
         tab.insecure_pending = None;
@@ -3636,7 +6626,15 @@ impl AppState {
     }
 
     /// The URL bar's loading indicator tracks the active tab only.
-    pub fn on_load_state(&self, id: u64, loading: bool) {
+    pub fn on_load_state(&mut self, id: u64, loading: bool) {
+        // Probe deltas describe one document, never a tab's lifetime. A real
+        // load start is the host-owned boundary; URL changes alone include
+        // same-document fragment navigation and must not erase the reading.
+        if loading {
+            if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+                tab.fingerprint_probes = FingerprintProbeCounts::default();
+            }
+        }
         // Freeze phase and TLS state both change across a load, and the
         // banner that warns about an intercepted connection is driven from
         // here. Without this the whole per-tab feed was silent.
@@ -3646,6 +6644,7 @@ impl AppState {
         if self.tabs.get(self.active).map(|tab| tab.id) == Some(id) {
             self.emit("load_state", json!({ "loading": loading }));
         }
+        crate::page_integrity::on_tab_load_state(self, id, loading);
     }
 }
 
@@ -4092,7 +7091,11 @@ mod permission_book_tests {
     fn the_denied_table_is_bounded_against_hostile_content() {
         let book = PermissionBook::default();
         for i in 0..2000 {
-            book.decide(&format!("https://n{i}.attacker.example"), SITE, PermKind::Camera);
+            book.decide(
+                &format!("https://n{i}.attacker.example"),
+                SITE,
+                PermKind::Camera,
+            );
         }
         let rows = book.status_for(SITE);
         assert!(
@@ -4134,7 +7137,10 @@ mod permission_book_tests {
     #[test]
     fn origins_normalise_so_one_grant_is_one_site() {
         let book = PermissionBook::default();
-        book.grant("https://Example.COM:443/some/path?q=1#frag", PermKind::Camera);
+        book.grant(
+            "https://Example.COM:443/some/path?q=1#frag",
+            PermKind::Camera,
+        );
         for spelling in [
             "https://example.com",
             "https://EXAMPLE.com",
@@ -4213,4 +7219,1086 @@ impl AppState {
             .map(|tab| tab.divergence_registered)
             .unwrap_or(false)
     }
+}
+
+/// Whether a URL is a page a user could have asked to read in another
+/// language. Excludes our own chrome and the translator origin explicitly:
+/// pointing the machinery at the privileged UI is exactly what the origin
+/// split exists to prevent, and it should be impossible by policy here too,
+/// not only by construction over there.
+pub fn is_translatable_url(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    if lower.starts_with(platform::CHROME_ORIGIN_PREFIX)
+        || lower.starts_with(platform::TRANSLATE_ORIGIN_PREFIX)
+        || lower.starts_with("about:")
+        || lower.starts_with("data:")
+        || lower.starts_with("file:")
+        || lower.is_empty()
+    {
+        return false;
+    }
+    lower.starts_with("http://") || lower.starts_with("https://")
+}
+
+
+#[cfg(test)]
+mod login_submit_tests {
+    use super::*;
+
+    /// THE TESTER'S SIDE OF THE STORY. A locked vault used to drop a
+    /// submission in silence; the only outcome that may stay silent now is the
+    /// one where there is nothing to unlock.
+    #[test]
+    fn a_locked_vault_is_no_longer_silent() {
+        use super::{login_submit_outcome, LoginSubmitOutcome};
+        // (vault unlocked, a vault file exists, already stored) -> outcome
+        let cases = [
+            ((true, true, false), LoginSubmitOutcome::Offer),
+            // AUTOFILL THEN SUBMIT. Reported from Windows hardware: filling a
+            // saved password and signing in immediately asked whether to save
+            // the password the browser had just typed. The vault already holds
+            // it, so there is no question to ask.
+            ((true, true, true), LoginSubmitOutcome::AlreadySaved),
+            // Unlocked implies a vault exists; kept to pin that the open vault
+            // wins regardless of what the second input says.
+            ((true, false, false), LoginSubmitOutcome::Offer),
+            // A LOCKED vault cannot have compared anything, so already_saved
+            // is false there by construction -- but pin that it would not
+            // change the answer even if something set it.
+            ((false, true, false), LoginSubmitOutcome::NoticeLocked),
+            ((false, true, true), LoginSubmitOutcome::NoticeLocked),
+            // Never created a vault: saying "unlock it" would name something
+            // that does not exist.
+            ((false, false, false), LoginSubmitOutcome::Silent),
+        ];
+        for ((unlocked, exists, saved), want) in cases {
+            assert_eq!(
+                login_submit_outcome(unlocked, exists, saved),
+                want,
+                "unlocked={unlocked} exists={exists} already_saved={saved}"
+            );
+        }
+    }
+
+    /// The cooldown is what keeps a page from stacking these up the side of
+    /// the chrome. It is time-based BECAUSE the page controls how often the
+    /// code runs (no isTrusted check on the submit listener, and the native
+    /// bridge is reachable directly) but does not control the clock.
+    #[test]
+    fn the_notice_cooldown_outlives_the_toast_it_rate_limits() {
+        use super::{locked_save_notice_due, LOCKED_SAVE_NOTICE_COOLDOWN};
+        // The property, not the number, and the number is READ FROM THE
+        // CHROME rather than restated here. Restating it is how this test
+        // would keep passing while measuring a lifetime the product no longer
+        // uses: the notification moved from 6s to 15s, and a hardcoded 6000
+        // would still have been satisfied by a cooldown too short to prevent
+        // two notices overlapping.
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        let at = CHROME_JS
+            .find("const TOAST_MS = ")
+            .expect("chrome.js no longer declares TOAST_MS");
+        let rest = &CHROME_JS[at + "const TOAST_MS = ".len()..];
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        // REFUSE what this cannot read, rather than reading part of it.
+        // Taking leading digits alone turns JavaScript's `60_000` -- sixty
+        // thousand milliseconds -- into 60, and a cooldown comparison against
+        // 60ms would pass while two notices overlapped on screen. A parser
+        // that silently returns a smaller number is worse than no parser.
+        let after = &rest[digits.len()..];
+        assert!(
+            after.starts_with(';'),
+            "TOAST_MS is not a plain decimal literal ({:?}...); this test can \
+             only compare a number it fully understands",
+            &rest[..digits.len() + 4.min(after.len())]
+        );
+        let toast_ms: u64 = digits.parse().expect("TOAST_MS is not a plain number");
+        assert!(
+            LOCKED_SAVE_NOTICE_COOLDOWN > Duration::from_millis(toast_ms),
+            "the cooldown ({LOCKED_SAVE_NOTICE_COOLDOWN:?}) must outlast a \
+             notification ({toast_ms}ms), or two can be on screen at once"
+        );
+
+        let t0 = Instant::now();
+        // Nothing shown yet: the first submission always speaks.
+        assert!(locked_save_notice_due(None, t0));
+        // A flood inside the window is refused, however many arrive.
+        for after in [0, 1, 5, 29] {
+            assert!(
+                !locked_save_notice_due(Some(t0), t0 + Duration::from_secs(after)),
+                "a second notice {after}s later must be suppressed"
+            );
+        }
+        // And it re-arms, so a genuine later login is still told.
+        assert!(locked_save_notice_due(Some(t0), t0 + LOCKED_SAVE_NOTICE_COOLDOWN));
+        assert!(locked_save_notice_due(Some(t0), t0 + Duration::from_secs(31)));
+    }
+
+
+
+    /// The JOIN, driven against a real vault.
+    ///
+    /// `has_matching_credential` had a test and `login_submit_outcome` had a
+    /// test; the line between them had none, so passing a literal `false`
+    /// would have put the autofill-then-asked-to-save bug straight back with
+    /// every test still passing.
+    #[test]
+    fn a_stored_credential_is_recognised_through_the_join() {
+        use super::already_stored;
+        let dir = std::env::temp_dir().join(format!("patanyx-join-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vault.json");
+        let _ = std::fs::remove_file(&path);
+        let mut vault = Vault::create_with_params(&path, "test passphrase", 8192, 1, 1)
+            .unwrap()
+            .0;
+        vault
+            .add_credential(
+                "accounts.example.com",
+                Some("accounts.example.com"),
+                "dora",
+                "hunter2",
+                "",
+            )
+            .unwrap();
+
+        // The reported case: filled from the vault, submitted, already stored.
+        assert!(
+            already_stored(Some(&vault), "accounts.example.com", "dora", "hunter2"),
+            "the credential the vault just stored was not recognised"
+        );
+        // Across subdomains, because that is how the FILL offer matches too.
+        assert!(
+            already_stored(Some(&vault), "mail.example.com", "dora", "hunter2"),
+            "a sibling subdomain must recognise it, or a second copy is saved"
+        );
+        // A changed password is a password change and must still be offered.
+        assert!(!already_stored(Some(&vault), "accounts.example.com", "dora", "hunter3"));
+        // A different site must never suppress another site's save offer.
+        assert!(!already_stored(Some(&vault), "evil.example.net", "dora", "hunter2"));
+        // A LOCKED vault compares nothing.
+        assert!(!already_stored(None, "accounts.example.com", "dora", "hunter2"));
+
+        // AND THE DISPATCHER MUST ACTUALLY ASK.
+        //
+        // Everything above drives `already_stored` directly. What no unit test
+        // here can reach is `note_login_submitted_at`, because AppState owns
+        // live webviews and cannot be built -- so replacing its call with a
+        // literal `false` restores the reported bug with every assertion above
+        // still green. Proven by planting exactly that.
+        //
+        // Checked as source text, which is weak, and recorded as weak rather
+        // than left implied. The strong version needs an AppState this crate
+        // cannot construct.
+        const SELF_SRC: &str = include_str!("state.rs");
+        // SPLIT so the needle cannot match ITSELF. Written whole, this literal
+        // appears in this very file, so the assertion stayed green after the
+        // call it guards was deleted -- it was finding its own text. `concat!`
+        // rebuilds it at compile time while leaving the source split.
+        let needle = concat!("already_stored(self.vault", ".as_ref()");
+        assert!(
+            SELF_SRC.contains(needle),
+            "note_login_submitted_at no longer asks whether the credential is \
+             already stored, so an autofilled password would be offered for \
+             saving again"
+        );
+
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir(&dir);
+    }
+
+    /// The suppression AS IT ACTUALLY RUNS: decision and stamp together,
+    /// driving the same state the dispatcher owns.
+    ///
+    /// This is the test whose absence let the stamp be deleted with every
+    /// other test here still passing.
+    #[test]
+    fn the_notice_stamps_itself_so_the_next_one_is_suppressed() {
+        use super::{take_locked_save_notice, LOCKED_SAVE_NOTICE_COOLDOWN};
+        let t0 = Instant::now();
+        let mut slot: Option<Instant> = None;
+
+        assert!(take_locked_save_notice(&mut slot, t0), "the first must speak");
+        assert_eq!(slot, Some(t0), "it must record that it spoke");
+
+        // A page can call this as often as it likes; the clock is what says no.
+        for after in [0, 1, 5, 29] {
+            let t = t0 + Duration::from_secs(after);
+            assert!(
+                !take_locked_save_notice(&mut slot, t),
+                "a notice {after}s later must be suppressed"
+            );
+            assert_eq!(slot, Some(t0), "a suppressed notice must not re-stamp");
+        }
+
+        // And it re-arms, so a genuine later login is still told.
+        let later = t0 + LOCKED_SAVE_NOTICE_COOLDOWN;
+        assert!(take_locked_save_notice(&mut slot, later));
+        assert_eq!(slot, Some(later), "speaking again must move the stamp");
+        assert!(
+            !take_locked_save_notice(&mut slot, later + Duration::from_secs(1)),
+            "the second notice must start its own cooldown"
+        );
+    }
+
+    /// The sentence and its catalog id have to agree, and the id has to exist.
+    /// This is the seam a JavaScript gate cannot see from the Rust side and
+    /// the Rust tests cannot see from the chrome side, so it is checked as
+    /// text, the way `every_error_code_has_user_facing_text` already does.
+    ///
+    /// KNOWN LIMIT, recorded rather than implied: this proves the id is
+    /// present in both files and that the chrome asks for it. It cannot prove
+    /// that the Rust arm actually emits `vault_locked_no_save` on a real
+    /// submission -- the capture path is Windows-only (`unix.rs` has no
+    /// `login_submit` handler at all), so that step is owed a Windows run.
+    #[test]
+    fn the_locked_notice_string_reaches_the_chrome() {
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        const EN_FTL: &str = include_str!("chrome/i18n/locales/en.ftl");
+        assert!(
+            CHROME_JS.contains("\"vault_locked_no_save\""),
+            "chrome.js does not handle the event this arm emits"
+        );
+        assert!(
+            CHROME_JS.contains("chrome-js-toast-locked-no-save"),
+            "chrome.js does not ask for the notice string"
+        );
+        assert!(
+            EN_FTL.contains("chrome-js-toast-locked-no-save = "),
+            "the catalog has no entry for the notice string"
+        );
+    }
+
+    /// Notifications are CENTRED AND BOLD, by decision: "I want all
+    /// notifications to show like that. Forget the upper right hand corner
+    /// notifications." They used to sit top-right in a 320px box, which is
+    /// easily missed, and a notification nobody reads is not a notification.
+    ///
+    /// Pinned as text because the shape of the surface is a decision, not an
+    /// accident, and the next person to tidy this CSS should have to change a
+    /// test that says so. The rendered result -- centre offset, weight, and no
+    /// truncation -- is measured in a real browser; this only guards the
+    /// intent.
+    #[test]
+    fn notifications_are_centred_and_bold() {
+        const CSS: &str = include_str!("chrome/chrome.css");
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        // Each rule is sliced to its own closing brace rather than a fixed
+        // number of characters. A fixed window silently stops covering the
+        // declarations it was written to check the moment someone adds a
+        // comment inside the rule -- which is exactly how this test started
+        // failing on a property that had not changed.
+        let rule = |name: &str| -> &str {
+            let at = CSS
+                .find(name)
+                .unwrap_or_else(|| panic!("{name} rule is gone"));
+            let end = CSS[at..]
+                .find("\n}")
+                .unwrap_or_else(|| panic!("{name} rule has no terminator"));
+            &CSS[at..at + end]
+        };
+        let block = rule("#toasts {");
+        assert!(
+            block.contains("left: 50%") && block.contains("translateX(-50%)"),
+            "the notification surface is no longer centred"
+        );
+        assert!(
+            !block.contains("right: 8px"),
+            "the notification surface went back to the corner"
+        );
+        let tblock = rule("\n.toast {");
+        assert!(
+            tblock.contains("font-weight: 600"),
+            "notifications are no longer bold"
+        );
+        assert!(
+            !tblock.contains("white-space: nowrap"),
+            "nowrap is back, so a long notification is silently truncated"
+        );
+
+        // CLICK-THROUGH. Notices sit centred, over the address bar, so the
+        // surface must not take clicks -- except the dismiss button, which is
+        // useless if it does not. Both halves matter and each has been wrong
+        // in a draft: a notice that eats clicks makes a six-second dead zone
+        // across the toolbar, and a button that does not take them is a
+        // control the user cannot press.
+        assert!(
+            block.contains("pointer-events: none"),
+            "the notification surface takes clicks; it would swallow clicks \
+             meant for the toolbar underneath it"
+        );
+        // ABOVE THE MODAL SCRIM. At z-index 20 the surface sat UNDER the
+        // scrim (30), so with any panel open a notification was dimmed and its
+        // dismiss button could not be clicked -- a control the user is told to
+        // use and cannot reach.
+        let z = block
+            .find("z-index: ")
+            .map(|i| {
+                block[i + "z-index: ".len()..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_digit())
+                    .collect::<String>()
+            })
+            .and_then(|d| d.parse::<u32>().ok())
+            .expect("#toasts declares no z-index");
+        // THE WHOLE ORDERING, not just "above the scrim". `z > 30` accepted
+        // 35, which still sits under the panels at 40 and under the strip at
+        // 50 while a modal is open, and accepted 65, which covers the accent
+        // frame at 60. Both would have passed this test while undoing what it
+        // exists to protect.
+        assert!(
+            z > 50,
+            "notifications sit at z-index {z}: above the scrim (30) is not \
+             enough, they must also clear the panels (40) and the strip (50) \
+             or the dismiss button is still unreachable with a panel open"
+        );
+        assert!(
+            z < 60,
+            "notifications sit at z-index {z}, at or above the accent frame \
+             (60), which is meant to be the outermost thing drawn"
+        );
+
+        // DISMISSING A NOTICE MUST NOT CLOSE THE PANEL UNDER IT.
+        //
+        // Lifting this surface above the modal scrim is what made the X
+        // clickable with a panel open, and the first thing that made possible
+        // was a mousedown bubbling to the document's outside-click handler,
+        // which ran `closeOpenPanel()` -- whose onClose wipes a chat
+        // transcript and its unsent draft. Pressing X to clear a notice
+        // destroyed the conversation behind it. Reproduced in a browser, fixed
+        // by adding #toasts to the handler's exemption list.
+        //
+        // Checked as TEXT because the DOM harness cannot model it: `_fire`
+        // does not bubble to a document-level listener, so a gate check there
+        // passed whether the exemption was present or not. The real
+        // interaction is verified in a browser; this pins the contract so it
+        // cannot be silently removed.
+        let at = CHROME_JS
+            .find("!ev.target.closest(")
+            .expect("the outside-click handler no longer guards on closest()");
+        // The SELECTOR ITSELF, split the way the browser reads it.
+        //
+        // Checking that a window of text merely CONTAINS "#toasts" is not the
+        // same claim: delete the comma before it and the list becomes
+        // `#confirm-overlay #toasts`, a valid DESCENDANT selector matching
+        // nothing, because those two containers are siblings. The exemption
+        // dies, the chat-wiping regression comes back, and a contains() check
+        // sails straight through it.
+        let open_q = CHROME_JS[at..]
+            .find('"')
+            .expect("the closest() guard has no selector literal")
+            + at;
+        let close_q = CHROME_JS[open_q + 1..]
+            .find('"')
+            .expect("the selector literal is unterminated")
+            + open_q
+            + 1;
+        let selector = &CHROME_JS[open_q + 1..close_q];
+        assert!(
+            selector.split(',').any(|part| part.trim() == "#toasts"),
+            "#toasts is not its own entry in the outside-click exemption list \
+             ({selector:?}), so pressing a notification's X would close the \
+             open panel and run its onClose, wiping a chat transcript"
+        );
+
+        let cblock = rule(".toast-close {");
+        assert!(
+            cblock.contains("pointer-events: auto"),
+            "the dismiss button does not take clicks, so it cannot be pressed"
+        );
+    }
+}
+
+#[cfg(test)]
+mod translation_session_tests {
+    use super::*;
+
+    /// THE TIER GATE, exhaustively against the real registry.
+    ///
+    /// Its three call sites (install, the download choke point, and translate)
+    /// hang off an AppState owning live WebViews and cannot be unit-tested;
+    /// the DECISION they all share can be, and is. If a tier-2 pair ever
+    /// became reachable without a licence, this fails.
+    #[test]
+    fn tier_two_pairs_need_premium_and_tier_one_never_does() {
+        let mut saw_tier_two = 0;
+        for p in crate::languages::PAIRS {
+            match p.tier {
+                1 => {
+                    assert!(tier_allows(p.token, false), "{} must be free", p.token);
+                    assert!(tier_allows(p.token, true), "{} must stay free", p.token);
+                }
+                2 => {
+                    saw_tier_two += 1;
+                    assert!(
+                        !tier_allows(p.token, false),
+                        "{} is tier 2 and must be REFUSED without a licence",
+                        p.token
+                    );
+                    assert!(
+                        tier_allows(p.token, true),
+                        "{} is tier 2 and must be allowed WITH a licence",
+                        p.token
+                    );
+                }
+                other => panic!("{}: unexpected tier {other}", p.token),
+            }
+        }
+        // NOT an anti-vacuity assert on the registry any more: since OPUS-MT
+        // became free there is no tier-2 row, and `saw_tier_two` is expected
+        // to be zero. The gate is proven directly instead, so it stays under
+        // test no matter what the product tiers today.
+        let _ = saw_tier_two;
+        assert!(tier_allows_row(1, false), "tier 1 is free");
+        assert!(tier_allows_row(1, true), "tier 1 stays free");
+        assert!(!tier_allows_row(2, false), "tier 2 without a licence is REFUSED");
+        assert!(tier_allows_row(2, true), "tier 2 with a licence is allowed");
+        // A tier above 2 is not a loophole: anything that is not tier 1 needs
+        // a licence.
+        assert!(!tier_allows_row(3, false), "an unknown high tier must not be free");
+    }
+
+    /// A FREE INSTALL IS NEVER TOLD THE PREMIUM LANGUAGES EXIST.
+    ///
+    /// `packs_status` is what the panel renders from, so the rule is enforced
+    /// where the data is made: an unentitled session receives no row for a
+    /// premium language it has not installed. This pins the shape of that
+    /// filter against the real registry (the AppState it hangs off owns live
+    /// WebViews and cannot be built in a test, so the predicate is checked
+    /// directly, the same way the tier gate is).
+    /// A language is installed when EVERY published direction is.
+    ///
+    /// `any` stranded a language with no way out: a user carrying en-es from
+    /// the old single-pair build saw Spanish marked Installed, so the row
+    /// offered Remove and nothing else -- while es-en had never been fetched,
+    /// leaving Spanish->English with no target and no control to fix it.
+    ///
+    /// The rule: every language translates to English and back,
+    /// unless the reverse pair does not exist upstream -- and then the single
+    /// direction IS the whole language. So this is a count against what the
+    /// registry publishes, never a fixed expectation of two.
+    #[test]
+    fn a_language_is_installed_only_when_all_its_directions_are() {
+        // The predicate as packs_status computes it.
+        let state = |present: usize, published: usize| {
+            let all = present > 0 && present == published;
+            let partial = present > 0 && !all;
+            (all, partial)
+        };
+        // Two-way language, one direction on disk: NOT installed, and partial
+        // so the panel can offer to finish it.
+        assert_eq!(state(1, 2), (false, true));
+        assert_eq!(state(2, 2), (true, false));
+        assert_eq!(state(0, 2), (false, false));
+        // One-way language (no reverse model upstream): the single direction
+        // is the whole language and must read as fully installed, never as
+        // half of something.
+        assert_eq!(state(1, 1), (true, false));
+        assert_eq!(state(0, 1), (false, false));
+
+        // The registry really does carry one-way languages, or the case above
+        // is hypothetical: Georgian, Hausa, Igbo and Kinyarwanda have no
+        // en-X model, and Azerbaijani and Albanian are one-way upstream.
+        let mut one_way = 0;
+        for lang in crate::languages::LANGUAGES {
+            if lang.code == "en" {
+                continue;
+            }
+            let n = crate::languages::PAIRS
+                .iter()
+                .filter(|p| p.from == lang.code || p.to == lang.code)
+                .count();
+            if n == 1 {
+                one_way += 1;
+            }
+        }
+        assert!(
+            one_way > 0,
+            "no one-way language in the registry: the single-direction case \
+             above would be untested"
+        );
+    }
+
+    #[test]
+    fn the_premium_row_filter_hides_unowned_languages_from_free_installs() {
+        // (premium, entitled, installed) -> is the row sent?
+        let sent = |premium: bool, entitled: bool, installed: bool| {
+            !premium || entitled || installed
+        };
+        // A free install sees every free language and no premium one.
+        assert!(sent(false, false, false), "free languages are always listed");
+        assert!(!sent(true, false, false), "a premium language must be hidden");
+        // Entitled sees them.
+        assert!(sent(true, true, false), "a licence reveals them");
+        // And the one exception: already installed stays listed even after a
+        // lapse, so the pack can still be REMOVED rather than stranded.
+        assert!(sent(true, false, true), "an installed pack keeps its Remove");
+
+        // No registry dependency: there is no premium language today (OPUS-MT
+        // became free on 2026-09-01), and the filter's RULE is what this pins.
+        // Tying it to a real row is what made it fail when the product
+        // retiered, which is the opposite of what a rule test should do.
+        assert!(
+            crate::languages::PAIRS.iter().all(|p| p.tier == 1),
+            "a premium language reappeared: re-check the panel copy and the \
+             gate tests, both of which assume nothing is gated today"
+        );
+    }
+
+    /// A token the registry does not carry is not the tier gate's business:
+    /// every caller has already refused it. Answering "denied" here would
+    /// report a typo as a licensing problem.
+    #[test]
+    fn an_unknown_token_is_not_a_licensing_refusal() {
+        for miss in ["", "zz-zz", "en", "en-es-fr", "LA-EN"] {
+            assert!(tier_allows(miss, false), "{miss:?} is not a tier refusal");
+        }
+    }
+
+    /// The pivot cannot be installed or removed as a language: every pair
+    /// contains English, so "install English" would mean the whole registry.
+    #[test]
+    fn english_is_not_an_installable_language() {
+        assert!(
+            crate::languages::PAIRS.iter().all(|p| p.from == "en" || p.to == "en"),
+            "the pivot assumption behind the en refusal no longer holds"
+        );
+    }
+
+    /// The pair is an allowlist against the PUBLISHED registry, not a parse.
+    /// This value selects a model to fetch and load, so anything the chrome
+    /// sends is either a token the registry publishes or it is refused --
+    /// nothing sanitised, nothing escaped.
+    #[test]
+    fn only_published_pairs_are_accepted() {
+        // Published tokens resolve to themselves (the 'static registry copy).
+        // en-fr is a REAL published pair now, where it used to be a stand-in
+        // for "not offered"; the hostile cases below carry that weight instead.
+        for good in ["en-es", "el-en", "es-en", "en-fr"] {
+            assert_eq!(validate_translation_pair(good), Some(good), "accept {good}");
+        }
+        for hostile in [
+            "en-es/../../etc/passwd",
+            "../en-es",
+            "en-es\0",
+            "EN-ES",            // registry tokens are lowercase
+            "en_es",            // wrong separator
+            "",
+            "en-es ",           // trailing space
+            "https://evil.example/model.bin",
+            "en-zz",            // shaped like a token, not published
+            "en-es-fr",         // three subtags
+            "xx-yy",            // valid shape, absent from the registry
+        ] {
+            assert_eq!(
+                validate_translation_pair(hostile),
+                None,
+                "must refuse {hostile:?}"
+            );
+        }
+    }
+
+    /// The registry lookup NEVER splits a token. A script-tagged code would be
+    /// unsplittable ("en-zh-Hans"), and although such tokens are excluded from
+    /// the registry, the resolver must not depend on that: it matches whole
+    /// tokens and returns the row's own components.
+    #[test]
+    fn pair_resolution_is_lookup_not_split() {
+        let row = crate::languages::pair_by_token("en-es").expect("published");
+        assert_eq!(row.token, "en-es");
+        assert_eq!(row.from, "en");
+        assert_eq!(row.to, "es");
+        // A THREE-SUBTAG token resolves to its true components, which is the
+        // whole reason resolution is a lookup: "en-zh-hans" cannot be split
+        // unambiguously, and nothing tries -- the row carries `from`/`to`,
+        // and `from` keeps the real casing the engine needs.
+        let row = crate::languages::pair_by_token("en-zh-hans").expect("published");
+        assert_eq!(row.from, "en");
+        assert_eq!(row.to, "zh-Hans");
+        // A token absent from the registry yields nothing, never a guessed split.
+        assert!(crate::languages::pair_by_token("en-zz-hans").is_none());
+        assert!(crate::languages::pair_by_token("en-zh-Hans").is_none(), "tokens are lowercase");
+    }
+
+    /// Page-controlled language strings are refused unless tag-shaped, so
+    /// bidi/control/homoglyph junk never reaches the badge.
+    #[test]
+    fn detected_lang_rejects_non_tags() {
+        for good in ["en", "el", "zh-hans", "pt-BR", "de"] {
+            assert!(is_plausible_lang_tag(good), "should accept {good}");
+        }
+        for bad in [
+            "",
+            "e",                       // too short
+            "\u{202E}evil",            // RTL override
+            "en\u{200B}",              // zero-width
+            "en es",                   // space
+            "en/es",
+            "en\0",
+            "语言",                     // non-ASCII
+            &"a".repeat(33),           // too long
+        ] {
+            assert!(!is_plausible_lang_tag(bad), "should refuse {bad:?}");
+        }
+    }
+
+    /// THE CORRUPTION GUARD, proved at the state layer: a Greek page against
+    /// an English source is refused, and the incident cannot recur.
+    ///
+    /// This is the planted-defect proof for the whole cluster. If
+    /// `script_refuses` ever returned false for the Greek-into-en case, the
+    /// mangled-Greek-written-into-the-page bug is back, and this test goes red.
+    #[test]
+    fn a_greek_page_against_an_english_source_is_refused() {
+        let greek: Vec<String> = [
+            "Καλώς ήλθατε στην εφαρμογή",
+            "Επιλέξτε Ενεργώ για τον εαυτό μου εφόσον έχετε ΑΦΜ και Κλειδάριθμο",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        // The incident: refused.
+        let counts = |source: &str, texts: &[String]| {
+            let mut c = crate::detect::ScriptCounts::new(source);
+            c.add_batch(texts);
+            c
+        };
+        assert!(script_refuses(&counts("en", &greek)), "Greek into en MUST refuse");
+        // Greek into a Greek source: allowed.
+        assert!(!script_refuses(&counts("el", &greek)), "Greek into el must proceed");
+
+        // A clean English page against en: allowed.
+        let english: Vec<String> = ["Welcome to the application, please choose an option below"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(!script_refuses(&counts("en", &english)), "English into en must proceed");
+        // English against a Greek source: refused (the mirror of the incident).
+        assert!(script_refuses(&counts("el", &english)), "English into el must refuse");
+    }
+
+    /// Every detection failure key the guard can produce has a panel case, so
+    /// a refusal renders a real message rather than degrading to the generic
+    /// one. Mirrors the langpack test for PackError keys.
+    #[test]
+    fn detection_failure_keys_reach_a_panel_case() {
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        for key in [
+            "translate-script-mismatch",
+            "translate-source-unknown",
+            "translate-pair-unavailable",
+            "translate-busy",
+        ] {
+            assert_eq!(translation_failure_key(key), key, "{key} must survive the allowlist");
+            assert!(
+                CHROME_JS.contains(&format!("case \"{key}\":")),
+                "{key} has no panel case; it would render the generic failure"
+            );
+        }
+    }
+
+    /// THE LINE THAT ENFORCES "NEVER AUTOMATIC".
+    ///
+    /// The extractor lives in a hostile page's own JS context, so the page can
+    /// call it whenever it likes -- pretending otherwise would be theatre.
+    /// What stops unprompted text being accepted is not the UI, which a page
+    /// cannot reach, but this refusal.
+    #[test]
+    fn text_from_a_page_with_no_session_is_refused() {
+        let page = "https://example.com/a";
+        assert!(!extract_is_acceptable(None, page, "extract", page));
+    }
+
+    /// THE BUG THE ENGINE PROBE CAUGHT, pinned so it cannot come back.
+    ///
+    /// `js_string` must produce a JavaScript STRING LITERAL. An earlier version
+    /// escaped without quoting, so the call site read
+    /// `translate({"id":"1",...})` -- an object literal. The document's
+    /// JSON.parse got an object and threw, and page text was sitting in source
+    /// position rather than data position, which is the thing this function
+    /// exists to prevent.
+    #[test]
+    fn a_payload_becomes_a_quoted_string_literal_not_an_object() {
+        let payload = r#"{"id":"1","texts":["hi"]}"#;
+        let out = js_string(payload);
+        assert!(out.starts_with('"'), "must be quoted: {out}");
+        assert!(out.ends_with('"'), "must be quoted: {out}");
+        // What the engine will see after JSON.parse: the original payload.
+        assert_eq!(serde_json::from_str::<String>(&out).unwrap(), payload);
+    }
+
+    /// Page text is hostile input and rides through this function. Each of
+    /// these is a character that ends a string, ends a statement, or opens a
+    /// comment if it survives unescaped into source position.
+    #[test]
+    fn hostile_page_text_cannot_escape_the_literal() {
+        for hostile in [
+            r#"");alert(1);(""#,
+            "\\\\\"",
+            "</script>",
+            "\n\r\t",
+            "\u{2028}break\u{2029}",
+            "\0",
+            "`${process}`",
+        ] {
+            let payload = serde_json::json!({ "texts": [hostile] }).to_string();
+            let out = js_string(&payload);
+            // It survives as DATA: parsing the literal returns exactly the
+            // payload, so nothing was lost and nothing was added.
+            assert_eq!(
+                serde_json::from_str::<String>(&out).unwrap(),
+                payload,
+                "round trip failed for {hostile:?}"
+            );
+            // And the two characters JSON permits raw but older JS did not
+            // never appear literally in the emitted source.
+            assert!(!out.contains('\u{2028}'), "raw U+2028 emitted");
+            assert!(!out.contains('\u{2029}'), "raw U+2029 emitted");
+        }
+    }
+
+    /// A document may only report a failure this product can render. Anything
+    /// else becomes a generic one rather than a blank line in the panel.
+    #[test]
+    fn an_unknown_failure_key_degrades_to_a_renderable_one() {
+        assert_eq!(
+            translation_failure_key("translate-pack-failed"),
+            "translate-pack-failed"
+        );
+        // Every key langpack can produce must survive the allowlist, or a
+        // real failure would render as a generic one.
+        for e in [
+            crate::langpack::PackError::Unreachable("network"),
+            crate::langpack::PackError::Manifest,
+            crate::langpack::PackError::Body,
+            crate::langpack::PackError::Malformed,
+            crate::langpack::PackError::Storage,
+        ] {
+            assert_eq!(
+                translation_failure_key(e.key()),
+                e.key(),
+                "{e:?} must survive the allowlist"
+            );
+        }
+        for unknown in ["", "something-else", "<script>", "translate-"] {
+            assert_eq!(translation_failure_key(unknown), "translate-failed");
+        }
+    }
+
+    /// A late reply from a CANCELLED run must not be filed against the run
+    /// that replaced it. Same page, same URL, same everything the URL check
+    /// looks at -- only the token tells them apart.
+    #[test]
+    fn a_stale_run_cannot_be_filed_against_the_run_that_replaced_it() {
+        assert!(extract_token_matches(Some(7), Some("7")));
+        assert!(!extract_token_matches(Some(8), Some("7")));
+        // No session at all: nobody asked, so nothing is acceptable.
+        assert!(!extract_token_matches(None, Some("7")));
+        // A message that names no run.
+        assert!(!extract_token_matches(Some(7), None));
+    }
+
+    /// The token is compared as a string and never parsed, so there is no
+    /// leniency to exploit. Every one of these is a value that a parse-then-
+    /// compare would have had to make a judgement about.
+    #[test]
+    fn the_token_is_matched_exactly_not_parsed() {
+        for hostile in ["07", " 7", "7 ", "+7", "7.0", "0x7", "7\0", "", "7a"] {
+            assert!(
+                !extract_token_matches(Some(7), Some(hostile)),
+                "must refuse {hostile:?}"
+            );
+        }
+    }
+
+    /// The page supplies `href`. It does not supply the session's page or the
+    /// tab's URL, which is precisely why it is checked against those two.
+    #[test]
+    fn a_page_cannot_lie_about_which_page_it_is() {
+        let consented = "https://example.com/article";
+        assert!(extract_is_acceptable(
+            Some(consented),
+            consented,
+            "extract",
+            consented
+        ));
+        // Claims to be the consented page while the tab is elsewhere.
+        assert!(!extract_is_acceptable(
+            Some(consented),
+            "https://example.com/other",
+            "extract",
+            consented
+        ));
+        // Tab is on the consented page, but the message claims another.
+        assert!(!extract_is_acceptable(
+            Some(consented),
+            consented,
+            "extract",
+            "https://evil.example/x"
+        ));
+    }
+
+    /// One shape, and only one. Anything else is dropped rather than
+    /// interpreted -- a message path that grows shapes by accident is how a
+    /// page ends up talking to something that was never meant to hear it.
+    #[test]
+    fn only_the_extract_shape_is_accepted() {
+        let p = "https://example.com/a";
+        for kind in ["", "fill_credential", "Extract", "extract ", "login_submit"] {
+            assert!(
+                !extract_is_acceptable(Some(p), p, kind, p),
+                "must refuse kind {kind:?}"
+            );
+        }
+        assert!(extract_is_acceptable(Some(p), p, "extract", p));
+    }
+
+    /// The gap this closes. Consent attaches to the PAGE the user was reading
+    /// when they clicked, and the explicit clear in `on_url_changed` is a line
+    /// of code nothing in this suite can verify still exists -- `Tab` owns a
+    /// live `WebView`, so no unit test can build one to drive a navigation.
+    ///
+    /// So correctness does not rest on that line. A session records the URL it
+    /// was given for, and a session whose page is not what the tab now shows
+    /// is treated as absent. Deleting the clear leaks memory; it does not
+    /// translate a page nobody asked about.
+
+    #[test]
+    fn a_session_does_not_survive_the_page_it_was_given_for() {
+        let consented = "https://example.com/article";
+        assert!(session_is_current(consented, consented));
+        for moved_to in [
+            "https://example.com/other",
+            "https://example.com/article/",
+            "https://evil.example/article",
+            "https://example.com/article?utm=1",
+            "about:blank",
+            "",
+        ] {
+            assert!(
+                !session_is_current(consented, moved_to),
+                "a session for {consented} must not apply on {moved_to}"
+            );
+        }
+    }
+
+    /// An empty recorded page must never match, or a session constructed
+    /// before a URL was known would apply to every page at once.
+    #[test]
+    fn an_empty_recorded_page_matches_nothing() {
+        assert!(!session_is_current("", ""));
+        assert!(!session_is_current("", "https://example.com/"));
+    }
+
+    // NOT TESTED, deliberately: that a validated pair is 'static and not the
+    // caller's slice. The signature `-> Option<&'static str>` already makes it
+    // impossible to return a borrow of the argument, so a test can only assert
+    // an implementation detail. The first version of this test compared
+    // pointers and failed on const inlining -- an accurate report about the
+    // compiler and nothing at all about safety.
+
+    /// The privileged UI and the translator origin are not pages a user asked
+    /// to read in another language. The origin split already makes pointing
+    /// the machinery at chrome impossible by construction; this makes it
+    /// impossible by policy as well, which is the half that survives someone
+    /// changing the construction.
+    #[test]
+    fn our_own_origins_are_never_translatable() {
+        assert!(!is_translatable_url(platform::CHROME_URL));
+        assert!(!is_translatable_url(platform::TRANSLATE_URL));
+        for internal in [
+            "about:blank",
+            "data:text/html,<b>x</b>",
+            "file:///etc/passwd",
+            "",
+        ] {
+            assert!(!is_translatable_url(internal), "{internal}");
+        }
+    }
+
+    /// Case must not be a way around the origin check.
+    #[test]
+    fn the_origin_check_is_case_insensitive() {
+        let shouty = platform::CHROME_URL.to_ascii_uppercase();
+        assert!(
+            !is_translatable_url(&shouty),
+            "uppercasing must not smuggle the chrome origin past the check: {shouty}"
+        );
+    }
+
+    /// Ordinary web pages are translatable; that is the point.
+    #[test]
+    fn real_pages_are_translatable() {
+        for page in [
+            "https://example.com/article",
+            "http://example.com/",
+            "https://example.com/a?b=c#d",
+        ] {
+            assert!(is_translatable_url(page), "{page}");
+        }
+    }
+    /// Every event the host PUSHES must have a listener on the page.
+    ///
+    /// THIS HAS NOW GONE WRONG TWICE, and both times a person found it by
+    /// staring at a screen. `tab_status` was emitted and handled by nothing,
+    /// freezing every per-tab indicator -- including the TLS-interception
+    /// banner, which could therefore never appear. Then `packs_status` was
+    /// emitted on every download progress tick and handled by nothing, so the
+    /// packs panel showed a percentage that never moved and rendered a FAILED
+    /// download identically to a running one.
+    ///
+    /// Neither was a hard failure: the host did its half correctly and the
+    /// page simply never heard. That is precisely the shape a test catches
+    /// and review does not, so an emitted event with no `case` is now a
+    /// failing test rather than a bug report.
+    ///
+    /// The needle is built at run time; spelling it literally would make this
+    /// scan match its own source.
+    /// Every kind the page-side script posts must be routed on Windows.
+    ///
+    /// The Windows backend shares one WebMessageReceived stream across
+    /// autofill, probes and translation, and tells translation messages apart
+    /// by an ALLOWLIST of kinds. That allowlist was written when the script
+    /// posted two kinds and never revisited: "detected" was added to the
+    /// script, flowed on WebKitGTK (whose channel forwards everything), and
+    /// was silently dropped on Windows -- so language detection, its panel
+    /// hint, and translate-as-you-browse all shipped dead on the platform
+    /// most users run, while every test on the other backend passed. The
+    /// list is now derived from what the script actually posts.
+    #[test]
+    fn every_kind_the_translate_script_posts_is_routed_on_windows() {
+        const SCRIPT: &str = include_str!("content_scripts/translate_extract.js");
+        const WINDOWS_RS: &str = include_str!("platform/windows.rs");
+        let mut kinds = Vec::new();
+        let needle = "kind: \"";
+        for (at, _) in SCRIPT.match_indices(needle) {
+            let rest = &SCRIPT[at + needle.len()..];
+            let end = rest.find('"').expect("unterminated kind");
+            let kind = &rest[..end];
+            if !kinds.contains(&kind) {
+                kinds.push(kind);
+            }
+        }
+        assert!(
+            kinds.len() >= 3,
+            "found only {kinds:?} -- the scan itself broke"
+        );
+        for kind in kinds {
+            assert!(
+                WINDOWS_RS.contains(&format!("kind == \"{kind}\"")),
+                "the content script posts kind {kind:?} and the Windows \
+                 message router never mentions it: on WebView2 that message \
+                 is dropped before the host sees it, while WebKitGTK forwards \
+                 it -- the exact platform split that shipped language \
+                 detection dead on Windows"
+            );
+        }
+    }
+
+    /// The stall deadline's key must survive the mapper and reach copy.
+    ///
+    /// `translation_failure_key` funnels unknown keys to a generic case, so a
+    /// key added on the Rust side and forgotten in the mapper silently loses
+    /// its specific message -- the timeout would render as plain "failed",
+    /// which tells a user nothing about what to do differently.
+    #[test]
+    fn the_timeout_key_survives_the_mapper_and_reaches_a_panel_case() {
+        assert_eq!(translation_failure_key("translate-timeout"), "translate-timeout");
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        assert!(
+            CHROME_JS.contains("case \"translate-timeout\":"),
+            "the timeout produces a key the panel has no case for"
+        );
+    }
+
+    /// The three coordinate systems, pinned.
+    ///
+    /// A mixed page filters nodes out, so engine index != batch index !=
+    /// document index. Getting this wrong puts a correct translation on the
+    /// WRONG paragraph, which reads as the model having produced nonsense --
+    /// far harder to diagnose than a plain failure, and the reason the
+    /// arithmetic is a tested function rather than an inline expression.
+    /// ONE precision reaches the engine, for every pack.
+    ///
+    /// The two-path version inferred precision from a pack's SOURCE, and the
+    /// OPUS-MT branch selected a path that computes correctly on WebKitGTK and
+    /// wrongly on WebView2 -- so every converted language shipped word salad
+    /// to the platform most users run, while the Mozilla languages beside them
+    /// were fine. The split was invisible on the machine that built it.
+    ///
+    /// Precision is not something to infer from provenance. If a pack ever
+    /// genuinely needs a different one, it records that itself.
+    /// The engine REPORTS its heap, so a heap claim can be measured.
+    ///
+    /// A previous version of this test asserted the heap must exceed twice
+    /// the largest pack plus the workspace, and the code raised it to 1.5 GiB
+    /// to satisfy that. The premise was wrong: the same converted pack
+    /// translates correctly at the original 223 MiB, so nothing was ever
+    /// starved. Asserting a number derived from a disproven model of the
+    /// engine would pin a fiction -- and would have blocked putting the heap
+    /// back.
+    ///
+    /// What IS worth pinning is the instrument: status() must keep reporting
+    /// `heapBytes`, so the next person with a memory theory can read the
+
+    #[test]
+    fn the_engine_is_asked_for_one_precision_and_it_is_the_portable_one() {
+        const STATE_RS: &str = include_str!("state.rs");
+        let asked = STATE_RS.matches("let gemm = \"int8shiftAll\";").count();
+        assert_eq!(asked, 1, "the GEMM path should be chosen in exactly one place");
+        // The alphas path must not be selectable from product code again
+        // without this test being revisited. The probe may still force it --
+        // comparing the two is how this was found -- so only THIS file counts.
+        assert!(
+            !STATE_RS.contains("\"int8shiftAlphaAll\""),
+            "state.rs selects int8shiftAlphaAll again: it is measurably wrong \
+             on WebView2, which is the platform most users run"
+        );
+    }
+
+    #[test]
+    fn a_patch_lands_on_the_node_its_text_came_from() {
+        // Batch of 6 at document offset 100; nodes 1, 3 and 4 survived the
+        // filter, so the engine was sent 3 items numbered 0,1,2.
+        let map = vec![1usize, 3, 4];
+        assert_eq!(patch_index(0, &map, 100), Some(101));
+        assert_eq!(patch_index(1, &map, 100), Some(103));
+        assert_eq!(patch_index(2, &map, 100), Some(104));
+        // An index the engine invented is dropped, not clamped.
+        assert_eq!(patch_index(3, &map, 100), None);
+        assert_eq!(patch_index(usize::MAX, &map, 100), None);
+        // Unfiltered batches are the identity case and must be unaffected.
+        let all: Vec<usize> = (0..5).collect();
+        for i in 0..5 {
+            assert_eq!(patch_index(i, &all, 0), Some(i as u64));
+            assert_eq!(patch_index(i, &all, 42), Some(i as u64 + 42));
+        }
+        // An empty map names nothing.
+        assert_eq!(patch_index(0, &[], 0), None);
+    }
+
+    #[test]
+    fn every_emitted_event_reaches_a_dispatcher_case() {
+        const STATE_RS: &str = include_str!("state.rs");
+        const CHROME_JS: &str = include_str!("chrome/chrome.js");
+        let needle = format!(".{}(\"", "emit");
+        let mut checked = 0;
+        for (at, _) in STATE_RS.match_indices(&needle) {
+            let rest = &STATE_RS[at + needle.len()..];
+            let end = rest.find('"').expect("unterminated event name");
+            let event = &rest[..end];
+            assert!(
+                CHROME_JS.contains(&format!("case \"{event}\":")),
+                "state.rs emits {event:?}, and chrome.js has no `case \"{event}\":` \
+                 for it. The event is pushed into nothing and whatever it was \
+                 meant to update stays frozen at its last value."
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 10,
+            "scanned only {checked} emit sites -- the scan itself broke, and a \
+             scan that finds nothing passes vacuously"
+        );
+    }
+
 }

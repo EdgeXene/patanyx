@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "0.9.65"
+version = "1.0.0"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -27,6 +27,12 @@ edition = "2021"
 # than a freebie.
 default = ["updater-net"]
 chat = ["dep:patanyx-chat"]
+# DANGEROUS TEST ARTIFACT: forces every Premium feature gate open so the v1
+# hardware test can exercise the whole product without spending an activation
+# grant or depending on the activation service. This is compile-time on purpose:
+# a public binary must contain NO discoverable runtime licence bypass. It must
+# NEVER enter `default`, a public package, or any release build offered to users.
+premium-unlocked = []
 # Reachable-beyond-the-LAN chat. Implies `chat` (a relay without the chat
 # stack is dead weight) and forwards to the flag crates/chat declares —
 # chat_panel.rs gates on THIS name via cfg!(feature = "relay-client").
@@ -53,16 +59,31 @@ relay-client = ["chat", "patanyx-chat/relay-client"]
 updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
 
 [dependencies]
-wry = "0.55"
+wry = { version = "0.55", features = ["devtools"] }
 tao = "0.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The string catalog. Pure Rust the whole way down (9 transitive crates, no
+# build script this tree does not already compile), which is what keeps the
+# Windows cross-compile alive -- the same constraint that chose tract over
+# ort in the OCR crate. Resolution happens HERE, in Rust: the chrome's JS
+# receives resolved strings over IPC and holds no catalog at all.
+#
+# unic-langid WITHOUT the macros feature on purpose: `langid!` is one more
+# proc-macro for something a runtime parse of a checked-in constant does.
+fluent-bundle = "0.16"
+unic-langid = "0.9"
 patanyx-vault = { path = "../vault" }
 patanyx-integrity = { path = "../integrity" }
 patanyx-corroborate = { path = "../corroborate" }
 patanyx-store = { path = "../store" }
 patanyx-update = { path = "../update" }
 patanyx-ocr = { path = "../ocr" }
+# Region OCR keeps the native capture for the scan, but the chrome must never
+# decode that unbounded full-page bitmap. Decode rows directly so a page's
+# height cannot turn into a whole-frame allocation merely to make the bounded
+# preview.
+png = "0.18"
 # UNCONDITIONAL, like patanyx-ocr and for the same reason the vault's
 # `tunnel` field is: a build that cannot bring a tunnel up must still be the
 # same binary shape as one that can, and feature-gating a privacy control is
@@ -160,6 +181,9 @@ windows = { version = "0.61", features = [
   "Win32_UI_WindowsAndMessaging",
   "Win32_System_LibraryLoader",
   "Win32_Graphics_Dwm",
+  # Reading the machine's configured HTTP proxy so activation can reach
+  # EdgeXene through a corporate egress (Zscaler and the like). See net.rs.
+  "Win32_System_Registry",
 ] }
 
 # GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
@@ -173,6 +197,18 @@ webkit2gtk = { version = "=2.0.2", features = ["v2_40"] }
 # WebKitUserContentFilterStore, which compiles ad-block rules and which the safe
 # crate does not wrap. See compile_filter in src/platform/unix.rs.
 webkit2gtk-sys = "=2.0.2"
+# Already in the tree beneath webkit2gtk; named here because reading a value a
+# CONTENT page posted up requires its ValueExt trait, and a trait cannot be
+# used from a crate that is only a transitive dependency. Pinned to the
+# version webkit2gtk already resolves, so this adds no new code to the build --
+# only the ability to name what is already there.
+javascriptcore-rs = "=1.1.2"
+# Its sys layer, for the same reason one step lower down: answering a page's
+# request means handing webkit2gtk-sys a *mut JSCValue, and that type is only
+# nameable through this crate -- webkit2gtk-sys renames its own copy to
+# `java_script_core`, which is private to it. Pinned to the version already in
+# Cargo.lock beneath both, so this adds no code to the build.
+javascriptcore-rs-sys = "=1.1.1"
 # The sys layer's signatures are in terms of raw glib/gobject/gio types, so
 # those crates have to be nameable here too.
 glib-sys = "0.18"

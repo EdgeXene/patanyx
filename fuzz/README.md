@@ -5,8 +5,9 @@ write. Added 2026-08-18 by the security audit.
 
 ## Running
 
-Needs a nightly toolchain; the repo's pinned 1.96.0 still governs every real
-build, and nothing here is part of one.
+Needs a nightly toolchain; the repo's pinned 1.98.0 still governs every real
+build, and nothing here is part of one. The nightly itself is not pinned to a
+date and floats with whatever rustup installs.
 
     rustup toolchain install nightly --profile minimal
     cargo +nightly install cargo-fuzz

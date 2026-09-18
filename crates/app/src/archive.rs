@@ -44,6 +44,12 @@ pub struct ArchiveHit {
     pub snippets: Vec<Snippet>,
     /// Matches found in the text, before the snippet cap applies.
     pub match_count: u32,
+    /// The three fields the list row also renders, so a SEARCH hit draws the
+    /// same row as a list entry: without them a hit had no View button and
+    /// the saved picture was unreachable from any search (launch sweep F-002).
+    pub scope: String,
+    pub has_picture: bool,
+    pub words: usize,
     /// True when `match_count` hit the searcher's ceiling, so it is a floor
     /// rather than an exact number. Carried through rather than dropped:
     /// the cross-tab search words a capped count as "1000+" and an archive
@@ -77,6 +83,9 @@ pub fn search(records: &[ArchiveRecord], query: &str) -> Result<Vec<ArchiveHit>,
                 url: record.url.clone(),
                 title: record.title.clone(),
                 created_at: record.created_at,
+                scope: record.scope.clone(),
+                has_picture: record.has_picture,
+                words: record.text.split_whitespace().count(),
                 in_metadata,
                 snippets: set.snippets,
                 match_count: set.total,
@@ -212,20 +221,65 @@ mod tests {
 /// leave a decrypted page servable behind it. The bytes are Zeroizing, so
 /// replace and clear both wipe rather than merely drop.
 struct StagedPicture {
+    record_id: String,
     token: u64,
     png: zeroize::Zeroizing<Vec<u8>>,
 }
 
 static STAGED_PICTURE: std::sync::Mutex<Option<StagedPicture>> = std::sync::Mutex::new(None);
 
+/// An unguessable `rbchrome` asset token: 64 bits straight from the OS.
+///
+/// Shared with `capture.rs` so both staging paths mint the same KIND of token
+/// and neither can drift back to a counter. `getrandom` is already how this
+/// binary mints a device id, so this adds no dependency.
+///
+/// Zero is avoided only so that "no token" and "token 0" can never be confused
+/// by a caller reading a default; the odds are negligible either way.
+pub(crate) fn random_token() -> u64 {
+    let mut bytes = [0u8; 8];
+    if getrandom::getrandom(&mut bytes).is_ok() {
+        let token = u64::from_le_bytes(bytes);
+        // Zero is avoided only so "no token" and "token 0" can never be confused
+        // by a caller reading a default; the odds are negligible either way.
+        return if token == 0 { 1 } else { token };
+    }
+    // The OS entropy source being unavailable is close to impossible on a desktop
+    // and is NOT a reason to hand back a predictable value. The clock mixed with a
+    // stack address is weak entropy, but it is not a sequence an attacker can walk
+    // by adding one -- which is the property that actually matters here. No unsafe:
+    // taking a reference's address is a safe cast.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let anchor = 0u8;
+    let addr = &anchor as *const u8 as u64;
+    (now ^ addr.rotate_left(17)) | 1
+}
+
 /// Stages a decrypted picture, replacing (and wiping) any previous one.
 /// The token is minted here so nothing outside this module can predict or
-/// reuse one; it shares nothing with capture.rs's counter.
-pub fn stash_picture(png: zeroize::Zeroizing<Vec<u8>>) -> Result<u64, &'static str> {
-    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+/// reuse one; it shares nothing with capture.rs's generator.
+///
+/// THE TOKEN IS RANDOM, and it has to be. It used to be a counter starting at
+/// 1, while this comment already claimed nothing could predict it -- the claim
+/// was the intent, the counter was the implementation, and they disagreed
+/// (security assessment 2026-08-28, R13). A guessable token is what turns a
+/// same-origin foothold on the chrome document into a read of the DECRYPTED
+/// archive page staged behind it, so it is the amplifier for any reserved-origin
+/// bypass rather than a finding on its own. 64 random bits from the OS.
+pub fn stash_picture(
+    record_id: &str,
+    png: zeroize::Zeroizing<Vec<u8>>,
+) -> Result<u64, &'static str> {
+    let token = random_token();
     let mut slot = STAGED_PICTURE.lock().map_err(|_| "stage_failed")?;
-    *slot = Some(StagedPicture { token, png });
+    *slot = Some(StagedPicture {
+        record_id: record_id.to_string(),
+        token,
+        png,
+    });
     Ok(token)
 }
 
@@ -248,6 +302,22 @@ pub fn clear_staged() {
     }
 }
 
+/// Drops the staged picture only when it belongs to `record_id`.
+///
+/// Deleting some other archive row must not retire the token for the picture
+/// the reader is still looking at. The record id stays inside this module;
+/// the protocol continues to serve only the unguessable token.
+pub fn clear_staged_record(record_id: &str) {
+    if let Ok(mut slot) = STAGED_PICTURE.lock() {
+        if slot
+            .as_ref()
+            .is_some_and(|staged| staged.record_id == record_id)
+        {
+            *slot = None;
+        }
+    }
+}
+
 #[cfg(test)]
 mod staged_picture_tests {
     use super::*;
@@ -263,10 +333,52 @@ mod staged_picture_tests {
     #[test]
     fn a_staged_picture_is_served_by_its_token_and_only_its_token() {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-        let token = stash_picture(zeroize::Zeroizing::new(vec![1, 2, 3])).unwrap();
+        let token = stash_picture("one", zeroize::Zeroizing::new(vec![1, 2, 3])).unwrap();
         assert_eq!(staged_png(token).as_deref(), Some(&[1u8, 2, 3][..]));
-        assert_eq!(staged_png(token + 1), None, "a guessed token serves nothing");
+        // `wrapping_add` because the token is now random: a plain `+ 1` on a
+        // token that happened to be u64::MAX would panic in a debug build.
+        assert_eq!(
+            staged_png(token.wrapping_add(1)),
+            None,
+            "a guessed token serves nothing"
+        );
         clear_staged();
+    }
+
+    /// The token is the ONLY thing standing between a page that has reached the
+    /// chrome origin and a decrypted archive picture, so it must not be a number
+    /// an attacker can simply count up to. It was a counter starting at 1 while
+    /// the module comment claimed it was unpredictable (security assessment
+    /// 2026-08-28, R13); this pins the claim to the implementation.
+    ///
+    /// Probabilistic by nature, but not flaky: three independent 64-bit draws
+    /// colliding or landing in sequence has a probability far below any rate a
+    /// test suite could observe.
+    #[test]
+    fn staged_picture_tokens_are_unguessable_not_sequential() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut seen = Vec::new();
+        for _ in 0..3 {
+            seen.push(stash_picture("r", zeroize::Zeroizing::new(vec![7])).unwrap());
+        }
+        clear_staged();
+        assert!(
+            seen.iter().all(|t| *t != 0),
+            "a token must never be zero: {seen:?}"
+        );
+        assert!(
+            seen[0] != seen[1] && seen[1] != seen[2] && seen[0] != seen[2],
+            "tokens repeated across stagings: {seen:?}"
+        );
+        assert!(
+            seen[1] != seen[0].wrapping_add(1) || seen[2] != seen[1].wrapping_add(1),
+            "tokens are still being handed out in sequence: {seen:?}"
+        );
+        // A counter starting at 1 would produce small values every time.
+        assert!(
+            seen.iter().any(|t| *t > u32::MAX as u64),
+            "every token landed in the low range, which a counter would do: {seen:?}"
+        );
     }
 
     #[test]
@@ -275,8 +387,8 @@ mod staged_picture_tests {
         // THE PRIVACY HALF: at most one decrypted screenshot exists at a
         // time, so an old preview URL cannot keep working after the user
         // moved on to another record.
-        let first = stash_picture(zeroize::Zeroizing::new(vec![1])).unwrap();
-        let second = stash_picture(zeroize::Zeroizing::new(vec![2])).unwrap();
+        let first = stash_picture("one", zeroize::Zeroizing::new(vec![1])).unwrap();
+        let second = stash_picture("two", zeroize::Zeroizing::new(vec![2])).unwrap();
         assert_eq!(staged_png(first), None, "the replaced token must die");
         assert_eq!(staged_png(second).as_deref(), Some(&[2u8][..]));
         clear_staged();
@@ -287,8 +399,18 @@ mod staged_picture_tests {
         let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         // The vault-lock path calls exactly this; a token that survived a
         // lock would serve a decrypted page out of a locked vault.
-        let token = stash_picture(zeroize::Zeroizing::new(vec![9])).unwrap();
+        let token = stash_picture("one", zeroize::Zeroizing::new(vec![9])).unwrap();
         clear_staged();
+        assert_eq!(staged_png(token), None);
+    }
+
+    #[test]
+    fn deleting_another_record_does_not_clear_the_staged_picture() {
+        let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let token = stash_picture("viewed", zeroize::Zeroizing::new(vec![7])).unwrap();
+        clear_staged_record("other");
+        assert_eq!(staged_png(token).as_deref(), Some(&[7u8][..]));
+        clear_staged_record("viewed");
         assert_eq!(staged_png(token), None);
     }
 }

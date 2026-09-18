@@ -4,6 +4,7 @@
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use std::io::Write;
 use std::path::Path;
 
 use patanyx_store::{Store, StoreError};
@@ -51,6 +52,83 @@ const MAX_FRAME_BYTES: usize = 1024 * 1024;
 /// it has to remember to apply is a rule that gets forgotten the next time
 /// somebody adds a poller -- and the failure is invisible, because a vault that
 /// never locks looks exactly like a vault that has not locked yet.
+/// Why `cred_autofill_offer_get` returned what it returned.
+///
+/// THE DEFECT THIS EXISTS TO FIX. The reply used to be `items` alone, and an
+/// empty list meant FOUR different things: the host had no origin for the
+/// active tab, no vault had ever been created, the vault was LOCKED, or a real
+/// search ran and matched nothing. The chrome could not tell them apart, so it
+/// said the only thing it knew how to say -- "No saved password for this site."
+/// Three quarters of the time that was a claim it had no basis for: with a
+/// locked vault nothing had been searched at all. A tester whose password was
+/// saved correctly was told it was not there, and reasonably concluded the
+/// browser had lost it.
+///
+/// Only `no-match` asserts that a search happened and came back empty. The
+/// other three say, in the surface's own words, that no search was made.
+///
+/// The ORIGIN weighed here is the host's, not the chrome's. Both derive it
+/// with `host_of`, but the chrome's copy rides a status event that can be a
+/// navigation stale, and this answer has to describe the lookup that actually
+/// ran, not the one the chrome believes it asked for.
+/// The field `cred_autofill_offer_get` carries its reason in.
+///
+/// A CONTRACT WITH chrome.js, so it is spelled once here rather than twice in
+/// two files that cannot see each other. `the_chrome_reads_every_reason_this_
+/// arm_can_send` fails if either side renames or stops handling one, which is
+/// the failure this whole change exists to prevent: the chrome silently
+/// falling back to "No saved password for this site" because the answer it
+/// needed arrived under a name it was not looking for.
+pub(crate) const AUTOFILL_REASON_FIELD: &str = "reason";
+
+/// The EXACT reply `cred_autofill_offer_get` sends, built in one place.
+///
+/// Extracted after a review found that every test added with this change --
+/// the classifier table, the chrome contract, six DOM checks -- still passed
+/// with the line that actually SENDS the reason deleted. The helper was
+/// tested, the chrome was tested against a hand-written reply, and the join
+/// between them was tested by nothing. Deleting the reason restored the
+/// original user-visible defect in silence.
+///
+/// So the handler now does no assembly of its own: it calls this, and this is
+/// what the tests drive. (What no unit test here can still cover is the
+/// handler choosing not to call it at all; that is one line, in view of the
+/// arm it serves.)
+fn autofill_offer_payload(
+    items: Value,
+    has_origin: bool,
+    vault_file_exists: bool,
+    unlocked: bool,
+) -> Value {
+    let matched = items.as_array().is_some_and(|a| !a.is_empty());
+    let reason = autofill_offer_reason(has_origin, vault_file_exists, unlocked, matched);
+    let mut reply = serde_json::Map::new();
+    reply.insert("items".to_string(), items);
+    reply.insert(AUTOFILL_REASON_FIELD.to_string(), json!(reason));
+    Value::Object(reply)
+}
+
+fn autofill_offer_reason(
+    has_origin: bool,
+    vault_file_exists: bool,
+    unlocked: bool,
+    matched: bool,
+) -> &'static str {
+    if matched {
+        return "match";
+    }
+    if !has_origin {
+        return "no-site";
+    }
+    if !vault_file_exists {
+        return "no-vault";
+    }
+    if !unlocked {
+        return "locked";
+    }
+    "no-match"
+}
+
 fn counts_as_presence(cmd: &str) -> bool {
     !matches!(
         cmd,
@@ -60,6 +138,8 @@ fn counts_as_presence(cmd: &str) -> bool {
             | "ocr_status"
             | "blocklist_status"
             | "resolver_status"
+            // The boot-time engine-floor question; the browser asking itself.
+            | "engine_status"
             | "store_status"
             | "vault_status"
             | "chat_status"
@@ -75,6 +155,7 @@ fn counts_as_presence(cmd: &str) -> bool {
             // presence by this list's default, and the pinning test names
             // them.
             | "licence_get"
+            | "fingerprint_probe_activity"
             // Passive too, and polled far more often than licence_get: the
             // toolbar refreshes it at startup and on every vault transition,
             // none of which is the user doing something. Counting it as
@@ -127,6 +208,17 @@ pub fn dispatch(state: &mut AppState, raw: &str) {
         if state.ping_count == 1 {
             state.eval_chrome(crate::chat_panel::CHAT_JS);
         }
+        // The chrome DOM now exists; if the stored locale is not English,
+        // this is the moment its strings arrive. English startup pushes
+        // nothing -- the markup IS the English, and zero-runtime-fill for
+        // an English build is a contract term, not an optimization. The
+        // same push also repairs a set that raced the chrome load.
+        if state.ping_count == 1 {
+            let locale = crate::prefs::load().ui_locale;
+            if locale != "en" {
+                state.push_locale_fill(&locale);
+            }
+        }
     }
     let result = handle(state, &request.cmd, &request.args);
     state.reply(request.id, result);
@@ -142,7 +234,7 @@ pub fn normalize_input(raw: &str) -> String {
     }
     if trimmed.chars().any(char::is_whitespace) || !trimmed.contains('.') {
         return format!(
-            "https://duckduckgo.com/?q={}",
+            "https://start.duckduckgo.com/?q={}",
             percent_encode(trimmed)
         );
     }
@@ -163,19 +255,19 @@ pub fn normalize_input(raw: &str) -> String {
 /// No substring matching: `fbclid` must not take `fbclid_backup` with it, and
 /// a site's own `gclid_verified` is not ours to remove.
 const TRACKING_PARAMS: &[&str] = &[
-    "fbclid",   // Facebook
-    "gclid",    // Google Ads
-    "dclid",    // DoubleClick
-    "gbraid",   // Google, app-to-web
-    "wbraid",   // Google, web-to-app
-    "msclkid",  // Microsoft Ads
-    "twclid",   // Twitter/X
-    "ttclid",   // TikTok
-    "igshid",   // Instagram
-    "mc_cid",   // Mailchimp campaign
-    "mc_eid",   // Mailchimp recipient
+    "fbclid",  // Facebook
+    "gclid",   // Google Ads
+    "dclid",   // DoubleClick
+    "gbraid",  // Google, app-to-web
+    "wbraid",  // Google, web-to-app
+    "msclkid", // Microsoft Ads
+    "twclid",  // Twitter/X
+    "ttclid",  // TikTok
+    "igshid",  // Instagram
+    "mc_cid",  // Mailchimp campaign
+    "mc_eid",  // Mailchimp recipient
     "_openstat",
-    "yclid",    // Yandex
+    "yclid", // Yandex
     "vero_id",
     "oly_anon_id",
     "oly_enc_id",
@@ -183,16 +275,16 @@ const TRACKING_PARAMS: &[&str] = &[
     "ml_subscriber",
     "ml_subscriber_hash",
     // Added 2026-08-04 from the privacytests.org tracking-param set.
-    "__hsfp",         // HubSpot
-    "__hssc",         // HubSpot
-    "__hstc",         // HubSpot
-    "_hsenc",         // HubSpot
-    "hsctatracking",  // HubSpot (lowercased: is_tracking_param matches case-insensitively)
-    "__s",            // Drip
-    "mkt_tok",        // Marketo / Adobe
-    "rb_clickid",     // Russian ad networks
-    "vero_conv",      // Vero
-    "wickedid",       // WickedReports
+    "__hsfp",        // HubSpot
+    "__hssc",        // HubSpot
+    "__hstc",        // HubSpot
+    "_hsenc",        // HubSpot
+    "hsctatracking", // HubSpot (lowercased: is_tracking_param matches case-insensitively)
+    "__s",           // Drip
+    "mkt_tok",       // Marketo / Adobe
+    "rb_clickid",    // Russian ad networks
+    "vero_conv",     // Vero
+    "wickedid",      // WickedReports
 ];
 
 /// The one prefix family. `utm_*` is a namespace by definition (Urchin), so
@@ -334,10 +426,17 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
         return None;
     }
     let (path, query) = match after.find('?') {
-        Some(at) => (&after[..at], after[at + 1..].split('#').next().unwrap_or("")),
+        Some(at) => (
+            &after[..at],
+            after[at + 1..].split('#').next().unwrap_or(""),
+        ),
         None => (after.split('#').next().unwrap_or(""), ""),
     };
-    Some((host.to_ascii_lowercase(), path.to_string(), query.to_string()))
+    Some((
+        host.to_ascii_lowercase(),
+        path.to_string(),
+        query.to_string(),
+    ))
 }
 
 /// Whether `candidate` is a well-formed absolute http(s) URL we are willing to
@@ -583,11 +682,94 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
+/// The one gate every chat ACTION arm and Page Corroboration ask before doing
+/// anything: the same `premium_required` the tab pack answers with, so the
+/// chrome has one lock vocabulary. A free function rather than a repeated
+/// two-line block, so the rule of which arms are gated (see the chat section
+/// of `handle`) is read in one place and the arms stay one-liners.
+#[cfg(feature = "chat")]
+fn chat_gate() -> Result<(), &'static str> {
+    crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())
+}
+
 fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'static str> {
     match cmd {
         // The reply carries the active tab's URL so a chrome UI that finished
         // loading after the first navigation can still populate its URL bar.
         "ping" => Ok(json!({ "url": state.active_url() })),
+
+        // The chrome's language. Get is read-only; set validates by
+        // BUILDING the next catalog before touching anything, so a refused
+        // tag leaves prefs, generation and bundle exactly as they were --
+        // refused, never defaulted. An accepted set persists, swaps the
+        // bundle, bumps the generation and pushes one full snapshot, which
+        // is how the change is visible immediately, everywhere, with no
+        // restart: the apply-live rule that killed every caching design.
+        // Generic resolution for strings whose arguments are born in the
+        // chrome (confirm dialogs, local counts): the originally designed
+        // candidate A, amended so the reply carries the locale generation
+        // -- a caller that awaited across a locale switch can tell its
+        // text is stale instead of painting it. English sessions never
+        // call this (the JS helper short-circuits to its fallback), so
+        // zero-runtime-lookup for English holds. Arguments cross as
+        // Fluent args; ids are logged on failure, values never.
+        "i18n_resolve" => {
+            let id = arg_str_capped(args, "id", 128)?;
+            if !crate::i18n::keys::ALL.contains(&id) && !crate::i18n::CHROME_MSG_KEYS.contains(&id)
+            {
+                return Err("unknown_message");
+            }
+            let mut fargs = crate::i18n::Args::default();
+            if let Some(map) = args.get("args").and_then(|v| v.as_object()) {
+                if map.len() > 8 {
+                    return Err("bad_args");
+                }
+                for (k, v) in map {
+                    if k.len() > 32 {
+                        return Err("bad_args");
+                    }
+                    match v {
+                        Value::String(text) if text.len() <= 1024 => {
+                            fargs.set(k.clone(), text.as_str())
+                        }
+                        Value::Number(n) if n.as_f64().is_some() => {
+                            fargs.set(k.clone(), n.as_f64().unwrap())
+                        }
+                        _ => return Err("bad_args"),
+                    }
+                }
+            }
+            Ok(json!({
+                "text": state.i18n.resolve(id, &fargs),
+                "generation": state.locale_generation,
+            }))
+        }
+        "ui_locale_get" => {
+            let prefs = crate::prefs::load();
+            Ok(json!({
+                "locale": prefs.ui_locale,
+                "available": crate::i18n::available_locales(),
+            }))
+        }
+        "ui_locale_set" => {
+            let tag = arg_str_capped(args, "locale", 35)?;
+            let next = match crate::i18n::I18n::bootstrap(tag) {
+                Ok(l10n) => l10n,
+                Err(crate::i18n::BootstrapError::UnknownLocale) => return Err("unknown_locale"),
+                // Unreachable after build validation; kept total rather
+                // than panicking inside an IPC arm.
+                Err(crate::i18n::BootstrapError::InvalidCatalog(_)) => {
+                    return Err("invalid_catalog")
+                }
+            };
+            let mut prefs = crate::prefs::load();
+            prefs.ui_locale = tag.to_string();
+            crate::prefs::save(&prefs)?;
+            state.i18n = next;
+            state.locale_generation += 1;
+            state.push_locale_fill(tag);
+            Ok(json!({ "locale": tag, "generation": state.locale_generation }))
+        }
 
         "navigate" => {
             let raw = arg_str(args, "url")?;
@@ -629,6 +811,77 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let id = state.new_tab(&url, true)?;
             Ok(json!({ "id": id }))
         }
+        // Open a disclosed affiliate partner's site.
+        //
+        // The argument is an IDENTIFIER, never a URL. `destination_for`
+        // resolves it against a compiled-in table and returns a string that
+        // has already passed normalization and the content allowlist, so the
+        // value navigated to here is the exact value that was checked. See
+        // `partner.rs` for why the indirection is the security property.
+        "partner_open" => {
+            if state.tabs.len() >= crate::state::MAX_TABS {
+                return Err("bad_args");
+            }
+            let url = crate::partner::destination_for(args)?;
+            let id = state.new_tab(&url, true)?;
+            Ok(json!({ "id": id }))
+        }
+
+        // Open the project's sponsorship page. This is a separate command
+        // from `partner_open`: support buys nothing, earns no commission and
+        // is not a partner placement. It keeps the same security shape,
+        // though -- chrome supplies only a compiled target's identifier, and
+        // the checked destination enters the ordinary new-tab path.
+        "sponsorship_open" => {
+            if state.tabs.len() >= crate::state::MAX_TABS {
+                return Err("bad_args");
+            }
+            let url = crate::sponsorship::destination_for(args)?;
+            let id = state.new_tab(&url, true)?;
+            Ok(json!({ "id": id }))
+        }
+
+        // Public metadata for the disclosed partner cards. This is a list of
+        // available placements, not an entitlement, so it must stay outside
+        // every Premium gate. The chrome treats an omitted identifier as not
+        // applicable and renders nothing rather than an empty shell.
+        "partner_list" => {
+            let items: Vec<Value> = crate::partner::PartnerTarget::ALL
+                .into_iter()
+                .map(|partner| {
+                    // `offer` is null for every partner but Saily; the chrome
+                    // renders a coupon line only when it is present, so no card
+                    // but Saily's can show one.
+                    let offer = partner
+                        .offer()
+                        .map(|(code, terms)| json!({ "code": code, "terms": terms }));
+                    json!({
+                        "id": partner.id(),
+                        "name": partner.name(),
+                        "description": partner.description(),
+                        "offer": offer,
+                    })
+                })
+                .collect();
+            Ok(json!({ "items": items }))
+        }
+
+        // Open the Premium purchase page. As with partner and sponsorship
+        // targets, chrome supplies only a compiled target's identifier and
+        // the checked destination enters the ordinary new-tab path. The
+        // backend repeats the launch gate: hiding a button is not authority,
+        // and pre-launch builds must never open the password-gated page.
+        "premium_purchase_open" => {
+            if !crate::licence_control::PREMIUM_ON_SALE
+                || state.tabs.len() >= crate::state::MAX_TABS
+            {
+                return Err("bad_args");
+            }
+            let url = crate::premium_purchase::destination_for(args)?;
+            let id = state.new_tab(&url, true)?;
+            Ok(json!({ "id": id }))
+        }
+
         // Open a NAMED url under a NAMED storage posture, in the foreground or
         // behind. This is what the right-click menu needs and what nothing
         // else could express: `tab_new` always switches and always uses the
@@ -685,6 +938,22 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             state.switch_tab(id)?;
             Ok(json!({}))
         }
+        "tab_reorder" => {
+            let ids: Vec<u64> = args
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or("bad_args")?
+                .iter()
+                .map(|value| value.as_u64().ok_or("bad_args"))
+                .collect::<Result<_, _>>()?;
+            // AppState validates the entire permutation before moving a tab
+            // and remaps its positional `active` field from this stable-id
+            // order. Ephemeral and quarantine tabs deliberately take the
+            // same path: moving a chip has no navigation or policy effect.
+            let ids = state.reorder_tabs(&ids)?;
+            let items = state.tab_list()["items"].clone();
+            Ok(json!({ "ids": ids, "items": items }))
+        }
         "tab_list" => Ok(state.tab_list()),
         // The switcher reads the SAME list through its own gated arm
         // rather than putting the gate on tab_list: the tab strip is
@@ -699,7 +968,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         }
         // A gate that does nothing else, on purpose. What Premium sells
         // here is the multi-select AFFORDANCE on the tab strip; the batch
-        // actions themselves (close, bookmark, set aside) are the same
+        // actions themselves (close, bookmark, shelve) are the same
         // ungated arms a free user already drives one tab at a time, so
         // entry is the moment to refuse, and the refusal has to be
         // server-side to mean anything.
@@ -708,13 +977,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
 
-        // SET-ASIDE SHELVES. One action stores the window's tabs as a named
+        // SHELVES. One action stores the window's tabs as a named
         // shelf and closes them; restore reopens a shelf's entries, delete
         // forgets the shelf. A shelf stores title + URL. Nothing else: no
         // favicons, no scroll positions, no cookies, no history -- that
         // minimality is the privacy contract of the feature.
         //
-        // Ephemeral tabs are NEVER set aside: their whole contract is that
+        // Ephemeral tabs are NEVER shelved: their whole contract is that
         // nothing outlives them. They stay out of the shelf and out of the
         // close list, and the reply says how many were left out so the
         // chrome can state it plainly.
@@ -770,7 +1039,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                             url: entry.url.to_owned(),
                         })
                         .collect::<Vec<_>>(),
-                    plan.entries.iter().map(|entry| entry.id).collect::<Vec<u64>>(),
+                    plan.entries
+                        .iter()
+                        .map(|entry| entry.id)
+                        .collect::<Vec<u64>>(),
                     plan.left_out,
                 )
             };
@@ -778,14 +1050,16 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // WRITE FIRST, close only after the write succeeded. On failure
             // the store has already rolled the shelf back and the window is
             // exactly as it was.
-            let stored = store_open(state)?.add_shelf(name, tabs).map_err(store_code)?;
+            let stored = store_open(state)?
+                .add_shelf(name, tabs)
+                .map_err(store_code)?;
             // Never-tabless is inherited from close_tab: it builds the
             // replacement BEFORE removing the last tab and refuses cleanly
             // if that build fails, so closing every stored tab cannot zero
             // the window. Closes are BEST EFFORT on purpose: the shelf is
             // already written, so a refused close loses nothing -- and
             // erroring the whole command here would report failure for a
-            // set-aside that in fact happened, inviting a retry that writes
+            // shelving that in fact happened, inviting a retry that writes
             // an overlapping second shelf.
             for id in close_ids {
                 let _ = state.close_tab(id);
@@ -936,6 +1210,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // recorded inside licence_control, never propagated into the
             // unlock.
             crate::licence_control::on_vault_unlocked(state);
+            // An activation result that finished while the vault was locked
+            // lands now, against the session it belongs to; a release the
+            // user started and this browser never resolved is finished.
+            crate::activation::replay_pending(state);
+            crate::activation::finish_pending_release(state);
             // Last, and only after the tunnel is up: see the fn's own doc.
             restore_after_tunnel_restart(state);
             Ok(json!({ "recovery_key": migrated }))
@@ -963,6 +1242,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::tunnel_control::on_vault_unlocked(state);
             // Same as vault_unlock: ungated, recorded, never fatal.
             crate::licence_control::on_vault_unlocked(state);
+            crate::activation::replay_pending(state);
+            crate::activation::finish_pending_release(state);
             // Same as vault_unlock: a recovery-key unlock owes the restore too.
             restore_after_tunnel_restart(state);
             Ok(json!({}))
@@ -1108,7 +1389,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             };
             let vault = unlocked(state)?;
             vault
-                .add_credential(&origin, Some(&origin), &pending.username, &pending.password, "")
+                .add_credential(
+                    &origin,
+                    Some(&origin),
+                    &pending.username,
+                    &pending.password,
+                    "",
+                )
                 .map_err(vault_code)?;
             Ok(json!({}))
         }
@@ -1116,9 +1403,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             state.take_pending_save();
             Ok(json!({}))
         }
-        // Read-only: id + username, NEVER the password. Empty list -- not an
-        // error -- whenever the vault is locked or the page has no
-        // recognizable origin; both are the ordinary case for most pages.
+        // Read-only: id + username, NEVER the password. An empty list is not
+        // an error -- a locked vault and a page with no recognizable origin
+        // are both ordinary -- but it is no longer SILENT: `reason` says which
+        // of those happened, so the chrome never has to guess (and never has
+        // to guess wrong, which is what it did before).
         "cred_autofill_offer_get" => {
             let origin = state
                 .tabs
@@ -1143,7 +1432,17 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 }
                 _ => Vec::new(),
             };
-            Ok(json!({ "items": items }))
+            // The reason rides the SAME reply as the items, deliberately. A
+            // second round trip for "and why" could answer about a different
+            // moment than the one that produced this list -- the vault can
+            // lock between two IPC calls -- and the surface would then be
+            // explaining a lookup that never happened.
+            Ok(autofill_offer_payload(
+                json!(items),
+                origin.is_some(),
+                Vault::exists(&state.vault_path),
+                state.vault.is_some(),
+            ))
         }
         "cred_autofill_fill" => {
             let id = arg_str(args, "id")?;
@@ -1216,25 +1515,49 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // ---- chat (only compiled with --features chat) --------------------
         // Same convention as every arm above: Result<Value, &'static str> with
         // short stable codes, so the chrome UI has one error vocabulary.
+        //
+        // Private chat is a Premium feature (decided 2026-08-16: gated by
+        // licence, not only by being compiled into the PATANYX-Premium build).
+        // The line is drawn the same way as everywhere else in this file:
+        // arms that DO something with the world -- mint an identity, announce
+        // presence, add a contact, open a session, send -- ask the gate first,
+        // before the vault, the store or the relay are consulted. Arms that
+        // only READ (identity, contacts, status, peers, relay address) stay
+        // open, or the panel could not explain why it is unavailable. And
+        // anything that turns chat OFF or takes something away (go offline,
+        // close a session, remove a contact) is never gated: a lapse
+        // mid-session must not strand someone online with no way out.
         #[cfg(feature = "chat")]
         "chat_identity" => crate::chat_panel::ipc_identity(state, args),
         // Split from `chat_identity` deliberately: the read must stay a read,
         // or the UI cannot ask whether an identity exists without creating one.
         #[cfg(feature = "chat")]
-        "chat_identity_create" => crate::chat_panel::ipc_identity_create(state),
+        "chat_identity_create" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_identity_create(state)
+        }
         #[cfg(feature = "chat")]
         "chat_contacts" => crate::chat_panel::ipc_contacts(state),
         #[cfg(feature = "chat")]
-        "chat_contact_note" => crate::chat_panel::ipc_contact_note(state, args),
+        "chat_contact_note" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_contact_note(state, args)
+        }
         // Presence is MANUAL: nothing announces the user until they say so.
         #[cfg(feature = "chat")]
-        "chat_go_online" => crate::chat_panel::ipc_go_online(state),
+        "chat_go_online" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_go_online(state)
+        }
         #[cfg(feature = "chat")]
         "chat_go_offline" => crate::chat_panel::ipc_go_offline(state),
         // AFK is the one status needing an announced marker — offline is
         // simply absence, so it needs no broadcast at all.
         #[cfg(feature = "chat")]
-        "chat_set_away" => crate::chat_panel::ipc_set_away(state, args),
+        "chat_set_away" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_set_away(state, args)
+        }
         #[cfg(feature = "chat")]
         "chat_status" => crate::chat_panel::ipc_status(state),
         // Relay configuration: URL, and WHICH identity registers. One, never
@@ -1243,25 +1566,46 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         #[cfg(feature = "chat")]
         "chat_relay_get" => crate::chat_panel::ipc_relay_get(state),
         #[cfg(feature = "chat")]
-        "chat_relay_set" => crate::chat_panel::ipc_relay_set(state, args),
+        "chat_relay_set" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_relay_set(state, args)
+        }
         #[cfg(feature = "chat")]
-        "chat_contact_add" => crate::chat_panel::ipc_contact_add(state, args),
+        "chat_contact_add" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_contact_add(state, args)
+        }
         #[cfg(feature = "chat")]
         "chat_contact_remove" => crate::chat_panel::ipc_contact_remove(state, args),
         #[cfg(feature = "chat")]
         "chat_peers" => crate::chat_panel::ipc_peers(state),
         #[cfg(feature = "chat")]
-        "chat_open" => crate::chat_panel::ipc_open(state, args),
+        "chat_open" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_open(state, args)
+        }
         #[cfg(feature = "chat")]
         "chat_close" => crate::chat_panel::ipc_close(state, args),
         #[cfg(feature = "chat")]
-        "chat_send" => crate::chat_panel::ipc_send(state, args),
+        "chat_send" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_send(state, args)
+        }
         #[cfg(feature = "chat")]
-        "chat_send_tab" => crate::chat_panel::ipc_send_tab(state, args),
+        "chat_send_tab" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_send_tab(state, args)
+        }
         #[cfg(feature = "chat")]
-        "chat_share_credential" => crate::chat_panel::ipc_share_credential(state, args),
+        "chat_share_credential" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_share_credential(state, args)
+        }
         #[cfg(feature = "chat")]
-        "chat_accept_tab" => crate::chat_panel::ipc_accept_tab(state, args),
+        "chat_accept_tab" => {
+            chat_gate()?;
+            crate::chat_panel::ipc_accept_tab(state, args)
+        }
 
         // ---- privacy controls ---------------------------------------------
         // The engine-capability flags travel with the values so the UI can
@@ -1325,7 +1669,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(state.privacy_status())
         }
 
-        // WHAT THE CHROME IS USING, on both axes, in one message.
+        // WHAT THE CHROME IS USING, on all three page-facing edges, in one
+        // message.
         //
         // Two numbers rather than two commands, because they describe one
         // rectangle: switching the toolbar to the left changes both at once,
@@ -1357,12 +1702,27 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "set_chrome_insets" => {
             let top = args.get("top").and_then(Value::as_i64).ok_or("bad_args")?;
             // Absent means zero: a chrome that has not measured a sidebar has
-            // no sidebar, which is exactly the Top layout.
+            // no sidebar, which is exactly either Top layout.
             let left = args.get("left").and_then(Value::as_i64).unwrap_or(0);
-            use crate::platform::{CHROME_LEFT_RANGE as LEFT, CHROME_TOP_RANGE as TOP};
+            let right = args.get("right").and_then(Value::as_i64).unwrap_or(0);
+            use crate::platform::{
+                CHROME_LEFT_RANGE as LEFT, CHROME_RIGHT_RANGE as RIGHT, CHROME_TOP_RANGE as TOP,
+            };
+            // ABSENT means "keep the strip you have", not "same as top".
+            // `top` is the panel's height while a modal is open, so adopting
+            // it as the strip is exactly the defect this field was added to
+            // remove.
+            let strip = args.get("strip").and_then(Value::as_i64);
             let top = top.clamp(*TOP.start(), *TOP.end()) as i32;
             let left = left.clamp(*LEFT.start(), *LEFT.end()) as i32;
-            state.set_chrome_insets(top, left);
+            let right = right.clamp(*RIGHT.start(), *RIGHT.end()) as i32;
+            match strip {
+                Some(s) => {
+                    let s = s.clamp(*TOP.start(), *TOP.end()) as i32;
+                    state.set_chrome_insets_with_strip(top, left, right, s);
+                }
+                None => state.set_chrome_insets(top, left, right),
+            }
             Ok(json!({}))
         }
 
@@ -1428,6 +1788,29 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // page is still there, which is the exact lie the solid scrim was
         // built to avoid.
         "chrome_caps" => Ok(json!({
+            // PAGE TRANSLATION, and it is FALSE on purpose.
+            //
+            // The panel section, the arms and the session state are built and
+            // tested, but the engine, the model delivery and the page seam are
+            // phases 3 and 4. A control that starts something which can never
+            // finish is worse than no control: the honest state today is
+            // "Getting ready" forever, which reads as a hang.
+            //
+            // So the capability gates the UI, and flips to true in the commit
+            // that makes a translation actually complete -- not before, and
+            // not as a config the user can turn on early.
+            //
+            // FLIPPED 2026-08-31, on the terms above being met rather than on
+            // the code merely existing. A translation now completes end to end
+            // from an EMPTY pack root: the pack is fetched from
+            // models.patanyx.net, its signature and hash verified, installed,
+            // loaded, and the page patched. Measured, not assumed.
+            //
+            // Still ENGINE-CONFIRMED rather than asserted: it reports what this
+            // backend actually granted, so a build whose message channel failed
+            // to register offers no control instead of a broken one. The same
+            // shape as every other capability in this list.
+            "page_translation": crate::platform::translate_channel_supported(),
             "translucent_overlay": crate::platform::translucent_overlay_supported(),
             // Whether the page draws OVER the chrome, which decides how far a
             // modal card may extend. On Windows with the lift armed the
@@ -1438,7 +1821,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // stylesheet needs to know which world it is in; it cannot
             // measure this.
             "page_covers_chrome": !crate::platform::translucent_overlay_supported(),
-            // Whether the toolbar can be moved to the left edge. True on both
+            // Whether the toolbar can be moved to either edge. True on both
             // backends: the page's rectangle is computed by one shared
             // function and both can inset it. Asked before the choice is
             // offered, per the standing rule that a control the platform
@@ -1458,7 +1841,6 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // same thing on both.
             "page_scrollbar": crate::platform::page_scrollbar_support(),
         })),
-
 
         // ---- vaultsurface ----
         // ---- backup, export, import, passphrase ---------------------------
@@ -1523,7 +1905,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // Computed before `unlocked(state)` borrows the vault: the
             // returned &mut Vault borrows all of `state`, so vault_path could
             // not be read afterwards.
-            let export_suggestion = sibling_file_suggestion(&state.vault_path, "patanyx-export.rbx");
+            let export_suggestion =
+                sibling_file_suggestion(&state.vault_path, "patanyx-export.rbx");
             let plaintext_suggestion =
                 sibling_file_suggestion(&state.vault_path, "patanyx-export.json");
             let vault = unlocked(state)?;
@@ -1598,40 +1981,77 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // before deciding, rather than being enforced here where they only
             // meet it afterwards.
             //
-            // A live UNLOCKED vault is still dropped first, so nothing keeps
-            // writing to the file that is about to be replaced.
-            state.vault = None;
             let dest = state.vault_path.clone();
-            let (vault, recovery, carried) =
+            let marker = state.library_replace_marker();
+            let mut import_started = false;
+            let imported = replace_library(&marker, || {
+                import_started = true;
+                // A live UNLOCKED vault is dropped only after the durable
+                // Library marker exists, so nothing keeps writing to the file
+                // that is about to be replaced. If establishing the marker
+                // fails, this closure is never entered and the current
+                // profile stays attached as well as unchanged on disk.
+                state.vault = None;
+                // The Library too, unconditionally. It used to be detached
+                // only inside restore_bookmarks, which returns early when the
+                // export carries no bookmarks, so an import over an unlocked
+                // profile kept the PREVIOUS profile's Store attached and
+                // readable under the new vault until restart (pentest F-005).
+                state.store = None;
                 Vault::import_encrypted(Path::new(src), &dest, passphrase, new_passphrase)
-                    .map_err(export_code)?;
+            });
+            let (vault, recovery, carried) = match imported {
+                Ok(imported) => imported,
+                Err(code) => {
+                    // A cleanup failure deliberately leaves (or recreates)
+                    // the marker. Record the same refusal in this session so
+                    // store_status is as fail-closed as the next unlock.
+                    if import_started && code == "library_replace_refused" && marker.exists() {
+                        state.detach_store_unreplaced();
+                    }
+                    return Err(code);
+                }
+            };
             // Rebuild the bookmark store under the NEW passphrase. A failure
             // here loses bookmarks, never the vault: the credentials are
             // already saved by this point, and refusing the whole import
             // because a bookmark did not survive would be the wrong trade.
-            let restored = restore_bookmarks(state, new_passphrase, carried.as_deref());
+            let library = finish_library_replacement(state, new_passphrase);
+            let restored = restore_bookmarks(state, carried.as_deref());
             // Import mints a fresh recovery key — like creation, it is
             // returned exactly once so the UI can show it and then it is gone.
             state.vault = Some(vault);
+            // The replacement Library, whether or not bookmarks were carried:
+            // restore_bookmarks only creates one on its bookmark path, so an
+            // export without bookmarks used to leave the profile with a vault
+            // and NO Library, and the previous profile's file still on disk
+            // for its old passphrase to reattach (review of pentest F-005).
+            // An import is a profile replacement; the old file goes.
             #[cfg(feature = "chat")]
             crate::chat_panel::on_vault_unlocked(state);
             Ok(json!({
                 "recovery_key": recovery.to_printable(),
                 "bookmarks": restored,
+                "library": library,
             }))
         }
+        // DISABLED FOR 1.0.0, deliberately, and the reason has to live here.
+        //
+        // The vault and the Library (Store) are two files under two keys
+        // derived from the same passphrase, and the Store's key also derives
+        // the picture-blob key and the download-provenance MAC key. Rotating
+        // the vault alone stranded the Library on the next unlock and left
+        // its file under the old passphrase (pentest F-001); rotating the
+        // Store's key too would break every saved picture and every
+        // provenance record (design review, 2026-09-16). The right fix is
+        // a wrapped master key in the Store format, migrated on unlock, so a
+        // passphrase change re-wraps one key and touches no data. That is
+        // 1.0.1 work with its own review. Until then this arm refuses, and
+        // the chrome hides the form on `vault_status.passphrase_change`.
         "vault_change_passphrase" => {
-            let current = arg_str(args, "current")?;
-            let new = arg_str(args, "new")?;
-            // A failed change (wrong `current`, or a failed save) leaves the
-            // slot untouched, so the OLD passphrase keeps working — the UI
-            // states this explicitly, because a user who believes the
-            // passphrase changed when it did not is locked out in the worst
-            // way.
-            unlocked(state)?
-                .change_passphrase(current, new)
-                .map_err(vault_code)?;
-            Ok(json!({}))
+            let _ = (arg_str(args, "current")?, arg_str(args, "new")?);
+            unlocked(state)?;
+            Err("passphrase_change_unavailable")
         }
 
         // Mint a recovery key for a vault that never got one.
@@ -1813,8 +2233,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // Hand the query to the ordinary single-tab find on the
             // now-active tab, through the SAME session + generation path as
             // find_start -- never around it.
-            if let crate::find::FindCmd::Start(q) =
-                state.find.on_query(query, &mut state.find_gen)
+            if let crate::find::FindCmd::Start(q) = state.find.on_query(query, &mut state.find_gen)
             {
                 let generation = state.find.generation();
                 let started = match state.active_webview() {
@@ -1840,8 +2259,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // set -- a preference saved but not acknowledged (old WebView2
         // runtime) is reported as exactly that, never as a theme in force.
         "page_theme_set" => {
-            let theme = crate::prefs::PageTheme::parse(arg_str(args, "theme")?)
-                .ok_or("bad_args")?;
+            let theme =
+                crate::prefs::PageTheme::parse(arg_str(args, "theme")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.page_theme = theme;
             crate::prefs::save(&p).map_err(|_| "io")?;
@@ -1857,8 +2276,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // Chrome accent theme: saved here, worn by chrome.js via a
         // data-theme attribute. No engine involvement, so no ack to carry.
         "chrome_theme_set" => {
-            let theme = crate::prefs::ChromeTheme::parse(arg_str(args, "theme")?)
-                .ok_or("bad_args")?;
+            let theme =
+                crate::prefs::ChromeTheme::parse(arg_str(args, "theme")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.chrome_theme = theme;
             crate::prefs::save(&p).map_err(|_| "io")?;
@@ -1911,8 +2330,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // Chrome scheme (Dark/White/Black): same shape as the accent pair
         // above, same no-engine-involvement, worn via data-scheme.
         "chrome_scheme_set" => {
-            let scheme = crate::prefs::ChromeScheme::parse(arg_str(args, "scheme")?)
-                .ok_or("bad_args")?;
+            let scheme =
+                crate::prefs::ChromeScheme::parse(arg_str(args, "scheme")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.chrome_scheme = scheme;
             crate::prefs::save(&p).map_err(|_| "io")?;
@@ -1927,8 +2346,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // engine involvement, so no ack to carry -- inventing an `applied`
         // field here would claim a confirmation nobody asked the engine for.
         "toolbar_labels_set" => {
-            let mode = crate::prefs::ToolbarLabels::parse(arg_str(args, "mode")?)
-                .ok_or("bad_args")?;
+            let mode =
+                crate::prefs::ToolbarLabels::parse(arg_str(args, "mode")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.toolbar_labels = mode;
             crate::prefs::save(&p).map_err(|_| "io")?;
@@ -1956,13 +2375,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
 
         // Where the feature buttons live. Same chrome-only shape as the
         // labels above -- saved here, worn by chrome.js as a data attribute
-        // -- with one addition: returning to Top must give the page its left
-        // edge back, and the chrome re-measuring and reporting zero is a
-        // round trip away. Setting the inset here closes that gap, so the
-        // page never spends a frame indented past a sidebar that is gone.
+        // -- with one addition: returning to a Top placement must give the
+        // page both side edges back, and the chrome re-measuring and reporting
+        // zero is a round trip away. Setting the insets here closes that gap.
         //
         // The top inset is left alone: it is whatever the chrome last
-        // measured, and the chrome will send both numbers again the moment
+        // measured, and the chrome will send all three values again the moment
         // its own layout settles.
         "toolbar_placement_set" => {
             let placement = crate::prefs::ToolbarPlacement::parse(arg_str(args, "placement")?)
@@ -1970,8 +2388,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mut p = crate::prefs::load();
             p.toolbar_placement = placement;
             crate::prefs::save(&p).map_err(|_| "io")?;
-            if matches!(placement, crate::prefs::ToolbarPlacement::Top) {
-                state.set_chrome_insets(state.chrome_height(), 0);
+            if matches!(
+                placement,
+                crate::prefs::ToolbarPlacement::TopLeft | crate::prefs::ToolbarPlacement::TopRight
+            ) {
+                state.set_chrome_insets(state.chrome_height(), 0, 0);
             }
             Ok(json!({ "placement": placement.as_str() }))
         }
@@ -2001,6 +2422,23 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             "enabled": crate::prefs::load().update_background_download,
         })),
 
+        // Auto-apply: install a staged maintenance/security release by itself
+        // at the next launch (feature releases still wait for consent or the
+        // grace period -- that split lives in the SIGNED manifest, not here).
+        "update_auto_apply_set" => {
+            let enabled = args
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.update_auto_apply = enabled;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "enabled": enabled }))
+        }
+        "update_auto_apply_get" => Ok(json!({
+            "enabled": crate::prefs::load().update_auto_apply,
+        })),
+
         // Fingerprint Divergence: the pref behind the privacy-panel
         // checkbox. Deliberately NO `applied` field: the script registers at
         // webview CONSTRUCTION only, so a change reaches the NEXT tab, and
@@ -2020,6 +2458,30 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "fingerprint_noise_get" => Ok(json!({
             "enabled": crate::prefs::load().fingerprint_noise,
         })),
+
+        // WebView2's profile-level tracker blocking. This is deliberately a
+        // separate pref pair from `privacy_set`: PATANYX's own host blocker
+        // and interception policy do not change when this engine layer does.
+        "tracking_prevention_get" => Ok(json!({
+            "level": crate::prefs::load().tracking_prevention.as_str(),
+            "supported": cfg!(windows),
+        })),
+        "tracking_prevention_set" => {
+            if !cfg!(windows) {
+                return Err("unsupported");
+            }
+            let level = crate::prefs::TrackingPreventionLevel::parse(arg_str(args, "level")?)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.tracking_prevention = level;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            let applied = state.set_tracking_prevention(level);
+            Ok(json!({
+                "level": level.as_str(),
+                "supported": true,
+                "applied": applied,
+            }))
+        }
 
         // Per-site Fingerprint Divergence. The GLOBAL toggle above stays
         // free: it ships today, and taking it away would break the promise
@@ -2043,7 +2505,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 patanyx_store::DivergenceLevel::Default
             };
             let store = store_open(state)?;
-            store.set_divergence_override(host, level).map_err(store_code)?;
+            store
+                .set_divergence_override(host, level)
+                .map_err(store_code)?;
             state.refresh_divergence_snapshot();
             Ok(json!({}))
         }
@@ -2059,6 +2523,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let items: Vec<Value> = store
                 .divergence_overrides()
                 .iter()
+                // Old builds stored `Default` when the checkbox was turned
+                // back on. It is not an exception, so do not keep presenting
+                // that legacy debris as one while the chrome clears new rows.
+                .filter(|o| matches!(o.level, patanyx_store::DivergenceLevel::Off))
                 .map(|o| {
                     json!({
                         "host": o.host,
@@ -2084,7 +2552,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 "enabled_globally": crate::prefs::load().fingerprint_noise,
                 "off_for_this_site": off_here,
                 "registered": state.active_divergence_registered(),
-                "surfaces": ["canvas", "audio", "graphics", "element measurement"],
+                "surfaces": ["canvas", "audio", "WebGL/Graphics", "element measurement"],
             }))
         }
 
@@ -2102,6 +2570,22 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             "on_sale": crate::licence_control::PREMIUM_ON_SALE,
         })),
 
+        // One remembered scope for both picture-backed reading flows. This
+        // command is deliberately ungated: the choice itself contains no
+        // premium data, and a locked panel still needs to show the user's
+        // standing choice honestly.
+        "capture_scope_get" => Ok(json!({
+            "scope": crate::prefs::load().capture_scope.as_str(),
+        })),
+        "capture_scope_set" => {
+            let scope = crate::prefs::CapturePreference::parse(arg_str(args, "scope")?)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.capture_scope = scope;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "scope": scope.as_str() }))
+        }
+
         // Save a picture of the current page. The capture is async in the
         // engine; the reply only confirms it started. The outcome (picker,
         // write, or an honest refusal) arrives as a toast from the event
@@ -2116,14 +2600,16 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let Some(webview) = state.active_webview() else {
                 return Err("no_tab");
             };
-            if crate::capture::CAPTURE_IN_FLIGHT
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if crate::capture::CAPTURE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // A second click while one capture is pending would queue a
                 // second picker behind the first; refuse instead.
                 return Err("busy");
             }
-            crate::platform::capture_page(webview, &state.proxy());
+            crate::platform::capture_page(
+                webview,
+                &state.proxy(),
+                crate::capture::CaptureScope::FullPage,
+            );
             Ok(json!({ "started": true }))
         }
 
@@ -2136,9 +2622,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if let Some(code) = crate::capture::refuse_capture(&url) {
                 return Err(code);
             }
-            if crate::capture::CAPTURE_IN_FLIGHT
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if crate::capture::CAPTURE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 // A losing racer must not repaint the intent of the capture
                 // that is already running, so the flag is won BEFORE the
                 // intent is written.
@@ -2148,12 +2632,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let Some(webview) = state.active_webview() else {
                 // Undo both: this refusal never started a capture, and the
                 // next SaveFile capture must not inherit a Region intent.
-                crate::capture::CAPTURE_IN_FLIGHT
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
                 state.capture_intent = crate::capture::CaptureIntent::SaveFile;
                 return Err("no_tab");
             };
-            crate::platform::capture_page(webview, &state.proxy());
+            let scope = crate::prefs::load().capture_scope.capture_scope();
+            crate::platform::capture_page(webview, &state.proxy(), scope);
             Ok(json!({ "started": true }))
         }
         // Read the text inside one rectangle of the pending region capture.
@@ -2181,19 +2665,17 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if state.store.is_none() {
                 return Err("not_unlocked");
             }
-            if crate::capture::CAPTURE_IN_FLIGHT
-                .swap(true, std::sync::atomic::Ordering::SeqCst)
-            {
+            if crate::capture::CAPTURE_IN_FLIGHT.swap(true, std::sync::atomic::Ordering::SeqCst) {
                 return Err("busy");
             }
             state.capture_intent = crate::capture::CaptureIntent::Archive;
             let Some(webview) = state.active_webview() else {
-                crate::capture::CAPTURE_IN_FLIGHT
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                crate::capture::CAPTURE_IN_FLIGHT.store(false, std::sync::atomic::Ordering::SeqCst);
                 state.capture_intent = crate::capture::CaptureIntent::SaveFile;
                 return Err("no_tab");
             };
-            crate::platform::capture_page(webview, &state.proxy());
+            let scope = crate::prefs::load().capture_scope.capture_scope();
+            crate::platform::capture_page(webview, &state.proxy(), scope);
             Ok(json!({ "started": true }))
         }
         // Find saved pages by a word. Gated: this is the half of Deep Recall
@@ -2214,6 +2696,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         "in_metadata": hit.in_metadata,
                         "match_count": hit.match_count,
                         "match_count_capped": hit.match_count_capped,
+                        // Same three fields archive_list returns: ONE renderer
+                        // draws both, and it reads these for the View button
+                        // (launch sweep F-002).
+                        "scope": hit.scope,
+                        "has_picture": hit.has_picture,
+                        "words": hit.words,
                         // Same field names the cross-tab panel already
                         // renders, so one chrome helper can draw a row from
                         // either search rather than two near-identical ones.
@@ -2260,10 +2748,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let id = arg_str(args, "id")?;
             let store = store_open(state)?;
             store.delete_archive(id).map_err(store_code)?;
-            // The staged preview may be showing exactly the record that was
-            // deleted; a picture the user removed must not stay on screen or
-            // servable. Cheap when it is someone else's: one slot either way.
-            crate::archive::clear_staged();
+            // A picture belonging to THIS record must stop being servable.
+            // A different row's delete leaves the one staged slot alone: its
+            // preview is still open and its record still exists.
+            crate::archive::clear_staged_record(id);
             Ok(json!({}))
         }
         // The other half of "as a picture": archive_save has stored an
@@ -2281,17 +2769,31 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let id = arg_str(args, "id")?;
             let store = store_open(state)?;
             let png = store.archive_picture(id).map_err(store_code)?;
-            let token = crate::archive::stash_picture(png)?;
+            let token = crate::archive::stash_picture(id, png)?;
             // The chrome builds the URL itself; only the token crosses IPC.
             // The bytes travel over the rbchrome protocol, where the 1 MiB
             // frame cap does not apply and img-src 'self' already allows it.
-            Ok(json!({ "token": token }))
+            // As a STRING: see capture::token_wire.
+            Ok(json!({ "token": crate::capture::token_wire(token) }))
         }
         // Ungated, like ocr_region_close: closing a preview must always
         // work, licence or no licence, and it destroys rather than reveals.
         "archive_picture_clear" => {
             crate::archive::clear_staged();
             Ok(json!({}))
+        }
+
+        // Snapshot pictures reuse Deep Recall's encrypted blob files, its
+        // one decrypted staging slot, and its token-addressed protocol URL.
+        // The only separate step is resolving a PageSnapshot record instead
+        // of an ArchiveRecord. Gate before touching either the store or slot:
+        // a locked Library must not decrypt a pixel.
+        "snapshot_picture_stage" => {
+            let id = arg_str(args, "id")?;
+            let store = store_open(state)?;
+            let png = store.page_snapshot_picture(id).map_err(store_code)?;
+            let token = crate::archive::stash_picture(id, png)?;
+            Ok(json!({ "token": crate::capture::token_wire(token) }))
         }
 
         "tab_status" => Ok(state.active_tab_status()),
@@ -2395,6 +2897,21 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 .bookmarks()
                 .iter()
                 .map(|b| {
+                    let snapshots = store
+                        .page_snapshots_for(&b.id)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|snapshot| {
+                            json!({
+                                "id": snapshot.id,
+                                "recorded_at": snapshot.recorded_at,
+                                "text_available": snapshot.text.is_some(),
+                                "text_trimmed": snapshot.text_trimmed,
+                                "has_picture": snapshot.has_picture,
+                                "picture_scope": snapshot.picture_scope,
+                            })
+                        })
+                        .collect::<Vec<_>>();
                     json!({
                         "id": b.id,
                         "url": b.url,
@@ -2402,8 +2919,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         "created_at": b.created_at,
                         "tags": b.tags,
                         "quick_access": b.quick_access,
-                        "has_digest": b.digest.is_some(),
-                        "digest_recorded_at": b.digest.as_ref().map(|d| d.recorded_at),
+                        "quick_access_order": b.quick_access_order,
+                        "has_digest": !snapshots.is_empty(),
+                        "digest_recorded_at": snapshots.first().and_then(|s| s.get("recorded_at")),
+                        "snapshots": snapshots,
                     })
                 })
                 .collect();
@@ -2464,9 +2983,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // over-long name is REFUSED (bad_args), not silently truncated -- a
         // rejected name is never created, so it cannot drift.
         "bookmark_folder_create" => {
-            let name =
-                patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
-            store_open(state)?.create_folder(&name).map_err(store_code)?;
+            let name = patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
+            store_open(state)?
+                .create_folder(&name)
+                .map_err(store_code)?;
             Ok(json!({ "name": name }))
         }
         "bookmark_folder_rename" => {
@@ -2480,9 +3000,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // Deleting a folder UNFILES its bookmarks; it never deletes them.
         // The store method carries the same guarantee (and a test pins it).
         "bookmark_folder_delete" => {
-            let name =
-                patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
-            let deleted = store_open(state)?.delete_folder(&name).map_err(store_code)?;
+            let name = patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
+            let deleted = store_open(state)?
+                .delete_folder(&name)
+                .map_err(store_code)?;
             Ok(json!({ "name": name, "deleted": deleted }))
         }
         // Atomic move: the store ADDS this folder to the bookmark's CURRENT
@@ -2492,8 +3013,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // whole list from a client-side snapshot).
         "bookmark_folder_file" => {
             let id = arg_str(args, "id")?.to_string();
-            let folder =
-                patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
+            let folder = patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
             match store_open(state)?
                 .file_bookmark(&id, &folder)
                 .map_err(store_code)?
@@ -2516,12 +3036,37 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 Some(changed) => Ok(json!({ "id": id, "on": on, "changed": changed })),
             }
         }
+        // One complete order, one atomic store mutation, at most one save.
+        // The store refuses anything except an exact permutation of every
+        // pinned id, so an unknown, unpinned, duplicate, or omitted id cannot
+        // produce a partial reorder.
+        "bookmark_quick_access_reorder" => {
+            let ids: Vec<String> = args
+                .get("ids")
+                .and_then(Value::as_array)
+                .ok_or("bad_args")?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .filter(|id| !id.is_empty())
+                        .map(str::to_string)
+                        .ok_or("bad_args")
+                })
+                .collect::<Result<_, _>>()?;
+            match store_open(state)?
+                .reorder_quick_access(&ids)
+                .map_err(store_code)?
+            {
+                None => Err("bad_args"),
+                Some(changed) => Ok(json!({ "ids": ids, "changed": changed })),
+            }
+        }
         // Remove ONE bookmark from ONE folder; its other folders and the
         // bookmark itself are untouched.
         "bookmark_folder_unfile" => {
             let id = arg_str(args, "id")?.to_string();
-            let folder =
-                patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
+            let folder = patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
             match store_open(state)?
                 .unfile_bookmark(&id, &folder)
                 .map_err(store_code)?
@@ -2602,8 +3147,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 store.bookmarks().iter().map(|b| b.url.clone()).collect();
             let owned: Vec<crate::bookmark_import::ParsedBookmark> =
                 allowed.into_iter().cloned().collect();
-            let (fresh, skipped_duplicates) =
-                crate::bookmark_import::split_new(&owned, &mut seen);
+            let (fresh, skipped_duplicates) = crate::bookmark_import::split_new(&owned, &mut seen);
             let mut imported = 0usize;
             for entry in fresh {
                 // If a save fails midway, entries already added stay added:
@@ -2673,17 +3217,29 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         }
         // Ask a contact what THEY got from the same address. Gate first,
         // before the vault, the store, or the peer are even consulted.
-        #[cfg(feature = "chat")]
         "download_compare_request" => {
             crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
-            crate::download_compare::ipc_request(state, args)
+            #[cfg(feature = "chat")]
+            {
+                crate::download_compare::ipc_request(state, args)
+            }
+            #[cfg(not(feature = "chat"))]
+            {
+                Err("unsupported")
+            }
         }
         // Change Cross-Check: ask a contact whether a bookmarked page
         // changed for them too.
-        #[cfg(feature = "chat")]
         "change_compare_request" => {
             crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())?;
-            crate::page_integrity::ipc_change_request(state, args)
+            #[cfg(feature = "chat")]
+            {
+                crate::page_integrity::ipc_change_request(state, args)
+            }
+            #[cfg(not(feature = "chat"))]
+            {
+                Err("unsupported")
+            }
         }
 
         // ---- integrity ----
@@ -2693,12 +3249,19 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // hand over the page bytes says so instead of guessing. Change
         // detection works in every build; corroboration rides on chat.
         "integrity_status" => crate::page_integrity::ipc_status(state),
-        "integrity_check" => crate::page_integrity::ipc_check(state),
+        "integrity_check" => crate::page_integrity::ipc_check(state, args),
+        "integrity_check_bookmark" => crate::page_integrity::ipc_check_bookmark(state, args),
         "integrity_mark_seen" => crate::page_integrity::ipc_mark_seen(state),
         // Corroboration travels over the chat channel, so it exists only in
         // chat builds.
+        // Page Corroboration is Premium too, same rule as the chat arms
+        // above; the free `integrity_*` arms are the change detection every
+        // build has.
         #[cfg(feature = "chat")]
-        "corroborate_request" => crate::page_integrity::ipc_corroborate_request(state, args),
+        "corroborate_request" => {
+            chat_gate()?;
+            crate::page_integrity::ipc_corroborate_request(state, args)
+        }
 
         // ---- updater ----
         // ---- updater -------------------------------------------------------
@@ -2719,14 +3282,23 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mode = prefs.dns;
             Ok(json!({
                 "mode": mode.as_str(),
-                "describe": mode.describe(),
+                "describe": mode.describe(&state.i18n),
                 "supported": cfg!(windows),
                 // True when a preferences file exists and could not be read.
                 // The mode above is then the DEFAULT -- System, meaning
-                // plaintext DNS -- not what the user picked, and the panel
-                // says so rather than showing a resolver choice that quietly
-                // reverted.
+                // plaintext DNS from the next start -- not what the user
+                // picked, and the panel says so rather than showing a
+                // resolver choice that quietly reverted.
                 "settings_unreadable": origin == crate::prefs::PrefsOrigin::Unreadable,
+                // What the ENGINE is running, as opposed to `mode`, which is
+                // what the file says and what the next start gets. The chip
+                // colours by this one: a file that became unreadable under a
+                // running engine reports the default above while the engine
+                // still runs whatever it started with; and after a Quad9
+                // choice the file says Quad9 before any engine runs it. The
+                // chip must claim neither early. System wherever no engine
+                // recorded one (Linux).
+                "applied": crate::prefs::applied_dns().as_str(),
             }))
         }
         "dns_set" => {
@@ -2736,10 +3308,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mode = crate::prefs::DnsMode::parse(arg_str(args, "mode")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.dns = mode;
+            // A click IS the choice the migration rule looks for: from here
+            // on the stored value is honoured, whatever the default becomes.
+            p.resolver_chosen = true;
             crate::prefs::save(&p).map_err(|_| "io")?;
             Ok(json!({
                 "mode": mode.as_str(),
-                "describe": mode.describe(),
+                "describe": mode.describe(&state.i18n),
                 "restart_required": true,
             }))
         }
@@ -2764,8 +3339,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 "mode": mode.as_str(),
                 // Both describes ship every time, so the panel can show the
                 // engine's own copy for EACH choice and never retype it.
-                "describe_off": crate::prefs::TunnelMode::Off.describe(),
-                "describe_imported": crate::prefs::TunnelMode::Imported.describe(),
+                "describe_off": crate::prefs::TunnelMode::Off.describe(&state.i18n),
+                "describe_imported": crate::prefs::TunnelMode::Imported.describe(&state.i18n),
                 "has_config": has_config,
                 "report": crate::tunnel_control::report(),
                 "start_error": crate::tunnel_control::last_start_error(),
@@ -2854,7 +3429,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // saying nothing about it. "Open new tabs without a saved profile"
         // is a BROWSER-WIDE setting, so with it on every tab is ephemeral,
         // the plan comes out empty, and the old code restarted anyway on the
-        // strength of a note promising "your tabs are set aside and reopen
+        // strength of a note promising "your tabs are shelved and reopen
         // after you unlock". One unconfirmed click, whole session gone, copy
         // asserting the opposite.
         //
@@ -2900,7 +3475,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // has exited and the kernel has released the lock.
         "tunnel_apply_restart" => {
             // Store first, exactly as shelf_create does: a session must never
-            // be set aside on the strength of a write that cannot happen.
+            // be shelved on the strength of a write that cannot happen.
             store_open(state)?;
 
             let plan = {
@@ -2963,14 +3538,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({ "relaunching": true }))
         }
         "tunnel_set_mode" => {
-            let mode = crate::prefs::TunnelMode::parse(arg_str(args, "mode")?)
-                .ok_or("bad_args")?;
+            let mode = crate::prefs::TunnelMode::parse(arg_str(args, "mode")?).ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             p.tunnel = mode;
             crate::prefs::save(&p).map_err(|_| "io")?;
             Ok(json!({
                 "mode": mode.as_str(),
-                "describe": mode.describe(),
+                "describe": mode.describe(&state.i18n),
                 // Unconditionally true on BOTH platforms: Windows takes the
                 // proxy only when the webview environment is created, and on
                 // Linux the per-view proxy plus the parked-listener lifecycle
@@ -3007,7 +3581,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "licence_paste" => {
             // Required up front, like every vault-mutating arm.
             unlocked(state)?;
-            let confirm = args.get("confirm").and_then(Value::as_bool).unwrap_or(false);
+            let confirm = args
+                .get("confirm")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
             let token_text = arg_str(args, "token")?;
             // The ring decides FIRST: a build with no usable keys cannot
             // verify ANY token, and the honest answer is "this build cannot
@@ -3059,6 +3636,23 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             unlocked(state)?
                 .set_licence_record(Some(record))
                 .map_err(|_| "io")?;
+            // A pasted token is a fresh intent: an earlier release of THIS
+            // device must not keep the new licence from activating, and
+            // neither must the in-memory "released" result or the
+            // once-per-unlock guard left by the release.
+            if let Some(here) = crate::licence_control::this_device_hex(state) {
+                unlocked(state)?
+                    .clear_released_device_if(&here)
+                    .map_err(|_| "io")?;
+                // ...and a release this device started and never finished.
+                // Pasting a token is the opposite instruction, and leaving
+                // the record would both suppress this paste's activation and
+                // free the slot at the next unlock.
+                unlocked(state)?
+                    .clear_release_pending_if(&here)
+                    .map_err(|_| "io")?;
+            }
+            crate::licence_control::forget_activation_suppression();
             // Re-run the unlock-time evaluation so the session state and
             // the row update immediately, from the stored text — the same
             // path every unlock takes.
@@ -3101,6 +3695,17 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let started = crate::licence_control::activate_now(state);
             Ok(json!({ "started": started }))
         }
+        // OFFLINE activation: import a receipt minted elsewhere, for a machine
+        // that cannot reach EdgeXene at all. The receipt is verified by the same
+        // unlock-time evaluation as any other activation (see
+        // `activation::import_receipt`); a forged or wrong-device one is rejected
+        // and rolled back, so this opens no bypass.
+        "licence_import_receipt" => {
+            unlocked(state)?;
+            let receipt = arg_str(args, "receipt")?;
+            let code = crate::activation::import_receipt(state, &receipt);
+            Ok(json!({ "activated": code == "activated", "code": code }))
+        }
         // Release this device's slot at EdgeXene and delete the local
         // receipt: Premium goes off HERE, which is what release means. The
         // slot is then free for another device. Only meaningful while
@@ -3138,6 +3743,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 "counts_blocked": counts_blocked,
             }))
         }
+
+        // Separate from privacy_receipt by design. Refused requests are the
+        // engine ledger's own observation; these probe counts are merely a
+        // claim pushed from the page's main-world wrappers (and forgeable by
+        // hostile page code using the same channel).
+        "fingerprint_probe_activity" => Ok(state.fingerprint_probe_activity()),
 
         // Fired automatically at chrome boot, like `ping` -- see its entry
         // in `counts_as_presence`. `onboarding_resolved` also decides, on an
@@ -3177,7 +3788,24 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if crate::blocklist::matched_rule(&host).is_none() {
                 return Err("bad_args");
             }
-            let tab = state.tabs.get(state.active).ok_or("no_tab")?;
+            // The tab the banner named, and only if THAT tab is the one the
+            // host recorded as blocked on this host. The active tab is not
+            // an answer: a background tab's banner used to hand its
+            // exception to whatever tab was in front (pentest F-006).
+            let tab_id = args
+                .get("tab_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let pending_id = args
+                .get("pending_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let tab = state.tabs.iter().find(|t| t.id == tab_id).ok_or("no_tab")?;
+            let current = tab.blocked_pending.borrow().clone();
+            if current != Some((pending_id, host.clone())) {
+                return Err("blocked_stale");
+            }
+            tab.blocked_pending.borrow_mut().take();
             tab.allow_malicious_host(&host);
             tab.webview.load_url(&format!("https://{host}/")).ok();
             Ok(json!({ "allowed": host }))
@@ -3197,14 +3825,92 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         }
         "insecure_dismiss" => state.insecure_dismiss(),
 
+        // THE HELD-PAGE BANNER. Named by tab AND pending id, unlike the two
+        // arms above, because this banner is rendered per tab from an async
+        // push and a switch can land between the paint and the click. Every
+        // argument confirms what the chrome displayed; none selects anything.
+        // The host is capped at the DNS limit like blocklist_allow.
+        "adlist_allow" => {
+            let tab_id = args
+                .get("tab_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let pending_id = args
+                .get("pending_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let shown = arg_str_capped(args, "host", 253)?;
+            state.adlist_allow(tab_id, pending_id, shown)
+        }
+        "adlist_dismiss" => {
+            let tab_id = args
+                .get("tab_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let pending_id = args
+                .get("pending_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            state.adlist_dismiss(tab_id, pending_id)
+        }
+
+        // PAGE TRANSLATION. Argument-less command discipline, exactly like the
+        // insecure-continue and site-forget arms above: the chrome sends a
+        // language pair and NOTHING ELSE. Rust picks the active tab and reads
+        // the URL itself, so a compromised chrome origin cannot aim
+        // translation at a page of its choosing.
+        //
+        // The pair is capped at 16 bytes here and then validated against the
+        // shipped set in state.rs. Two checks rather than one because this
+        // value goes on to select a model to fetch and load: the cap stops an
+        // absurd argument early, the allowlist stops a plausible one.
+        //
+        // NEVER AUTOMATIC is enforced by there being no other caller: nothing
+        // in the browser starts a session, only this arm does, and this arm
+        // runs only when the user clicks.
+        "translate_page" => {
+            let pair = arg_str_capped(args, "pair", 16)?;
+            state.translate_active_tab(pair)
+        }
+        "translate_status" => state.translation_status(),
+        "translate_cancel" => state.translation_cancel(),
+        "translate_restore" => state.restore_active_tab(),
+
+        // Language-pack management. `packs_status` is the packs panel's data;
+        // install/remove act on a whole language (both directions). The code
+        // is capped and resolved against LANGUAGES on the state side, the same
+        // membership-not-shape discipline the pair token gets.
+        "packs_status" => state.packs_status(),
+        "pack_install" => {
+            let code = arg_str_capped(args, "code", 16)?;
+            state.install_language(&code)
+        }
+        "pack_remove" => {
+            let code = arg_str_capped(args, "code", 16)?;
+            state.remove_language(&code)
+        }
+        // The remembered target language. Read on the state side is via prefs;
+        // this only writes it, and only accepts a code the registry knows.
+        "translate_set_target" => {
+            let code = arg_str_capped(args, "code", 16)?;
+            state.set_translate_target(&code)
+        }
+
         // The resolver-unreachable banner. `resolver_retry` re-probes on
         // demand; `resolver_dismiss` closes the banner for this episode only.
         // Neither can change the DNS setting -- switching resolvers is
         // `dns_set` and stays a deliberate act in the panel, so a network that
         // breaks the browser can never talk it into a weaker configuration.
-        "resolver_status" => crate::resolver_probe::ipc_status(),
+        "resolver_status" => crate::resolver_probe::ipc_status(&state.i18n),
         "resolver_retry" => crate::resolver_probe::ipc_retry(&state.proxy()),
         "resolver_dismiss" => crate::resolver_probe::ipc_dismiss(&state.proxy()),
+
+        // The engine-below-floor banner, asked once at boot. Read-only: there
+        // is no in-app way to update the engine (Microsoft's updater owns the
+        // Evergreen runtime; a distribution owns WebKitGTK), so the reply
+        // carries what version clears the floor and the sentence that says
+        // so, composed in the locale by platform::engine_floor_body.
+        "engine_status" => crate::platform::engine_ipc_status(&state.i18n),
 
         "ocr_status" => crate::ocr_support::ipc_status(),
         "ocr_scan" => crate::ocr_support::ipc_scan(state, args),
@@ -3295,8 +4001,106 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
     }
 }
 
+/// JOIN the real worker the paste started, so a busy-flag assertion that
+/// follows measures what the sequence itself started. Polling the flag was
+/// not enough: the synthetic results this sequence injects clear the same
+/// flag while a real worker may still be running.
+fn smoke_drain_activation() {
+    crate::activation::join_worker();
+}
+
+/// The passphrase the smoke vault carries once the vault sequence is done
+/// (its last step re-keys to this), so later sequences can REOPEN the vault
+/// from disk rather than restore an in-memory object.
+const SMOKE_VAULT_PASS: &str = "smoke-imported-passphrase";
+
+/// Drop the in-memory vault and open the file again, the way a real lock
+/// and unlock does. Restoring a parked `Vault` object would carry in-memory
+/// state (an unsaved release, say) across the "lock", which is exactly what
+/// a real lock discards.
+fn smoke_reopen_vault(state: &mut AppState) -> Result<(), String> {
+    state.vault = None;
+    crate::licence_control::on_vault_locked();
+    let vault = patanyx_vault::Vault::unlock(&state.vault_path, SMOKE_VAULT_PASS)
+        .map_err(|e| format!("smoke reopen: {e}"))?;
+    state.vault = Some(vault);
+    Ok(())
+}
+
 fn smoke_step(state: &mut AppState, cmd: &str, args: Value) -> Result<Value, String> {
     handle(state, cmd, &args).map_err(|e| format!("{cmd}: {e}"))
+}
+
+/// The complete Premium dispatcher surface in the public build. Arguments are
+/// deliberately the least-privileged honest calls available: the gate is the
+/// property under test, while a missing page, region, archive record, or chat
+/// transport is allowed to refuse after it. In particular, do not add fixture
+/// state here merely to turn those post-gate refusals into successes.
+fn smoke_premium_arm_calls() -> Vec<(&'static str, Value)> {
+    vec![
+        ("tabs_switcher_list", json!({})),
+        ("tabs_batch_enter", json!({})),
+        ("find_tabs_search", json!({})),
+        ("find_tabs_goto", json!({})),
+        ("ocr_region_capture", json!({})),
+        ("ocr_region_scan", json!({})),
+        // The leak check redeems a file-pick token; 0 is never minted, so an
+        // open gate falls through to post-gate bad_args, never to a read.
+        ("ocr_scan", json!({ "token": 0, "kind": "leaks" })),
+        ("archive_save", json!({})),
+        ("archive_search", json!({ "q": "wp-k-gate-probe" })),
+        ("archive_list", json!({})),
+        ("archive_picture_stage", json!({ "id": "wp-k-missing" })),
+        ("download_compare_request", json!({})),
+        ("change_compare_request", json!({})),
+    ]
+}
+
+/// Prove the negative direction with the gate's exact refusal. Merely asking
+/// for `is_err()` would let a missing gate pass on an unrelated `bad_args`.
+#[cfg(not(feature = "premium-unlocked"))]
+fn smoke_premium_arms_closed(state: &mut AppState) -> Result<(), String> {
+    for (cmd, args) in smoke_premium_arm_calls() {
+        let expected = format!("{cmd}: premium_required");
+        match smoke_step(state, cmd, args) {
+            Err(error) if error == expected => {}
+            Err(error) => {
+                return Err(format!(
+                    "Premium arm {cmd} was not refused by the closed gate: {error}"
+                ));
+            }
+            Ok(_) => {
+                return Err(format!(
+                    "Premium arm {cmd} answered while Premium was off: the gate is open"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Prove the positive direction, without mistaking an arm's legitimate
+/// precondition failure for a command failure. Each printed line records both
+/// halves of the proof so a successful gate run cannot hide an uncalled arm.
+fn smoke_premium_arms_open(state: &mut AppState) -> Result<(), String> {
+    for (cmd, args) in smoke_premium_arm_calls() {
+        let outcome = match smoke_step(state, cmd, args) {
+            Ok(_) => "answered".to_owned(),
+            Err(error) => {
+                let code = error
+                    .strip_prefix(&format!("{cmd}: "))
+                    .unwrap_or(error.as_str());
+                if code == "premium_required" {
+                    return Err(format!(
+                        "Premium arm {cmd} still refused with premium_required while the gate should be open"
+                    ));
+                }
+                format!("post-gate {code}")
+            }
+        };
+        println!("SMOKE licence: arm {cmd}: premium_required off; {outcome} on");
+    }
+    Ok(())
 }
 
 /// Smoke-test only: drive a full vault lifecycle through the real dispatch
@@ -3329,7 +4133,10 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     // given a URL here, which is also what the real UI does.
     const CARRIED_URL: &str = "https://carried.example/page";
     {
-        let tab = state.tabs.get_mut(state.active).ok_or("smoke: no active tab")?;
+        let tab = state
+            .tabs
+            .get_mut(state.active)
+            .ok_or("smoke: no active tab")?;
         tab.url = CARRIED_URL.to_string();
         tab.title = "carried".to_string();
     }
@@ -3337,7 +4144,11 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     // The receipt arm end-to-end through real dispatch: reply shape and the
     // number-or-null contract, on whichever platform the smoke runs.
     let receipt = smoke_step(state, "privacy_receipt", json!({}))?;
-    if receipt.get("counts_blocked").and_then(|v| v.as_bool()).is_none() {
+    if receipt
+        .get("counts_blocked")
+        .and_then(|v| v.as_bool())
+        .is_none()
+    {
         return Err("privacy_receipt: counts_blocked missing".into());
     }
     let coherent = match receipt.get("counts_blocked").and_then(|v| v.as_bool()) {
@@ -3345,11 +4156,32 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
         _ => receipt.get("session_blocked").map(|v| v.is_null()) == Some(true),
     };
     if !coherent {
-        return Err("privacy_receipt: counts must be numbers when observable, null when not".into());
+        return Err(
+            "privacy_receipt: counts must be numbers when observable, null when not".into(),
+        );
     }
     smoke_step(state, "vault_lock", json!({}))?;
     if smoke_step(state, "cred_list", json!({})).is_ok() {
         return Err("cred_list succeeded while locked".into());
+    }
+    if smoke_step(state, "bookmark_list", json!({})).is_ok() {
+        return Err("bookmark_list succeeded while locked".into());
+    }
+    match smoke_step(
+        state,
+        "snapshot_picture_stage",
+        json!({ "id": "locked-picture-probe" }),
+    ) {
+        Err(error) if error == "snapshot_picture_stage: not_unlocked" => {}
+        other => {
+            return Err(format!(
+                "snapshot picture vault gate did not refuse before lookup: {other:?}"
+            ));
+        }
+    }
+    let locked_store = smoke_step(state, "store_status", json!({}))?;
+    if locked_store["open"] != json!(false) {
+        return Err("store_status exposed the Library while locked".into());
     }
     smoke_step(state, "vault_unlock", json!({ "passphrase": pass }))?;
     let entry = smoke_step(state, "cred_get", json!({ "id": id }))?;
@@ -3365,7 +4197,7 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     // and needs a human to click a portal dialog, so it is not driven here --
     // but everything that happens either side of the click is.
     let export_pass = "smoke-export-passphrase";
-    let new_pass = "smoke-imported-passphrase";
+    let new_pass = SMOKE_VAULT_PASS;
     let export_path = state
         .vault_path
         .parent()
@@ -3445,27 +4277,135 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
 /// Smoke-test only: drive the tab lifecycle through the real dispatch
 /// surface and check the URL-bar search fallback.
 pub fn smoke_tab_sequence(state: &mut AppState) -> Result<(), String> {
-    let first_id = smoke_step(state, "tab_list", json!({}))?["items"][0]["id"]
+    let original_id = smoke_step(state, "tab_list", json!({}))?["items"][0]["id"]
         .as_u64()
         .ok_or("tab_list: first tab has no id")?;
-    let new_id = smoke_step(state, "tab_new", json!({}))?["id"]
-        .as_u64()
-        .ok_or("tab_new: reply carries no id")?;
-    let count = smoke_tab_count(state)?;
-    if count != 2 {
-        return Err(format!("tab_list after tab_new: expected 2 tabs, got {count}"));
+    // THE STATUS CARRIES THE TAB'S ID, read from the production function on
+    // the real binary. The held-page banner answers by tab id AND pending id
+    // and takes the tab id from this field; it was absent, every click was
+    // rejected as bad_args, and the DOM gate could not see it because its
+    // fixture had invented the field (review R-001, round 2). A fixture can
+    // only ever match the shape someone believed; this reads the shape that is.
+    match state.active_tab_status()["id"].as_u64() {
+        Some(id) if id == original_id => {}
+        Some(other) => {
+            return Err(format!(
+                "tab_status id is {other}, active tab is {original_id}"
+            ))
+        }
+        None => {
+            return Err("tab_status carries no id; the held-page banner cannot answer".to_string())
+        }
     }
-    smoke_step(state, "tab_switch", json!({ "id": first_id }))?;
-    smoke_step(state, "tab_close", json!({ "id": new_id }))?;
+    let mut opened = Vec::new();
+    for _ in 0..3 {
+        opened.push(
+            smoke_step(state, "tab_new", json!({}))?["id"]
+                .as_u64()
+                .ok_or("tab_new: reply carries no id")?,
+        );
+    }
+    let count = smoke_tab_count(state)?;
+    if count != 4 {
+        return Err(format!(
+            "tab_list after three tab_new calls: expected 4 tabs, got {count}"
+        ));
+    }
+
+    // Reorder through the REAL dispatcher. AppState.active is positional, so
+    // the proof is by stable id: the active page must be the same page after
+    // its Vec slot moves. The original tab is included because tab_reorder
+    // accepts only a complete permutation of the live strip.
+    let before = smoke_step(state, "tab_list", json!({}))?;
+    let active_id = before["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|tab| tab["active"] == json!(true)))
+        .and_then(|tab| tab["id"].as_u64())
+        .ok_or("tab_list before reorder has no active id")?;
+    if active_id != opened[2] {
+        return Err("third opened tab was not active before reorder".into());
+    }
+    let commanded = vec![opened[1], original_id, opened[2], opened[0]];
+    let reply = smoke_step(state, "tab_reorder", json!({ "ids": commanded }))?;
+    let replied: Vec<u64> = reply["ids"]
+        .as_array()
+        .ok_or("tab_reorder reply has no canonical ids")?
+        .iter()
+        .map(|id| id.as_u64().ok_or("tab_reorder reply contains a non-id"))
+        .collect::<Result<_, _>>()?;
+    if replied != commanded {
+        return Err(format!(
+            "tab_reorder replied with {replied:?}, commanded {commanded:?}"
+        ));
+    }
+    let reordered = smoke_step(state, "tab_list", json!({}))?;
+    let actual: Vec<u64> = reordered["items"]
+        .as_array()
+        .ok_or("tab_list after reorder has no items")?
+        .iter()
+        .map(|tab| tab["id"].as_u64().ok_or("tab_list item has no id"))
+        .collect::<Result<_, _>>()?;
+    if actual != commanded {
+        return Err(format!("tab order is {actual:?}, commanded {commanded:?}"));
+    }
+    let active_after = reordered["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|tab| tab["active"] == json!(true)))
+        .and_then(|tab| tab["id"].as_u64())
+        .ok_or("tab_list after reorder has no active id")?;
+    if active_after != active_id {
+        return Err(format!(
+            "tab reorder changed active identity from {active_id} to {active_after}"
+        ));
+    }
+
+    // Duplicate + omission: not a permutation. The full tab_list equality is
+    // the mutation proof, including both order and active marker.
+    let mut bogus = commanded.clone();
+    bogus[3] = bogus[0];
+    match smoke_step(state, "tab_reorder", json!({ "ids": bogus })) {
+        Err(error) if error == "tab_reorder: bad_args" => {}
+        Err(error) => return Err(format!("bogus tab permutation returned {error}")),
+        Ok(_) => return Err("bogus tab permutation was accepted".into()),
+    }
+    let after_bogus = smoke_step(state, "tab_list", json!({}))?;
+    if after_bogus != reordered {
+        return Err("bogus tab permutation mutated order or active tab".into());
+    }
+
+    // opened[0] began directly after the original tab and is now last. Close
+    // by id must still remove that tab, not whichever tab occupies its old or
+    // new positional slot.
+    smoke_step(state, "tab_close", json!({ "id": opened[0] }))?;
+    let after_close = smoke_step(state, "tab_list", json!({}))?;
+    let remaining = after_close["items"]
+        .as_array()
+        .ok_or("tab_list after reordered close has no items")?;
+    if remaining.iter().any(|tab| tab["id"] == json!(opened[0]))
+        || !remaining.iter().any(|tab| tab["id"] == json!(opened[1]))
+        || !remaining.iter().any(|tab| tab["id"] == json!(opened[2]))
+        || !remaining.iter().any(|tab| tab["id"] == json!(original_id))
+    {
+        return Err("close-by-id removed the wrong tab after reorder".into());
+    }
+
+    // Restore the one-tab starting shape for the smoke sequences that follow.
+    smoke_step(state, "tab_close", json!({ "id": opened[2] }))?;
+    smoke_step(state, "tab_close", json!({ "id": opened[1] }))?;
     let count = smoke_tab_count(state)?;
     if count != 1 {
         return Err(format!(
-            "tab_list after tab_close: expected 1 tab, got {count}"
+            "tab cleanup after reorder: expected 1 tab, got {count}"
         ));
     }
+    println!(
+        "SMOKE tabs: reordered; active id preserved; bad permutation refused; close-by-id correct"
+    );
     let normalized = normalize_input("rust tutorial");
-    if normalized != "https://duckduckgo.com/?q=rust%20tutorial" {
-        return Err(format!("normalize_input search fallback broken: {normalized}"));
+    if normalized != "https://start.duckduckgo.com/?q=rust%20tutorial" {
+        return Err(format!(
+            "normalize_input search fallback broken: {normalized}"
+        ));
     }
 
     // Privacy controls through the real dispatch surface. Turning ad blocking
@@ -3495,7 +4435,11 @@ pub fn smoke_tab_sequence(state: &mut AppState) -> Result<(), String> {
     let before = smoke_step(state, "fingerprint_noise_get", json!({}))?["enabled"]
         .as_bool()
         .ok_or("fingerprint_noise_get returned no bool")?;
-    let flipped = smoke_step(state, "fingerprint_noise_set", json!({ "enabled": !before }))?;
+    let flipped = smoke_step(
+        state,
+        "fingerprint_noise_set",
+        json!({ "enabled": !before }),
+    )?;
     if flipped["enabled"] != json!(!before) {
         return Err("fingerprint_noise_set did not flip the pref".into());
     }
@@ -3518,20 +4462,43 @@ pub fn smoke_tab_sequence(state: &mut AppState) -> Result<(), String> {
         .as_str()
         .ok_or("toolbar_placement_get returned no string")?
         .to_owned();
-    let other = if placed == "left" { "top" } else { "left" };
-    let flipped = smoke_step(state, "toolbar_placement_set", json!({ "placement": other }))?;
-    if flipped["placement"] != json!(other) {
-        return Err("toolbar_placement_set did not move the toolbar".into());
+    // Always exercise Right, even when the saved placement already is Right:
+    // the geometry message below is the real-engine proof that the page can
+    // be inset from that edge without panicking on either backend.
+    let moved = smoke_step(
+        state,
+        "toolbar_placement_set",
+        json!({ "placement": "right" }),
+    )?;
+    if moved["placement"] != json!("right") {
+        return Err("toolbar_placement_set did not accept Right".into());
     }
-    if smoke_step(state, "toolbar_placement_get", json!({}))?["placement"] != json!(other) {
+    if smoke_step(state, "toolbar_placement_get", json!({}))?["placement"] != json!("right") {
         return Err("toolbar_placement_get lost the value set moments earlier".into());
     }
+    smoke_step(
+        state,
+        "set_chrome_insets",
+        json!({ "top": 88, "left": 0, "right": 56 }),
+    )?;
     // An out-of-range pair must be clamped rather than refused or obeyed:
     // this is the frame that would otherwise hide the page behind its own
     // chrome.
-    smoke_step(state, "set_chrome_insets", json!({ "top": 99_999, "left": -5 }))?;
-    smoke_step(state, "set_chrome_insets", json!({ "top": 148, "left": 0 }))?;
-    smoke_step(state, "toolbar_placement_set", json!({ "placement": placed }))?;
+    smoke_step(
+        state,
+        "set_chrome_insets",
+        json!({ "top": 99_999, "left": -5, "right": 99_999 }),
+    )?;
+    smoke_step(
+        state,
+        "set_chrome_insets",
+        json!({ "top": 148, "left": 0, "right": 0 }),
+    )?;
+    smoke_step(
+        state,
+        "toolbar_placement_set",
+        json!({ "placement": placed }),
+    )?;
 
     // The palette through the real dispatch surface. What this proves is
     // the part no unit test reaches: `set_chrome_palette` fans out to the
@@ -3588,6 +4555,31 @@ pub fn smoke_tab_sequence(state: &mut AppState) -> Result<(), String> {
 ///
 /// Requires the vault UNLOCKED, which is how `smoke_vault_sequence` leaves
 /// it. Restores what it touched: the token is removed at the end.
+#[cfg(feature = "premium-unlocked")]
+pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
+    // The bypass is compile-time, but the licence row is not: it must continue
+    // to report the actual empty vault while only the feature gate is forced.
+    let status = smoke_step(state, "premium_status", json!({}))?;
+    if status["premium"] != json!(true) || status["state"] != json!("free") {
+        return Err(format!(
+            "unlocked build did not pair an open gate with the real free session: {status}"
+        ));
+    }
+    let licence = smoke_step(state, "licence_get", json!({}))?;
+    if licence["state"] != json!("free")
+        || licence["has_token"] != json!(false)
+        || licence["activation"] != json!("not_needed")
+    {
+        return Err(format!(
+            "unlocked build falsified the real no-token licence row: {licence}"
+        ));
+    }
+    smoke_premium_arms_open(state)?;
+    println!("SMOKE licence: unlocked test gate open; real licence row remains free");
+    Ok(())
+}
+
+#[cfg(not(feature = "premium-unlocked"))]
 pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
     let accept = std::env::var("PATANYX_SMOKE_LICENCE_TOKEN").ok();
     let foreign = std::env::var("PATANYX_SMOKE_FOREIGN_TOKEN").ok();
@@ -3604,6 +4596,51 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
     if smoke_step(state, "tabs_switcher_list", json!({})).is_ok() {
         return Err("tabs_switcher_list answered with no licence: the gate is open".into());
     }
+    smoke_premium_arms_closed(state)?;
+    // The recovery-key scan is FREE on purpose (it exists to get a locked-out
+    // user into the vault, where Premium lives), so with the gate closed it
+    // must fail past the gate, never at it.
+    // With a REAL pick token (minted the way file_pick_open mints one, for a
+    // path that does not exist) the arm gets past the gate, past kind
+    // parsing and past token redemption, and fails only at the image
+    // itself -- or earlier at OCR availability, which also sits after the
+    // gate. Anything else (bad_args from an unparsed kind, premium_required
+    // from a gate that grew) is a failure, unlike the token-0 probe in the
+    // arm list, whose bad_args cannot tell those apart.
+    let recovery_token = state.remember_picked_path(std::path::PathBuf::from(
+        "/nonexistent/patanyx-smoke-recovery.png",
+    ));
+    match smoke_step(
+        state,
+        "ocr_scan",
+        json!({ "token": recovery_token, "kind": "recovery" }),
+    ) {
+        Err(error) if error == "ocr_scan: bad_image" || error == "ocr_scan: ocr_unavailable" => {}
+        Err(error) if error == "ocr_scan: premium_required" => {
+            return Err("ocr_scan recovery is paywalled: the recovery aid must stay free".into());
+        }
+        other => {
+            return Err(format!(
+                "ocr_scan recovery with a real token did not fail past the gate: {other:?}"
+            ));
+        }
+    }
+    let leaks_token = state.remember_picked_path(std::path::PathBuf::from(
+        "/nonexistent/patanyx-smoke-leaks.png",
+    ));
+    match smoke_step(
+        state,
+        "ocr_scan",
+        json!({ "token": leaks_token, "kind": "leaks" }),
+    ) {
+        Err(error) if error == "ocr_scan: premium_required" => {}
+        other => {
+            return Err(format!(
+                "ocr_scan leaks with a real token was not refused at the gate: {other:?}"
+            ));
+        }
+    }
+    println!("SMOKE licence: ocr_scan recovery not gated while leaks is");
 
     if let Some(token) = foreign {
         // A token signed by some other key. Well-formed, so it reaches the
@@ -3626,11 +4663,15 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
     if let Some(token) = accept {
         let reply = smoke_step(state, "licence_paste", json!({ "token": token }))?;
         if reply["accepted"] != json!(true) {
-            return Err(format!("licence_paste refused the token this build must accept: {reply}"));
+            return Err(format!(
+                "licence_paste refused the token this build must accept: {reply}"
+            ));
         }
         let state_word = reply["state"].as_str().unwrap_or("");
         if state_word != "active" && state_word != "perpetual" {
-            return Err(format!("pasted token evaluated to {state_word:?}, not active"));
+            return Err(format!(
+                "pasted token evaluated to {state_word:?}, not active"
+            ));
         }
         // Phase 4: an ACTIVE token alone must NOT open the gate. Until this
         // device holds a receipt the state is "unactivated" and the arm
@@ -3666,30 +4707,45 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
                 release: None,
             },
         );
-        if !matches!(outcome, crate::activation::ActivateOutcome::Activated { .. }) {
+        if !matches!(
+            outcome,
+            crate::activation::ActivateOutcome::Activated { .. }
+        ) {
             return Err(format!("activation did not succeed: {outcome:?}"));
         }
         let status = smoke_step(state, "premium_status", json!({}))?;
         if status["premium"] != json!(true) {
-            return Err(format!("premium_status still says off after activation: {status}"));
+            return Err(format!(
+                "premium_status still says off after activation: {status}"
+            ));
         }
         let lic = smoke_step(state, "licence_get", json!({}))?;
         if lic["activation"] != json!("activated") {
-            return Err(format!("licence_get does not report this device activated: {lic}"));
+            return Err(format!(
+                "licence_get does not report this device activated: {lic}"
+            ));
         }
         // THE POINT: the arm that refused a moment ago now answers.
         smoke_step(state, "tabs_switcher_list", json!({}))?;
+        smoke_premium_arms_open(state)?;
         println!("SMOKE licence: device activated, receipt bound offline");
         // A receipt for ANOTHER device must not count here: ask the server
         // for a real, honestly signed receipt for a different device id
         // (a synced vault would carry exactly this), put ONLY that one in
         // the vault, re-evaluate, and the gate must shut. Then put ours back.
         {
-            let mut mine = unlocked(state).map_err(|e| e.to_string())?.activation_records();
+            let mut mine = unlocked(state)
+                .map_err(|e| e.to_string())?
+                .activation_records();
             let other_device = [0x0fu8; 16];
-            let foreign_receipt = match crate::activation::activate_blocking(&token, &other_device) {
+            let foreign_receipt = match crate::activation::activate_blocking(&token, &other_device)
+            {
                 crate::activation::ActivateOutcome::Activated { receipt_text } => receipt_text,
-                other => return Err(format!("could not obtain a foreign-device receipt: {other:?}")),
+                other => {
+                    return Err(format!(
+                        "could not obtain a foreign-device receipt: {other:?}"
+                    ))
+                }
             };
             let foreign = vec![patanyx_vault::ActivationRecord {
                 license_id_hex: license_id_hex.clone(),
@@ -3713,6 +4769,99 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
                 return Err("restoring this device's receipt did not reopen the gate".into());
             }
         }
+        // Offline receipt import (licence_import_receipt): the manual path for
+        // a machine that cannot reach EdgeXene at all. Same receipt a network
+        // activation would have written, pasted by hand. It must reject a
+        // malformed string, ACTIVATE from cold on this device's own receipt,
+        // and reject a well-signed receipt bound to ANOTHER device -- leaving
+        // whatever was there untouched on every rejection.
+        {
+            // Malformed: refused on shape before the vault is touched.
+            let bad = smoke_step(
+                state,
+                "licence_import_receipt",
+                json!({ "receipt": "not-a-receipt" }),
+            )?;
+            if bad["activated"] != json!(false) || bad["code"] != json!("receipt_malformed") {
+                return Err(format!(
+                    "offline import accepted a malformed receipt: {bad}"
+                ));
+            }
+
+            // Cold start: clear this device's activation so Premium is OFF, and
+            // prove the import is what turns it back on -- not a receipt that
+            // merely happened to already be present.
+            unlocked(state)
+                .map_err(|e| e.to_string())?
+                .set_activation_records(Vec::new())
+                .map_err(|e| format!("vault: {e}"))?;
+            crate::licence_control::on_vault_unlocked(state);
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+                return Err("clearing activation records left Premium on".into());
+            }
+
+            // A well-signed receipt for ANOTHER device: verified and rejected,
+            // and the rollback must leave the (now empty) records untouched.
+            // Reuse the foreign slot the block above already granted (0x0f) so
+            // no additional device slot is consumed on the throwaway server.
+            let other_device = [0x0fu8; 16];
+            let foreign_receipt = match crate::activation::activate_blocking(&token, &other_device)
+            {
+                crate::activation::ActivateOutcome::Activated { receipt_text } => receipt_text,
+                other => {
+                    return Err(format!(
+                        "could not mint a foreign receipt for import: {other:?}"
+                    ))
+                }
+            };
+            let rejected = smoke_step(
+                state,
+                "licence_import_receipt",
+                json!({ "receipt": foreign_receipt }),
+            )?;
+            if rejected["activated"] != json!(false)
+                || rejected["code"] != json!("receipt_rejected")
+            {
+                return Err(format!(
+                    "offline import accepted a foreign-device receipt: {rejected}"
+                ));
+            }
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+                return Err("a rejected offline import turned Premium on".into());
+            }
+
+            // The honest paste: this device's own receipt, imported with no
+            // network, opens the gate.
+            let mine_receipt = match crate::activation::activate_blocking(&token, &device_id) {
+                crate::activation::ActivateOutcome::Activated { receipt_text } => receipt_text,
+                other => {
+                    return Err(format!(
+                        "could not mint this device's receipt for import: {other:?}"
+                    ))
+                }
+            };
+            let ok = smoke_step(
+                state,
+                "licence_import_receipt",
+                json!({ "receipt": mine_receipt }),
+            )?;
+            if ok["activated"] != json!(true) || ok["code"] != json!("activated") {
+                return Err(format!(
+                    "offline import refused this device's own receipt: {ok}"
+                ));
+            }
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+                return Err("offline import of a valid receipt did not open Premium".into());
+            }
+            println!(
+                "SMOKE licence: offline import activates own receipt, rejects foreign and malformed"
+            );
+        }
+        // Let any REAL worker the paste started finish before the release
+        // assertions below read the busy flag, so "nothing in flight" means
+        // nothing new was started rather than a synthetic result having
+        // cleared a real worker's flag.
+        smoke_drain_activation();
         // Release this device: the slot goes back to the server and Premium
         // goes off HERE, then re-activation is possible again.
         let released = crate::activation::release_blocking(&token, &device_id)
@@ -3733,13 +4882,28 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
         if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
             return Err("release left Premium on".into());
         }
+        // Release must not quietly take the slot back: not right away (the
+        // evaluation release triggers used to start a silent activation),
+        // and not at the next unlock either (the marker lives in the vault).
+        if crate::licence_control::activation_in_flight() {
+            return Err("release started a silent re-activation".into());
+        }
+        crate::licence_control::on_vault_locked();
+        crate::licence_control::on_vault_unlocked(state);
+        if crate::licence_control::activation_in_flight() {
+            return Err("the unlock after a release started a silent re-activation".into());
+        }
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+            return Err("the unlock after a release turned Premium back on".into());
+        }
+        println!("SMOKE licence: released device stays released across a lock");
         let outcome = crate::activation::activate_blocking(&token, &device_id);
         crate::activation::handle_event(
             state,
             crate::activation::ActivationEvent {
                 kind: crate::activation::CallKind::Activate,
-                license_id_hex,
-                device_id_hex,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
                 activate: Some(outcome),
                 release: None,
             },
@@ -3747,7 +4911,484 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
         if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
             return Err("re-activation after release did not reopen the gate".into());
         }
-        println!("SMOKE licence: foreign-device receipt refused, release and re-activation round-trip");
+        if state
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.is_released(&device_id_hex))
+        {
+            return Err("a completed activation left the released marker in the vault".into());
+        }
+        // A RELEASE INTERRUPTED BY A RESTART. The intent reaches the disk
+        // before the request leaves, so losing the answer -- to a lock, to
+        // the process ending, to anything -- cannot leave the server holding
+        // a freed slot while this vault still has a receipt. The next unlock
+        // asks again. Nothing in memory is carried across: the vault is
+        // dropped and opened from the file, which is what a restart does.
+        smoke_drain_activation();
+        // THROUGH THE REAL ENTRY POINT, so what is proven is what the Vault
+        // panel's button does: the record is on disk before the request
+        // leaves, not merely when a test writes it.
+        if !crate::activation::start_release(state) {
+            return Err("start_release did not start".into());
+        }
+        if !state
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.release_pending().is_some())
+        {
+            return Err("start_release did not record the release before the request left".into());
+        }
+        crate::activation::join_worker();
+        crate::licence_control::clear_activation_in_flight();
+        // The worker's own answer is what arrives here, with the vault
+        // locked: dropped on purpose (the vault, not memory, is the record).
+        let released_locked = true;
+        state.vault = None;
+        crate::licence_control::on_vault_locked();
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Release,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
+                activate: None,
+                release: Some(Ok(released_locked)),
+            },
+        );
+        if state.pending_activation_event.is_some() {
+            return Err("a release result was parked in memory; the vault is the record".into());
+        }
+        // THE REAL UNLOCK COMMAND, not the pieces of it: this is the wiring
+        // a user's unlock actually runs, and the only thing that proves the
+        // arm finishes an unresolved release rather than some helper the
+        // test called itself.
+        smoke_step(
+            state,
+            "vault_unlock",
+            json!({ "passphrase": SMOKE_VAULT_PASS }),
+        )?;
+        if !state
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.release_pending().is_some())
+        {
+            return Err("the started release did not survive losing the vault".into());
+        }
+        // The receipt is still on disk, so the session is ACTIVATED and an
+        // activation retry is impossible: a worker here can only be the
+        // release being finished.
+        if !crate::licence_control::activation_in_flight() {
+            return Err("the unlock after an interrupted release did not finish it".into());
+        }
+        crate::activation::join_worker();
+        crate::licence_control::clear_activation_in_flight();
+        let released_retry = crate::activation::release_blocking(&token, &device_id)
+            .map_err(|e| format!("release (retry): {e}"))?;
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Release,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
+                activate: None,
+                release: Some(Ok(released_retry)),
+            },
+        );
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+            return Err("the finished release did not turn Premium off".into());
+        }
+        if !state
+            .vault
+            .as_ref()
+            .is_some_and(|v| v.is_released(&device_id_hex))
+            || state
+                .vault
+                .as_ref()
+                .and_then(|v| v.release_pending())
+                .is_some()
+        {
+            return Err("the finished release did not clear its own record".into());
+        }
+        println!(
+            "SMOKE licence: a release interrupted by a restart is finished at the next unlock"
+        );
+        // Back to activated for the steps that follow.
+        let outcome = crate::activation::activate_blocking(&token, &device_id);
+        crate::activation::handle_event(
+            state,
+            crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Activate,
+                license_id_hex: license_id_hex.clone(),
+                device_id_hex: device_id_hex.clone(),
+                activate: Some(outcome),
+                release: None,
+            },
+        );
+        if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+            return Err("activation after the replayed release did not reopen the gate".into());
+        }
+        // A FAILED release write: the server has released, the vault could
+        // not record it. The started-release record is still on disk, so the
+        // next unlock asks again and writes again -- proven after a REAL
+        // reopen, which still holds the receipt.
+        #[cfg(debug_assertions)]
+        {
+            smoke_drain_activation();
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone before the write-failure case")?
+                .begin_release(&device_id_hex)
+                .map_err(|e| format!("begin_release (write-failure case): {e}"))?;
+            let released_again = crate::activation::release_blocking(&token, &device_id)
+                .map_err(|e| format!("release (write-failure case): {e}"))?;
+            if !released_again {
+                return Err(
+                    "the server did not count this device as active at the third release".into(),
+                );
+            }
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone before the injected failure")?
+                .inject_save_failure_once();
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Release,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: None,
+                    release: Some(Ok(released_again)),
+                },
+            );
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false) {
+                return Err("a release whose write failed left Premium on in memory".into());
+            }
+            smoke_reopen_vault(state)?;
+            if !state
+                .vault
+                .as_ref()
+                .is_some_and(|v| !v.activation_records().is_empty())
+            {
+                return Err("the injected failure did not leave the receipt on disk (the fault was not injected)".into());
+            }
+            if !state
+                .vault
+                .as_ref()
+                .is_some_and(|v| v.release_pending().is_some())
+            {
+                return Err("the failed write lost the started-release record".into());
+            }
+            crate::licence_control::on_vault_unlocked(state);
+            crate::activation::finish_pending_release(state);
+            if !crate::licence_control::activation_in_flight() {
+                return Err("the unlock after a failed release write did not retry it".into());
+            }
+            crate::activation::join_worker();
+            crate::licence_control::clear_activation_in_flight();
+            let released_retry = crate::activation::release_blocking(&token, &device_id)
+                .map_err(|e| format!("release (write-failure retry): {e}"))?;
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Release,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: None,
+                    release: Some(Ok(released_retry)),
+                },
+            );
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(false)
+                || !state
+                    .vault
+                    .as_ref()
+                    .is_some_and(|v| v.is_released(&device_id_hex))
+                || state
+                    .vault
+                    .as_ref()
+                    .and_then(|v| v.release_pending())
+                    .is_some()
+            {
+                return Err("the retried release did not land at the next unlock".into());
+            }
+            println!("SMOKE licence: a release whose write failed is retried at the next unlock");
+            // AN UNRESOLVED RELEASE OUTRANKS THE ACTIVATION RETRY. With the
+            // receipt gone and only the started-release record left, the
+            // evaluation must not take the slot back; the row says what is
+            // happening, and finishing the release is the unlock arm's job.
+            {
+                let vault = state
+                    .vault
+                    .as_mut()
+                    .ok_or("vault gone before the precedence case")?;
+                vault
+                    .clear_released_device_if(&device_id_hex)
+                    .map_err(|e| format!("clear marker: {e}"))?;
+                vault
+                    .begin_release(&device_id_hex)
+                    .map_err(|e| format!("begin_release (precedence case): {e}"))?;
+            }
+            crate::licence_control::on_vault_unlocked(state);
+            if crate::licence_control::activation_in_flight() {
+                return Err("an unresolved release did not stop the activation retry".into());
+            }
+            let row = smoke_step(state, "licence_get", json!({}))?;
+            let note = row["activation_note"].as_str().unwrap_or_default();
+            if !note.contains("being released") {
+                return Err(format!(
+                    "the row does not say the release is being finished: {note}"
+                ));
+            }
+            if !crate::activation::finish_pending_release(state) {
+                return Err("the unlock arm did not finish the unresolved release".into());
+            }
+            crate::activation::join_worker();
+            crate::licence_control::clear_activation_in_flight();
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone")?
+                .clear_release_pending_if(&device_id_hex)
+                .map_err(|e| format!("clear pending: {e}"))?;
+            println!("SMOKE licence: an unresolved release outranks the activation retry");
+            // An unactivated vault with a PARKED activation result: the
+            // unlock must not start a worker of its own (the replay answers
+            // the question), and the replay must install the receipt.
+            let outcome = crate::activation::activate_blocking(&token, &device_id);
+            state.vault = None;
+            crate::licence_control::on_vault_locked();
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Activate,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: Some(outcome),
+                    release: None,
+                },
+            );
+            if state.pending_activation_event.is_none() {
+                return Err("an activation result that arrived while locked was dropped".into());
+            }
+            smoke_reopen_vault(state)?;
+            // The released marker from the previous step would suppress the
+            // retry on its own; lift it so the pending-result guard is the
+            // only thing keeping a worker from starting here.
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone")?
+                .clear_released_device_if(&device_id_hex)
+                .map_err(|e| format!("clear marker: {e}"))?;
+            crate::licence_control::on_vault_unlocked(state);
+            if crate::licence_control::activation_in_flight() {
+                return Err(
+                    "the unlock with a parked activation result started its own worker".into(),
+                );
+            }
+            crate::activation::replay_pending(state);
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+                return Err("the replayed activation did not install the receipt".into());
+            }
+            println!(
+                "SMOKE licence: a parked activation result is applied without a second worker"
+            );
+            // REPLAY WHILE ANOTHER WORKER OWNS THE FLAG. A parked result is
+            // delivered while a (simulated) live worker is in flight: the
+            // replay must not clear that worker's flag.
+            let outcome = crate::activation::activate_blocking(&token, &device_id);
+            state.vault = None;
+            crate::licence_control::on_vault_locked();
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Activate,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: Some(outcome),
+                    release: None,
+                },
+            );
+            smoke_reopen_vault(state)?;
+            crate::licence_control::on_vault_unlocked(state);
+            crate::licence_control::mark_activation_in_flight();
+            crate::activation::replay_pending(state);
+            if !crate::licence_control::activation_in_flight() {
+                return Err("replaying a parked result cleared a live worker's busy flag".into());
+            }
+            crate::licence_control::clear_activation_in_flight();
+            println!("SMOKE licence: a replay leaves a live worker's busy flag alone");
+            // A PARKED RESULT FOR ANOTHER LICENCE must not stop this licence's
+            // retry. Put the device back into the unactivated, not-released
+            // state, park a foreign-licence result, and unlock: a worker must
+            // start (it is joined and its flag cleared here, since the smoke
+            // runs inside one event-loop callback and cannot receive it).
+            smoke_drain_activation();
+            let released_for_guard = crate::activation::release_blocking(&token, &device_id)
+                .map_err(|e| format!("release (foreign-pending case): {e}"))?;
+            if !released_for_guard {
+                return Err(
+                    "the server did not count this device as active at the fourth release".into(),
+                );
+            }
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Release,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: None,
+                    release: Some(Ok(released_for_guard)),
+                },
+            );
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone")?
+                .clear_released_device_if(&device_id_hex)
+                .map_err(|e| format!("clear marker: {e}"))?;
+            state.vault = None;
+            crate::licence_control::on_vault_locked();
+            state.pending_activation_event = Some(crate::activation::ActivationEvent {
+                kind: crate::activation::CallKind::Activate,
+                license_id_hex: "00".repeat(16),
+                device_id_hex: device_id_hex.clone(),
+                activate: Some(crate::activation::ActivateOutcome::Refused(
+                    "bad_token".into(),
+                )),
+                release: None,
+            });
+            smoke_reopen_vault(state)?;
+            crate::licence_control::on_vault_unlocked(state);
+            if !crate::licence_control::activation_in_flight() {
+                return Err(
+                    "a parked result for ANOTHER licence suppressed this licence's retry".into(),
+                );
+            }
+            crate::activation::replay_pending(state);
+            if state.pending_activation_event.is_some() {
+                return Err("the foreign-licence result was not consumed by the replay".into());
+            }
+            smoke_drain_activation();
+            crate::licence_control::clear_activation_in_flight();
+            println!("SMOKE licence: a parked result for another licence does not block the retry");
+            // Back to a known activated state for the steps that follow.
+            let outcome = crate::activation::activate_blocking(&token, &device_id);
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Activate,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: Some(outcome),
+                    release: None,
+                },
+            );
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+                return Err("activation after the guard scenarios did not reopen the gate".into());
+            }
+            // THE USER ACTS WHILE A RELEASE IS UNRESOLVED. One cycle covers
+            // three rules: a failed activation result arriving while locked
+            // leaves the started release alone (it carries nothing durable);
+            // Activate now CANCELS it, durably, before its request leaves;
+            // and an imported receipt, which is persisted, cancels it too.
+            let receipt_text = match crate::activation::activate_blocking(&token, &device_id) {
+                crate::activation::ActivateOutcome::Activated { receipt_text } => receipt_text,
+                other => {
+                    return Err(format!(
+                        "could not obtain a receipt for the import case: {other:?}"
+                    ))
+                }
+            };
+            smoke_drain_activation();
+            let release_started = |state: &AppState| {
+                state
+                    .vault
+                    .as_ref()
+                    .and_then(|v| v.release_pending())
+                    .as_deref()
+                    == Some(device_id_hex.as_str())
+            };
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone before the user-action cycle")?
+                .begin_release(&device_id_hex)
+                .map_err(|e| format!("begin_release (user-action cycle): {e}"))?;
+            if !release_started(state) {
+                return Err("the started release was not recorded".into());
+            }
+            // (1) a failed activation result lands while locked
+            state.vault = None;
+            crate::licence_control::on_vault_locked();
+            crate::activation::handle_event(
+                state,
+                crate::activation::ActivationEvent {
+                    kind: crate::activation::CallKind::Activate,
+                    license_id_hex: license_id_hex.clone(),
+                    device_id_hex: device_id_hex.clone(),
+                    activate: Some(crate::activation::ActivateOutcome::Refused(
+                        "slots_full".into(),
+                    )),
+                    release: None,
+                },
+            );
+            smoke_reopen_vault(state)?;
+            if !release_started(state) {
+                return Err("a failed activation result erased the started release".into());
+            }
+            state.pending_activation_event = None;
+            // (2) Activate now cancels it, durably, and starts its worker.
+            // The evaluation alone must not touch the network here: only an
+            // unlock arm finishes a release, and the user is about to say
+            // the opposite.
+            crate::licence_control::on_vault_unlocked(state);
+            if crate::licence_control::activation_in_flight() {
+                return Err("the licence evaluation started a release call of its own".into());
+            }
+            if !crate::licence_control::activate_now(state) {
+                return Err("Activate now did not start a worker".into());
+            }
+            if release_started(state) {
+                return Err("Activate now left the release pending while activating".into());
+            }
+            smoke_drain_activation();
+            crate::licence_control::clear_activation_in_flight();
+            smoke_reopen_vault(state)?;
+            if release_started(state) {
+                return Err("Activate now cancelled the release only in memory".into());
+            }
+            // The reopen dropped the session; bring it back (and reap the
+            // retry worker the unlock starts, whose result this synchronous
+            // sequence cannot receive).
+            crate::licence_control::on_vault_unlocked(state);
+            crate::activation::join_worker();
+            crate::licence_control::clear_activation_in_flight();
+            // (3) an imported receipt is persisted: it cancels one too
+            state
+                .vault
+                .as_mut()
+                .ok_or("vault gone before the import case")?
+                .begin_release(&device_id_hex)
+                .map_err(|e| format!("begin_release (import case): {e}"))?;
+            let verdict = crate::activation::import_receipt(state, &receipt_text);
+            if verdict != "activated" {
+                return Err(format!(
+                    "importing this device's own receipt with a release started: {verdict}"
+                ));
+            }
+            if release_started(state) {
+                return Err("a persisted receipt import left the started release in place".into());
+            }
+            if smoke_step(state, "premium_status", json!({}))?["premium"] != json!(true) {
+                return Err("the imported receipt did not reopen the gate".into());
+            }
+            println!("SMOKE licence: a started release survives a failed activation, and Activate now or an imported receipt cancels it");
+        }
+        println!(
+            "SMOKE licence: foreign-device receipt refused, release and re-activation round-trip"
+        );
         // A copy of the same token with one character changed must be
         // refused, and the stored good token must stay in force. The CRC
         // covers everything before it and is checked before the signature,
@@ -3781,6 +5422,154 @@ pub fn smoke_licence_sequence(state: &mut AppState) -> Result<(), String> {
         }
         println!("SMOKE licence: token accepted, gate opened and closed");
     }
+    Ok(())
+}
+
+/// Smoke-test only: prove `partner_open` through the REAL dispatcher, against
+/// real tab state.
+///
+/// WHY A SMOKE SEQUENCE AND NOT A UNIT TEST. The unit tests in `partner.rs`
+/// exercise `destination_for`, which is the resolution logic. They cannot see
+/// the dispatcher, so they would still pass if the `partner_open` arm were
+/// miswired, consulted `args["url"]` itself, or opened a tab before returning
+/// an error. `AppState` needs a real webview and cannot be built in a unit
+/// test, so proving the WIRING means going through `smoke_step` like every
+/// other end-to-end property in this file.
+///
+/// Three things this establishes that `partner.rs` cannot:
+///
+/// 1. A known identifier actually opens a tab, and that tab carries the
+///    approved URL byte for byte -- attribution intact, nothing stripped in
+///    passing.
+/// 2. An unknown identifier and a bare `url` argument each open NOTHING. The
+///    tab count is checked, not just the error, because "returns an error" and
+///    "opened nothing" are different claims.
+/// 3. The command is reachable at all, which is the one thing a miswired match
+///    arm would break silently.
+pub fn smoke_partner_sequence(state: &mut AppState) -> Result<(), String> {
+    const NORDVPN: &str = "https://go.nordvpn.net/aff_c?offer_id=15&aff_id=155286&url_id=902";
+
+    let before = smoke_tab_count(state)?;
+
+    // A refused request must leave the tab count exactly where it was.
+    for bad in [
+        json!({ "partner": "not-a-partner" }),
+        json!({ "partner": "" }),
+        json!({}),
+        // The indirection under test: a caller-supplied URL is not a
+        // destination, and must not become one.
+        json!({ "url": "https://example.com/" }),
+    ] {
+        if smoke_step(state, "partner_open", bad.clone()).is_ok() {
+            return Err(format!(
+                "partner_open accepted {bad}, which must be refused"
+            ));
+        }
+        let now = smoke_tab_count(state)?;
+        if now != before {
+            return Err(format!(
+                "partner_open opened a tab for {bad}: {before} -> {now}"
+            ));
+        }
+    }
+
+    // A known identifier opens exactly one tab, at the approved destination.
+    let id = smoke_step(state, "partner_open", json!({ "partner": "nordvpn" }))?["id"]
+        .as_u64()
+        .ok_or("partner_open: reply carries no id")?;
+    let now = smoke_tab_count(state)?;
+    if now != before + 1 {
+        return Err(format!(
+            "partner_open should open exactly one tab: {before} -> {now}"
+        ));
+    }
+
+    let items = smoke_step(state, "tab_list", json!({}))?;
+    let opened = items["items"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["id"].as_u64() == Some(id)))
+        .ok_or("partner_open: the new tab is not in tab_list")?;
+    let url = opened["url"].as_str().unwrap_or_default();
+    if url != NORDVPN {
+        return Err(format!(
+            "partner_open navigated to {url}, not the approved destination"
+        ));
+    }
+
+    smoke_step(state, "tab_close", json!({ "id": id }))?;
+    let now = smoke_tab_count(state)?;
+    if now != before {
+        return Err(format!(
+            "partner smoke left {now} tabs, started with {before}"
+        ));
+    }
+    // Same shape as READOUT: a stable single-token line ci-trixie greps for, so
+    // that unchaining this sequence from the smoke run fails CI rather than
+    // passing quietly. The security-audit pass that added this gate found the
+    // sequence was wired in but unguarded.
+    println!("PARTNER ok");
+    Ok(())
+}
+
+/// Smoke-test only: prove the About sponsorship button's engine command goes
+/// through the real dispatcher and opens only its compiled destination.
+pub fn smoke_sponsorship_sequence(state: &mut AppState) -> Result<(), String> {
+    const SPONSORSHIP: &str = "https://donate.stripe.com/7sYaEZ1Qxh126KteDRbsc00";
+
+    let before = smoke_tab_count(state)?;
+    for bad in [
+        json!({ "sponsorship": "not-a-target" }),
+        json!({ "sponsorship": "" }),
+        json!({}),
+        json!({ "url": SPONSORSHIP }),
+    ] {
+        if smoke_step(state, "sponsorship_open", bad.clone()).is_ok() {
+            return Err(format!(
+                "sponsorship_open accepted {bad}, which must be refused"
+            ));
+        }
+        let now = smoke_tab_count(state)?;
+        if now != before {
+            return Err(format!(
+                "sponsorship_open opened a tab for {bad}: {before} -> {now}"
+            ));
+        }
+    }
+
+    let id = smoke_step(
+        state,
+        "sponsorship_open",
+        json!({ "sponsorship": "patanyx" }),
+    )?["id"]
+        .as_u64()
+        .ok_or("sponsorship_open: reply carries no id")?;
+    let now = smoke_tab_count(state)?;
+    if now != before + 1 {
+        return Err(format!(
+            "sponsorship_open should open exactly one tab: {before} -> {now}"
+        ));
+    }
+
+    let items = smoke_step(state, "tab_list", json!({}))?;
+    let opened = items["items"]
+        .as_array()
+        .and_then(|a| a.iter().find(|t| t["id"].as_u64() == Some(id)))
+        .ok_or("sponsorship_open: the new tab is not in tab_list")?;
+    let url = opened["url"].as_str().unwrap_or_default();
+    if url != SPONSORSHIP {
+        return Err(format!(
+            "sponsorship_open navigated to {url}, not the approved destination"
+        ));
+    }
+
+    smoke_step(state, "tab_close", json!({ "id": id }))?;
+    let now = smoke_tab_count(state)?;
+    if now != before {
+        return Err(format!(
+            "sponsorship smoke left {now} tabs, started with {before}"
+        ));
+    }
+    println!("SPONSORSHIP ok");
     Ok(())
 }
 
@@ -3822,9 +5611,7 @@ pub fn smoke_readout_sequence(state: &mut AppState) -> Result<(), String> {
     crate::platform::show_all(hosts);
     let (visible, _) = crate::platform::hover_readout_state(hosts);
     if visible {
-        return Err(
-            "show_all re-showed the readout; set_no_show_all is missing or broken".into(),
-        );
+        return Err("show_all re-showed the readout; set_no_show_all is missing or broken".into());
     }
 
     // 2. A link the rules allow must show, verbatim.
@@ -3887,11 +5674,7 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, &'static str> {
 /// Deliberately not applied to passphrases: they are bounded by the frame cap,
 /// a KDF is meant to be expensive, and a length limit on a secret is a
 /// property users can discover and attackers can exploit.
-fn arg_str_capped<'a>(
-    args: &'a Value,
-    key: &str,
-    max: usize,
-) -> Result<&'a str, &'static str> {
+fn arg_str_capped<'a>(args: &'a Value, key: &str, max: usize) -> Result<&'a str, &'static str> {
     let value = arg_str(args, key)?;
     if value.len() > max {
         return Err("bad_args");
@@ -3904,7 +5687,10 @@ fn arg_str_capped<'a>(
 pub(crate) fn vault_code(error: VaultError) -> &'static str {
     match error {
         VaultError::BadFormat(_) => "bad_format",
+        // NOT bad_format. The file is fine; this build is old.
+        VaultError::NewerVault { .. } => "vault_newer",
         VaultError::AuthFailed => "auth_failed",
+        VaultError::BackupsRetained(_) => "passphrase_changed_backups_retained",
         VaultError::AlreadyExists(_) => "vault_exists",
         // Its own code, not "io": the user can act on this one. Closing the
         // other window fixes it, and saying so beats a generic failure.
@@ -3936,45 +5722,206 @@ fn sibling_file_suggestion(vault_path: &Path, file_name: &str) -> String {
         .into_owned()
 }
 
-/// Export/import failures are a distinct type from [`VaultError`], so they
-/// get their own mapper. A wrong EXPORT passphrase gets its own code rather
-/// than `auth_failed`: that code's user-facing text says "wrong passphrase or
-/// corrupted vault", and telling someone their vault may be corrupted when
-/// the failure is about an export file points them at the wrong file.
-/// Every code here must exist in ERROR_TEXT in chrome.js.
-/// Put imported bookmarks back, under the NEW passphrase.
+const LIBRARY_REPLACE_MARKER_BODY: &[u8] =
+    b"a profile import is replacing the previous profile's Library\n";
+
+/// The parent entry is part of the marker's safety property, not bookkeeping:
+/// syncing the marker file alone can still lose a newly-created name after a
+/// power failure. Unix lets us flush the containing directory. On Windows,
+/// `File::sync_all` above is the available durable-file primitive and opening
+/// a directory as a normal `File` is not supported.
+fn sync_parent_directory(path: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        std::fs::File::open(parent)?.sync_all()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Ok(())
+    }
+}
+
+/// Publish the fail-closed marker durably before the imported vault can be
+/// committed. The first line is explanatory and the second names the import
+/// that wrote it; `AppState::open_store` reads neither, and treats even an
+/// empty surviving marker as authoritative. The token exists so that the
+/// import which created a marker can recognise its own before removing it.
+fn establish_library_replace_marker(marker: &Path, token: &str) -> std::io::Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(marker)?;
+    file.write_all(LIBRARY_REPLACE_MARKER_BODY)?;
+    file.write_all(b"owner ")?;
+    file.write_all(token.as_bytes())?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    sync_parent_directory(marker)
+}
+
+/// A value no other import will produce, so "is this marker mine?" has an
+/// answer. Not a secret and not security-relevant on its own: the marker is
+/// fail-closed whatever it contains, and this only decides who may take it
+/// away.
+fn new_marker_token() -> String {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    )
+}
+
+/// True when the marker on disk is the one `token` created. A marker that
+/// cannot be read is NOT ours: the fail-closed answer is to leave it.
+fn marker_is_owned_by(marker: &Path, token: &str) -> bool {
+    match std::fs::read(marker) {
+        Ok(bytes) => {
+            let wanted = format!("owner {token}\n");
+            bytes
+                .windows(wanted.len())
+                .any(|w| w == wanted.as_bytes())
+        }
+        Err(_) => false,
+    }
+}
+
+/// Remove a marker only once its protection is no longer needed. Syncing the
+/// parent makes the removal durable for the same reason creation needs it.
+fn clear_library_replace_marker(marker: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(marker) {
+        Ok(()) => sync_parent_directory(marker),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Gate the vault install on a durable Library-replacement marker.
 ///
-/// Returns how many were restored, so the panel can say so rather than
-/// leaving the user to guess whether anything came across.
-///
-/// EVERY FAILURE HERE IS SWALLOWED, and that is deliberate. By the time this
-/// runs the credentials are already written and the vault is sound; the
-/// bookmarks are a bonus that travelled with them. Propagating an error would
-/// report the whole import as failed when the part that matters succeeded, and
-/// a user who then re-ran it would be re-importing a vault they already have.
-/// Bookmarks are recoverable from the export file. A vault the user believes
-/// failed to import is not.
-///
-/// The store is REPLACED, not merged. An import is the user saying "make this
-/// machine look like that one"; silently unioning two bookmark sets would
-/// leave a state neither machine ever had.
-fn restore_bookmarks(state: &mut AppState, passphrase: &str, carried: Option<&[u8]>) -> usize {
+/// `install` is deliberately a callback: this function owns the ordering, so
+/// the vault write cannot accidentally move above the marker later. A normal
+/// import refusal clears the marker and preserves its original error code. If
+/// the marker cannot be established or cannot be cleared again, the install is
+/// refused with a code the import form can explain; a best-effort rewrite on
+/// cleanup failure preserves the fail-closed restart behaviour.
+fn replace_library<T>(
+    marker: &Path,
+    install: impl FnOnce() -> Result<T, ExportError>,
+) -> Result<T, &'static str> {
+    // SERIALISED ACROSS PROCESSES, because nothing weaker was ever going to
+    // work. An import is a transaction over two encrypted stores: publish a
+    // marker, commit a vault, replace a Library, retire the marker. Three
+    // review rounds tried to make the cleanup infer what a concurrent import
+    // had done -- first a start-of-call `exists()` snapshot, then an owner
+    // token, then a fingerprint of the vault file -- and each one was correct
+    // about the case in front of it and blind to the next. The fingerprint
+    // was the clearest lesson: it could be defeated by two writes inside one
+    // filesystem timestamp tick, it read two unreadable observations as "no
+    // change", and it mistook an ORDINARY credential save in another window
+    // for a replacement and stranded the marker, locking that user out of
+    // their own bookmarks. A heuristic standing in for a lock is a bug with
+    // a schedule.
+    //
+    // So: one import at a time, enforced by the kernel. The lock is an OS
+    // file lock on its own handle, released when the process dies however it
+    // dies, so a crash cannot leave anyone locked out -- the reasoning is in
+    // `patanyx_vault::lock`, and this reuses that tested primitive rather
+    // than growing a second one. It is keyed on the MARKER path, so the file
+    // it locks is `<store>.replace-pending.lock`, which cannot collide with
+    // the vault's own lock that `Vault::assemble` takes inside `install`.
+    //
+    // A refusal here is another import already running, which is a real
+    // answer and reuses the code the import form can already explain.
+    let _transaction = patanyx_vault::lock::acquire(marker).map_err(|_| "library_replace_refused")?;
+
+    // With the transaction serialised, the remaining question is narrow: is
+    // the marker on disk one this import wrote, or one that outlived an
+    // EARLIER import that committed a vault and could not delete the old
+    // Library? The second kind is the only thing keeping that Library shut,
+    // and a refusal must never widen access, so it is left byte for byte
+    // alone rather than restamped. `is_file` rather than `exists`, so a
+    // directory in the way still reaches the establish call and is refused
+    // there. The token then means a crashed predecessor's marker is never
+    // mistaken for ours.
+    let token = if marker.is_file() {
+        None
+    } else {
+        let token = new_marker_token();
+        establish_library_replace_marker(marker, &token).map_err(|_| "library_replace_refused")?;
+        Some(token)
+    };
+    match install() {
+        Ok(installed) => Ok(installed),
+        Err(error) => {
+            let Some(token) = token else {
+                // Somebody else's protection. Report this import's own
+                // failure and leave the marker exactly where it was.
+                return Err(export_code(error));
+            };
+            if !marker_is_owned_by(marker, &token) {
+                return Err(export_code(error));
+            }
+            if clear_library_replace_marker(marker).is_err() {
+                let _ = establish_library_replace_marker(marker, &token);
+                return Err("library_replace_refused");
+            }
+            Err(export_code(error))
+        }
+    }
+}
+
+/// Complete the Library half after the imported vault has committed. The
+/// marker remains in place until the previous Store is durably absent; a
+/// removal failure therefore blocks that Store across unlock and restart.
+fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'static str {
+    state.store = None;
+    let marker = state.library_replace_marker();
+    match std::fs::remove_file(&state.store_path) {
+        Ok(()) => {
+            if sync_parent_directory(&state.store_path).is_err() {
+                state.detach_store_unreplaced();
+                return "not_replaced";
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            state.detach_store_unreplaced();
+            return "not_replaced";
+        }
+    }
+    if state.store_path.exists() || clear_library_replace_marker(&marker).is_err() {
+        state.detach_store_unreplaced();
+        return "not_replaced";
+    }
+    state.open_store(passphrase);
+    if state.store.is_some() {
+        "replaced"
+    } else {
+        "not_opened"
+    }
+}
+
+/// Writes carried bookmarks into the ALREADY replaced Library. Returns the
+/// count written; nothing here touches which Store is open.
+fn restore_bookmarks(state: &mut AppState, carried: Option<&[u8]>) -> usize {
     let Some(bytes) = carried else { return 0 };
-    // A v1 export, or one taken before bookmarks travelled, carries nothing.
-    // Not an error -- just an older file.
     let Ok(bookmarks) = serde_json::from_slice::<Vec<patanyx_store::Bookmark>>(bytes) else {
         return 0;
     };
     if bookmarks.is_empty() {
         return 0;
     }
-    // Remove any store belonging to the vault that was just replaced. Keeping
-    // it would leave bookmarks sealed under the OLD passphrase next to
-    // credentials under the new one, and the next unlock would fail to open it
-    // and report the store damaged.
-    state.store = None;
-    let _ = std::fs::remove_file(&state.store_path);
-    state.open_store(passphrase);
     let Some(store) = state.store.as_mut() else {
         return 0;
     };
@@ -4093,7 +6040,7 @@ fn store_tunnel_config(state: &mut AppState, text: &mut String) -> Result<Value,
     Ok(json!({ "imported": true }))
 }
 
-/// Reopen the session "Apply and restart" set aside, if this boot is the one
+/// Reopen the session "Apply and restart" shelved, if this boot is the one
 /// that owes it. Called from both unlock arms, immediately after the tunnel
 /// is brought up.
 ///
@@ -4204,6 +6151,9 @@ fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize), 
 }
 
 fn store_open(state: &mut AppState) -> Result<&mut Store, &'static str> {
+    if state.vault.is_none() {
+        return Err("not_unlocked");
+    }
     // Resolved BEFORE the mutable borrow below: reading it inside the `None`
     // arm would borrow `state` immutably while `as_mut` still holds it.
     let why = state.store_error().unwrap_or("not_unlocked");
@@ -4247,11 +6197,13 @@ fn licence_payload(state: &mut AppState) -> Value {
         return json!({
             "row_head": Value::Null,
             "row_sub": Value::Null,
+            "purchase_copy": Value::Null,
             "state": Value::Null,
             "days_left": Value::Null,
             "has_token": Value::Null,
             "ended_display": Value::Null,
             "keys_available": keys_available,
+            "device_id_hex": Value::Null,
         });
     };
     // An unlocked vault always has a session state (every unlock path runs
@@ -4293,9 +6245,20 @@ fn licence_payload(state: &mut AppState) -> Value {
             json!(crate::licence_control::activation_copy(reason)),
         ),
     };
+    // Offline activation needs the user to know THIS machine's device id.
+    // Only surfaced when a Premium token is present (has_token). Minting it here
+    // is the same id activation would bind to; showing it opens no new secret.
+    let device_id_hex = if has_token {
+        crate::activation::device_id_or_mint(&state.vault_path)
+            .map(|d| crate::activation::hex_encode_16(&d))
+            .ok()
+    } else {
+        None
+    };
     json!({
         "row_head": row_head,
         "row_sub": row_sub,
+        "purchase_copy": crate::licence_control::purchase_copy(),
         "state": state_name,
         "days_left": days_left,
         "has_token": has_token,
@@ -4304,6 +6267,7 @@ fn licence_payload(state: &mut AppState) -> Value {
         "activation": activation,
         "activation_note": activation_note,
         "activation_busy": crate::licence_control::activation_in_flight(),
+        "device_id_hex": device_id_hex,
     })
 }
 
@@ -4313,8 +6277,9 @@ fn licence_payload(state: &mut AppState) -> Value {
 /// (unknown key/tier) both mean "minted by a newer build than this one".
 fn licence_paste_code(error: &patanyx_licence::LicenceError) -> &'static str {
     match error {
-        patanyx_licence::LicenceError::NotAToken
-        | patanyx_licence::LicenceError::CrcMismatch => "licence_not_a_token",
+        patanyx_licence::LicenceError::NotAToken | patanyx_licence::LicenceError::CrcMismatch => {
+            "licence_not_a_token"
+        }
         patanyx_licence::LicenceError::UnknownKeyId { .. }
         | patanyx_licence::LicenceError::UnknownTier { .. } => "licence_needs_newer_build",
         patanyx_licence::LicenceError::BadSignature => "licence_not_issued",
@@ -4358,6 +6323,237 @@ mod tests {
     use super::normalize_input;
     use crate::state::is_allowed_content_url;
     use serde_json::json;
+
+    #[test]
+    fn library_marker_is_present_before_the_vault_install_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        let install_ran = std::cell::Cell::new(false);
+
+        let result = super::replace_library(&marker, || {
+            install_ran.set(true);
+            let body = std::fs::read(&marker).expect("the pre-import marker must be readable");
+            assert!(
+                body.starts_with(super::LIBRARY_REPLACE_MARKER_BODY),
+                "the vault install ran before the replacement marker was published"
+            );
+            assert!(
+                String::from_utf8_lossy(&body).contains("owner "),
+                "a marker this import created must name its owner, or it can never take it back"
+            );
+            Ok(())
+        });
+
+        assert_eq!(result, Ok(()));
+        assert!(
+            install_ran.get(),
+            "the successful install callback did not run"
+        );
+        assert!(
+            marker.is_file(),
+            "a committed vault must remain guarded until Library replacement finishes"
+        );
+    }
+
+    #[test]
+    fn marker_establishment_failure_refuses_import_and_preserves_the_vault() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.rbv");
+        let old_vault = b"existing vault bytes";
+        std::fs::write(&vault_path, old_vault).expect("seed destination vault");
+
+        // A directory at the marker path makes opening it as the durable
+        // marker file fail on every supported platform. The callback is the
+        // destructive boundary: if it runs, the test overwrites the vault.
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        std::fs::create_dir(&marker).expect("block marker creation");
+        let install_ran = std::cell::Cell::new(false);
+        let result = super::replace_library(&marker, || {
+            install_ran.set(true);
+            std::fs::write(&vault_path, b"imported vault bytes")?;
+            Ok(())
+        });
+
+        assert_eq!(
+            result,
+            Err("library_replace_refused"),
+            "the import form needs the exact refusal code it can explain"
+        );
+        assert!(
+            !install_ran.get(),
+            "Vault::import_encrypted would have run without a durable marker"
+        );
+        assert_eq!(
+            std::fs::read(&vault_path).expect("read preserved destination vault"),
+            old_vault,
+            "marker failure changed the destination vault despite refusing the import"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_import_failure_clears_the_precommit_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        let result: Result<(), _> = super::replace_library(&marker, || {
+            assert!(
+                marker.is_file(),
+                "the marker must precede even a failed import"
+            );
+            Err(patanyx_vault::ExportError::AuthFailed)
+        });
+
+        assert_eq!(result, Err("export_auth_failed"));
+        assert!(
+            !marker.exists(),
+            "a rejected backup must not leave the unchanged profile blocked"
+        );
+    }
+
+    #[test]
+    fn a_failed_import_leaves_an_earlier_imports_marker_standing() {
+        // The sequence that made this a data-exposure bug rather than an
+        // untidy one (review R-002). Import A commits its vault and cannot
+        // remove the previous Library, so a marker stays behind and is the
+        // only thing keeping that Library shut across unlock and restart.
+        // Import B is then attempted with the wrong export passphrase and
+        // fails. B must report its own refusal and touch nothing else: the
+        // old Library file is still on disk, and clearing the marker would
+        // let the next matching unlock reopen someone else's bookmarks,
+        // Tab Shelf and download history.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        let old_library = dir.path().join("Library.rbl");
+        std::fs::write(&old_library, b"previous profile").expect("seed old library");
+        super::establish_library_replace_marker(&marker, "import-A")
+            .expect("import A leaves a marker");
+
+        let result: Result<(), _> =
+            super::replace_library(&marker, || {
+                Err(patanyx_vault::ExportError::AuthFailed)
+            });
+
+        assert_eq!(
+            result,
+            Err("export_auth_failed"),
+            "the failing import still owes its own honest code"
+        );
+        assert!(
+            marker.is_file(),
+            "a failed import removed the marker guarding a previous profile's Library"
+        );
+        assert!(
+            old_library.is_file(),
+            "the failed import must not have touched the old Library either"
+        );
+    }
+
+    #[test]
+    fn a_marker_replaced_while_the_import_ran_is_left_alone() {
+        // The interleaving a start-of-call snapshot cannot see (review R-002,
+        // second round). This import finds no marker and writes its own, so
+        // it believes it has the right to remove it. While `install()` runs,
+        // a SECOND import replaces the marker with its own, commits, and
+        // fails to delete the old Library -- so the marker now on disk is the
+        // only thing keeping that Library shut. When this import then fails,
+        // it must notice that what is there is no longer the file it wrote.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        let old_library = dir.path().join("Library.rbl");
+        std::fs::write(&old_library, b"the other import's previous profile")
+            .expect("seed old library");
+
+        let result: Result<(), _> = super::replace_library(&marker, || {
+            assert!(marker.is_file(), "this import must publish its own marker first");
+            // The second import lands here.
+            super::establish_library_replace_marker(&marker, "the-other-import")
+                .expect("the second import republishes the marker under its own name");
+            Err(patanyx_vault::ExportError::AuthFailed)
+        });
+
+        assert_eq!(
+            result,
+            Err("export_auth_failed"),
+            "the failing import still owes its own honest code"
+        );
+        assert!(
+            marker.is_file(),
+            "a failed import removed a marker that another import had replaced it with"
+        );
+        assert!(
+            String::from_utf8_lossy(&std::fs::read(&marker).expect("marker readable"))
+                .contains("owner the-other-import"),
+            "the surviving marker must still be the other import's, untouched"
+        );
+    }
+
+    #[test]
+    fn a_second_import_cannot_run_while_one_is_in_flight() {
+        // What three rounds of heuristics were trying to approximate. The
+        // interleaving that kept costing protection -- a concurrent import
+        // committing a vault inside the window where this one is still
+        // authenticating -- is not detected any more, it is prevented: the
+        // second import cannot enter the transaction at all, and says so with
+        // the code the import form already explains.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        let old_library = dir.path().join("Library.rbl");
+        std::fs::write(&old_library, b"the previous profile's Library")
+            .expect("seed old library");
+
+        let mut inner_result = None;
+        let result: Result<(), _> = super::replace_library(&marker, || {
+            inner_result = Some(super::replace_library(&marker, || Ok(())));
+            Err(patanyx_vault::ExportError::AuthFailed)
+        });
+
+        assert_eq!(
+            inner_result,
+            Some(Err("library_replace_refused")),
+            "a second import ran while the first held the transaction"
+        );
+        assert_eq!(
+            result,
+            Err("export_auth_failed"),
+            "the first import still owes its own honest code"
+        );
+        assert!(
+            !marker.exists(),
+            "nothing committed, so this import's own marker must not be left behind"
+        );
+        assert!(old_library.is_file(), "the old Library is untouched");
+    }
+
+    #[test]
+    fn the_transaction_lock_is_released_for_the_next_import() {
+        // The other half, and the reason this is an OS lock rather than a
+        // file somebody has to remember to delete: once the first import is
+        // over, the next one must be able to run.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("Library.rbl.replace-pending");
+
+        let first: Result<(), _> =
+            super::replace_library(&marker, || Err(patanyx_vault::ExportError::AuthFailed));
+        assert_eq!(first, Err("export_auth_failed"));
+
+        let second: Result<(), &'static str> = super::replace_library(&marker, || Ok(()));
+        assert_eq!(second, Ok(()), "the lock outlived the import that took it");
+    }
+
+    #[test]
+    fn an_unreadable_marker_is_never_assumed_to_be_ours() {
+        // `marker_is_owned_by` decides who may delete protection, so its
+        // failure direction matters more than its success one.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("not-here");
+        assert!(!super::marker_is_owned_by(&missing, "anyone"));
+
+        let marker = dir.path().join("Library.rbl.replace-pending");
+        super::establish_library_replace_marker(&marker, "mine").expect("write marker");
+        assert!(super::marker_is_owned_by(&marker, "mine"));
+        assert!(!super::marker_is_owned_by(&marker, "min"));
+        assert!(!super::marker_is_owned_by(&marker, "mine2"));
+        assert!(!super::marker_is_owned_by(&marker, "theirs"));
+    }
 
     #[test]
     fn a_typed_bookmark_address_cannot_smuggle_a_forbidden_scheme() {
@@ -4421,6 +6617,7 @@ mod tests {
             "ocr_status",
             "blocklist_status",
             "resolver_status",
+            "engine_status",
             "store_status",
             "vault_status",
             "chat_status",
@@ -4641,7 +6838,9 @@ mod tests {
     /// with the same characters is ordinary untrusted web content.
     #[test]
     fn lookalike_chrome_host_is_still_allowed_as_content() {
-        assert!(is_allowed_content_url("http://rbchrome.localhost.evil.com/"));
+        assert!(is_allowed_content_url(
+            "http://rbchrome.localhost.evil.com/"
+        ));
         assert!(is_allowed_content_url("https://notrbchrome.localhost/"));
     }
 
@@ -4696,10 +6895,114 @@ mod tests {
             "http://rbchrome\u{3002}localhost/",
             // U+FF52 FULLWIDTH LATIN SMALL LETTER R, which IDNA maps to 'r'.
             "http://\u{ff52}bchrome.localhost/",
+            // THE TRAILING DOT (security assessment 2026-08-28, R1). The
+            // root-anchored spelling of the same name. It slipped BOTH parsers
+            // rather than one: `host_of` compared the dotted string literally,
+            // and `Url::parse` preserves the dot verbatim, so neither vetoed
+            // while the engine resolves it to the chrome origin. The same gap
+            // reached `classify_uri`, so the subframe request filter -- the
+            // backstop for the one path that skips this predicate -- missed it
+            // too. Both are fixed by trimming in `host_of`.
+            "http://rbchrome.localhost./",
+            "http://rbchrome.localhost.",
+            "https://rbchrome.localhost./index.html",
+            "http://rbchrome.localhost.:80/",
+            "http://user@rbchrome.localhost./",
+            // More than one trailing dot is still the same name to us: the
+            // comparison must not depend on how many were typed.
+            "http://rbchrome.localhost../",
+            // Dot plus a spelling that is already handled, so the two tricks
+            // cannot be combined into a new one.
+            "http://%72bchrome.localhost./",
+            "http://rbchrome\u{3002}localhost./",
+            "http://RBCHROME.LOCALHOST./",
+            // CONTROL CHARACTERS IN THE HOST (same assessment, R10). These made
+            // `Url::parse` FAIL, and the old code treated a parse failure as
+            // "skip the second opinion" -- so breaking the strict parser was the
+            // way past it. Now a rejected URL is denied outright.
+            "http://rbchrome.localhost%00/",
+            "http://rbchrome.localhost%0b/",
+            "http://rbchrome.localhost%0c/",
         ] {
             assert!(
                 !is_allowed_content_url(url),
                 "chrome origin reached the content allowlist: {url:?}"
+            );
+        }
+    }
+
+    /// `host_of` MUST normalise the trailing dot itself, and this pins that
+    /// directly rather than through `is_allowed_content_url`.
+    ///
+    /// The distinction is not pedantry, and a planted-defect run is what found
+    /// it: removing the trim from `host_of` left the table above GREEN, because
+    /// the content predicate also normalises the host it gets from the strict
+    /// parser, and either check alone denies the tab. But the content predicate
+    /// is not the only consumer. `classify_uri` builds the host for the
+    /// request-time reserved-origin filter -- the subframe backstop, which
+    /// exists precisely because a subframe never reaches the navigation
+    /// allowlist -- and it gets its host from HERE, with no second parser to
+    /// cover for it. So the trim in `host_of` is the half of the fix that
+    /// closes the subframe path, and without a test at this level it could be
+    /// deleted as redundant while a real hole reopened silently.
+    #[test]
+    fn host_of_normalises_the_trailing_dot_so_the_subframe_filter_sees_one_name() {
+        let reserved = crate::platform::CHROME_RESERVED_HOST;
+        for url in [
+            "http://rbchrome.localhost./",
+            "http://rbchrome.localhost.",
+            "https://rbchrome.localhost./index.html",
+            "http://rbchrome.localhost.:80/",
+            "http://rbchrome.localhost../",
+            "http://user@rbchrome.localhost./",
+            "http://RBCHROME.LOCALHOST./",
+        ] {
+            assert_eq!(
+                super::super::state::host_of(url).as_deref(),
+                Some(reserved),
+                "host_of handed the reserved-origin filter a name it will not \
+                 match, so a subframe request to {url:?} would not be blocked"
+            );
+        }
+        // Ordinary hosts normalise the same way and keep working.
+        assert_eq!(
+            super::super::state::host_of("https://example.com./x").as_deref(),
+            Some("example.com")
+        );
+        // A bare dot is not a host.
+        assert_eq!(super::super::state::host_of("http://./"), None);
+    }
+
+    /// The fix for the trailing dot must not have been bought by refusing
+    /// ordinary sites, and the fail-closed arm must not have swallowed the
+    /// legitimate web along with the malformed.
+    ///
+    /// Pinned because the cheap way to pass the table above is to deny more, and
+    /// a content predicate that denies real pages is a broken browser rather than
+    /// a secure one.
+    #[test]
+    fn ordinary_urls_still_load_after_the_host_normalisation() {
+        for url in [
+            "https://example.com/",
+            "http://example.com/path?q=1#f",
+            "https://sub.example.co.uk/a/b",
+            // A trailing dot on a NON-reserved host is still that host, and it
+            // must still be allowed -- the trim normalises, it does not reject.
+            "https://example.com./",
+            // Hosts that merely resemble the reserved one.
+            "https://notrbchrome.localhost/",
+            "http://rbchrome.localhost.evil.com/",
+            "https://rbchrome-localhost.example.com/",
+            // Ports, userinfo, IPv6 and IPv4 literals.
+            "https://example.com:8443/x",
+            "http://user:pw@example.com/",
+            "http://[::1]:3000/",
+            "http://127.0.0.1:8080/",
+            "about:blank",
+        ] {
+            assert!(
+                is_allowed_content_url(url),
+                "an ordinary URL was refused by the content allowlist: {url:?}"
             );
         }
     }
@@ -4725,8 +7028,16 @@ mod tests {
     #[test]
     fn malformed_urls_are_denied_and_never_panic() {
         for url in [
-            "", "http://", "https://", "http:///path", "http://@", "http://:80/", "//example.com",
-            "http:/example.com", "javascript:alert(1)", "  http://example.com",
+            "",
+            "http://",
+            "https://",
+            "http:///path",
+            "http://@",
+            "http://:80/",
+            "//example.com",
+            "http:/example.com",
+            "javascript:alert(1)",
+            "  http://example.com",
         ] {
             assert!(!is_allowed_content_url(url), "wrongly allowed: {url:?}");
         }
@@ -4748,13 +7059,19 @@ mod tests {
 
         // The ordinary case: same site, offer allowed, banner names it.
         assert_eq!(
-            login_offer_origin("https://example.com/login", Some("https://example.com/login")),
+            login_offer_origin(
+                "https://example.com/login",
+                Some("https://example.com/login")
+            ),
             Some("example.com".to_string())
         );
         // A fragment or query moved, the site did not. Still one honest offer:
         // refusing here would throw away real submissions on ordinary sites.
         assert_eq!(
-            login_offer_origin("https://example.com/login#a", Some("https://example.com/login?b=1")),
+            login_offer_origin(
+                "https://example.com/login#a",
+                Some("https://example.com/login?b=1")
+            ),
             Some("example.com".to_string())
         );
         // THE RACE: posted from one site, the tab has already moved to another.
@@ -4765,7 +7082,10 @@ mod tests {
         );
         // A subdomain is a different host, and this comparison is exact.
         assert_eq!(
-            login_offer_origin("https://accounts.example.com/", Some("https://example.com/")),
+            login_offer_origin(
+                "https://accounts.example.com/",
+                Some("https://example.com/")
+            ),
             None
         );
         // No tab, no placeable offer.
@@ -4797,7 +7117,12 @@ mod tests {
     /// on a byte index, so this direction is worth a test of its own.
     #[test]
     fn non_ascii_hosts_do_not_panic() {
-        for url in ["http://\u{1F600}", "http://é", "https://ドメイン.jp/パス", "http://é@é/é"] {
+        for url in [
+            "http://\u{1F600}",
+            "http://é",
+            "https://ドメイン.jp/パス",
+            "http://é@é/é",
+        ] {
             let _ = is_allowed_content_url(url);
         }
         assert!(is_allowed_content_url("https://ドメイン.jp/"));
@@ -4825,7 +7150,7 @@ mod tests {
     fn multi_word_becomes_search() {
         assert_eq!(
             normalize_input("rust tutorial"),
-            "https://duckduckgo.com/?q=rust%20tutorial"
+            "https://start.duckduckgo.com/?q=rust%20tutorial"
         );
     }
 
@@ -4833,7 +7158,7 @@ mod tests {
     fn single_word_without_dot_becomes_search() {
         assert_eq!(
             normalize_input("localhost"),
-            "https://duckduckgo.com/?q=localhost"
+            "https://start.duckduckgo.com/?q=localhost"
         );
     }
 
@@ -4841,7 +7166,7 @@ mod tests {
     fn search_encodes_query_chars() {
         assert_eq!(
             normalize_input("what? & why"),
-            "https://duckduckgo.com/?q=what%3F%20%26%20why"
+            "https://start.duckduckgo.com/?q=what%3F%20%26%20why"
         );
     }
 
@@ -4925,7 +7250,10 @@ mod tests {
             "short": "example.com",
             "long": "a".repeat(300),
         });
-        assert_eq!(super::arg_str_capped(&args, "short", 253), Ok("example.com"));
+        assert_eq!(
+            super::arg_str_capped(&args, "short", 253),
+            Ok("example.com")
+        );
         assert_eq!(super::arg_str_capped(&args, "long", 253), Err("bad_args"));
         // A missing key is still bad_args, not a silent empty string.
         assert_eq!(super::arg_str_capped(&args, "absent", 253), Err("bad_args"));
@@ -4947,15 +7275,159 @@ mod tests {
     /// only honest check is the one that looks at what actually ships -- and
     /// both files are compiled into the binary, so they cannot drift apart at
     /// runtime the way two separately-deployed halves could.
+
+    /// Every empty-list case, named. THE TESTER'S BUG is the `locked` row:
+    /// before this existed, that row and the `no-match` row were the same
+    /// answer, and the chrome rendered both as "No saved password for this
+    /// site." A person whose password was saved correctly was told it was
+    /// gone.
+    #[test]
+    fn an_empty_offer_list_says_why_it_is_empty() {
+        use super::autofill_offer_reason;
+        // (origin, vault file exists, unlocked, matched) -> reason
+        let cases = [
+            // The defect. A vault exists and is shut: NOTHING was searched.
+            ((true, true, false, false), "locked"),
+            // Nothing was ever saved anywhere, so there is no vault to unlock.
+            ((true, false, false, false), "no-vault"),
+            // The HOST had no origin for the active tab, so no lookup ran.
+            ((false, true, true, false), "no-site"),
+            // A no-origin page cannot become "locked" or "no-vault": the
+            // lookup was not attempted for a reason that precedes the vault.
+            ((false, true, false, false), "no-site"),
+            ((false, false, false, false), "no-site"),
+            // The ONLY row that asserts a search happened and found nothing.
+            ((true, true, true, false), "no-match"),
+            // A match outranks everything; the chrome renders the offer.
+            ((true, true, true, true), "match"),
+        ];
+        for ((origin, exists, unlocked, matched), want) in cases {
+            let got = autofill_offer_reason(origin, exists, unlocked, matched);
+            assert_eq!(
+                got, want,
+                "origin={origin} exists={exists} unlocked={unlocked} matched={matched}"
+            );
+        }
+    }
+
+    /// The reply itself, not the helper behind it.
+    ///
+    /// This is the test whose absence let a review delete the reason from the
+    /// wire with every other test still green.
+    #[test]
+    fn the_reply_carries_the_reason_for_every_state() {
+        use super::{autofill_offer_payload, AUTOFILL_REASON_FIELD};
+        let none = json!([]);
+        let one = json!([{ "id": "c1", "username": "alice" }]);
+        // (items, has_origin, vault file exists, unlocked) -> reason
+        let cases = [
+            (none.clone(), true, true, false, "locked"),
+            (none.clone(), true, false, false, "no-vault"),
+            (none.clone(), false, true, true, "no-site"),
+            (none.clone(), true, true, true, "no-match"),
+            (one.clone(), true, true, true, "match"),
+        ];
+        for (items, origin, exists, unlocked, want) in cases {
+            let sent = items.clone();
+            let reply = autofill_offer_payload(items, origin, exists, unlocked);
+            let obj = reply.as_object().expect("the reply must be an object");
+            assert!(
+                obj.contains_key(AUTOFILL_REASON_FIELD),
+                "the reply dropped {AUTOFILL_REASON_FIELD:?}; the chrome would \
+                 fall back to \"no saved password\" and tell a user with a \
+                 locked vault that nothing is saved"
+            );
+            assert_eq!(
+                obj.get(AUTOFILL_REASON_FIELD).and_then(|v| v.as_str()),
+                Some(want),
+                "origin={origin} exists={exists} unlocked={unlocked}"
+            );
+            // The items still have to arrive, under their own name.
+            assert_eq!(obj.get("items"), Some(&sent), "the reply lost its items");
+        }
+    }
+
+    /// A locked vault must NEVER answer with the sentence that started this.
+    #[test]
+    fn a_locked_vault_never_reports_no_match() {
+        use super::autofill_offer_reason;
+        for exists in [true, false] {
+            for origin in [true, false] {
+                let got = autofill_offer_reason(origin, exists, false, false);
+                assert_ne!(
+                    got, "no-match",
+                    "a locked vault claimed a search happened (origin={origin} exists={exists})"
+                );
+            }
+        }
+    }
+
+    /// The two halves of the contract, checked against each other.
+    ///
+    /// Same reasoning as `every_error_code_has_user_facing_text` above: the
+    /// producer is Rust, the consumer is a JS object literal with no Rust
+    /// representation, and both are compiled into this binary, so reading the
+    /// chrome as text is the only honest check. It bites in both directions --
+    /// rename the field here and chrome.js no longer contains it; drop a reason
+    /// from the chrome's table and the reason this arm can still emit has no
+    /// text to render.
+    #[test]
+    fn the_chrome_reads_every_reason_this_arm_can_send() {
+        use super::{autofill_offer_reason, AUTOFILL_REASON_FIELD};
+        let chrome = include_str!("chrome/chrome.js");
+        let accessor = format!("data.{AUTOFILL_REASON_FIELD}");
+        assert!(
+            chrome.contains(&accessor),
+            "chrome.js does not read {accessor} -- the reason would be ignored \
+             and every empty list would fall back to \"no saved password\""
+        );
+
+        let table_start = chrome
+            .find("AUTOFILL_REASON_TEXT = {")
+            .expect("AUTOFILL_REASON_TEXT table not found in chrome.js");
+        let table_end = chrome[table_start..]
+            .find("\n  };")
+            .expect("AUTOFILL_REASON_TEXT has no terminator")
+            + table_start;
+        let table = &chrome[table_start..table_end];
+
+        // Collected from the function itself rather than retyped, so a new
+        // reason cannot be added in Rust without this noticing.
+        let mut reachable = Vec::new();
+        for origin in [true, false] {
+            for exists in [true, false] {
+                for unlocked in [true, false] {
+                    let r = autofill_offer_reason(origin, exists, unlocked, false);
+                    if !reachable.contains(&r) {
+                        reachable.push(r);
+                    }
+                }
+            }
+        }
+        assert!(
+            reachable.len() >= 4,
+            "expected every empty-list reason to be reachable, got {reachable:?}"
+        );
+        for reason in reachable {
+            assert!(
+                table.contains(&format!("\"{reason}\"")),
+                "chrome.js has no text for reason {reason:?}; it would render \
+                 the fallback and tell the user something it does not know"
+            );
+        }
+    }
+
     #[test]
     fn every_error_code_has_user_facing_text() {
         let chrome = include_str!("chrome/chrome.js");
+        // The table lives inside a rebuildOnLocaleFill builder now, so its
+        // entries follow a live locale switch; the anchor follows the
+        // assignment and the deeper indentation of the wrapped body.
         let table_start = chrome
-            .find("const ERROR_TEXT = {")
+            .find("ERROR_TEXT = {")
             .expect("ERROR_TEXT table not found in chrome.js");
-        // The table ends at the first line that closes it at top level.
         let table_end = chrome[table_start..]
-            .find("\n  };")
+            .find("\n    };")
             .expect("ERROR_TEXT table has no terminator")
             + table_start;
         let table = &chrome[table_start..table_end];
@@ -5033,10 +7505,7 @@ mod tests {
             let at = own
                 .find(map_fn)
                 .unwrap_or_else(|| panic!("{map_fn} not found; the error map was renamed"));
-            let body_end = own[at..]
-                .find("\n}")
-                .expect("error map has no terminator")
-                + at;
+            let body_end = own[at..].find("\n}").expect("error map has no terminator") + at;
             let body = &own[at..body_end];
             for (arrow_at, _) in body.match_indices("=> \"") {
                 let start = arrow_at + "=> \"".len();
@@ -5226,8 +7695,16 @@ mod tests {
         // Every name added from the privacytests.org set, mixed with a kept
         // param, must be removed while the kept one survives byte-for-byte.
         for name in [
-            "__hsfp", "__hssc", "__hstc", "_hsenc", "hsCtaTracking", "__s", "mkt_tok",
-            "rb_clickid", "vero_conv", "wickedid",
+            "__hsfp",
+            "__hssc",
+            "__hstc",
+            "_hsenc",
+            "hsCtaTracking",
+            "__s",
+            "mkt_tok",
+            "rb_clickid",
+            "vero_conv",
+            "wickedid",
         ] {
             let url = format!("https://x.example/p?keep=1&{name}=track&also=2");
             assert_eq!(
@@ -5389,8 +7866,7 @@ mod unwrap_redirect_tests {
             "about:blank",
         ] {
             let encoded = target.replace(':', "%3A").replace('/', "%2F");
-            let url =
-                format!("https://safelinks.protection.outlook.com/?url={encoded}");
+            let url = format!("https://safelinks.protection.outlook.com/?url={encoded}");
             let out = unwrap_redirect(&url);
             assert_eq!(out, url, "must refuse {target}");
             assert!(!out.starts_with(target), "must never return {target}");
@@ -5415,7 +7891,11 @@ mod unwrap_redirect_tests {
 
     #[test]
     fn an_opaque_shortener_is_untouched_and_never_resolved() {
-        for url in ["https://t.co/abc123", "https://bit.ly/xyz", "https://x.co/q"] {
+        for url in [
+            "https://t.co/abc123",
+            "https://bit.ly/xyz",
+            "https://x.co/q",
+        ] {
             assert_eq!(unwrap_redirect(url), url);
         }
     }
@@ -5428,12 +7908,19 @@ mod unwrap_redirect_tests {
         let wrap = |t: &str| {
             format!(
                 "https://safelinks.protection.outlook.com/?url={}",
-                t.replace(':', "%3A").replace('/', "%2F").replace('?', "%3F").replace('=', "%3D")
+                t.replace(':', "%3A")
+                    .replace('/', "%2F")
+                    .replace('?', "%3F")
+                    .replace('=', "%3D")
             )
         };
         // Four levels: fully unwrapped, since the cap is four.
         let four = wrap(&wrap(&wrap(&wrap(inner))));
-        assert_eq!(unwrap_redirect(&four), inner, "four levels must fully unwrap");
+        assert_eq!(
+            unwrap_redirect(&four),
+            inner,
+            "four levels must fully unwrap"
+        );
 
         // Six levels: exactly two wrappers must remain. Counted rather than
         // string-compared, because each unwrap percent-DECODES its carrier, so
@@ -5447,7 +7934,10 @@ mod unwrap_redirect_tests {
             remaining, 2,
             "six levels minus a cap of four must leave exactly two, got {remaining} in {out}"
         );
-        assert!(out.ends_with(inner), "the innermost target must still be there");
+        assert!(
+            out.ends_with(inner),
+            "the innermost target must still be there"
+        );
     }
 
     /// Compose order: unwrap first, then strip. A destination recovered from a
@@ -5469,7 +7959,10 @@ mod unwrap_redirect_tests {
             LinkChange::Stripped
         );
         assert_eq!(
-            clean_link("https://safelinks.protection.outlook.com/?url=https%3A%2F%2Freal.example%2Fp").1,
+            clean_link(
+                "https://safelinks.protection.outlook.com/?url=https%3A%2F%2Freal.example%2Fp"
+            )
+            .1,
             LinkChange::Unwrapped
         );
     }

@@ -48,7 +48,7 @@ use wry::{Rect, WebContext, WebView, WebViewBuilder, WebViewBuilderExtWindows};
 
 use super::privacy::{
     self, EngineSettings, FreezePhase, HostRecord, ProfileMode, SettingState, TabPolicy, TabState,
-    TlsState,
+    TlsState, TrackingPreventionState,
 };
 use super::{ChromeLayout, CHROME_HEIGHT_PX};
 use crate::shortcuts::{self, Key, Mods};
@@ -74,13 +74,11 @@ fn without_default_context_menu(builder: WebViewBuilder<'_>) -> WebViewBuilder<'
 /// Handled keys are marked handled so the page does not also act on them;
 /// everything else is left alone so typing still works.
 fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+    use webview2_com::AcceleratorKeyPressedEventHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_PHYSICAL_KEY_STATUS,
     };
-    use webview2_com::AcceleratorKeyPressedEventHandler;
-    use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT,
-    };
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
     use wry::WebViewExtWindows;
 
     let proxy = proxy.clone();
@@ -114,11 +112,7 @@ fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                 // The event carries no modifier state, so it is read from the
                 // keyboard: the high bit of GetKeyState means "currently down".
                 let down = |vk| (GetKeyState(i32::from(vk)) as u16 & 0x8000) != 0;
-                let mods = Mods::new(
-                    down(VK_CONTROL.0),
-                    down(VK_SHIFT.0),
-                    down(VK_MENU.0),
-                );
+                let mods = Mods::new(down(VK_CONTROL.0), down(VK_SHIFT.0), down(VK_MENU.0));
 
                 // EVERY keydown is evidence a human is here, not just the bound
                 // ones. This hook already sees them all and used to discard
@@ -136,8 +130,9 @@ fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
 
                 // Virtual key first, scan code only as a fallback: the main row
                 // works today and must keep working exactly as it does.
-                let pressed = shortcuts::vk_key(virtual_key)
-                    .or_else(|| shortcuts::keypad_scan_code(status.ScanCode, status.IsExtendedKey.as_bool()));
+                let pressed = shortcuts::vk_key(virtual_key).or_else(|| {
+                    shortcuts::keypad_scan_code(status.ScanCode, status.IsExtendedKey.as_bool())
+                });
                 if let Some(action) = pressed.and_then(|k| shortcuts::resolve(mods, k)) {
                     let _ = proxy.send_event(UserEvent::Shortcut(action));
                     args.SetHandled(true)?;
@@ -359,8 +354,42 @@ fn profile_dir() -> Option<&'static Path> {
 /// A MALFORMED ARGUMENT FAILS ENVIRONMENT CREATION, which means the browser
 /// does not open at all. That is the risk, it is not hypothetical, and it is
 /// why this is one commit on its own.
+/// THE DEVICE APIS ARE REMOVED, NOT PROMPTED.
+///
+/// A security review asked the question this answers: can a page reach the
+/// hardware over Bluetooth or USB? It could. Web Bluetooth, WebUSB, Web
+/// Serial and WebHID ship ENABLED in the Chromium engine underneath
+/// WebView2, and none of them is a `COREWEBVIEW2_PERMISSION_KIND` -- the
+/// permission handler cannot gate them even in principle, because they are
+/// gated by a device-chooser dialog instead. A page could open that chooser
+/// and one click reached real hardware.
+///
+/// Nothing in this browser uses them, so the honest fix is removal rather
+/// than a prompt: an API that is not there cannot be granted by a tired user
+/// at the wrong moment. Both switches are passed because Chromium splits
+/// these between base features and Blink runtime features and the split is
+/// not stable across versions; naming a flag the engine does not know is
+/// ignored, so the belt and the braces cost nothing.
+///
+/// VERIFICATION IS A HARDWARE CHECK, not a compile: on Windows, confirm
+/// `navigator.bluetooth`, `navigator.usb`, `navigator.serial` and
+/// `navigator.hid` are all `undefined` on a real page. A flag that silently
+/// stopped working would leave this comment claiming a protection the engine
+/// no longer applies.
+/// ONE `--disable-features`, and it has to stay that way.
+///
+/// Chromium parses this switch once: a SECOND `--disable-features=` on the
+/// same command line REPLACES the first rather than merging with it. Passing
+/// the device APIs as their own flag would therefore have silently dropped
+/// msSmartScreenProtection and the rest of the list above it, turning a
+/// hardening commit into a hardening regression. So every value lives in this
+/// single comma-separated list, and anything added later belongs IN it.
 const BROWSER_ARGS: &str = concat!(
     "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection",
+    // Device APIs, removed rather than prompted -- see the block comment
+    // above this constant.
+    ",WebBluetooth,WebUSB,WebSerial,WebHID",
+    " --disable-blink-features=WebBluetooth,WebUSB,Serial,HID",
     " --disable-background-networking",
     " --disable-domain-reliability",
     " --no-pings",
@@ -414,9 +443,14 @@ fn desired_browser_args() -> String {
     // for DNS, which is why changing it needs a restart and why the UI says
     // so rather than pretending otherwise.
     let mut args = String::from(BROWSER_ARGS);
-    let dns = crate::prefs::load().dns;
-    if let (Some(mode), Some(template)) = (dns.doh_mode(), dns.doh_template()) {
-        // `secure`, which FAILS CLOSED. Picking a resolver and then being
+    // ONE resolver per process. The first build freezes what the file said;
+    // every later build -- the fallback path, the translator webview created
+    // long after boot -- is handed that frozen value, never a fresh read of
+    // a file the user may have changed since. Everything that claims a
+    // resolver is IN FORCE (chip, probe, diagnostics) reads the same record.
+    let dns = crate::prefs::applied_dns_or_record(crate::prefs::load().dns);
+    if let Some(doh) = dns.doh_args() {
+        // `secure`, which FAILS CLOSED. Being on a resolver and then being
         // silently downgraded to the network's plaintext DNS is the exact
         // leak the setting exists to close, and WebView2 gives no signal
         // that it happened -- so an `automatic` fallback would be a
@@ -426,12 +460,14 @@ fn desired_browser_args() -> String {
         // resolver chosen, hotel and airport login pages will not load.
         // That is survivable only because it is opt-in and reversible --
         // `System` carries no mode at all, so switching back and
-        // restarting is the way onto such a network, and `describe()` says
-        // so in the sentence shown before the choice is made.
-        args.push_str(" --dns-over-https-mode=");
-        args.push_str(mode);
-        args.push_str(" --dns-over-https-templates=");
-        args.push_str(template);
+        // restarting is the way onto such a network; `describe()` says so
+        // in the sentence shown before the choice is made, and
+        // `resolver_probe` raises a banner with the same instructions when
+        // the resolver is unreachable.
+        //
+        // The switch text itself is composed in prefs.rs (`doh_args`) so a
+        // Linux-run test can pin it; this function only appends it.
+        args.push_str(&doh);
     }
 
     // The tunnel proxy, for the same reason DoH is here: WebView2 accepts
@@ -465,7 +501,7 @@ fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
     };
     use windows::core::{HSTRING, PCWSTR};
     use windows::Win32::Globalization::{
-        LCIDToLocaleName, GetUserDefaultUILanguage, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME,
+        GetUserDefaultUILanguage, LCIDToLocaleName, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME,
     };
 
     static ENV: OnceLock<Option<SendEnv>> = OnceLock::new();
@@ -510,11 +546,10 @@ fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
                             environment.ok_or_else(|| {
                                 windows::core::Error::from(windows::Win32::Foundation::E_POINTER)
                             })
-                        })();
+                        })(
+                        );
                         tx.send(result).map_err(|_| {
-                            windows::core::Error::from(
-                                windows::Win32::Foundation::E_UNEXPECTED,
-                            )
+                            windows::core::Error::from(windows::Win32::Foundation::E_UNEXPECTED)
                         })?;
                         Ok(())
                     },
@@ -625,6 +660,63 @@ pub fn new_webview_builder() -> WebViewBuilder<'static> {
     builder.with_general_autofill_enabled(false)
 }
 
+/// The translator's user-data folder. SEPARATE from the browsing profile, and
+/// separate on purpose.
+///
+/// A separate origin partitions what the ENGINE keys by origin. It does not by
+/// itself stop the two views sharing one user-data folder, and this backend's
+/// own `new_webview_builder` doc spells out the consequence of that folder
+/// being shared: concurrent environments over one directory must be created
+/// with IDENTICAL options, and "anything that ever needs per-webview options
+/// has to give that webview its own directory". The translator is that case --
+/// it needs a looser CSP and it holds hostile page text, so it gets its own
+/// directory rather than borrowing the one the privileged UI lives in.
+///
+/// Sits BESIDE the browsing profile rather than inside it, so a future "clear
+/// browsing data" that empties the profile does not silently take the
+/// downloaded language packs with it, and so a reader of the disk can tell the
+/// two apart.
+fn translator_profile_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = super::translator_profile_dir_for(&Vault::default_path());
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            diag(&format!(
+                "translator profile: could not create {} ({error}); the translator \
+                 webview will fall back to wry's default folder",
+                dir.display()
+            ));
+            return None;
+        }
+        diag(&format!("translator profile: user data folder is {}", dir.display()));
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// Builder for the translator webview: its own data directory, and therefore
+/// NOT the process-wide shared environment.
+///
+/// `shared_environment()` is bound to the browsing profile's folder. Handing it
+/// to a webview pointed at a different directory is the one combination this
+/// backend must not produce, so this takes the documented alternative and
+/// passes the same hardening arguments directly. What it loses relative to the
+/// shared environment is what `hardened_environment()` already reports as lost
+/// in the fallback regime -- crash reporting off, extensions off -- and it
+/// loses that for the TRANSLATOR only, not for the browser.
+pub fn new_translator_webview_builder() -> WebViewBuilder<'static> {
+    let builder = match translator_profile_dir() {
+        Some(dir) => WebViewBuilder::new_with_web_context(Box::leak(Box::new(
+            WebContext::new(Some(dir.to_path_buf())),
+        ))),
+        None => WebViewBuilder::new(),
+    };
+    builder
+        .with_additional_browser_args(&desired_browser_args())
+        .with_general_autofill_enabled(false)
+        .with_navigation_handler(|url: String| url.starts_with(super::TRANSLATE_ORIGIN_PREFIX))
+}
+
 /// Reports a profile left beside the executable by an earlier build.
 ///
 /// MIGRATION DECISION, recorded here because "nothing happened" and "nobody
@@ -672,20 +764,28 @@ pub fn build_chrome(
     proxy: &EventLoopProxy<UserEvent>,
 ) -> Result<WebView, wry::Error> {
     let webview = without_default_context_menu(builder).build_as_child(&hosts.window)?;
+    note_running_environment(&webview);
+    // NOTHING refuses external drops on the chrome, and that absence is
+    // load-bearing. See the note where refuse_chrome_external_drop used to be.
     // Discarded deliberately: the chrome is our own UI, not web content, and
     // has no TabState to report against. `false` because the chrome webview is
     // never built incognito -- it is the persistent UI, and asking for
     // ephemeral here would be a question about a tab that does not exist.
-    let _ = harden_privacy(&webview, false);
+    let _ = harden_privacy(
+        &webview,
+        false,
+        crate::prefs::load().tracking_prevention,
+    );
     connect_shortcuts(&webview, proxy);
     // Child webviews get no automatic layout; the chrome strip gets its
     // initial bounds here and layout() keeps them current from then on.
     // A top strip with no sidebar: the chrome has not measured itself yet, so
     // there is nothing else this could honestly seed from. The first
-    // set_chrome_insets replaces both numbers within a round trip.
+    // set_chrome_insets replaces all three values within a round trip.
     let _ = webview.set_bounds(chrome_rect(
         &hosts.window,
         CHROME_HEIGHT_PX,
+        0,
         0,
         ChromeLayout::Strip,
     ));
@@ -694,6 +794,29 @@ pub fn build_chrome(
     arm_translucent_overlay(hosts, &webview);
     Ok(webview)
 }
+
+// WHY THE CHROME DOES NOT CALL SetAllowExternalDrop.
+//
+// A function here once did, and it was REMOVED TWICE -- the second time
+// because it came back through a merge and broke tab dragging again on
+// real hardware after the fix had already been confirmed there.
+//
+// The removed code argued, correctly quoting Microsoft, that AllowExternalDrop
+// governs only objects dragged in from OUTSIDE the WebView2 bounds, so a tab
+// drag beginning and ending inside the same webview should be unaffected.
+// MEASURED on Windows 11, 2026-08-26: it is affected. The same binary, one
+// environment switch apart, refuses to drag a tab with the setter and drags
+// correctly with the engine default. Two independent source-only readings of
+// that documentation -- the original one and an independent review's -- both concluded
+// it was safe, and both were wrong. Do not re-add it from the documentation.
+//
+// wry's `with_drag_drop_handler` stays absent for a related reason: setting one
+// makes wry RevokeDragDrop the engine's own child-HWND drop target and register
+// a CF_HDROP-only replacement, which cannot carry an in-page text/plain drag.
+//
+// What refuses a dropped file is the navigation handler in main.rs: the chrome
+// may only ever navigate to CHROME_ORIGIN_PREFIX. The chrome has no file inputs
+// and denies new windows unconditionally.
 
 /// Arms the translucent-backdrop lift, and ONLY if both of its legs stand.
 ///
@@ -850,6 +973,9 @@ static READOUT_SUPPRESSED: AtomicBool = AtomicBool::new(false);
 /// layout, which is what every build before the sidebar reported. Written by
 /// layout(), read by the callback, same contract as READOUT_SCALE.
 static READOUT_LEFT: AtomicI32 = AtomicI32::new(0);
+/// Logical pixels reserved at the page's right edge. Unlike the left value it
+/// does not move the origin; it caps the readout width before the right rail.
+static READOUT_RIGHT: AtomicI32 = AtomicI32::new(0);
 /// Palette, as Win32 COLORREFs (0x00BBGGRR -- hover_style::colorref does the
 /// swap and its tests are what stop these being orange).
 static READOUT_FG: AtomicU32 = AtomicU32::new(0);
@@ -1049,8 +1175,10 @@ fn readout_apply(text: Option<&str>) {
     // so it is scaled here and nowhere else.
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let left_px = (f64::from(READOUT_LEFT.load(Ordering::Relaxed)) * readout_scale()) as i32;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let right_px = (f64::from(READOUT_RIGHT.load(Ordering::Relaxed)) * readout_scale()) as i32;
     let (x, y, w, h) =
-        crate::hover_style::readout_rect(client.right, client.bottom, left_px, text_w, line_h);
+        crate::hover_style::readout_rect(client.right, client.bottom, left_px, right_px, text_w, line_h);
 
     // HWND_TOP on every show: content webviews are created AFTER this window
     // (arm runs before the first tab), and siblings later in creation order
@@ -1073,7 +1201,7 @@ fn readout_apply(text: Option<&str>) {
 /// Builds (or rebuilds) the readout font for the current scale.
 fn rebuild_readout_font() {
     use windows::Win32::Graphics::Gdi::{
-        CreateFontIndirectW, DeleteObject, HFONT, HGDIOBJ, CLEARTYPE_QUALITY, FW_NORMAL, LOGFONTW,
+        CreateFontIndirectW, DeleteObject, CLEARTYPE_QUALITY, FW_NORMAL, HFONT, HGDIOBJ, LOGFONTW,
     };
 
     let scale = readout_scale();
@@ -1143,8 +1271,8 @@ fn readout_paint(hwnd: windows::Win32::Foundation::HWND) {
     use windows::Win32::Foundation::{COLORREF, RECT};
     use windows::Win32::Graphics::Gdi::{
         BeginPaint, CreateSolidBrush, DeleteObject, DrawTextW, EndPaint, FillRect, SelectObject,
-        SetBkMode, SetTextColor, HFONT, HGDIOBJ, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS,
-        DT_SINGLELINE, DT_VCENTER, PAINTSTRUCT, TRANSPARENT,
+        SetBkMode, SetTextColor, DT_LEFT, DT_NOPREFIX, DT_PATH_ELLIPSIS, DT_SINGLELINE, DT_VCENTER,
+        HFONT, HGDIOBJ, PAINTSTRUCT, TRANSPARENT,
     };
     use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
@@ -1227,9 +1355,7 @@ fn readout_paint(hwnd: windows::Win32::Foundation::HWND) {
 /// never created or the runtime predates `ICoreWebView2_12` (SDK 1.0.1108).
 fn connect_hover_readout(webview: &WebView) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_12;
-    use webview2_com::{
-        NavigationStartingEventHandler, StatusBarTextChangedEventHandler,
-    };
+    use webview2_com::{NavigationStartingEventHandler, StatusBarTextChangedEventHandler};
     use windows::core::Interface as _;
     use wry::WebViewExtWindows;
 
@@ -1274,7 +1400,9 @@ fn connect_hover_readout(webview: &WebView) -> bool {
     }
 
     let Ok(v12) = core.cast::<ICoreWebView2_12>() else {
-        diag("hover readout: no ICoreWebView2_12 on this runtime; this tab reports no link targets");
+        diag(
+            "hover readout: no ICoreWebView2_12 on this runtime; this tab reports no link targets",
+        );
         return false;
     };
 
@@ -1334,6 +1462,88 @@ fn connect_hover_readout(webview: &WebView) -> bool {
 /// message shape that reads a page's DOM back out on demand, and no shape
 /// this side will act on besides the two named in the script's own header.
 const CONTENT_AUTOFILL_SCRIPT: &str = include_str!("../content_scripts/autofill.js");
+/// The translation seam's page half. ONE FILE FOR BOTH ENGINES: it picks its
+/// transport by feature detection, so this backend and unix cannot drift into
+/// two scripts that agree on nothing.
+const CONTENT_TRANSLATE_SCRIPT: &str = include_str!("../content_scripts/translate_extract.js");
+
+/// The name of the shared page-to-host channel, for symmetry with unix.
+///
+/// THERE IS NO SEPARATE CHANNEL HERE, and that is the honest difference.
+/// WebKitGTK needed a second, registered handler because its reply mechanism
+/// is per-handler; WebView2 has one `WebMessageReceived` stream per webview and
+/// a real host-to-page push, so translation rides the stream autofill already
+/// uses and is told apart by `kind`. Registering a second anything would be
+/// ceremony.
+pub const TRANSLATE_CHANNEL: &str = "chrome.webview";
+
+/// Whether content webviews on this backend have a translation channel.
+///
+/// Always true once a content webview exists: `window.chrome.webview` is
+/// native to every WebView2 document and needs no shim, unlike WebKitGTK where
+/// the handler registration can fail and is therefore measured. The per-TAB
+/// question -- is a document actually listening -- is `translate_page_ready`,
+/// and that one is observed rather than assumed on both backends.
+pub fn translate_channel_supported() -> bool {
+    true
+}
+
+/// Sends one host-authored message to a content page.
+///
+/// See unix's twin for the contract. Here it is `PostWebMessageAsJson`, the
+/// same channel `fill_credential` and `set_page_scrollbar` already use -- host
+/// into page, one direction, and NOT `evaluate_script`, which state.rs forbids
+/// on content webviews.
+///
+/// `message` is HOST-AUTHORED JSON and crosses as DATA. The engine parses it
+/// and hands the page a structured object; no JavaScript source is built from
+/// it at either end, which is what keeps translated text -- text that came
+/// from a page and is going back into one -- off every evaluation path.
+pub fn deliver_translation(webview: &WebView, view: &TabView, message: String) -> bool {
+    use windows::core::{HSTRING, PCWSTR};
+    use wry::WebViewExtWindows;
+    // Refused rather than attempted when no document has announced itself:
+    // the engine drops a message posted to a page with no listener, and a
+    // silent drop reported as success is how a user ends up watching a
+    // translation that was never going to arrive.
+    if !view.state.borrow().translate_page_ready {
+        return false;
+    }
+    let core = webview.webview();
+    let text = HSTRING::from(message);
+    if unsafe { core.PostWebMessageAsJson(PCWSTR(text.as_ptr())) }.is_err() {
+        diag("translate: PostWebMessageAsJson refused; this tab cannot be translated until it reloads");
+        return false;
+    }
+    true
+}
+
+/// Whether a document in this tab is listening for translation commands.
+pub fn translate_page_ready(view: &TabView) -> bool {
+    view.state.borrow().translate_page_ready
+}
+
+/// Builds the hidden translator webview. See the unix sibling for the rules
+/// this follows; the difference here is only how "hidden" is expressed.
+///
+/// A fresh WebView2 child defaults to VISIBLE, which is why `build_content`
+/// hides tabs immediately after creating them. Same hazard, same remedy, one
+/// difference: this view is never shown afterwards by anything.
+pub fn build_translator(hosts: &Hosts, builder: WebViewBuilder<'_>) -> Result<WebView, wry::Error> {
+    let webview = builder.build_as_child(&hosts.window)?;
+    note_running_environment(&webview);
+    let _ = webview.set_visible(false);
+    Ok(webview)
+}
+
+/// Debug-only sibling of unix's `build_probe`; see there for why it exists.
+/// Never compiled into a release binary.
+#[cfg(debug_assertions)]
+pub fn build_probe(hosts: &Hosts, builder: WebViewBuilder<'_>) -> Result<WebView, wry::Error> {
+    let webview = builder.build_as_child(&hosts.window)?;
+    note_running_environment(&webview);
+    Ok(webview)
+}
 
 pub fn build_content(
     hosts: &Hosts,
@@ -1344,7 +1554,7 @@ pub fn build_content(
     malicious_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
     id: u64,
     permissions: crate::state::PermissionBook,
-) -> Result<(WebView, TabView), wry::Error> {
+) -> Result<(WebView, TabView, bool), wry::Error> {
     // ENGINE-OWNED ZOOM HOTKEYS, on content tabs only.
     //
     // Measured 2026-07-28: WebView2 never delivers keypad keys to
@@ -1397,11 +1607,16 @@ pub fn build_content(
     // document-start way as autofill. wry keeps initialization scripts in a
     // Vec, so this ADDS to autofill rather than replacing it.
     let builder = builder.with_initialization_script(privacy::GPC_SCRIPT);
+    // The translation seam, added the same way and for the same reason. It
+    // reads nothing and sends nothing until the host asks -- see its header.
+    let builder = builder.with_initialization_script(CONTENT_TRANSLATE_SCRIPT);
     let webview = builder.build_as_child(&hosts.window)?;
-    let hardening = harden_privacy(&webview, policy.ephemeral);
-    // Before this tab can navigate anywhere: a new session must not inherit
-    // the last one's logins. No-op after the first content webview.
-    clear_cookies_for_new_session(&webview);
+    note_running_environment(&webview);
+    let hardening = harden_privacy(
+        &webview,
+        policy.ephemeral,
+        crate::prefs::load().tracking_prevention,
+    );
     connect_shortcuts(&webview, proxy);
     // Tabs start hidden; AppState activates one via show_tab + layout. A
     // fresh WebView2 child defaults to visible, so hide it before it can
@@ -1409,7 +1624,7 @@ pub fn build_content(
     let _ = webview.set_visible(false);
     // Seeded, not final: the tab is hidden here and AppState calls layout()
     // when it activates one, which is where the current insets are applied.
-    let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX, 0, 0));
+    let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX, 0, 0, 0));
 
     let state = Rc::new(RefCell::new(TabState::new(policy)));
     {
@@ -1429,7 +1644,16 @@ pub fn build_content(
         // Right-click menu. Its own registration, because a tab whose menu
         // failed to register is not a tab whose autofill failed.
         connect_context_menu(&webview, proxy, window_hwnd(hosts));
-        st.content_script_registered = if connect_content_messages(&webview, proxy, id) {
+        let content_messages = connect_content_messages(&webview, proxy, id, state.clone());
+        st.content_script_registered = if content_messages {
+            SettingState::Applied
+        } else {
+            SettingState::Failed
+        };
+        // The same native WebMessageReceived registration carries the
+        // divergence script's batched count-only reports. Keep a separate
+        // state because autofill and probe reporting make different claims.
+        st.fingerprint_probe_reporting = if content_messages {
             SettingState::Applied
         } else {
             SettingState::Failed
@@ -1437,19 +1661,19 @@ pub fn build_content(
         // Deny-by-default permissions. Its own registration line, because a
         // tab whose permission handler failed is not a tab whose autofill
         // failed, and the panel reports them separately.
-        st.permissions_registered =
-            if connect_permission_policy(&webview, permissions.clone(), id) {
-                SettingState::Applied
-            } else {
-                SettingState::Failed
-            };
+        st.permissions_registered = if connect_permission_policy(&webview, permissions.clone(), id)
+        {
+            SettingState::Applied
+        } else {
+            SettingState::Failed
+        };
         // The hover readout's status-bar hook. Content tabs only -- the
         // chrome is our own UI and a hover in the toolbar is not a
         // destination. Failure diags inside and the tab simply reports no
         // link targets; nothing else about the tab is affected.
         let _ = connect_hover_readout(&webview);
     }
-    connect_request_interception(&webview, state.clone(), malicious_override);
+    connect_request_interception(&webview, state.clone(), malicious_override, proxy.clone(), id);
     connect_navigation_events(&webview, state.clone(), proxy);
     connect_cert_errors(&webview, state.clone());
     // Fingerprint noise. Registered on the raw ICoreWebView2 rather than the
@@ -1475,10 +1699,25 @@ pub fn build_content(
     // satisfies (about:blank is allowed explicitly, and the rest arrive
     // pre-validated by the same predicate). Strictly more restrictive, in
     // the direction the allowlist already intended.
-    if let Err(error) = webview.load_url(url) {
-        diag(&format!("build: initial navigation to {url} failed ({error})"));
+    // The saved profile is wiped asynchronously ONCE per process. Every tab
+    // built while it runs stays blank; the completion event releases their
+    // initial navigations through AppState. This closes both races: the first
+    // page cannot start before ClearBrowsingData completes, and a fast second
+    // tab cannot outrun the first tab's clear. An ephemeral tab neither needs
+    // nor claims the saved-profile wipe; the first ordinary tab still does it.
+    let initial_navigation_pending = if policy.ephemeral {
+        false
+    } else {
+        begin_new_session_wipe(&webview, proxy)
+    };
+    if !initial_navigation_pending {
+        if let Err(error) = super::load_initial_url(&webview, id, url) {
+            diag(&format!(
+                "build: initial navigation to {url} failed ({error})"
+            ));
+        }
     }
-    Ok((webview, TabView { state }))
+    Ok((webview, TabView { state }, initial_navigation_pending))
 }
 
 /// Registers the Fingerprint Divergence script for every document this
@@ -1518,8 +1757,8 @@ fn install_divergence_script(webview: &WebView, ephemeral: bool) {
     };
     let core = webview.webview();
     let source_wide: Vec<u16> = source.encode_utf16().chain(std::iter::once(0)).collect();
-    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
-        |hr, _script_id| {
+    let handler =
+        AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|hr, _script_id| {
             if hr.is_err() {
                 diag(
                     "divergence: registration REFUSED by the engine; \
@@ -1527,8 +1766,7 @@ fn install_divergence_script(webview: &WebView, ephemeral: bool) {
                 );
             }
             Ok(())
-        },
-    ));
+        }));
     let result = unsafe {
         core.AddScriptToExecuteOnDocumentCreated(
             windows::core::PCWSTR(source_wide.as_ptr()),
@@ -1616,7 +1854,9 @@ pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
         let core = webview.webview();
         let text = HSTRING::from(privacy::page_scrollbar_message(rgb));
         if unsafe { core.PostWebMessageAsJson(PCWSTR(text.as_ptr())) }.is_err() {
-            diag("page scrollbar: PostWebMessageAsJson refused; this tab recolours on its next load");
+            diag(
+                "page scrollbar: PostWebMessageAsJson refused; this tab recolours on its next load",
+            );
         }
     }
     let previous = view.state.borrow_mut().scrollbar_script_id.take();
@@ -1625,8 +1865,10 @@ pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
         let core = webview.webview();
         // A failed removal is diag'd and the add still happens: a stale
         // duplicate is a redundant sheet, a missing one is a grey scrollbar.
-        if unsafe { core.RemoveScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(id_wide.as_ptr())) }
-            .is_err()
+        if unsafe {
+            core.RemoveScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(id_wide.as_ptr()))
+        }
+        .is_err()
         {
             diag("page scrollbar: could not remove the previous registration; the new one is added beside it");
         }
@@ -1634,7 +1876,8 @@ pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
     add_scrollbar_script(webview, &view.state, rgb);
 }
 
-/// Receives what `CONTENT_AUTOFILL_SCRIPT` posts UP from this tab.
+/// Receives the two narrowly-shaped messages content scripts post UP from
+/// this tab: credential submissions and batched fingerprint-probe counts.
 ///
 /// Registered directly on the raw `ICoreWebView2`, the same escape hatch
 /// `connect_navigation_events` already uses -- NOT through wry's
@@ -1649,7 +1892,16 @@ pub fn set_page_scrollbar(webview: &WebView, view: &TabView, rgb: [u8; 3]) {
 /// `content_script_registered` reports -- not whether any message has
 /// arrived yet, which most tabs (no login form, nothing submitted) will
 /// never see and must not be reported as a failure.
-fn connect_content_messages(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: u64) -> bool {
+fn connect_content_messages(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+    // Shared with the tab, so the handler can record that a document
+    // announced itself for translation. WebView2 raises these on the UI
+    // thread, so Rc/RefCell is correct here for the same reason it is for
+    // every other per-tab handler in this file.
+    ready_state: Rc<RefCell<TabState>>,
+) -> bool {
     use webview2_com::{take_pwstr, WebMessageReceivedEventHandler};
     use windows::core::PWSTR;
     use wry::WebViewExtWindows;
@@ -1676,12 +1928,68 @@ fn connect_content_messages(webview: &WebView, proxy: &EventLoopProxy<UserEvent>
                 let Ok(msg) = serde_json::from_str::<serde_json::Value>(&text) else {
                     return Ok(());
                 };
-                // The ONE message shape this side acts on, named in the
-                // script's own header comment. Anything else -- a future
+                let kind = msg.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+
+                // TRANSLATION rides this same stream. WebView2 gives one
+                // WebMessageReceived per webview, so a second registration
+                // would be ceremony; the messages are told apart by `kind`.
+                // "detected" WAS MISSING FROM THIS LIST, and the cost of that
+                // was invisible by construction: the page announced its
+                // declared language, this filter dropped it, and everything
+                // downstream -- the source prefill, the "looks like Greek"
+                // hint, translate-as-you-browse -- was built, tested on the
+                // other backend, and dead on the platform most users run.
+                // The test over in state.rs now derives this list from what
+                // the content script actually posts, so the NEXT kind cannot
+                // be forgotten here the same way.
+                if kind == "ready" || kind == "extract" || kind == "detected" {
+                    // WHERE THE MESSAGE CAME FROM IS THE ENGINE'S ANSWER, NOT
+                    // THE PAGE'S -- the F20 rule below, applied here BEFORE it
+                    // can be got wrong rather than after. The script posts an
+                    // `href`; a page can put anything there. `Source` is the
+                    // URI of the document that actually sent the message, so
+                    // the page's claim is OVERWRITTEN with the engine's answer
+                    // and the host never sees the page's version at all.
+                    let mut src = PWSTR::null();
+                    if args.Source(&mut src).is_err() {
+                        return Ok(());
+                    }
+                    let source = take_pwstr(src);
+                    if source.is_empty() {
+                        return Ok(());
+                    }
+                    if kind == "ready" {
+                        // Not forwarded to the event loop: readiness is a
+                        // property of this tab's view, and the panel reads it
+                        // through translate_page_ready when it needs it.
+                        ready_state.borrow_mut().translate_page_ready = true;
+                        return Ok(());
+                    }
+                    let mut msg = msg;
+                    if let Some(obj) = msg.as_object_mut() {
+                        obj.insert("href".into(), serde_json::Value::String(source));
+                    }
+                    let _ = proxy.send_event(UserEvent::ContentTranslate(id, msg.to_string()));
+                    return Ok(());
+                }
+
+                // Probe reports are page-sourced and therefore untrusted.
+                // The shared decoder accepts only a fixed surface name and
+                // an integer delta; no readout content can enter the event.
+                if kind == "fingerprint_probe_counts" {
+                    if let Some(counts) = crate::state::fingerprint_probe_report(&msg) {
+                        let _ =
+                            proxy.send_event(UserEvent::FingerprintProbes { tab_id: id, counts });
+                    }
+                    return Ok(());
+                }
+
+                // The ONE message shape left that this side acts on, named in
+                // the script's own header comment. Anything else -- a future
                 // script version, a malformed frame -- is silently ignored,
                 // not an error: content is untrusted input, and a parse
                 // failure here must never do anything but nothing.
-                if msg.get("kind").and_then(|v| v.as_str()) != Some("login_submit") {
+                if kind != "login_submit" {
                     return Ok(());
                 }
                 // WHERE THE MESSAGE CAME FROM IS THE ENGINE'S ANSWER, NOT
@@ -1791,13 +2099,17 @@ pub fn fill_credential(webview: &WebView, username: &str, password: &str) -> boo
 /// Every error path ends in deny-and-handled. A failed Uri read or a failed
 /// PermissionKind read must not fall through to the engine default, which
 /// would prompt or allow.
-fn connect_permission_policy(webview: &WebView, book: crate::state::PermissionBook, id: u64) -> bool {
+fn connect_permission_policy(
+    webview: &WebView,
+    book: crate::state::PermissionBook,
+    id: u64,
+) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2PermissionRequestedEventArgs2, ICoreWebView2PermissionRequestedEventArgs3,
         COREWEBVIEW2_PERMISSION_KIND_CAMERA, COREWEBVIEW2_PERMISSION_KIND_GEOLOCATION,
         COREWEBVIEW2_PERMISSION_KIND_MICROPHONE, COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS,
-        COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION,
-        COREWEBVIEW2_PERMISSION_STATE_ALLOW, COREWEBVIEW2_PERMISSION_STATE_DENY,
+        COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION, COREWEBVIEW2_PERMISSION_STATE_ALLOW,
+        COREWEBVIEW2_PERMISSION_STATE_DENY,
     };
     use webview2_com::{take_pwstr, PermissionRequestedEventHandler};
     use windows::core::{Interface, PWSTR};
@@ -1831,7 +2143,27 @@ fn connect_permission_policy(webview: &WebView, book: crate::state::PermissionBo
                 } else if raw_kind == COREWEBVIEW2_PERMISSION_KIND_NOTIFICATIONS {
                     crate::state::PermKind::Notifications
                 } else {
-                    // Out of scope: not handled, not recorded, engine default.
+                    // ANY OTHER PERMISSION KIND IS REFUSED, and that is the
+                    // whole point of the arm.
+                    //
+                    // This used to `return Ok(())` without deciding, which
+                    // handed the request to WebView2's own prompt. A security
+                    // review found what that costs: clipboard reading, File
+                    // System Access, MIDI SysEx, multiple automatic
+                    // downloads, window management -- and every kind a future
+                    // runtime adds -- reached a dialog offering Allow, and an
+                    // Allow granted there is SAVED IN THE PROFILE, because
+                    // `SetSavesInProfile(false)` lives further down a path
+                    // this early return never reached. A browser that exists
+                    // to refuse things had a default of "ask the engine, and
+                    // remember whatever it answers".
+                    //
+                    // Deny-and-handle instead. The cost is honest and small:
+                    // a kind this browser has no UI for cannot be granted at
+                    // all, rather than being granted behind our back. Adding
+                    // one to the four handled kinds above is what unblocks
+                    // it, deliberately.
+                    deny_and_handle(&args);
                     return Ok(());
                 };
 
@@ -2039,11 +2371,13 @@ fn connect_request_interception(
     webview: &WebView,
     state: Rc<RefCell<TabState>>,
     malicious_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    proxy: EventLoopProxy<UserEvent>,
+    tab_id: u64,
 ) {
     use webview2_com::take_pwstr;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2_22, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
-        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET,
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET,
         COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
     };
     // Generated handler wrappers live at the crate root, not under the raw
@@ -2115,12 +2449,16 @@ fn connect_request_interception(
                         // A FAILED context read maps to not-a-socket on
                         // purpose: the socket path is an exemption, and an
                         // unclassifiable request must not inherit it.
-                        let websocket = {
+                        let context = {
                             let mut context = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL;
-                            args.ResourceContext(&mut context)
-                                .map(|()| context == COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET)
-                                .unwrap_or(false)
+                            args.ResourceContext(&mut context).ok().map(|()| context)
                         };
+                        let websocket = context == Some(COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET);
+                        // A failed context read is None, and None is not a
+                        // document: the held-page path fails CLOSED on an
+                        // unclassifiable request, which then gets the ordinary
+                        // silent refusal below rather than a banner.
+                        let is_document = context == Some(COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
                         // These bindings return the object rather than
                         // filling an out-param. take_pwstr converts and
                         // frees.
@@ -2180,20 +2518,142 @@ fn connect_request_interception(
                             return Ok(());
                         }
 
+                        // FIRST-PARTY MARKER (see marker.rs). In-page
+                        // navigations and subresource fetches to the two
+                        // PATANYX domains carry X-Patanyx: 1; the exact-host
+                        // check lives in marker::is_our_site and its tests.
+                        // A failure to set the header is only a missing
+                        // badge, so it is diagnosed and never blocks the
+                        // request.
+                        if uri.as_deref().is_some_and(crate::marker::is_our_site) {
+                            let set = (|| -> windows::core::Result<()> {
+                                let request = args.Request()?;
+                                let headers = request.Headers()?;
+                                let name = HSTRING::from("X-Patanyx");
+                                let value = HSTRING::from("1");
+                                unsafe {
+                                    headers.SetHeader(
+                                        PCWSTR(name.as_ptr()),
+                                        PCWSTR(value.as_ptr()),
+                                    )
+                                }
+                            })();
+                            if set.is_err() {
+                                diag("request: marker header could not be set");
+                            }
+                        }
+
                         // One borrow, released before any COM call below:
                         // WebView2 can re-enter on the UI thread, and a
                         // RefCell held across a COM call is a panic waiting
                         // for the right page.
                         let decision = {
                             let mut st = handler_state.borrow_mut();
+                            // The tab's ad-list override, or None. Read here
+                            // rather than inside the decision so the rule
+                            // stays a function of its arguments: see
+                            // `decide_request`'s own doc.
+                            let override_host = st.adlist_override_host();
                             st.decide_request(
                                 uri.as_deref(),
                                 websocket,
                                 privacy::bundled_rules(),
                                 Instant::now(),
+                                override_host.as_deref(),
                             )
                         };
                         trace_request(&decision, uri.as_deref(), websocket);
+
+                        // THE HELD PAGE. A refused DOCUMENT request that is
+                        // the top-level document the user navigated to gets
+                        // OUR placeholder and a banner, not the engine's error
+                        // page. Every other refusal keeps the silent 403.
+                        //
+                        // Three things have to be true, and each one is a way
+                        // this becomes a consent-spoofing surface if skipped:
+                        // the reason is the ad list (a freeze or the reserved
+                        // origin must never offer "Open anyway"); the context
+                        // is DOCUMENT; and the correlation says this request
+                        // is the navigation's own document rather than an
+                        // iframe's, which the engine will not say for us
+                        // (toplevel_request.rs explains what it will not
+                        // expose). The borrow is released before any COM
+                        // call, per this file's standing hazard.
+                        // EVERY document request consumes its correlation
+                        // slot, allowed or refused, and it does so before the
+                        // decision is looked at. Consuming only on refusal
+                        // left an allowed page's slot armed, and a same-URL
+                        // iframe requested after blocking was switched on
+                        // took it: banner raised, placeholder in the frame,
+                        // real page still on screen (review R-001, round 4).
+                        // The correlation hands back the COMPLETE navigation
+                        // URL, fragment included; the request URI never
+                        // carries one (R-006).
+                        let nav_url = if is_document {
+                            uri.as_deref().and_then(|u| {
+                                handler_state.borrow_mut().toplevel.take_top_level_document(u)
+                            })
+                        } else {
+                            None
+                        };
+                        if let privacy::RequestDecision::Block(privacy::BlockReason::AdRule) = decision {
+                            let held = nav_url;
+                            // No nonce means the placeholder cannot be told
+                            // apart from a server document downstream, so it
+                            // is not served: the request gets the plain 403
+                            // below and no banner. Losing the banner is the
+                            // safe failure; recording our own bytes as the
+                            // site's is not (review R-002, round 3).
+                            let held = held.filter(|_| !crate::adlist_consent::held_nonce().is_empty());
+                            if let Some(url) = held {
+                                let host = privacy::host_of(&url).unwrap_or_default();
+                                let method = handler_state.borrow().last_top_level_method.clone();
+                                let _ = proxy.send_event(UserEvent::AdlistBlocked {
+                                    tab_id,
+                                    url,
+                                    host,
+                                    method,
+                                });
+                                let placed = (|| -> windows::core::Result<()> {
+                                    use windows::Win32::UI::Shell::SHCreateMemStream;
+                                    // SAFETY: COM interop; the stream owns a
+                                    // copy of the bytes and outlives the call.
+                                    let stream = unsafe {
+                                        SHCreateMemStream(Some(
+                                            crate::adlist_consent::PLACEHOLDER_HTML.as_bytes(),
+                                        ))
+                                    }
+                                    .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+                                    // A 200, because a 4xx renders the engine's
+                                    // error page over our document. The marker
+                                    // header is how the integrity capture and
+                                    // the navigation handler tell this load
+                                    // apart from a server document.
+                                    let text = HSTRING::from("OK");
+                                    // The marker's VALUE is a per-process
+                                    // secret, so a server cannot forge it:
+                                    // see adlist_consent::held_nonce.
+                                    let headers = HSTRING::from(format!(
+                                        "Content-Type: text/html; charset=utf-8\r\nX-PATANYX-Held: {}",
+                                        crate::adlist_consent::held_nonce()
+                                    ));
+                                    let response = environment.CreateWebResourceResponse(
+                                        Some(&stream),
+                                        200,
+                                        PCWSTR(text.as_ptr()),
+                                        PCWSTR(headers.as_ptr()),
+                                    )?;
+                                    args.SetResponse(&response)
+                                })();
+                                if let Err(error) = placed {
+                                    // Say so, and fall through to the 403 so
+                                    // the request still never leaves.
+                                    diag(&format!("adlist: placeholder FAILED ({error}); refusing with 403 instead"));
+                                } else {
+                                    return Ok(());
+                                }
+                            }
+                        }
 
                         let privacy::RequestDecision::Block(reason) = decision else {
                             // ALLOWED. Before the request proceeds, stamp the
@@ -2400,8 +2860,9 @@ fn trace_request(decision: &privacy::RequestDecision, uri: Option<&str>, websock
 /// reports when secure-mode DoH fails, so guessing wide is the safe direction.
 ///
 /// Excluded on purpose:
-///   * the CERTIFICATE_* statuses -- a TLS problem, which `#tls-warning`
-///     already owns and which says nothing about name resolution;
+///   * the CERTIFICATE_* statuses -- a TLS problem, which the Tab Activity
+///     panel's certificate lines already own and which says nothing about
+///     name resolution;
 ///   * OPERATION_CANCELED -- that is a user navigating away mid-load, not a
 ///     failure at all, and counting it would accuse the network every time
 ///     someone was impatient.
@@ -2475,6 +2936,20 @@ fn connect_navigation_events(
                     let mut uri = PWSTR::null();
                     if args.Uri(&mut uri).is_ok() {
                         let uri = take_pwstr(uri);
+                        // Record this hop for the request handler's top-level
+                        // correlation. NavigationStarting re-fires per redirect
+                        // hop with the same id and the new URI, and the
+                        // recorder treats each hop as its own document
+                        // request, so a redirect INTO a listed host lands on
+                        // the banner rather than an engine error.
+                        {
+                            let mut nav_id: u64 = 0;
+                            let _ = args.NavigationId(&mut nav_id);
+                            starting_state
+                                .borrow_mut()
+                                .toplevel
+                                .on_navigation_starting(nav_id, &uri);
+                        }
                         // TRACKING-PARAM STRIPPING, top-level only.
                         //
                         // This event is the TOP FRAME: WebView2 has a separate
@@ -2497,6 +2972,9 @@ fn connect_navigation_events(
                         // treated as "might be a POST" and skips stripping:
                         // the conservative end is losing a strip, never losing
                         // someone's typed data.
+                        // Read once, kept for the held-page banner: a form
+                        // submission that gets held cannot be replayed, and
+                        // the copy has to say so before the click.
                         let body_bearing = match args.RequestHeaders() {
                             Ok(headers) => {
                                 let name = windows::core::w!("Content-Type");
@@ -2519,7 +2997,11 @@ fn connect_navigation_events(
                             }
                         };
                         if let Some(clean) =
-                            (!body_bearing).then(|| crate::ipc::navigation_strip_target(&uri)).flatten()
+                            {
+                                starting_state.borrow_mut().last_top_level_method =
+                                    if body_bearing { "POST" } else { "GET" }.to_string();
+                                (!body_bearing).then(|| crate::ipc::navigation_strip_target(&uri)).flatten()
+                            }
                         {
                             let mut wide: Vec<u16> =
                                 clean.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2563,6 +3045,15 @@ fn connect_navigation_events(
                 // Success and failure both count as finished: a failed load
                 // must not leave the tab permanently unfreezable.
                 state.borrow_mut().on_load_finished(Instant::now());
+                // A finished navigation can no longer explain a request;
+                // leaving it would let a later same-URL iframe be taken for
+                // the page.
+                if let Some(args) = args.as_ref() {
+                    let mut nav_id: u64 = 0;
+                    if args.NavigationId(&mut nav_id).is_ok() {
+                        state.borrow_mut().toplevel.on_navigation_completed(nav_id);
+                    }
+                }
 
                 // The args used to be discarded. They carry the engine's own
                 // verdict on this navigation, which is the only evidence the
@@ -2644,12 +3135,10 @@ fn connect_cert_errors(webview: &WebView, state: Rc<RefCell<TabState>>) {
             return;
         };
         let _ = core14.add_ServerCertificateErrorDetected(
-            &ServerCertificateErrorDetectedEventHandler::create(Box::new(
-                move |_sender, _args| {
-                    state.borrow_mut().tls_error_verdict = Some(TlsState::Unreadable);
-                    Ok(())
-                },
-            )),
+            &ServerCertificateErrorDetectedEventHandler::create(Box::new(move |_sender, _args| {
+                state.borrow_mut().tls_error_verdict = Some(TlsState::Unreadable);
+                Ok(())
+            })),
             &mut token,
         );
     }
@@ -2660,7 +3149,7 @@ fn connect_cert_errors(webview: &WebView, state: Rc<RefCell<TabState>>) {
 /// runtime that silently refused them.
 struct Hardening {
     smartscreen_off: SettingState,
-    tracking_prevention: SettingState,
+    tracking_prevention: TrackingPreventionState,
     /// The engine's OWN autofill and password store, off. Reported like the
     /// others because a browser that says it does not accumulate your details
     /// must not be guessing about whether it stopped.
@@ -2677,55 +3166,158 @@ struct Hardening {
     ephemeral: SettingState,
 }
 
-/// Stops WebView2 sending the user's browsing to Microsoft.
-///
-/// SmartScreen is ON by default and reputation-checks what is visited, which
-/// means the URLs a user opens leave the machine. Microsoft documents that
-/// disabling it also turns off the other privacy services in WebView2, and that
-/// shipping with it enabled obliges the app to tell users their information is
-/// sent to Microsoft. Neither is acceptable in a browser sold on privacy.
-///
-/// What this does NOT fix, and must not be claimed otherwise: WebView2 reports
-/// "required" component health data (API and SDK usage, creation failures) that
-/// no embedding application can switch off. That limit is real, nothing here
-/// reaches it, and it is the reason "zero telemetry" must not be written
-/// anywhere.
-///
-/// Crash-dump upload is a DIFFERENT limit, and it is NOT out of reach. This
-/// comment claimed it was until 2026-07-27, and the claim was load-bearing:
-/// it is one of the two legs the product's telemetry wording rests on.
-/// Corrected by reading the vendored crates rather than reasoning about them.
-/// `ICoreWebView2EnvironmentOptions3::SetIsCustomCrashReportingEnabled` does
-/// have to be set when the environment is CREATED -- but wry does not insist on
-/// creating it. `WebViewBuilderExtWindows::with_environment` accepts a finished
-/// `ICoreWebView2Environment` (wry 0.55.1 `src/lib.rs:1778`), and
-/// `src/webview2/mod.rs:134` calls `create_environment` ONLY when none was
-/// supplied. webview2-com 0.38.2 already implements the option
-/// (`src/options.rs:444`). The app can build its own environment and hand it
-/// over, with no patch to wry.
-///
-/// DONE since this paragraph was written, and it used to say "NOT DONE". See
-/// `shared_environment` above: the process now builds its own environment,
-/// reproducing every option wry sets in `create_environment` -- the
-/// `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` browser
-/// args, the UI language from `GetUserDefaultUILanguage` /
-/// `LCIDToLocaleName`, the scrollbar style, the browser-extensions flag, and
-/// the `enable_tracking_prevention: true` that
-/// `CoreWebView2EnvironmentOptions::default()` supplies and that the STRICT
-/// setter below silently depends on. Getting any one of them wrong would make
-/// a protection inert without failing, which is why they are enumerated here
-/// rather than left to be rediscovered.
-///
-/// The sequencing worry in the old text -- that this and the shared profile
-/// directory should not land together on a platform the build host cannot run
-/// -- was resolved by doing the profile directory first. `hardened_environment`
-/// now reports whether the environment creation actually succeeded, so a
-/// silent fallback to wry's environment (which drops every argument above) is
-/// visible in the privacy panel instead of only in a debug log.
-fn harden_privacy(webview: &WebView, want_ephemeral: bool) -> Hardening {
+// Privacy-hardening context shared by the setters below: SmartScreen is ON by
+// default and reputation-checks what is visited, which means the URLs a user
+// opens leave the machine. Microsoft documents that disabling it also turns
+// off the other privacy services in WebView2, and that shipping with it enabled
+// obliges the app to tell users their information is sent to Microsoft. Neither
+// is acceptable in a browser sold on privacy.
+//
+// What this does NOT fix, and must not be claimed otherwise: WebView2 reports
+// "required" component health data (API and SDK usage, creation failures) that
+// no embedding application can switch off. That limit is real, nothing here
+// reaches it, and it is the reason "zero telemetry" must not be written
+// anywhere.
+//
+// Crash-dump upload is a DIFFERENT limit, and it is NOT out of reach. This
+// comment claimed it was until 2026-07-27, and the claim was load-bearing: it is
+// one of the two legs the product's telemetry wording rests on. Corrected by
+// reading the vendored crates rather than reasoning about them.
+// `ICoreWebView2EnvironmentOptions3::SetIsCustomCrashReportingEnabled` does
+// have to be set when the environment is CREATED -- but wry does not insist on
+// creating it. `WebViewBuilderExtWindows::with_environment` accepts a finished
+// `ICoreWebView2Environment` (wry 0.55.1 `src/lib.rs:1778`), and
+// `src/webview2/mod.rs:134` calls `create_environment` ONLY when none was
+// supplied. webview2-com 0.38.2 already implements the option
+// (`src/options.rs:444`). The app can build its own environment and hand it
+// over, with no patch to wry.
+//
+// DONE since this paragraph was written, and it used to say "NOT DONE". See
+// `shared_environment` above: the process now builds its own environment,
+// reproducing every option wry sets in `create_environment` -- the
+// `--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection` browser
+// args, the UI language from `GetUserDefaultUILanguage` /
+// `LCIDToLocaleName`, the scrollbar style, the browser-extensions flag, and the
+// `enable_tracking_prevention: true` that
+// `CoreWebView2EnvironmentOptions::default()` supplies and that the level
+// setter below silently depends on. Getting any one of them wrong would make a
+// protection inert without failing, which is why they are enumerated here
+// rather than left to be rediscovered.
+//
+// The sequencing worry in the old text -- that this and the shared profile
+// directory should not land together on a platform the build host cannot run
+// -- was resolved by doing the profile directory first. `hardened_environment`
+// now reports whether the environment creation actually succeeded, so a silent
+// fallback to wry's environment (which drops every argument above) is visible
+// in the privacy panel instead of only in a debug log.
+/// Applies and verifies the requested tracking-prevention level on this
+/// WebView's shared profile.
+fn apply_tracking_prevention_level(
+    webview: &WebView,
+    requested: crate::prefs::TrackingPreventionLevel,
+) -> TrackingPreventionState {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Profile3, ICoreWebView2Profile6, ICoreWebView2Settings8, ICoreWebView2_13,
+        ICoreWebView2Profile3, ICoreWebView2_13, COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_BALANCED,
         COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT,
+    };
+    use windows::core::Interface;
+    use wry::WebViewExtWindows;
+
+    let wanted = match requested {
+        crate::prefs::TrackingPreventionLevel::Strict => {
+            COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT
+        }
+        crate::prefs::TrackingPreventionLevel::Balanced => {
+            COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_BALANCED
+        }
+    };
+
+    // PROFILE-SCOPED AND RUNTIME-SETTABLE. Microsoft's API contract says all
+    // WebView2s sharing this profile are affected. It does not promise that
+    // already-loaded bytes are revisited, and this call does not reload a
+    // page; the panel therefore tells the user to reload when testing a site
+    // so its next navigation starts entirely under the new level.
+    //
+    // DEPENDENCY: the level is respected only when tracking prevention was
+    // enabled on ICoreWebView2EnvironmentOptions5. `shared_environment` sets
+    // that true explicitly. This setter never replaces PATANYX's host list or
+    // request interception; those are independent and untouched.
+    unsafe {
+        let core = webview.webview();
+        let Ok(v13) = core.cast::<ICoreWebView2_13>() else {
+            diag("harden: no ICoreWebView2_13; requested tracking-prevention level FAILED");
+            return TrackingPreventionState::Failed;
+        };
+        let Ok(profile) = v13.Profile() else {
+            diag("harden: no WebView2 profile; requested tracking-prevention level FAILED");
+            return TrackingPreventionState::Failed;
+        };
+        let Ok(p3) = profile.cast::<ICoreWebView2Profile3>() else {
+            diag("harden: no ICoreWebView2Profile3; requested tracking-prevention level FAILED");
+            return TrackingPreventionState::Failed;
+        };
+
+        if let Err(error) = p3.SetPreferredTrackingPreventionLevel(wanted) {
+            diag(&format!(
+                "harden: SetPreferredTrackingPreventionLevel({}) FAILED ({error})",
+                requested.as_str().to_ascii_uppercase()
+            ));
+            return TrackingPreventionState::Failed;
+        }
+
+        // Name the level IN FORCE, not merely the argument passed to a setter.
+        // A successful setter followed by a different readback is a refusal,
+        // exactly like the profile autofill checks below.
+        let mut actual = Default::default();
+        match p3.PreferredTrackingPreventionLevel(&mut actual) {
+            Ok(()) if actual == wanted => match requested {
+                crate::prefs::TrackingPreventionLevel::Strict => TrackingPreventionState::Strict,
+                crate::prefs::TrackingPreventionLevel::Balanced => {
+                    TrackingPreventionState::Balanced
+                }
+            },
+            Ok(()) => {
+                diag(&format!(
+                    "harden: tracking-prevention setter returned OK for {} but read back {:?}; \
+                     requested level FAILED",
+                    requested.as_str().to_ascii_uppercase(),
+                    actual
+                ));
+                TrackingPreventionState::Failed
+            }
+            Err(error) => {
+                diag(&format!(
+                    "harden: tracking-prevention readback FAILED ({error}); requested {} level \
+                     is unconfirmed",
+                    requested.as_str().to_ascii_uppercase()
+                ));
+                TrackingPreventionState::Failed
+            }
+        }
+    }
+}
+
+/// Applies a new preference to the live profile behind this tab and records
+/// the engine's readback for `tab_status`/diagnostics.
+pub fn set_tracking_prevention(
+    webview: &WebView,
+    view: &TabView,
+    level: crate::prefs::TrackingPreventionLevel,
+) -> TrackingPreventionState {
+    let state = apply_tracking_prevention_level(webview, level);
+    view.state.borrow_mut().tracking_prevention = state;
+    state
+}
+
+/// Stops WebView2 sending the user's browsing to Microsoft and applies the
+/// remaining profile privacy preferences.
+fn harden_privacy(
+    webview: &WebView,
+    want_ephemeral: bool,
+    tracking_level: crate::prefs::TrackingPreventionLevel,
+) -> Hardening {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Profile6, ICoreWebView2Settings8, ICoreWebView2_13,
     };
     use windows::core::Interface;
     use wry::WebViewExtWindows;
@@ -2734,9 +3326,37 @@ fn harden_privacy(webview: &WebView, want_ephemeral: bool) -> Hardening {
     // an older one should degrade to "SmartScreen still on" rather than a crash
     // on startup.
     let mut smartscreen_off = SettingState::Failed;
-    let mut tracking_prevention = SettingState::Failed;
+    let tracking_prevention = apply_tracking_prevention_level(webview, tracking_level);
     let mut autofill_off = SettingState::Failed;
     let mut ephemeral = SettingState::Failed;
+
+    // NOTHING CALLS SetAllowExternalDrop HERE, AND THE ABSENCE IS THE FIX.
+    //
+    // Dragging a tab to reorder it did nothing on Windows. There were two
+    // causes; this is the second. (The first was cross-engine: a dragstart
+    // that writes nothing into dataTransfer is abandoned by both engines,
+    // which select the text under the cursor instead. Fixed in chrome.js.)
+    //
+    // Microsoft documents AllowExternalDrop as governing objects dragged in
+    // from OUTSIDE the WebView2 bounds, so by the documentation it has no
+    // business affecting a drag that begins and ends on the same tab strip.
+    // Measured on Windows 11 hardware, 2026-08-26, it does:
+    // the same binary refuses to drag with the setter and drags correctly
+    // with the engine default, one environment switch apart. Two separate
+    // source-only readings of that documentation -- mine and an independent
+    // review's -- both ruled this out and both were wrong. Do not re-add it
+    // from the docs; the measurement outranks them.
+    //
+    // What refuses a file dropped onto the privileged UI is the navigation
+    // handler in main.rs, which permits only CHROME_ORIGIN_PREFIX, so a drop
+    // cannot take the chrome anywhere. It has no file inputs for a drop to
+    // populate and denies new windows unconditionally. That is the lock.
+    //
+    // The wry drag-drop handler stays absent for a related reason: setting
+    // one makes wry RevokeDragDrop the engine's own child-HWND drop target
+    // and register a CF_HDROP-only replacement, which cannot carry an
+    // in-page text/plain drag at all.
+
     unsafe {
         let core = webview.webview();
         if let Ok(settings) = core.Settings() {
@@ -2750,46 +3370,6 @@ fn harden_privacy(webview: &WebView, want_ephemeral: bool) -> Hardening {
             } else {
                 diag("harden: no ICoreWebView2Settings8; SmartScreen is STILL ON on this runtime");
             }
-        }
-
-        // Tracking prevention. WebView2 defaults this to BALANCED, which lets
-        // a great deal through; STRICT is the strongest level the runtime
-        // offers and is what a browser making this product's claims has to
-        // ask for. Same reasoning as ITP on the GTK side, and the reason
-        // both are set is that the two engines' defaults disagree.
-        //
-        // Best-effort in the same way as above: Profile() is
-        // ICoreWebView2_13 (Runtime 102+) and the level setter is
-        // ICoreWebView2Profile3 (Runtime 111+). An older runtime keeps
-        // BALANCED rather than failing to start. Note that STRICT here does
-        // NOT replace the content blocker: this stops known trackers the
-        // engine recognises, the filter stops the hosts we list.
-        // DEPENDENCY: the profile level only takes effect when tracking
-        // prevention is enabled on the ENVIRONMENT via
-        // ICoreWebView2EnvironmentOptions5. wry 0.55.1 builds its environment
-        // from CoreWebView2EnvironmentOptions::default(), and webview2-com
-        // 0.38.2 defaults enable_tracking_prevention to true, so the setter
-        // below is live rather than inert. Verified by reading both crates.
-        // If wry ever changes that default, STRICT goes silently inert and
-        // this comment is where to start looking.
-        if let Ok(v13) = core.cast::<ICoreWebView2_13>() {
-            if let Ok(profile) = v13.Profile() {
-                if let Ok(p3) = profile.cast::<ICoreWebView2Profile3>() {
-                    match p3.SetPreferredTrackingPreventionLevel(
-                        COREWEBVIEW2_TRACKING_PREVENTION_LEVEL_STRICT,
-                    ) {
-                        Ok(()) => tracking_prevention = SettingState::Applied,
-                        Err(error) => diag(&format!(
-                            "harden: SetPreferredTrackingPreventionLevel(STRICT) FAILED ({error}); \
-                             the runtime keeps BALANCED"
-                        )),
-                    }
-                } else {
-                    diag("harden: no ICoreWebView2Profile3; tracking prevention stays BALANCED");
-                }
-            }
-        } else {
-            diag("harden: no ICoreWebView2_13; tracking prevention stays BALANCED");
         }
 
         // Autofill and password autosave, at the PROFILE level.
@@ -2914,7 +3494,7 @@ fn harden_privacy(webview: &WebView, want_ephemeral: bool) -> Hardening {
 /// claim this project's own About page exists to refuse.
 pub fn forget_site_cookies(webview: &WebView, host: &str) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Profile6, ICoreWebView2_13};
-    use windows::core::{Interface, HSTRING, PCWSTR};
+    use windows::core::{Interface, PCWSTR};
     use wry::WebViewExtWindows;
 
     let core = webview.webview();
@@ -2937,17 +3517,96 @@ pub fn forget_site_cookies(webview: &WebView, host: &str) -> bool {
             diag("forget_site: no CookieManager on this runtime; cookies were NOT cleared");
             return false;
         };
-        let domain = HSTRING::from(host);
-        match manager.DeleteCookiesWithDomainAndPath(
+        // ENUMERATE, THEN DELETE EACH. The previous call here was
+        // DeleteCookiesWithDomainAndPath with a null name, and the engine's
+        // reference says "cookie name is required" for it, so every click
+        // was refused (E_INVALIDARG) and the panel said "the engine refused
+        // the request" (seen on YouTube, 2026-09-16).
+        //
+        // ASKS FOR EVERY COOKIE, NOT THE SITE'S URI, and that is the whole
+        // point of this shape. `GetCookies("https://host/")` applies RFC 6265
+        // PATH matching as well as domain matching, so a cookie scoped to
+        // `/account` is simply not in the answer -- and the count check below
+        // then saw nothing left to do and reported success while the user's
+        // session cookie sat untouched on disk (review R-001). A clear that
+        // lies is worse than one that refuses. So: enumerate the profile with
+        // a null URI, decide membership with `cookie_domain_matches`, which is
+        // domain matching alone and unit-tested on every platform, and delete
+        // what matches. Domain cookies such as `.youtube.com` are covered by
+        // that test, and a stranger that merely ends the same way is not.
+        //
+        // The wait is the same message-pumping wait the engine layer uses for
+        // its own reads.
+        use webview2_com::GetCookiesCompletedHandler;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let manager_for_delete = manager.clone();
+        let host_owned = host.to_string();
+        let started = manager.GetCookies(
             PCWSTR::null(),
-            PCWSTR(domain.as_ptr()),
-            PCWSTR::null(),
-        ) {
-            Ok(()) => true,
+            &GetCookiesCompletedHandler::create(Box::new(move |error_code, list| {
+                let result: windows::core::Result<(u32, u32)> = (|| {
+                    error_code?;
+                    // A missing list is NOT an empty profile. It means the
+                    // enumeration produced nothing we can read, and answering
+                    // "0 of 0 cleared" to that is the same lie in a different
+                    // place, so it fails closed.
+                    let Some(list) = list else {
+                        return Err(windows::core::Error::from(
+                            windows::Win32::Foundation::E_UNEXPECTED,
+                        ));
+                    };
+                    let mut count = 0u32;
+                    list.Count(&mut count)?;
+                    let mut found = 0u32;
+                    let mut deleted = 0u32;
+                    for i in 0..count {
+                        let cookie = list.GetValueAtIndex(i)?;
+                        let mut raw = windows::core::PWSTR::null();
+                        cookie.Domain(&mut raw)?;
+                        // Converted, then freed unconditionally, then used --
+                        // the same order as every other COM string here, so a
+                        // conversion failure cannot leak the buffer.
+                        let domain = if raw.is_null() {
+                            String::new()
+                        } else {
+                            let text = raw.to_string().unwrap_or_default();
+                            windows::Win32::System::Com::CoTaskMemFree(Some(raw.0 as *const _));
+                            text
+                        };
+                        if !crate::platform::cookie_domain_matches(&domain, &host_owned) {
+                            continue;
+                        }
+                        found += 1;
+                        if manager_for_delete.DeleteCookie(&cookie).is_ok() {
+                            deleted += 1;
+                        }
+                    }
+                    Ok((found, deleted))
+                })();
+                tx.send(result).map_err(|_| {
+                    windows::core::Error::from(windows::Win32::Foundation::E_UNEXPECTED)
+                })
+            })),
+        );
+        if let Err(error) = started {
+            diag(&format!("forget_site: GetCookies({host}) FAILED ({error})"));
+            return false;
+        }
+        match webview2_com::wait_with_pump(rx) {
+            Ok(Ok((count, deleted))) if deleted == count => {
+                diag(&format!("forget_site: {deleted} cookie(s) deleted for the site"));
+                true
+            }
+            Ok(Ok((count, deleted))) => {
+                diag(&format!("forget_site: only {deleted} of {count} cookie(s) could be deleted"));
+                false
+            }
+            Ok(Err(error)) => {
+                diag(&format!("forget_site: enumeration FAILED ({error})"));
+                false
+            }
             Err(error) => {
-                diag(&format!(
-                    "forget_site: DeleteCookiesWithDomainAndPath({host}) FAILED ({error})"
-                ));
+                diag(&format!("forget_site: wait FAILED ({error})"));
                 false
             }
         }
@@ -3007,69 +3666,120 @@ pub fn forget_all_cookies(webview: &WebView) -> bool {
     }
 }
 
-/// Drops every cookie in the profile, ONCE per process, at the first content
-/// webview.
+/// Clears the saved engine profile's site state, ONCE per process, before any
+/// ordinary content webview navigates.
 ///
 /// WHY THIS EXISTS. Measured 2026-08-01 on real hardware
 /// (`scripts/login-probe.ps1`): a login cookie set in one launch was still
-/// present in the next. WebKitGTK loses them, WebView2 keeps them -- the same
-/// product behaving oppositely on a user-visible property, and NOTHING chose
-/// that. It was an engine default on each side. The decided behaviour is
-/// that neither platform keeps them: a session should not know who you were
-/// last time. See docs/third-party-cookies.md.
+/// present in the next. The cookie-only fix left service workers, DOM storage
+/// and caches alive. That is not merely a narrower privacy reset: an
+/// offline-first worker can serve a cached authenticated shell after its
+/// cookie disappeared, intercept the navigation, and leave the site unable to
+/// load data or redirect to sign-in. Cookies and the state that interprets
+/// them therefore have to cross the session boundary together.
 ///
 /// WHY AT STARTUP RATHER THAN AT EXIT, when the property is named "forget on
 /// exit". An exit hook does not run when the process is killed, crashes, or
 /// loses power -- precisely the cases where somebody else may later open the
 /// browser. Clearing as the first thing a session does is unconditional: it
 /// cannot be skipped by dying badly, and it delivers the guarantee users
-/// actually care about, which is that a NEW session starts anonymous. The
-/// honest cost, and it belongs in the About copy rather than hidden here: the
-/// data does sit on disk between sessions, so this is not erasure against
+/// actually care about, which is that a NEW session inherits no site data.
+/// The honest cost, and it belongs in the About copy rather than hidden here:
+/// the bytes do sit on disk between sessions, so this is not erasure against
 /// someone with the machine and forensic tools.
 ///
 /// ONCE PER PROCESS, not per tab: every content webview shares one profile,
 /// so doing this on the second tab would delete the cookies the first tab
 /// just legitimately acquired -- logging the user out mid-session, which is a
 /// different and much worse product than the one being asked for.
-fn clear_cookies_for_new_session(webview: &WebView) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Profile6, ICoreWebView2_13};
+///
+/// KIND SELECTION. ALL_SITE deliberately includes cookies, all DOM storage
+/// (localStorage, IndexedDB, Web SQL, file systems and Cache Storage), and
+/// future site-owned storage classes. SERVICE_WORKERS is also named
+/// explicitly: current WebView2 documents it under DOM storage, but it has a
+/// standalone bit and it is the storage class behind the field defect, so a
+/// future hierarchy change cannot silently drop it. DISK_CACHE is the HTTP
+/// cache, which is outside ALL_SITE. We deliberately do NOT select Settings,
+/// DownloadHistory, BrowsingHistory, GeneralAutofill, PasswordAutosave or
+/// AllProfile: those are browser/profile records, not state a site may carry
+/// into the next session. In particular, Settings can contain permission and
+/// other deliberate settings; a site-data reset must not rewrite them. PATANYX's
+/// own camera/microphone/location/notification grants are separately
+/// session-only (`SetSavesInProfile(false)`).
+///
+/// ASYNC WITHOUT THE RACE. The first caller starts ClearBrowsingData and stays
+/// blank. Later tab builders see the shared gate in `Waiting` and also stay
+/// blank. Only the completion handler (including every honest failure path)
+/// posts SessionWipeFinished, which releases their queued initial URLs. A
+/// slow clear therefore never blocks construction or the event loop, but no
+/// first navigation can consume the half-cleared profile.
+fn begin_new_session_wipe(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+) -> bool {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Profile2, ICoreWebView2_13,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS,
+    };
+    use webview2_com::ClearBrowsingDataCompletedHandler;
     use windows::core::Interface;
     use wry::WebViewExtWindows;
 
-    static DONE: AtomicBool = AtomicBool::new(false);
-    // swap, not load-then-store: two webviews could otherwise both read false.
-    if DONE.swap(true, Ordering::SeqCst) {
-        return;
+    match super::enter_session_wipe() {
+        super::SessionWipeEntry::Ready => return false,
+        super::SessionWipeEntry::Waiting => return true,
+        super::SessionWipeEntry::Start => {}
     }
+
+    let finish = |proxy: &EventLoopProxy<UserEvent>| {
+        super::finish_session_wipe();
+        let _ = proxy.send_event(UserEvent::SessionWipeFinished);
+    };
 
     let core = webview.webview();
     unsafe {
         let Ok(v13) = core.cast::<ICoreWebView2_13>() else {
-            diag("session: no ICoreWebView2_13; cookies from the last session were NOT cleared");
-            return;
+            diag("session: no ICoreWebView2_13; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
+            finish(proxy);
+            return true;
         };
         let Ok(profile) = v13.Profile() else {
-            diag("session: could not reach the profile; cookies were NOT cleared");
-            return;
+            diag("session: could not reach the profile; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
+            finish(proxy);
+            return true;
         };
-        let Ok(manager) = profile
-            .cast::<ICoreWebView2Profile6>()
-            .and_then(|p6| p6.CookieManager())
-        else {
-            diag("session: no CookieManager; cookies from the last session were NOT cleared");
-            return;
+        let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() else {
+            diag("session: no ICoreWebView2Profile2; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
+            finish(proxy);
+            return true;
         };
-        match manager.DeleteAllCookies() {
-            // Reported, because a silent success is indistinguishable from a
-            // silent no-op and this one is a privacy claim.
-            Ok(()) => diag("session: cookies from the previous session cleared"),
-            Err(error) => diag(&format!(
-                "session: DeleteAllCookies FAILED ({error}); cookies from the last session REMAIN"
-            )),
+
+        let done_proxy = proxy.clone();
+        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
+            if let Err(error) = result {
+                diag(&format!(
+                    "session: ClearBrowsingData FAILED ({error}); cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared"
+                ));
+            } else {
+                diag("session: cleared cookies, DOM storage, service workers, Cache Storage, and HTTP cache from the previous session");
+            }
+            super::finish_session_wipe();
+            let _ = done_proxy.send_event(UserEvent::SessionWipeFinished);
+            Ok(())
+        }));
+        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE;
+        if let Err(error) = profile2.ClearBrowsingData(kinds, &handler) {
+            diag(&format!(
+                "session: ClearBrowsingData could not start ({error}); cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared"
+            ));
+            finish(proxy);
         }
     }
+    true
 }
 
 /// Applies a policy to a live tab. Ad blocking and freeze need no engine
@@ -3184,6 +3894,24 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
 /// Returns false when the runtime is too old to carry `ICoreWebView2_16`, so
 /// the caller can say so instead of appearing to do nothing -- the failure this
 /// whole function exists to stop.
+/// Opens the engine's developer tools on this CONTENT webview.
+///
+/// Called through the native shortcut path rather than relying on WebView2's
+/// own F12 handling, which follows focus and would just as happily open on
+/// the privileged chrome. `AreDevToolsEnabled` is set true on content
+/// builders only, so this call is inert on any webview the browser does not
+/// mean to expose -- the trust boundary is the builder flag, not this call.
+pub fn open_devtools(webview: &WebView) {
+    use wry::WebViewExtWindows;
+    // SAFETY: COM interop; the only failure worth reporting is the call
+    // itself, and a failed inspector must never take the browser with it.
+    unsafe {
+        if let Err(error) = webview.webview().OpenDevToolsWindow() {
+            diag(&format!("devtools: OpenDevToolsWindow FAILED ({error})"));
+        }
+    }
+}
+
 pub fn show_print_ui(webview: &WebView) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2_16, COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER,
@@ -3216,11 +3944,7 @@ pub fn show_print_ui(webview: &WebView) -> bool {
 /// without `ICoreWebView2_7`, or a refused call -- so the caller can say so
 /// immediately rather than leaving the user waiting for an event that will
 /// never arrive.
-pub fn save_page_as_pdf(
-    webview: &WebView,
-    dest: &Path,
-    proxy: &EventLoopProxy<UserEvent>,
-) -> bool {
+pub fn save_page_as_pdf(webview: &WebView, dest: &Path, proxy: &EventLoopProxy<UserEvent>) -> bool {
     use webview2_com::Microsoft::Web::WebView2::Win32::{
         ICoreWebView2Environment6, ICoreWebView2_7,
     };
@@ -3396,8 +4120,7 @@ fn connect_context_menu(
                 // Where to open the menu, in SCREEN pixels. `Location` alone
                 // is webview-relative CSS pixels and TrackPopupMenu wants
                 // screen pixels; the conversion lives in menu_screen_point.
-                let parent =
-                    windows::Win32::Foundation::HWND(parent_ptr as *mut core::ffi::c_void);
+                let parent = windows::Win32::Foundation::HWND(parent_ptr as *mut core::ffi::c_void);
                 let point = menu_screen_point(&args, &controller, parent);
 
                 let Some(chosen) = show_menu(point, parent, &entries, &engine) else {
@@ -3563,7 +4286,12 @@ fn click_target_of(
             Err(_) => false,
         }
     };
-    ClickTarget { link, image, editable, selection }
+    ClickTarget {
+        link,
+        image,
+        editable,
+        selection,
+    }
 }
 
 /// The image source, or None unless the target IS an image. SourceUri is also
@@ -3743,8 +4471,13 @@ fn show_menu(
         // as empty rather than shown blank.
         let mut add = |id: u32, label: &str| {
             let wide: Vec<u16> = label.encode_utf16().chain(std::iter::once(0)).collect();
-            if AppendMenuW(menu, MF_STRING, id as usize, windows::core::PCWSTR(wide.as_ptr()))
-                .is_ok()
+            if AppendMenuW(
+                menu,
+                MF_STRING,
+                id as usize,
+                windows::core::PCWSTR(wide.as_ptr()),
+            )
+            .is_ok()
             {
                 rows += 1;
             }
@@ -3830,7 +4563,9 @@ fn show_menu(
 static SESSION_LOCK_STATE: OnceLock<SettingState> = OnceLock::new();
 
 pub fn session_lock_registered() -> SettingState {
-    *SESSION_LOCK_STATE.get().unwrap_or(&SettingState::NotAttempted)
+    *SESSION_LOCK_STATE
+        .get()
+        .unwrap_or(&SettingState::NotAttempted)
 }
 
 /// Where the subclass sends what it sees. Set once, before the subclass is
@@ -4039,8 +4774,8 @@ pub fn pick_file_to_open(hosts: &Hosts, title: &str) -> Option<std::path::PathBu
         // SAFETY: COM apartment is already initialised on this thread -- wry
         // calls CoInitializeEx before creating any webview, and this only ever
         // runs from an IPC command on that same UI thread.
-        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)
-            .ok()?;
+        let dialog: IFileOpenDialog =
+            CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let _ = dialog.SetTitle(&HSTRING::from(title));
         // Show() returns an error when the user cancels. Cancel is an answer,
         // not a fault: every caller treats None as "they changed their mind".
@@ -4061,8 +4796,8 @@ pub fn pick_file_to_save(
 
     unsafe {
         // SAFETY: as above.
-        let dialog: IFileSaveDialog = CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER)
-            .ok()?;
+        let dialog: IFileSaveDialog =
+            CoCreateInstance(&FileSaveDialog, None, CLSCTX_INPROC_SERVER).ok()?;
         let _ = dialog.SetTitle(&HSTRING::from(title));
         let _ = dialog.SetFileName(&HSTRING::from(suggested_name));
         // The overwrite prompt is on by default for IFileSaveDialog, matching
@@ -4192,7 +4927,9 @@ fn connect_page_bytes(webview: &WebView) {
                         // Unnamed navigation: open a generation with no
                         // candidate, which captures nothing rather than
                         // leaving the previous one armed.
-                        diag("page-bytes: NavigationStarting with unreadable URI; capturing nothing");
+                        diag(
+                            "page-bytes: NavigationStarting with unreadable URI; capturing nothing",
+                        );
                         nav_tracker.borrow_mut().begin_navigation("");
                     }
                 }
@@ -4287,6 +5024,51 @@ fn connect_page_bytes(webview: &WebView) {
                     .StatusCode(&mut raw_status)
                     .ok()
                     .map(|()| raw_status.clamp(0, u16::MAX as i32) as u16);
+                // OUR PLACEHOLDER IS NOT A SERVER DOCUMENT. The held-page path
+                // answers a refused top-level request with a synthesized 200
+                // carrying X-PATANYX-Held, and a 200 DOCUMENT is exactly what
+                // this capture treats as the page's real bytes. Without this
+                // check the placeholder becomes the "server document" the
+                // integrity comparison is measured against (R-003). The marker
+                // is consumed here and nowhere else; that is the whole point of
+                // emitting it.
+                // Matched by VALUE against a per-process secret, not by the
+                // header's presence. Presence was forgeable: a page could send
+                // the header on its own document to skip capture, then fetch
+                // its own URL and have that response accepted as the page's
+                // original bytes, because the pending candidate was left
+                // armed (review R-002, round 2). A server cannot know the
+                // nonce; and on a match the candidate is ABANDONED, so no
+                // later response at this URI can be taken for the document.
+                //
+                // Three outcomes, not two: the marker is present and matches
+                // (abandon), the marker is confirmed ABSENT (proceed), or the
+                // headers could not be inspected at all (abandon). The first
+                // draft folded the third into the second, so a placeholder
+                // whose headers failed to read walked into capture as the
+                // server's document (review R-002, round 4). Every other
+                // getter failure on this path abandons; this one now does too.
+                let name = HSTRING::from("X-PATANYX-Held");
+                let expected = crate::adlist_consent::held_nonce();
+                let marker_absent = (|| -> Option<bool> {
+                    let headers = response.Headers().ok()?;
+                    let mut present = windows::core::BOOL(0);
+                    headers.Contains(PCWSTR(name.as_ptr()), &mut present).ok()?;
+                    if !present.as_bool() {
+                        return Some(true);
+                    }
+                    let mut value = PWSTR::null();
+                    headers.GetHeader(PCWSTR(name.as_ptr()), &mut value).ok()?;
+                    let v = take_pwstr(value);
+                    // Present but not our nonce: a server's forgery attempt,
+                    // treated as absent so the capture still runs (R-002,
+                    // round 2 made the value unforgeable, not the name).
+                    Some(!(!expected.is_empty() && v == expected))
+                })();
+                if marker_absent != Some(true) {
+                    resp_tracker.borrow_mut().abandon();
+                    return Ok(());
+                }
                 let location: Option<String> = response.Headers().ok().and_then(|headers| {
                     let name = HSTRING::from("Location");
                     let mut value = PWSTR::null();
@@ -4322,7 +5104,9 @@ fn connect_page_bytes(webview: &WebView) {
                             // async completion safe: a late answer from an
                             // abandoned visit is dropped, never written over
                             // the page now displayed.
-                            done_tracker.borrow_mut().store(&done_uri, generation, result);
+                            done_tracker
+                                .borrow_mut()
+                                .store(&done_uri, generation, result);
                             Ok(())
                         },
                     )),
@@ -4442,7 +5226,10 @@ pub fn request_main_resource_bytes(
     use wry::WebViewExtWindows;
 
     let send = |result: Result<Vec<u8>, PageBytesError>| {
-        let _ = proxy.send_event(UserEvent::Integrity(IntegrityEvent::PageBytes { token, result }));
+        let _ = proxy.send_event(UserEvent::Integrity(IntegrityEvent::PageBytes {
+            token,
+            result,
+        }));
     };
 
     let core = webview.webview();
@@ -4523,14 +5310,19 @@ pub fn freeze(_webview: &WebView, view: &TabView) {
 
 /// One-call unfreeze.
 pub fn unfreeze(_webview: &WebView, view: &TabView) {
-    view.state
-        .borrow_mut()
-        .freeze
-        .unfreeze(Instant::now());
+    view.state.borrow_mut().freeze.unfreeze(Instant::now());
 }
 
 /// Per-site override: `host` is allowed even while the tab is frozen. The
 /// request handler consults overrides per request, so no engine work.
+/// Set or clear this tab's ad-list override. Same call in both directions so
+/// the revocation cannot be the path nobody wrote. Read by `decide_request` on
+/// Windows; on WebKitGTK there is no per-host exception (see
+/// `adlist_consent::CAN_ALLOW`), so this only keeps the state honest.
+pub fn set_adlist_override(view: &TabView, host: Option<String>) {
+    view.state.borrow_mut().set_adlist_override(host);
+}
+
 pub fn allow_site(_webview: &WebView, view: &TabView, host: &str) {
     view.state.borrow_mut().freeze.add_override(host);
 }
@@ -4559,6 +5351,12 @@ pub fn blocked_total(view: &TabView) -> u64 {
     view.state.borrow().ledger.blocked_total()
 }
 
+/// Whether the current document was loaded over plain HTTP. For the Info tab's
+/// "not encrypted" row.
+pub fn page_insecure(view: &TabView) -> bool {
+    view.state.borrow().page_insecure
+}
+
 /// Current TLS verdict. Deviation from the brief's sketch: takes `view` as
 /// well, to match the unix signature (which needs the stored error verdict).
 ///
@@ -4575,6 +5373,13 @@ pub fn blocked_total(view: &TabView) -> u64 {
 /// false on every Windows page load, including ordinary public certificates.
 /// Same conflation `SettingState` splits into NotAttempted vs Failed.
 /// Revisit if a future SDK adds chain inspection.
+/// WebView2 exposes no certificate issuer through any API, so this build
+/// cannot name one. The Info tab says so honestly (TlsState::Unreadable);
+/// returning None here is that statement in data form.
+pub fn tls_issuer(_webview: &WebView, _view: &TabView) -> Option<String> {
+    None
+}
+
 pub fn tls_state(_webview: &WebView, view: &TabView) -> TlsState {
     view.state
         .borrow()
@@ -4633,6 +5438,10 @@ pub fn engine_settings(view: &TabView) -> EngineSettings {
 /// protection the tab does not have.
 pub fn script_setting(view: &TabView) -> &'static str {
     view.state.borrow().script_setting.as_str()
+}
+
+pub fn fingerprint_probe_reporting(view: &TabView) -> &'static str {
+    view.state.borrow().fingerprint_probe_reporting.as_str()
 }
 
 /// How far this tab's request interception got. Reported in `tab_status` so
@@ -4787,11 +5596,15 @@ fn find_create_session(
     // matches or approximates the policy), so they diag and continue.
     // SAFETY: COM setters, results checked below.
     for (name, result) in [
-        ("SetIsCaseSensitive", unsafe { options.SetIsCaseSensitive(false) }),
+        ("SetIsCaseSensitive", unsafe {
+            options.SetIsCaseSensitive(false)
+        }),
         ("SetShouldHighlightAllMatches", unsafe {
             options.SetShouldHighlightAllMatches(true)
         }),
-        ("SetShouldMatchWord", unsafe { options.SetShouldMatchWord(false) }),
+        ("SetShouldMatchWord", unsafe {
+            options.SetShouldMatchWord(false)
+        }),
     ] {
         if let Err(error) = result {
             diag(&format!(
@@ -4833,9 +5646,10 @@ fn find_create_session(
         find_emit_counts(&active_find, key, active_gen.get(), &active_proxy);
         Ok(())
     }));
-    if let Err(error) = unsafe { find.add_ActiveMatchIndexChanged(&on_active, &mut active_token) }
-    {
-        diag(&format!("find: add_ActiveMatchIndexChanged FAILED: {error}"));
+    if let Err(error) = unsafe { find.add_ActiveMatchIndexChanged(&on_active, &mut active_token) } {
+        diag(&format!(
+            "find: add_ActiveMatchIndexChanged FAILED: {error}"
+        ));
         // Do not leave the count handler registered for a session we are
         // about to drop: it would keep emitting counts nobody owns.
         // SAFETY: unregistering the token registered above.
@@ -4873,7 +5687,11 @@ fn find_emit_counts(
     // below 1 normalises to None so find.rs never has to know which engine a
     // count came from. (Hardware check: stepping should move "1 of N" to
     // "2 of N"; an off-by-one here means the contract read differently.)
-    let active = if active >= 1 { Some(active as u32) } else { None };
+    let active = if active >= 1 {
+        Some(active as u32)
+    } else {
+        None
+    };
     let total = if total > 0 { total as u32 } else { 0 };
     // WebView2 documents no count cap the way WebKitGTK's max does.
     let _ = proxy.send_event(UserEvent::Find(crate::find::FindEvent {
@@ -5007,10 +5825,14 @@ fn find_destroy_session(session: WinFindSession) {
     if let Err(error) = unsafe { session.find.remove_MatchCountChanged(session.match_token) } {
         diag(&format!("find: remove_MatchCountChanged FAILED: {error}"));
     }
-    if let Err(error) =
-        unsafe { session.find.remove_ActiveMatchIndexChanged(session.active_token) }
-    {
-        diag(&format!("find: remove_ActiveMatchIndexChanged FAILED: {error}"));
+    if let Err(error) = unsafe {
+        session
+            .find
+            .remove_ActiveMatchIndexChanged(session.active_token)
+    } {
+        diag(&format!(
+            "find: remove_ActiveMatchIndexChanged FAILED: {error}"
+        ));
     }
 }
 
@@ -5055,7 +5877,9 @@ pub fn apply_page_theme(webview: &WebView, theme: crate::prefs::PageTheme) -> bo
     match unsafe { profile.SetPreferredColorScheme(scheme) } {
         Ok(()) => true,
         Err(error) => {
-            diag(&format!("page-theme: SetPreferredColorScheme FAILED: {error}"));
+            diag(&format!(
+                "page-theme: SetPreferredColorScheme FAILED: {error}"
+            ));
             false
         }
     }
@@ -5063,8 +5887,8 @@ pub fn apply_page_theme(webview: &WebView, theme: crate::prefs::PageTheme) -> bo
 
 // ---- page capture ----
 
-/// Ask WebView2 for a PNG of the WHOLE PAGE and deliver the bytes (or an
-/// honest failure) as a UserEvent.
+/// Ask WebView2 for the requested page region and deliver the PNG bytes (or
+/// an honest failure) as a UserEvent.
 ///
 /// "CapturePreview is all the engine offers" is what this comment used to
 /// say, and it was wrong -- which is why Deep Recall saved a viewport for
@@ -5076,11 +5900,19 @@ pub fn apply_page_theme(webview: &WebView, theme: crate::prefs::PageTheme) -> bo
 /// screen) was right about resizing and wrong about the conclusion: the
 /// engine will do it properly if asked properly.
 ///
-/// CapturePreview stays as the fallback, so a runtime too old for the
-/// protocol call still saves something rather than failing. The user is told
-/// which they got by the picture itself; nothing here claims a full page it
-/// did not take.
-pub fn capture_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+/// CapturePreview is both the explicit viewport path and the fallback, so a
+/// runtime too old for the protocol call still saves something rather than
+/// failing. The user is told which path actually completed; nothing here
+/// claims a full page it did not take.
+pub fn capture_page(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    requested: crate::capture::CaptureScope,
+) {
+    if requested == crate::capture::CaptureScope::VisibleArea {
+        capture_viewport(webview, proxy);
+        return;
+    }
     if capture_full_page(webview, proxy) {
         return;
     }
@@ -5105,51 +5937,87 @@ fn capture_full_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) -> bo
     unsafe {
         let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
             move |error_code, result| {
-                let png: Result<Vec<u8>, &'static str> = (|| {
-                    if let Err(error) = &error_code {
-                        diag(&format!("capture: captureScreenshot FAILED: {error}"));
-                        return Err("capture_failed");
-                    }
-                    // {"data":"<base64 png>"} -- parsed with the JSON already
-                    // in the tree rather than by hand.
-                    let raw = result;
-                    let value: serde_json::Value =
-                        serde_json::from_str(&raw).map_err(|_| "capture_failed")?;
-                    let b64 = value
-                        .get("data")
-                        .and_then(|d| d.as_str())
-                        .ok_or("capture_failed")?;
-                    // A CEILING THE VIEWPORT PATH NEVER NEEDED. CapturePreview
-                    // was bounded by the window (about 2 MP); a full-page
-                    // capture of an infinite-scroll page has no such bound,
-                    // and the base64 string, its JSON copy, and the decoded
-                    // bytes are all live at once. Refuse before decoding
-                    // rather than after.
-                    if b64.len() > crate::capture::MAX_CAPTURE_BASE64 {
-                        diag("capture: full-page PNG is too large to hold");
-                        return Err("capture_too_large");
-                    }
-                    let bytes = crate::capture::decode_base64(b64).ok_or("capture_failed")?;
-                    // The same validator the viewport path's bytes go
-                    // through, so a full-page capture cannot skip a check the
-                    // smaller one passes.
-                    crate::capture::validate_capture_bytes(&bytes)?;
-                    Ok(bytes)
-                })();
-                // No viewport retry from in here: the WebView cannot be
-                // carried into this handler, and a capture that the engine
-                // ACCEPTED and then failed is a real failure worth reporting
-                // rather than papering over with a smaller picture. The
-                // fallback that matters -- a runtime with no protocol
-                // support at all -- is handled where the call is issued.
-                let _ = done_proxy.send_event(UserEvent::Capture(
-                    // The protocol path renders past the viewport, so this
-                    // one genuinely is the whole page.
-                    crate::capture::CaptureEvent {
-                        png,
-                        scope: crate::capture::CaptureScope::FullPage,
-                    },
-                ));
+                if let Err(error) = &error_code {
+                    diag(&format!("capture: captureScreenshot FAILED: {error}"));
+                    let _ = done_proxy.send_event(UserEvent::Capture(
+                        crate::capture::CaptureEvent {
+                            png: Err("capture_engine_failed"),
+                            scope: crate::capture::CaptureScope::FullPage,
+                        },
+                    ));
+                    return Ok(());
+                }
+                // The callback binding has already materialised the protocol
+                // result as this owned String. Move it immediately: JSON
+                // allocation, a possible 72 MiB base64 decode and PNG
+                // validation must not run on the browser's UI callback.
+                let raw = result;
+                std::thread::spawn(move || {
+                    let png: Result<Vec<u8>, &'static str> = (|| {
+                        // {"data":"<base64 png>"} -- parsed with the JSON
+                        // already in the tree rather than by hand.
+                        let value: serde_json::Value =
+                            serde_json::from_str(&raw).map_err(|_| "capture_decode_failed")?;
+                        let b64 = value
+                            .get("data")
+                            .and_then(|d| d.as_str())
+                            .ok_or("capture_decode_failed")?;
+                        // A CEILING THE VIEWPORT PATH NEVER NEEDED.
+                        // CapturePreview was bounded by the window (about 2
+                        // MP); a full-page capture of an infinite-scroll page
+                        // has no such bound, and the base64 string, its JSON
+                        // copy, and decoded bytes are all live at once. Refuse
+                        // before decoding rather than after.
+                        if b64.len() > crate::capture::MAX_CAPTURE_BASE64 {
+                            let prefix: String = b64.chars().take(64).collect();
+                            let dims = crate::capture::decode_base64(&prefix)
+                                .and_then(|bytes| crate::capture::png_dimensions(&bytes));
+                            let dims = dims
+                                .map(|(w, h)| format!("{w}x{h}"))
+                                .unwrap_or_else(|| "unknown dimensions".to_string());
+                            diag(&format!(
+                                "capture: large full-page PNG {dims}, {} base64 bytes (over limit)",
+                                b64.len()
+                            ));
+                            diag("capture: full-page PNG is too large to hold");
+                            return Err("capture_too_large");
+                        }
+                        let bytes =
+                            crate::capture::decode_base64(b64).ok_or("capture_decode_failed")?;
+                        // The same validator the viewport path's bytes go
+                        // through, so a full-page capture cannot skip a check
+                        // the smaller one passes.
+                        crate::capture::validate_capture_bytes(&bytes)?;
+                        if b64.len() > crate::capture::MAX_CAPTURE_BASE64 / 2 {
+                            let (width, height) =
+                                crate::capture::png_dimensions(&bytes).unwrap_or((0, 0));
+                            diag(&format!(
+                                "capture: large full-page PNG {width}x{height}, {} PNG bytes ({} base64 bytes)",
+                                bytes.len(),
+                                b64.len()
+                            ));
+                        }
+                        Ok(bytes)
+                    })();
+                    // Do not let the protocol JSON overlap the region
+                    // preview worker's native-image decode after this event
+                    // wakes the UI loop.
+                    drop(raw);
+                    // No viewport retry from in here: the WebView cannot be
+                    // carried into this handler, and a capture that the engine
+                    // ACCEPTED and then failed is a real failure worth reporting
+                    // rather than papering over with a smaller picture. The
+                    // fallback that matters -- a runtime with no protocol
+                    // support at all -- is handled where the call is issued.
+                    let _ = done_proxy.send_event(UserEvent::Capture(
+                        // The protocol path renders past the viewport, so this
+                        // one genuinely is the whole page.
+                        crate::capture::CaptureEvent {
+                            png,
+                            scope: crate::capture::CaptureScope::FullPage,
+                        },
+                    ));
+                });
                 Ok(())
             },
         ));
@@ -5160,7 +6028,9 @@ fn capture_full_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) -> bo
         ) {
             Ok(()) => true,
             Err(error) => {
-                diag(&format!("capture: CallDevToolsProtocolMethod FAILED: {error}"));
+                diag(&format!(
+                    "capture: CallDevToolsProtocolMethod FAILED: {error}"
+                ));
                 false
             }
         }
@@ -5172,14 +6042,14 @@ fn capture_full_page(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) -> bo
 fn capture_viewport(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
     use webview2_com::CapturePreviewCompletedHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG;
-    use windows::Win32::System::Com::{STREAM_SEEK_SET};
+    use windows::Win32::System::Com::STREAM_SEEK_SET;
     use windows::Win32::UI::Shell::SHCreateMemStream;
     use wry::WebViewExtWindows;
 
     let core = webview.webview();
     let fail = |proxy: &EventLoopProxy<UserEvent>| {
         let _ = proxy.send_event(UserEvent::Capture(crate::capture::CaptureEvent {
-            png: Err("capture_failed"),
+            png: Err("capture_engine_failed"),
             // Nothing was captured; the scope is immaterial but must be
             // something, and claiming the smaller one cannot mislead.
             scope: crate::capture::CaptureScope::VisibleArea,
@@ -5199,15 +6069,15 @@ fn capture_viewport(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
             let png: Result<Vec<u8>, &'static str> = (|| {
                 if let Err(error) = &error_code {
                     diag(&format!("capture: CapturePreview FAILED: {error}"));
-                    return Err("capture_failed");
+                    return Err("capture_engine_failed");
                 }
                 // The engine wrote the PNG; rewind before reading it back.
                 // SAFETY: COM stream owned by this closure.
                 if let Err(error) = unsafe { done_stream.Seek(0, STREAM_SEEK_SET, None) } {
                     diag(&format!("capture: stream Seek FAILED: {error}"));
-                    return Err("capture_failed");
+                    return Err("capture_engine_failed");
                 }
-                read_stream_capped(&done_stream).map_err(|_| "capture_failed")
+                read_stream_capped(&done_stream).map_err(|_| "capture_engine_failed")
             })();
             // CapturePreview is the viewport, and says so -- this is the
             // fallback path, and it must not inherit the full-page path's
@@ -5250,8 +6120,16 @@ pub fn remove_tab(view: &TabView, webview: &WebView) {
 /// no GTK widget to update here.
 pub fn set_chrome_height(_hosts: &Hosts, _px: i32) {}
 
+/// See `set_chrome_height`: same no-op. This backend lays the page out from
+/// `layout()`, which is given the arrangement directly, so it has never had to
+/// tell a strip height from a panel height.
+pub fn set_chrome_strip(_hosts: &Hosts, _px: i32) {}
+
 /// See `set_chrome_height`: same no-op, other axis.
 pub fn set_chrome_left(_hosts: &Hosts, _px: i32) {}
+
+/// See `set_chrome_height`: same no-op, mirrored right edge.
+pub fn set_chrome_right(_hosts: &Hosts, _px: i32) {}
 
 /// The three attribute writes on their own: what `set_window_accent` does
 /// with a report and a frame refresh around it, and what `reapply_window_
@@ -5456,7 +6334,6 @@ pub fn set_window_accent(hosts: &Hosts, palette: &super::ChromePalette) -> bool 
     !refused
 }
 
-
 /// Re-apply bounds for the chrome and the active tab's webview. Inactive
 /// tabs stay hidden and get correct bounds when next activated.
 pub fn layout(
@@ -5464,7 +6341,9 @@ pub fn layout(
     chrome: &WebView,
     active: Option<&WebView>,
     chrome_height: i32,
+    chrome_strip: i32,
     chrome_left: i32,
+    chrome_right: i32,
     arrangement: ChromeLayout,
 ) {
     // THE ONE FACT EVERY ARRANGEMENT BELOW RESTS ON: content webviews are
@@ -5500,6 +6379,7 @@ pub fn layout(
     // statics rather than from state (see `readout_apply`), so the inset has
     // to be published the same way.
     READOUT_LEFT.store(chrome_left.max(0), Ordering::Relaxed);
+    READOUT_RIGHT.store(chrome_right.max(0), Ordering::Relaxed);
     readout_apply(None);
 
     let size = hosts
@@ -5518,13 +6398,15 @@ pub fn layout(
                 &hosts.window,
                 chrome_height,
                 chrome_left,
+                chrome_right,
                 arrangement,
             ));
             if let Some(webview) = active {
                 let _ = webview.set_bounds(content_rect(
                     &hosts.window,
-                    chrome_height,
+                    crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
                     chrome_left,
+                    chrome_right,
                     0,
                 ));
             }
@@ -5561,55 +6443,64 @@ pub fn layout(
                 if !set_chrome_z(hosts, true) {
                     diag("layout: overlay wanted, but the chrome could not be raised");
                 }
-                // THE PAGE IS NOT MOVED AT ALL, and that is the point.
+                // THE PAGE IS LAID OUT AGAINST THE CLOSED STRIP, which is
+                // where it sits with no panel open. So opening a modal does
+                // not move it, and that is still the point.
                 //
-                // Opening a modal must not change where the page sits. Every
-                // attempt to RECOMPUTE its position here has been wrong by
-                // some amount and the error is always visible: laying it out
-                // against `chrome_height` pushed it down by the whole panel
-                // height, and against a separately-tracked strip height pulled
-                // it ~12px UP,
-                // exposing a sliver of undimmed page above the scrim -- a band
-                // whose colour tracked the site, white on bbc.com and grey on
-                // google.com, which is how it was identified.
-                //
-                // There is no correct number to compute, because the right
-                // answer is "wherever it already was". Rust seeds its idea of
+                // This used to preserve `y` verbatim and recompute only x and
+                // width, because every attempt to RECOMPUTE the position had
+                // been wrong by some amount and the error is always visible:
+                // laying it out against `chrome_height` pushed it down by the
+                // whole panel height, and against a separately-tracked strip
+                // height pulled it ~12px UP, exposing a sliver of undimmed
+                // page above the scrim -- a band whose colour tracked the
+                // site, white on bbc.com and grey on google.com, which is how
+                // it was identified. The comment here concluded there was no
+                // correct number to compute, because Rust seeded its idea of
                 // the strip from CHROME_HEIGHT_PX (120) while chrome.js
-                // measures itself against a floor of 148 -- two constants for
-                // one quantity, and any arithmetic mixing them inherits the
+                // measured itself against a floor of 148: two constants for
+                // one quantity, and any arithmetic mixing them inherited the
                 // gap.
                 //
-                // THE SIZE, HOWEVER, IS RE-APPLIED, and the distinction is
-                // the whole fix. This used to read "resizing the window while
-                // a modal is open leaves the page at its old size until the
-                // modal closes", filed as a small defect because a modal was
-                // open for seconds at a time. The vault now offers itself at
-                // launch, so the FIRST thing many people do -- maximise the
-                // window -- happened with a modal open, and the page stayed
-                // at its old rectangle with bare window showing beside and
-                // below it. Not seconds any more, and not small.
+                // THAT IS NO LONGER TRUE. e40624d made the chrome STATE its
+                // closed strip on every `set_chrome_insets`, and it is that
+                // stated value which arrives here as `chrome_strip`. There is
+                // one number for the quantity now, measured by the only party
+                // that can measure it, so the correct position can be
+                // computed rather than remembered.
                 //
-                // The position is still never recomputed. That is what caused
-                // the band, and the comment above still holds: the right
-                // answer for WHERE is "wherever it already was". So ask the
-                // webview where it is, keep that exactly, and only stretch
-                // width and height to the window's new edges. No constant is
-                // consulted and no arithmetic mixes the two strip heights,
-                // which is what every previous attempt got wrong.
+                // Freezing y had a cost that only showed on real hardware:
+                // switching TOOLBAR to Left while this panel is open shortens
+                // the strip by ~60px (the pills leave the top row for the
+                // rail; chrome.js carries floors of 148 and 88 for exactly
+                // this). x followed the change, y did not, and the gap between
+                // them was an unpainted band across the content width for as
+                // long as the panel stayed open.
+                //
+                // `content_rect` is the same call the Strip branch makes, so
+                // the two arrangements now agree by construction: for one
+                // strip value they produce one rectangle, and a modal opening
+                // or closing cannot move the page on its own. Banner and
+                // find-bar heights ride in `chrome_strip` (chrome.js sends
+                // `closedChromePx() + extra`), which is correct -- those are
+                // real rows the page sits below, modal or not.
+                //
+                // THE SIZE IS RE-APPLIED for the reason it always was: this
+                // used to read "resizing the window while a modal is open
+                // leaves the page at its old size until the modal closes",
+                // filed as small because a modal was open for seconds at a
+                // time. The vault now offers itself at launch, so the FIRST
+                // thing many people do -- maximise the window -- happens with
+                // a modal open. `content_rect` reads the window's current
+                // size, so that is covered here too.
                 if let Some(webview) = active {
-                    if let Ok(now) = webview.bounds() {
-                        let scale = hosts.window.scale_factor();
-                        let at = now.position.to_logical::<f64>(scale);
-                        let _ = webview.set_bounds(Rect {
-                            position: LogicalPosition::new(at.x, at.y).into(),
-                            size: LogicalSize::new(
-                                (size.width - at.x).max(0.0),
-                                (size.height - at.y).max(0.0),
-                            )
-                            .into(),
-                        });
-                    }
+                    let _ = webview.set_bounds(content_rect(
+                        &hosts.window,
+                        crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
+                        chrome_left,
+                        chrome_right,
+                        0,
+                    ));
                 }
             } else if let Some(webview) = active {
                 let _ = webview.set_bounds(Rect {
@@ -5642,13 +6533,15 @@ pub fn layout(
                 size: LogicalSize::new(size.width, size.height).into(),
             });
             if let Some(webview) = active {
-                // The pane is on the right and the sidebar on the left, so
-                // the two coexist: the page is what is left between them.
+                // Side strips and the pane all coexist: page_rect subtracts
+                // left chrome from the left and both right-hand widths from
+                // the right.
                 #[allow(clippy::cast_possible_truncation)]
                 let _ = webview.set_bounds(content_rect(
                     &hosts.window,
                     chrome_height,
                     chrome_left,
+                    chrome_right,
                     pane as i32,
                 ));
             }
@@ -5722,9 +6615,15 @@ fn set_chrome_z(hosts: &Hosts, top: bool) -> bool {
 /// its top strip. That is not a compromise: the page is created after the
 /// chrome and draws over it, so a chrome given the window shows through in
 /// exactly the shape the page does not cover.
-fn chrome_rect(window: &Window, chrome_height: i32, chrome_left: i32, arrangement: ChromeLayout) -> Rect {
+fn chrome_rect(
+    window: &Window,
+    chrome_height: i32,
+    chrome_left: i32,
+    chrome_right: i32,
+    arrangement: ChromeLayout,
+) -> Rect {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
-    let height = if crate::platform::chrome_covers_window(chrome_left, arrangement) {
+    let height = if crate::platform::chrome_covers_window(chrome_left, chrome_right, arrangement) {
         size.height
     } else {
         f64::from(chrome_height.max(0))
@@ -5737,13 +6636,20 @@ fn chrome_rect(window: &Window, chrome_height: i32, chrome_left: i32, arrangemen
 
 /// The page's rectangle. The arithmetic lives in `platform::page_rect`, which
 /// is pure and tested; this only supplies the window's size.
-fn content_rect(window: &Window, chrome_height: i32, chrome_left: i32, pane: i32) -> Rect {
+fn content_rect(
+    window: &Window,
+    chrome_height: i32,
+    chrome_left: i32,
+    chrome_right: i32,
+    pane: i32,
+) -> Rect {
     let size = window.inner_size().to_logical::<f64>(window.scale_factor());
     let (x, y, w, h) = crate::platform::page_rect(
         size.width,
         size.height,
         chrome_height,
         chrome_left,
+        chrome_right,
         pane,
         crate::platform::PAGE_FRAME_PX,
     );
@@ -5753,47 +6659,153 @@ fn content_rect(window: &Window, chrome_height: i32, chrome_left: i32, pane: i32
     }
 }
 
-/// Runtime WebView2 version.
-///
-/// No floor is enforced here, deliberately. The WebView2 Evergreen runtime
-/// updates itself out of band from this application, so a stale one is not a
-/// state the user can be in for long and not one we would be right to nag
-/// about. The version is still reported, because "which engine am I actually
-/// running" is a question a privacy browser should answer on both platforms.
-pub fn engine_info() -> crate::platform::EngineInfo {
+/// The lowest `BrowserVersionString` any live WebView2 environment in this
+/// process has reported, or that environments exist and none could be read.
+/// See `platform::RunningVersion` for the rule; `note_running_environment`
+/// is the only writer.
+static RUNNING_ENGINE: Mutex<crate::platform::RunningVersion> =
+    Mutex::new(crate::platform::RunningVersion::NoneYet);
+
+/// The Evergreen runtime INSTALLED on this machine, every field kept, or
+/// `None` when the runtime is absent or the read fails.
+fn installed_runtime_version() -> Option<Vec<u32>> {
     use webview2_com::Microsoft::Web::WebView2::Win32::GetAvailableCoreWebView2BrowserVersionString;
     use windows::core::PCWSTR;
-
     // SAFETY: the runtime writes an allocated wide string we must free with
     // CoTaskMemFree; a null browser-executable folder means "use the
     // installed Evergreen runtime".
-    let version = unsafe {
+    unsafe {
         let mut raw = windows::core::PWSTR::null();
         match GetAvailableCoreWebView2BrowserVersionString(PCWSTR::null(), &mut raw) {
             Ok(()) if !raw.is_null() => {
                 let text = raw.to_string().unwrap_or_default();
                 windows::Win32::System::Com::CoTaskMemFree(Some(raw.0 as *const _));
-                // "141.0.3537.57" -> (141, 0, 3537); the fourth field is
-                // dropped because EngineInfo carries a semver-shaped triple.
-                let mut parts = text.split('.').filter_map(|p| p.parse::<u32>().ok());
-                match (parts.next(), parts.next(), parts.next()) {
-                    (Some(a), Some(b), Some(c)) => Some((a, b, c)),
-                    _ => None,
-                }
+                // "152.0.4191.62" -> [152, 0, 4191, 62], every field kept.
+                crate::platform::parse_version_fields(&text)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Record the engine a freshly built webview actually runs on.
+///
+/// Reads `BrowserVersionString` from the webview's OWN environment -- the
+/// one wry handed it, whether that was `shared_environment()` or wry's
+/// fallback -- so the fallback regime is observed the same way as the
+/// hardened one. Does NOT create an environment to ask: every caller has
+/// just built a webview, so the environment exists already. Called from
+/// every build path (chrome, content, translator, probe); a path that
+/// forgets is a path whose engine is invisible, which `RunningVersion`
+/// then reports as the installed build until another path reports.
+fn note_running_environment(webview: &WebView) {
+    use wry::WebViewExtWindows;
+    let environment = webview.environment();
+    // SAFETY: same contract as the installed read; the environment
+    // allocates the string and CoTaskMemFree releases it.
+    let observed: Option<Vec<u32>> = unsafe {
+        let mut raw = windows::core::PWSTR::null();
+        match environment.BrowserVersionString(&mut raw) {
+            Ok(()) if !raw.is_null() => {
+                let text = raw.to_string().unwrap_or_default();
+                windows::Win32::System::Com::CoTaskMemFree(Some(raw.0 as *const _));
+                crate::platform::parse_version_fields(&text)
             }
             _ => None,
         }
     };
+    match &observed {
+        Some(v) => diag(&format!(
+            "engine: live environment reports {}",
+            crate::platform::join_version(v)
+        )),
+        None => diag("engine: live environment version could not be read; running version is unknown"),
+    }
+    if let Ok(mut guard) = RUNNING_ENGINE.lock() {
+        let current = std::mem::replace(&mut *guard, crate::platform::RunningVersion::Unknown);
+        // WebView2 precision is the compiled floor's: four fields. A report
+        // with fewer (a suffixed or truncated string) is incomplete and is
+        // merged as a failed read, never as a lower version.
+        *guard = crate::platform::merge_running(
+            current,
+            observed,
+            crate::platform::MIN_WEBVIEW2.len(),
+        );
+    }
+}
+
+/// Runtime WebView2 version, and whether it is below the security floor.
+///
+/// The floor used to be deliberately absent here, on the reasoning that the
+/// Evergreen runtime updates itself out of band, so a stale one is not a
+/// state a user can be in for long and not one worth nagging about. Half of
+/// that survives: being below the floor raises a BANNER (see
+/// `enforce_engine_floor` in main.rs), never the refusal the WebKitGTK side
+/// applies, because on Windows the fix is on its way. What did not survive
+/// is the silence. CVE-2026-85046 and then CVE-2026-87491 were exploited in
+/// the wild before their fixes shipped, and a runtime that still carries one
+/// is a state the user should
+/// be able to SEE, for the days it lasts, on the browser whose headline
+/// promise is that pages cannot reach the machine.
+///
+/// Every version field is kept. "152.0.4191.62" and "152.0.4191.66" are the
+/// exposed and the fixed runtime, and a triple that drops the fourth field
+/// (as this function once did) calls them the same version.
+pub fn engine_info() -> crate::platform::EngineInfo {
+    use crate::platform::{EngineVersionSource, RunningVersion};
+
+    // INSTALLED is not RUNNING. `GetAvailableCoreWebView2BrowserVersionString`
+    // reports the Evergreen build on disk, which updates itself while the
+    // browser is open; every live webview keeps the build it was created
+    // with until the process restarts. Before any webview exists the
+    // installed number is the honest startup diagnostic. Once environments
+    // exist, only their own `BrowserVersionString` (recorded by
+    // `note_running_environment`) is the engine underneath the pages, and a
+    // failed read stays unknown rather than borrowing the newer number.
+    let installed = installed_runtime_version();
+    let running = RUNNING_ENGINE
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or(RunningVersion::Unknown);
+    // The pretend version comes first, and only in a debug build; see
+    // platform::debug_version_override for why a release build has no such
+    // switch. It stands in for the RUNNING version, so the hardware
+    // checklist can also show the restart wording against a real installed
+    // runtime that is already past the floor.
+    let (version, version_source) = match crate::platform::debug_version_override() {
+        Some(pretend) => (Some(pretend), EngineVersionSource::Running),
+        None => crate::platform::resolve_engine_version(running, installed.clone()),
+    };
+    let compiled = &crate::platform::MIN_WEBVIEW2;
+    let floor = crate::platform::effective_floor("WebView2", compiled);
+    let below_floor = version
+        .as_deref()
+        .is_some_and(|found| crate::platform::below_floor(found, &floor));
+    let below_compiled_floor = version
+        .as_deref()
+        .is_some_and(|found| crate::platform::below_floor(found, compiled));
     crate::platform::EngineInfo {
         name: "WebView2",
         version,
-        below_floor: false,
+        below_floor,
+        below_compiled_floor,
+        floor,
+        compiled_floor: compiled,
+        advisory: crate::platform::WEBVIEW2_ADVISORY,
+        installed,
+        version_source,
         // Requested at build time in harden_privacy. Unlike the GTK side
         // there is no cheap read-back here (the getter lives on the profile,
-        // which needs a live webview), so this states what was asked for.
-        // Confirming it is a Windows runtime test, not something this
-        // process can prove.
-        tracking_prevention: "Tracking prevention: Strict (requested)",
+        // which needs a live webview), so this process-level summary names the
+        // persisted ask. Per-tab diagnostics carry the actual readback.
+        tracking_prevention: match crate::prefs::load().tracking_prevention {
+            crate::prefs::TrackingPreventionLevel::Strict => {
+                "Tracking prevention: Strict (requested)"
+            }
+            crate::prefs::TrackingPreventionLevel::Balanced => {
+                "Tracking prevention: Balanced (requested)"
+            }
+        },
     }
 }
 

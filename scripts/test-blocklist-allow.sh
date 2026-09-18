@@ -48,7 +48,18 @@ N=$(parse "$ALLOW" | wc -l)
 # repository, a national carrier -- plus four hosting apexes where the
 # abusive page is a subdomain and taking the apex takes every customer.
 # Nothing from the refuse band; none of these ever held a build.
-check "shipped allowlist parses to 64 hosts" "64" "$N"
+# 76 as of 2026-09-01. Twelve additions, from two unrelated causes, and the
+# split is recorded because a single number hides it: THREE (telegram.im,
+# playmods.net, getmodsapk.com) were already in the working tree unadjudicated
+# against this pin when ShadowWhisperer was wired in -- the pin had been
+# reading 67-against-64 and failing before that work started. The other NINE
+# are the ShadowWhisperer onboarding review: of the eighteen top-10k hosts its
+# Malware list brought to the tripwire, these are the false positives and the
+# out-of-scope entries. See the dated block in the allowlist for each one's
+# evidence.
+# 77 as of 2026-09-09: line.me, PhishDestroy's report of the LINE apex, which
+# held publishing for a day until it was ruled ALLOW.
+check "shipped allowlist parses to 77 hosts" "77" "$N"
 # googll.store was allowlisted for one draft on the strength of its Tranco rank
 # and then removed; see the note in the allowlist. Asserted explicitly because
 # the mistake is an easy one to make twice.

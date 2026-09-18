@@ -83,15 +83,15 @@ A browser repository can produce some surprising language percentages, so one de
 
 ### Toolchain
 
-The Rust toolchain is pinned to version `1.96.0` through `rust-toolchain.toml`. Pinning the compiler reduces build-environment drift and is one part of PATANYX's reproducible-build process.
+The Rust toolchain is pinned to version `1.98.0` through `rust-toolchain.toml`. Pinning the compiler reduces build-environment drift and is one part of PATANYX's reproducible-build process.
 
 ## Quick start
 
-The toolchain is pinned to **Rust 1.96.0** by `rust-toolchain.toml` as part of PATANYX's reproducible-build process (see [docs/reproducible-builds.md](docs/reproducible-builds.md)); rustup selects it automatically when you build.
+The toolchain is pinned to **Rust 1.98.0** by `rust-toolchain.toml` as part of PATANYX's reproducible-build process (see [docs/reproducible-builds.md](docs/reproducible-builds.md)); rustup selects it automatically when you build.
 
 ### Linux (native build)
 
-PATANYX renders with WebKitGTK. Building needs the GTK 3 and WebKitGTK development packages (Debian: `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`); running needs WebKitGTK 2.52.5 or newer, which ships with Debian 13.
+PATANYX renders with WebKitGTK. Building needs the GTK 3 and WebKitGTK development packages (Debian: `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`); running needs WebKitGTK 2.52.6 or newer (Debian 13 security, 2.52.6-1~deb13u1).
 
 ```bash
 git clone https://github.com/EdgeXene/patanyx.git

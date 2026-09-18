@@ -1,15 +1,24 @@
-/target
-*.rbv
-*.vault
+
 /dist
 freeze-probe-log.txt
-
-/target-publish
-
-# Tranco popularity snapshot: build-box only, never redistributed.
-# See scripts/refresh-tranco.sh and scripts/tranco-snapshot.sha256.
-scripts/tranco-top100k.txt
-
-# Python bytecode from running the review tooling.
-__pycache__/
 *.pyc
+
+# The in-product isolation probe writes its result beside the CWD it runs in.
+# A runtime artifact, not source: it landed in three commits before anyone
+# noticed, carried by a `git add -A`.
+patanyx-isolation-probe.jsonl
+# Likewise the translation reply-channel probe.
+patanyx-translate-probe.jsonl
+scripts/langpack-provenance.json.lock
+__pycache__/
+# Python bytecode from running the review tooling.
+*.rbv
+scripts/tranco-top100k.txt
+# See scripts/refresh-tranco.sh and scripts/tranco-snapshot.sha256.
+/target
+/target-publish
+/target-publish-win
+/target-win
+# Tranco popularity snapshot: build-box only, never redistributed.
+*.vault
+/target-dbg*

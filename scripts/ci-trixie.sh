@@ -31,19 +31,27 @@ cargo test -p patanyx --features chat --locked
 # reconnect, backoff, the drain that stops frames surviving a reconnect -- was
 # covered by either line above. It had never run in CI at all.
 cargo test -p patanyx-chat --features relay-client --locked
-
+# The chrome scripts are EXECUTED, not parsed: node --check validates syntax
+# and has already let a load-time ReferenceError ship. Also bans innerHTML in
+# the webview that holds IPC and the vault. Its partner-gate entry drives all
+# three disclosed placements, so CI cannot pass on the renderer merely
+# existing as unreachable code again.
+# Cheapest gate here and the one that invalidates the rest if it fails: if a
+# build path installs a compiler other than the pinned one, every artifact
+# below was produced by the wrong rustc.
 echo
 echo "=== lints ==="
 # Separate from the test suites on purpose: a suite proves behavior, a linter
 # catches the class of mistake that compiles, passes, and is still wrong. Both
 # components come from the pinned toolchain, so this needs no setup the pin does
 # not already provide.
-#
-# NOT -D warnings, deliberately, and that is the honest state rather than an
-# oversight: there is a small backlog of style findings, and a gate that fails
-# on day one gets switched off within a week. What this buys is the thing that
-# matters, which is that clippy actually RUNS before a release, so a real defect
-# it spots is seen. Tightening it is its own commit, once the backlog is clear.
+# NOT --check and NOT -D warnings, deliberately, and this is the honest state
+# rather than an oversight. The tree has never been rustfmt-normalized (637
+# files differ) and clippy has a handful of style findings, so a hard gate here
+# would fail on day one and be switched off within a week. What this does buy is
+# the thing that matters: clippy actually RUNS before a release, so a real
+# defect it spots is seen. Tighten to -D warnings once the backlog is cleared,
+# and make that a deliberate commit rather than a side effect of this one.
 cargo clippy --workspace --all-targets --locked
 # RustSec advisories against the locked dependency set. Cheap, and the only
 # thing that notices a dependency going bad between releases.
@@ -53,12 +61,14 @@ else
   echo "cargo audit: SKIPPED (cargo-audit not installed)"
 fi
 
-echo
-echo "=== gates ==="
-# The chrome scripts are EXECUTED, not parsed: node --check validates syntax
-# and has already let a load-time ReferenceError ship. Also bans innerHTML in
-# the webview that holds IPC and the vault.
+./scripts/toolchain-pin-gate.sh
 ./scripts/chrome-js-gate.sh
+# Tab reordering broke twice from the SAME Windows API call, and the second
+# time it reached real hardware in a release build because every
+# other gate stayed green: nothing asserted the ABSENCE of a call. This one
+# does, alongside the wry handler that revokes the engine's drop target and
+# the dataTransfer payload both engines need to start a drag at all.
+node ./scripts/drag-regression-gate.js
 # 27 scheme/accent chromes exist; nobody eyeballs them all. Fails on any
 # WCAG pair below its bar (or below the shipped Dark baseline).
 python3 ./scripts/theme-contrast-gate.py
@@ -83,7 +93,6 @@ fi
 # stays applicable while it waits: fails if the branch drifts so the patch
 # no longer applies, or if PREMIUM_ON_SALE flips early. Delete this line and
 # the patch in the launch commit itself.
-./scripts/premium-launch-flip.sh check
 # The relay's token-logging gate LEFT THIS REPOSITORY with the relay itself
 # (commit e7f2a5a, the OSS split). It ran unconditionally here for a while
 # after that, which aborts this script under `set -e` before every gate
@@ -97,7 +106,7 @@ fi
 python3 ./scripts/check-cargo-sources.py
 # The app version and the AppStream version must be the same number. They
 # drifted 0.9.0 -> 0.9.52 unnoticed because nothing compared them.
-./scripts/check-version.sh
+EXPECTED_VERSION=1.0.0 ./scripts/check-version.sh
 # The About panel names every third-party package compiled into the binary, and
 # that list is a checked-in file. Add a dependency without regenerating it and
 # the browser confidently attributes a set of software it is no longer built
@@ -122,6 +131,18 @@ RUNS="${DELIVERY_PROBE_RUNS:-5}" ./scripts/chat-delivery-probe.sh
 echo
 echo "=== release build ==="
 cargo build --release --locked
+
+# The suite above must exercise the real session-and-activation gate. An
+# unlocked build can pass every positive Premium test while proving nothing
+# about that rule, which is the same false-green shape the planted-defect gate
+# exists to prevent. Check the exact release artifact that smoke runs next;
+# the compile-time warning is mandatory in every premium-unlocked binary.
+unlocked_marker="UNLOCKED TEST BUILD: Premium forced on; no licence checked"
+if strings -a "$CARGO_TARGET_DIR/release/patanyx" | grep -F "$unlocked_marker" >/dev/null; then
+  echo "GATE FAIL: ci-trixie built premium-unlocked; licence-gate results are invalid" >&2
+  exit 1
+fi
+echo "licence gate: real session/activation build (premium-unlocked absent)"
 
 echo
 echo "=== the gate that matters: run it, ask the engine ==="
@@ -156,11 +177,68 @@ case "$engine_line" in
   *) echo "GATE FAIL: ITP is not on -> $engine_line" >&2; exit 1 ;;
 esac
 
+# THE CONTENT-FILTER ENGINE GATE.
+#
+# Asks THIS IMAGE'S WebKit whether the shipped ad and tracker rules actually
+# compile. Everything above proves our code is self-consistent; this proves the
+# engine accepts what we intend to ship to users.
+#
+# It exists because the failure it catches is SILENT. WebKit refuses a compiled
+# rule list above an undocumented ceiling -- measured 2026-09-01 as exactly
+# 150,000 rules on both 2.50.6 and 2.52.6 -- and refuses patterns outside the
+# subset its regex engine accepts. Either refusal installs NO filter, and the
+# browser then runs with ad blocking switched on in the UI and nothing actually
+# blocking. Nothing in the product notices.
+#
+# A build-time assertion against the constant 150000 would only restate today's
+# number: if a future engine LOWERS the ceiling or narrows the accepted
+# patterns, the constant still passes and the release ships broken. Asking the
+# engine is the only check that survives the engine changing, which is the
+# whole point on the way to 1.0.
+echo
+echo "=== content filter compiles against this engine ==="
+if ! filter_out="$(xvfb-run -a --server-args="-screen 0 1280x900x24" \
+      "$CARGO_TARGET_DIR/release/patanyx" --verify-content-filter 2>&1)"; then
+  echo "$filter_out"
+  echo "GATE FAIL: this engine REFUSED the shipped ad/tracker rules." >&2
+  echo "  Nothing would block for users, and nothing in the product would say so." >&2
+  echo "  Split the rule lists further or drop the rejected pattern." >&2
+  exit 1
+fi
+echo "$filter_out"
+
 # The hover readout's live check (ipc::smoke_readout_sequence). Its absence
 # means either the sequence failed -- the smoke exit already failed above in
 # that case -- or someone unchained it from the smoke run, which this catches.
 echo "$out" | grep -q '^READOUT ok$' || {
   echo "GATE FAIL: the hover readout did not pass its live check" >&2
+  exit 1
+}
+
+# The affiliate partner path's live check (ipc::smoke_partner_sequence). Same
+# reasoning as READOUT above: the sequence proves that partner_open opens the
+# approved destination and that a caller-supplied url opens nothing, and this
+# grep is what stops someone unchaining it from the smoke run without CI
+# noticing.
+echo "$out" | grep -q '^PARTNER ok$' || {
+  echo "GATE FAIL: the affiliate partner path did not pass its live check" >&2
+  exit 1
+}
+
+# The project-support destination has its own non-affiliate identifier path.
+# Require the real-dispatch result so removing that path cannot leave only a
+# mocked About-button test passing.
+echo "$out" | grep -q '^SPONSORSHIP ok$' || {
+  echo "GATE FAIL: the sponsorship path did not pass its live check" >&2
+  exit 1
+}
+
+# Tab reordering has a positional-state hazard no mocked DOM can prove: the
+# active Vec index must be remapped by id, malformed orders must be atomic,
+# and an id-addressed close must still find its tab after a move. Pin the real
+# dispatcher sequence so it cannot be silently unchained from smoke mode.
+echo "$out" | grep -q '^SMOKE tabs:' || {
+  echo "GATE FAIL: tab reorder did not pass its real-dispatch smoke check" >&2
   exit 1
 }
 

@@ -2,13 +2,11 @@
 //! a home for. Everything local; nothing here may ever grow a network
 //! client.
 //!
-//! The platforms honestly differ, and the difference is labelled rather
-//! than papered over: WebView2 exposes only CapturePreview (the VISIBLE
-//! VIEWPORT -- resizing the real webview to page height to fake more would
-//! repaint the user's window and lie about what was on screen), while
-//! WebKitGTK snapshots the FULL DOCUMENT. The scope appears in the toast
-//! and the default file name, so a saved file never claims to be more than
-//! it is.
+//! Both engines can now render either the visible viewport or the full
+//! document. WebView2's full-page protocol call may be unavailable on an old
+//! runtime, in which case it truthfully falls back to CapturePreview. The
+//! scope is carried on the finished event rather than inferred from the
+//! request, so every result can say what the picture actually contains.
 //!
 //! Text extraction USED to compose with the OCR panel only via a saved file
 //! (capture, then scan the file), and this header used to forbid a fused
@@ -85,7 +83,7 @@ pub fn validate_capture_bytes(bytes: &[u8]) -> Result<(), &'static str> {
         return Err("no_capture_page");
     }
     if !is_plausible_png(bytes) {
-        return Err("capture_failed");
+        return Err("capture_decode_failed");
     }
     Ok(())
 }
@@ -98,6 +96,47 @@ pub fn validate_capture_bytes(bytes: &[u8]) -> Result<(), &'static str> {
 /// an endless feed is bounded by nothing, and the encoded string, its parsed
 /// copy and the decoded bytes are all resident at the same moment.
 pub const MAX_CAPTURE_BASE64: usize = 96 * 1024 * 1024;
+
+/// Hard bounds for the bitmap handed to the chrome region-preview `<img>`.
+/// Eight megapixels is at most about 32 MiB once decoded to RGBA, while the
+/// independent side limit keeps pathological tall/narrow captures inside a
+/// conservative GPU texture dimension. The native PNG is NOT subject to
+/// these bounds: it remains the source of truth for OCR and archive storage.
+pub const REGION_PREVIEW_MAX_PIXELS: u64 = 8_000_000;
+pub const REGION_PREVIEW_MAX_SIDE: u32 = 8_192;
+
+/// The deliberate allocation budget handed to the row-streaming PNG decoder.
+///
+/// 64 MiB is enough for the decoder's compressed-data bookkeeping and several
+/// very wide capture rows without ever granting it a source-frame-sized
+/// allocation. The preview itself is independently bounded above at 8 MP
+/// (about 30.5 MiB of RGBA); the horizontal and vertical area accumulators are
+/// one row each, at most 256 KiB plus 512 KiB.
+pub const REGION_PREVIEW_DECODER_ALLOC_LIMIT: usize = 64 * 1024 * 1024;
+
+/// Chooses preview dimensions without changing aspect ratio beyond the one
+/// pixel rounding needed for integer dimensions. Returns the source size
+/// exactly when it is already safe, which lets the caller serve the original
+/// bytes without a decode/re-encode round trip.
+pub fn region_preview_dimensions(width: u32, height: u32) -> (u32, u32) {
+    if width == 0 || height == 0 {
+        return (0, 0);
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels <= REGION_PREVIEW_MAX_PIXELS
+        && width <= REGION_PREVIEW_MAX_SIDE
+        && height <= REGION_PREVIEW_MAX_SIDE
+    {
+        return (width, height);
+    }
+    let pixel_scale = (REGION_PREVIEW_MAX_PIXELS as f64 / pixels as f64).sqrt();
+    let side_scale = f64::from(REGION_PREVIEW_MAX_SIDE) / f64::from(width.max(height));
+    let scale = pixel_scale.min(side_scale).min(1.0);
+    (
+        (f64::from(width) * scale).floor().max(1.0) as u32,
+        (f64::from(height) * scale).floor().max(1.0) as u32,
+    )
+}
 
 /// Decodes standard base64 (RFC 4648, with or without padding).
 ///
@@ -177,11 +216,14 @@ pub enum CaptureIntent {
     /// for text and then encrypted into a blob. Like Region it never
     /// reaches the save dialog; unlike Region it does reach disk, encrypted.
     Archive,
+    /// Page Integrity snapshot: hashes and text are already prepared; this
+    /// capture supplies the optional bounded picture stored beside them.
+    Snapshot,
 }
 
 /// Delivered to the event loop when the async platform capture finishes.
-/// The main loop validates, runs the picker, writes, and toasts -- all on
-/// the UI thread, exactly like the other pickers.
+/// Windows full-page parsing, decoding and validation are already complete
+/// on a worker; the main loop handles intent, picker, writing, and UI state.
 pub struct CaptureEvent {
     pub png: Result<Vec<u8>, &'static str>,
     /// What this capture ACTUALLY covered, set by the path that produced it
@@ -208,7 +250,10 @@ pub struct CaptureEvent {
 /// when the mode closes -- bounded by construction, like the in-flight flag.
 pub struct PendingRegion {
     pub token: u64,
+    /// Native capture bytes. OCR always crops from this buffer.
     pub png: Vec<u8>,
+    /// Chrome-only bounded rendition. Never used as an OCR source.
+    pub preview_png: Vec<u8>,
     pub width: u32,
     pub height: u32,
 }
@@ -231,32 +276,392 @@ pub fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PreviewDecodeStats {
+    rows_decoded: u32,
+    /// A seam for the memory invariant: source rows are borrowed from the PNG
+    /// reader and consumed before the next row is requested. No source-frame
+    /// collection exists behind the preview helper.
+    peak_source_rows_held: u32,
+    peak_accumulator_rows: u32,
+}
+
+fn preview_decode_error(error: png::DecodingError) -> &'static str {
+    match error {
+        png::DecodingError::LimitsExceeded => "capture_too_large",
+        _ => "capture_decode_failed",
+    }
+}
+
+/// Validates a PNG without changing the small-page fast path's bytes. Even a
+/// clone must be a complete, decodable PNG rather than merely an IHDR-shaped
+/// buffer; validation remains O(one source row).
+fn validate_png_rows(bytes: &[u8]) -> Result<PreviewDecodeStats, &'static str> {
+    use png::{Decoder, Limits, Transformations};
+    use std::io::Cursor;
+
+    let mut decoder = Decoder::new_with_limits(
+        Cursor::new(bytes),
+        Limits {
+            bytes: REGION_PREVIEW_DECODER_ALLOC_LIMIT,
+        },
+    );
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(preview_decode_error)?;
+    if reader.info().interlaced {
+        return Err("capture_too_large");
+    }
+    let mut rows_decoded = 0u32;
+    while reader.next_row().map_err(preview_decode_error)?.is_some() {
+        rows_decoded = rows_decoded.checked_add(1).ok_or("capture_too_large")?;
+    }
+    if rows_decoded != reader.info().height {
+        return Err("capture_decode_failed");
+    }
+    Ok(PreviewDecodeStats {
+        rows_decoded,
+        peak_source_rows_held: u32::from(rows_decoded > 0),
+        peak_accumulator_rows: 0,
+    })
+}
+
+fn rgba_at(color: png::ColorType, source: &[u8], at: usize) -> Option<[u8; 4]> {
+    match color {
+        png::ColorType::Grayscale => source.get(at).map(|&g| [g, g, g, 255]),
+        png::ColorType::GrayscaleAlpha => Some([
+            *source.get(at)?,
+            *source.get(at)?,
+            *source.get(at)?,
+            *source.get(at + 1)?,
+        ]),
+        png::ColorType::Rgb => Some([
+            *source.get(at)?,
+            *source.get(at + 1)?,
+            *source.get(at + 2)?,
+            255,
+        ]),
+        png::ColorType::Rgba => Some([
+            *source.get(at)?,
+            *source.get(at + 1)?,
+            *source.get(at + 2)?,
+            *source.get(at + 3)?,
+        ]),
+        png::ColorType::Indexed => None,
+    }
+}
+
+/// Box-downscales a non-interlaced PNG while holding only one decoded source
+/// row, one horizontally reduced row, one vertical accumulator row, and the
+/// already-bounded preview. Coordinates use integer coverage units, so every
+/// source pixel contributes its exact area and the result is deterministic.
+fn stream_preview_png_with_stats(
+    bytes: &[u8],
+    preview_width: u32,
+    preview_height: u32,
+) -> Result<(Vec<u8>, PreviewDecodeStats), &'static str> {
+    use png::{BitDepth, ColorType, Decoder, Encoder, Limits, Transformations};
+    use std::io::Cursor;
+
+    let mut decoder = Decoder::new_with_limits(
+        Cursor::new(bytes),
+        Limits {
+            bytes: REGION_PREVIEW_DECODER_ALLOC_LIMIT,
+        },
+    );
+    decoder.set_transformations(Transformations::normalize_to_color8());
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    let mut reader = decoder.read_info().map_err(preview_decode_error)?;
+    let (source_width, source_height) = reader.info().size();
+    if preview_width == 0
+        || preview_height == 0
+        || preview_width > source_width
+        || preview_height > source_height
+    {
+        return Err("capture_too_large");
+    }
+    // Adam7 rows are partial passes, not complete scanlines. Browser capture
+    // encoders emit non-interlaced PNGs, so refuse rather than materialising a
+    // source frame to deinterlace, exactly as the OCR band decoder does.
+    if reader.info().interlaced {
+        return Err("capture_too_large");
+    }
+    let (color, depth) = reader.output_color_type();
+    if depth != BitDepth::Eight || color == ColorType::Indexed {
+        return Err("capture_decode_failed");
+    }
+    let samples = color.samples();
+    let preview_len = usize::try_from(u64::from(preview_width) * u64::from(preview_height) * 4)
+        .map_err(|_| "capture_too_large")?;
+    let row_accumulators = usize::try_from(preview_width).map_err(|_| "capture_too_large")?;
+    let mut preview = Vec::new();
+    preview
+        .try_reserve_exact(preview_len)
+        .map_err(|_| "capture_too_large")?;
+    let mut horizontal = Vec::<[u64; 4]>::new();
+    horizontal
+        .try_reserve_exact(row_accumulators)
+        .map_err(|_| "capture_too_large")?;
+    horizontal.resize(row_accumulators, [0; 4]);
+    let mut vertical = Vec::<[u128; 4]>::new();
+    vertical
+        .try_reserve_exact(row_accumulators)
+        .map_err(|_| "capture_too_large")?;
+    vertical.resize(row_accumulators, [0; 4]);
+
+    let sw = u64::from(source_width);
+    let sh = u64::from(source_height);
+    let pw = u64::from(preview_width);
+    let ph = u64::from(preview_height);
+    let divisor = u128::from(sw) * u128::from(sh);
+    let mut output_y = 0u64;
+    let mut rows_decoded = 0u32;
+
+    for source_y in 0..source_height {
+        let row = reader
+            .next_row()
+            .map_err(preview_decode_error)?
+            .ok_or("capture_decode_failed")?;
+        rows_decoded = rows_decoded.checked_add(1).ok_or("capture_too_large")?;
+        let source = row.data();
+        horizontal.fill([0; 4]);
+
+        for output_x in 0..pw {
+            // Both intervals use units of 1/pw source pixels. The output bin
+            // is [output_x*sw, (output_x+1)*sw); a source pixel is
+            // [source_x*pw, (source_x+1)*pw).
+            let bin_left = output_x * sw;
+            let bin_right = (output_x + 1) * sw;
+            let first_source_x = bin_left / pw;
+            let last_source_x = (bin_right - 1) / pw;
+            let dest = &mut horizontal[output_x as usize];
+            for source_x in first_source_x..=last_source_x {
+                let pixel_left = source_x * pw;
+                let pixel_right = (source_x + 1) * pw;
+                let overlap = pixel_right.min(bin_right) - pixel_left.max(bin_left);
+                let at = usize::try_from(source_x)
+                    .ok()
+                    .and_then(|x| x.checked_mul(samples))
+                    .ok_or("capture_too_large")?;
+                let rgba = rgba_at(color, source, at).ok_or("capture_decode_failed")?;
+                for channel in 0..4 {
+                    dest[channel] += u64::from(rgba[channel]) * overlap;
+                }
+            }
+        }
+
+        // The same exact-coverage construction vertically. Because this is
+        // downscaling, one source row can meet at most two output rows.
+        let source_top = u64::from(source_y) * ph;
+        let source_bottom = (u64::from(source_y) + 1) * ph;
+        let mut at_y = source_top;
+        while at_y < source_bottom {
+            if output_y >= ph {
+                return Err("capture_decode_failed");
+            }
+            let output_bottom = (output_y + 1) * sh;
+            let overlap_y = source_bottom.min(output_bottom) - at_y;
+            for output_x in 0..row_accumulators {
+                for channel in 0..4 {
+                    vertical[output_x][channel] +=
+                        u128::from(horizontal[output_x][channel]) * u128::from(overlap_y);
+                }
+            }
+            at_y += overlap_y;
+            if at_y == output_bottom {
+                for pixel in &vertical {
+                    for &value in pixel {
+                        let rounded = (value + divisor / 2) / divisor;
+                        preview.push(u8::try_from(rounded).map_err(|_| "capture_decode_failed")?);
+                    }
+                }
+                vertical.fill([0; 4]);
+                output_y += 1;
+            }
+        }
+    }
+    if output_y != ph || preview.len() != preview_len {
+        return Err("capture_decode_failed");
+    }
+
+    // Do not overlap the decoder's deliberate 64 MiB budget with the encoded
+    // preview Vec. Encoding needs the bounded RGBA preview, not the source.
+    drop(reader);
+    let mut encoded = Vec::new();
+    {
+        let mut encoder = Encoder::new(&mut encoded, preview_width, preview_height);
+        encoder.set_color(ColorType::Rgba);
+        encoder.set_depth(BitDepth::Eight);
+        let mut writer = encoder
+            .write_header()
+            .map_err(|_| "capture_preview_failed")?;
+        writer
+            .write_image_data(&preview)
+            .map_err(|_| "capture_preview_failed")?;
+    }
+    Ok((
+        encoded,
+        PreviewDecodeStats {
+            rows_decoded,
+            peak_source_rows_held: u32::from(rows_decoded > 0),
+            peak_accumulator_rows: u32::from(preview_height > 0),
+        },
+    ))
+}
+
+const CAPTURE_DIAG_LOG_CAP: usize = 16;
+static CAPTURE_DIAG_LOG: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<String>>> =
+    std::sync::OnceLock::new();
+
+fn capture_preview_diag(dimensions: Option<(u32, u32)>, decoded_bytes: Option<u128>, path: &str) {
+    let dimensions = dimensions
+        .map(|(w, h)| format!("{w}x{h}"))
+        .unwrap_or_else(|| "unknown".to_string());
+    let decoded_bytes = decoded_bytes
+        .map(|bytes| bytes.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let line = format!(
+        "capture preview: source={dimensions} decoded_rgba_estimate={decoded_bytes}B path={path}"
+    );
+    if cfg!(debug_assertions) {
+        eprintln!("patanyx: {line}");
+    }
+    let log = CAPTURE_DIAG_LOG.get_or_init(|| {
+        std::sync::Mutex::new(std::collections::VecDeque::with_capacity(
+            CAPTURE_DIAG_LOG_CAP,
+        ))
+    });
+    if let Ok(mut log) = log.lock() {
+        if log.len() >= CAPTURE_DIAG_LOG_CAP {
+            log.pop_front();
+        }
+        log.push_back(line);
+    }
+}
+
+/// Capture-preview diagnostics for the explicit diagnostics export. Entries
+/// contain dimensions and byte counts only, never a page URL or image bytes.
+pub fn recent_diagnostics() -> Vec<String> {
+    CAPTURE_DIAG_LOG
+        .get()
+        .and_then(|log| log.lock().ok().map(|log| log.iter().cloned().collect()))
+        .unwrap_or_default()
+}
+
+/// The single 8 MP / 8192 px rendition used wherever a captured page is
+/// allowed into a chrome `<img>` or a snapshot blob. Small pictures keep
+/// their original bytes; larger ones use WP-Z's row-streaming downscale, so
+/// snapshot storage cannot grow a second image-decoding pipeline.
+pub fn bounded_picture_png(png: &[u8]) -> Result<Vec<u8>, &'static str> {
+    let Some((width, height)) = png_dimensions(png) else {
+        capture_preview_diag(None, None, "refused(decode_format)");
+        return Err("capture_decode_failed");
+    };
+    let decoded_bytes = u128::from(width) * u128::from(height) * 4;
+    let (preview_width, preview_height) = region_preview_dimensions(width, height);
+    if (preview_width, preview_height) == (width, height) {
+        if let Err(code) = validate_png_rows(png) {
+            capture_preview_diag(
+                Some((width, height)),
+                Some(decoded_bytes),
+                &format!("refused({code})"),
+            );
+            return Err(code);
+        }
+        capture_preview_diag(Some((width, height)), Some(decoded_bytes), "fast_clone");
+        Ok(png.to_vec())
+    } else {
+        match stream_preview_png_with_stats(png, preview_width, preview_height) {
+            Ok((preview, _stats)) => {
+                capture_preview_diag(
+                    Some((width, height)),
+                    Some(decoded_bytes),
+                    "streamed_downscale",
+                );
+                Ok(preview)
+            }
+            Err(code) => {
+                capture_preview_diag(
+                    Some((width, height)),
+                    Some(decoded_bytes),
+                    &format!("refused({code})"),
+                );
+                Err(code)
+            }
+        }
+    }
+}
+
 /// Stashes a fresh region capture, replacing any previous one, and returns
-/// `(token, width, height)` for the `region_capture_ready` event. The token
-/// is minted here so nothing outside this module can predict or reuse one.
-pub fn stash_region(png: Vec<u8>) -> Result<(u64, u32, u32), &'static str> {
-    let (width, height) = png_dimensions(&png).ok_or("capture_failed")?;
-    static NEXT_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let token = NEXT_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let mut slot = PENDING_REGION.lock().map_err(|_| "capture_failed")?;
+/// `(token, source_width, source_height, preview_width, preview_height)` for
+/// the `region_capture_ready` event. The token is minted here so nothing
+/// outside this module can predict or reuse one.
+pub fn stash_region(png: Vec<u8>) -> Result<(u64, u32, u32, u32, u32), &'static str> {
+    let Some((width, height)) = png_dimensions(&png) else {
+        capture_preview_diag(None, None, "refused(decode_format)");
+        return Err("capture_decode_failed");
+    };
+    let (preview_width, preview_height) = region_preview_dimensions(width, height);
+    let preview_png = bounded_picture_png(&png)?;
+    // Random, not a counter: the same reason as `archive::stash_picture`, which
+    // this comment used to match in claim but not in code (security assessment
+    // 2026-08-28, R13). A region capture is whatever was on the user's screen.
+    let token = crate::archive::random_token();
+    let mut slot = PENDING_REGION
+        .lock()
+        .map_err(|_| "capture_preview_failed")?;
     *slot = Some(PendingRegion {
         token,
         png,
+        preview_png,
         width,
         height,
     });
-    Ok((token, width, height))
+    Ok((token, width, height, preview_width, preview_height))
 }
 
 /// A clone of the pending capture's bytes, if `token` names it. NON-consuming
 /// on purpose: the user may drag several regions out of one capture, and the
 /// protocol handler serves the same bytes the scan reads. The capture is
 /// released by `clear_region` (mode closed) or by the next `stash_region`.
+/// A picture token on its way to the chrome, as a JSON STRING.
+///
+/// The tokens became 64 random bits on 2026-08-28 (a counter was guessable).
+/// Sent as a JSON number, a value above 2^53 arrives in JavaScript with its
+/// low digits rounded away, the chrome builds `/region-capture/<wrong>.png`
+/// from it, the handler answers 404, and every picture surface (region read,
+/// Deep Recall, bookmark snapshots) shows a broken image. Nothing in Rust
+/// could see it: the unit tests never cross the JSON boundary. A string
+/// round-trips exactly, and the chrome only ever concatenates the token.
+pub fn token_wire(token: u64) -> String {
+    token.to_string()
+}
+
+/// The inverse, for a token the chrome sends back. Accepts the string form
+/// and, for one release of leniency, the old number form (correct below 2^53).
+pub fn token_from_wire(value: &serde_json::Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_str().and_then(|s| s.parse::<u64>().ok()))
+}
+
 pub fn region_png(token: u64) -> Option<Vec<u8>> {
     let slot = PENDING_REGION.lock().ok()?;
     slot.as_ref()
         .filter(|r| r.token == token)
         .map(|r| r.png.clone())
+}
+
+/// The bounded PNG served only to the chrome `<img>`. Keeping this accessor
+/// separate from `region_png` makes it mechanically hard for OCR to start
+/// reading the lossy preview instead of the native source bytes.
+pub fn region_preview_png(token: u64) -> Option<Vec<u8>> {
+    let slot = PENDING_REGION.lock().ok()?;
+    slot.as_ref()
+        .filter(|r| r.token == token)
+        .map(|r| r.preview_png.clone())
 }
 
 /// The pending capture's dimensions, if `token` names it. Used to validate a
@@ -290,13 +695,16 @@ mod tests {
         assert_eq!(decode_base64("TWE").as_deref(), Some(&b"Ma"[..]));
         // A real PNG header, which is what this actually carries.
         let png = decode_base64("iVBORw0KGgo=").expect("png header");
-        assert!(crate::capture::is_plausible_png(&[&png[..], &[0u8; 32][..]].concat()));
+        assert!(crate::capture::is_plausible_png(
+            &[&png[..], &[0u8; 32][..]].concat()
+        ));
     }
 
     #[test]
     fn base64_refuses_rather_than_guesses() {
-        // A mis-decode would surface later as "capture_failed" on a PNG that
-        // was never a PNG, which is a much worse message than refusing here.
+        // A mis-decode would surface later as "capture_decode_failed" on a
+        // PNG that was never a PNG, which is a much worse message than
+        // refusing here.
         assert_eq!(decode_base64("!!!!"), None, "invalid alphabet");
         assert_eq!(decode_base64("TQ==TQ=="), None, "data after padding");
         assert_eq!(decode_base64("T"), None, "a lone sextet is truncated");
@@ -331,15 +739,24 @@ mod tests {
         // empty means the page had nothing renderable, wrong-magic means
         // the engine handed back something unexpected.
         assert_eq!(validate_capture_bytes(&[]), Err("no_capture_page"));
-        assert_eq!(validate_capture_bytes(b"not a png"), Err("capture_failed"));
+        assert_eq!(
+            validate_capture_bytes(b"not a png"),
+            Err("capture_decode_failed")
+        );
         let png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 1, 2, 3];
         assert_eq!(validate_capture_bytes(&png), Ok(()));
     }
 
     #[test]
     fn names_and_labels_state_the_scope_and_never_the_url() {
-        assert_eq!(default_save_name(CaptureScope::VisibleArea), "capture-visible-area.png");
-        assert_eq!(default_save_name(CaptureScope::FullPage), "capture-full-page.png");
+        assert_eq!(
+            default_save_name(CaptureScope::VisibleArea),
+            "capture-visible-area.png"
+        );
+        assert_eq!(
+            default_save_name(CaptureScope::FullPage),
+            "capture-full-page.png"
+        );
         assert_eq!(scope_label(current_scope()), scope_label(current_scope()));
     }
 
@@ -354,6 +771,47 @@ mod tests {
         bytes
     }
 
+    fn rgba_pixels_png(w: u32, h: u32, pixels: &[[u8; 4]]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, w, h);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().expect("header");
+            writer
+                .write_image_data(pixels.as_flattened())
+                .expect("pixels");
+        }
+        encoded
+    }
+
+    fn rgba_png(w: u32, h: u32, rgba: [u8; 4]) -> Vec<u8> {
+        let pixels = vec![rgba; usize::try_from(u64::from(w) * u64::from(h)).unwrap()];
+        rgba_pixels_png(w, h, &pixels)
+    }
+
+    /// A cheap enormous PNG: one-bit solid rows keep both construction memory
+    /// and the compressed file small even though the RGBA decode estimate is
+    /// beyond the old image-crate ceiling.
+    fn enormous_one_bit_png(w: u32, h: u32) -> Vec<u8> {
+        use std::io::Write;
+
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut encoded, w, h);
+            encoder.set_color(png::ColorType::Grayscale);
+            encoder.set_depth(png::BitDepth::One);
+            let mut writer = encoder.write_header().expect("header");
+            let mut stream = writer.stream_writer().expect("stream");
+            let row = vec![0u8; usize::try_from(w).unwrap().div_ceil(8)];
+            for _ in 0..h {
+                stream.write_all(&row).expect("row");
+            }
+            stream.finish().expect("finish");
+        }
+        encoded
+    }
+
     #[test]
     fn png_dimensions_read_the_ihdr_and_refuse_the_degenerate() {
         assert_eq!(png_dimensions(&png_header(800, 600)), Some((800, 600)));
@@ -361,22 +819,58 @@ mod tests {
         // returning a size nothing could select inside.
         assert_eq!(png_dimensions(&png_header(0, 600)), None);
         assert_eq!(png_dimensions(&png_header(800, 600)[..20].to_vec()), None);
-        assert_eq!(png_dimensions(b"JFIF not a png at all, but long enough.."), None);
+        assert_eq!(
+            png_dimensions(b"JFIF not a png at all, but long enough.."),
+            None
+        );
+    }
+
+    #[test]
+    fn region_preview_decision_obeys_both_bounds_and_preserves_small_pages() {
+        assert_eq!(region_preview_dimensions(1920, 1080), (1920, 1080));
+        assert_eq!(region_preview_dimensions(4000, 2000), (4000, 2000));
+
+        for (w, h) in [(4001, 2000), (1000, 20_000), (20_000, 1000)] {
+            let (pw, ph) = region_preview_dimensions(w, h);
+            assert!(pw > 0 && ph > 0);
+            assert!(u64::from(pw) * u64::from(ph) <= REGION_PREVIEW_MAX_PIXELS);
+            assert!(pw <= REGION_PREVIEW_MAX_SIDE && ph <= REGION_PREVIEW_MAX_SIDE);
+            let x_scale = f64::from(pw) / f64::from(w);
+            let y_scale = f64::from(ph) / f64::from(h);
+            assert!((x_scale - y_scale).abs() <= 1.0 / f64::from(w.min(h)));
+        }
+        assert_eq!(region_preview_dimensions(1000, 20_000), (409, 8192));
+    }
+
+    #[test]
+    fn snapshot_bound_uses_the_same_8mp_8192px_rendition_as_region_preview() {
+        let source = rgba_png(9_000, 2, [12, 34, 56, 255]);
+        let bounded = bounded_picture_png(&source).expect("bounded picture");
+        let expected = region_preview_dimensions(9_000, 2);
+        assert_eq!(png_dimensions(&bounded), Some(expected));
+        assert!(u64::from(expected.0) * u64::from(expected.1) <= REGION_PREVIEW_MAX_PIXELS);
+        assert!(expected.0 <= REGION_PREVIEW_MAX_SIDE && expected.1 <= REGION_PREVIEW_MAX_SIDE);
     }
 
     #[test]
     fn a_stashed_region_is_readable_by_its_token_alone_and_replaced_by_the_next() {
-        let (token, w, h) = stash_region(png_header(64, 32)).expect("stash");
-        assert_eq!((w, h), (64, 32));
+        let first_png = rgba_png(64, 32, [12, 34, 56, 255]);
+        let (token, w, h, preview_w, preview_h) = stash_region(first_png.clone()).expect("stash");
+        assert_eq!((w, h, preview_w, preview_h), (64, 32, 64, 32));
         // Reads are non-consuming: the protocol handler and the scan both
         // read the same capture, and one drag must not eat the next.
         assert!(region_png(token).is_some());
         assert!(region_png(token).is_some());
+        assert_eq!(
+            region_preview_png(token).as_deref(),
+            Some(first_png.as_slice())
+        );
+        assert_eq!(region_preview_png(token), region_png(token));
         assert_eq!(region_dimensions(token), Some((64, 32)));
         // The wrong token gets nothing -- not the previous capture, nothing.
         assert_eq!(region_png(token + 999), None);
         // A new stash replaces the old capture and retires its token.
-        let (token2, ..) = stash_region(png_header(10, 10)).expect("stash");
+        let (token2, ..) = stash_region(rgba_png(10, 10, [1, 2, 3, 4])).expect("stash");
         assert_ne!(token, token2);
         assert_eq!(region_png(token), None);
         assert!(region_png(token2).is_some());
@@ -388,6 +882,90 @@ mod tests {
 
     #[test]
     fn a_capture_that_is_not_a_plausible_png_cannot_be_stashed() {
-        assert_eq!(stash_region(b"not a png".to_vec()), Err("capture_failed"));
+        assert_eq!(
+            stash_region(b"not a png".to_vec()),
+            Err("capture_decode_failed")
+        );
+        assert_eq!(
+            stash_region(png_header(64, 32)),
+            Err("capture_decode_failed"),
+            "a plausible IHDR is not a complete PNG"
+        );
+    }
+
+    #[test]
+    fn streamed_preview_crosses_the_old_512_mib_decode_ceiling_one_row_at_a_time() {
+        // 131072 * 1025 * 4 = 537,395,200 decoded RGBA bytes, strictly above
+        // image 0.25.10's old 512 MiB default allocation limit. One-bit solid
+        // input keeps this regression fixture compact and cheap to construct.
+        const W: u32 = 131_072;
+        const H: u32 = 1_025;
+        let decoded_rgba = u64::from(W) * u64::from(H) * 4;
+        assert!(decoded_rgba > 512 * 1024 * 1024);
+        let png = enormous_one_bit_png(W, H);
+        let (preview_w, preview_h) = region_preview_dimensions(W, H);
+        assert_ne!((preview_w, preview_h), (W, H));
+
+        let (preview, stats) =
+            stream_preview_png_with_stats(&png, preview_w, preview_h).expect("stream preview");
+        assert_eq!(png_dimensions(&preview), Some((preview_w, preview_h)));
+        assert_eq!(stats.rows_decoded, H);
+        assert_eq!(stats.peak_source_rows_held, 1);
+        assert_eq!(stats.peak_accumulator_rows, 1);
+        assert!(preview.len() < 1024 * 1024, "solid preview should compress");
+    }
+
+    #[test]
+    fn streamed_preview_area_averages_source_pixels() {
+        let source = rgba_pixels_png(
+            2,
+            2,
+            &[
+                [0, 0, 0, 0],
+                [100, 120, 140, 160],
+                [200, 220, 240, 255],
+                [100, 60, 20, 225],
+            ],
+        );
+        let (preview, _) = stream_preview_png_with_stats(&source, 1, 1).expect("preview");
+        let decoder = png::Decoder::new(std::io::Cursor::new(preview));
+        let mut reader = decoder.read_info().expect("read preview");
+        let mut rgba = [0u8; 4];
+        let output = reader.next_frame(&mut rgba).expect("decode preview");
+        assert_eq!((output.width, output.height), (1, 1));
+        assert_eq!(rgba, [100, 100, 100, 160]);
+    }
+
+    #[test]
+    fn a_corrupt_streaming_png_reports_decode_not_engine_failure() {
+        let mut png = rgba_png(9_000, 1, [20, 40, 60, 255]);
+        png.truncate(png.len() / 2);
+        let (preview_w, preview_h) = region_preview_dimensions(9_000, 1);
+        assert_eq!(
+            stream_preview_png_with_stats(&png, preview_w, preview_h),
+            Err("capture_decode_failed")
+        );
+    }
+    /// The defect: a token above 2^53 sent as a JSON number does not survive
+    /// JavaScript. Pinned at the boundary, not in JavaScript: the wire form
+    /// must be a string, and a string round-trips exactly.
+    #[test]
+    fn a_picture_token_crosses_ipc_as_a_string_and_round_trips() {
+        let token = u64::MAX - 12345; // far above 2^53, like a random token
+        let wire = serde_json::json!({ "token": token_wire(token) });
+        assert!(wire["token"].is_string(), "a number above 2^53 is rounded by JavaScript");
+        // What JavaScript would have done with the number form, to show the
+        // pin is not vacuous: f64 cannot hold it.
+        assert_ne!((token as f64) as u64, token, "precondition: this token is not f64-exact");
+        assert_eq!(token_from_wire(&wire["token"]), Some(token));
+    }
+
+    /// The old number form is still accepted where it was exact.
+    #[test]
+    fn a_small_number_token_is_still_accepted() {
+        assert_eq!(token_from_wire(&serde_json::json!(42)), Some(42));
+        assert_eq!(token_from_wire(&serde_json::json!("42")), Some(42));
+        assert_eq!(token_from_wire(&serde_json::json!("x")), None);
+        assert_eq!(token_from_wire(&serde_json::json!(null)), None);
     }
 }

@@ -1,4 +1,4 @@
-//! Pure decision logic for tab set-aside ("shelves"), kept free of `Tab`,
+//! Pure decision logic for tab shelving ("shelves"), kept free of `Tab`,
 //! webviews, and the store so it is unit-testable without a UI. The IPC
 //! arms translate `Tab`s into `Candidate`s, act on the `Plan`, and never
 //! re-decide any of this themselves.
@@ -47,9 +47,9 @@ pub(crate) fn is_storable_url(url: &str) -> bool {
 /// a name on purpose; the stored creation order (`seq`) tells them apart.
 pub(crate) fn shelf_name(count: usize) -> String {
     if count == 1 {
-        "Set aside 1 tab".to_string()
+        "Shelf with 1 tab".to_string()
     } else {
-        format!("Set aside {} tabs", count)
+        format!("Shelf with {} tabs", count)
     }
 }
 
@@ -163,8 +163,8 @@ mod tests {
     #[test]
     fn shelf_names_carry_count_and_no_timestamp() {
         // Exact phrasing per the spec, count included, nothing else.
-        assert_eq!(shelf_name(1), "Set aside 1 tab");
-        assert_eq!(shelf_name(12), "Set aside 12 tabs");
+        assert_eq!(shelf_name(1), "Shelf with 1 tab");
+        assert_eq!(shelf_name(12), "Shelf with 12 tabs");
     }
     #[test]
     fn subset_keeps_only_the_listed_tabs() {

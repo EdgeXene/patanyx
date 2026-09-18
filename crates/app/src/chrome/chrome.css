@@ -82,7 +82,8 @@ body {
   left: 0;
   right: 0;
   top: 0;
-  height: 2px;
+  /* One width with PAGE_FRAME_PX and #page-frame; a guard test reads this. */
+  height: 1px;
   background: var(--accent);
   /* Under the tabs: an active chip's own top edge must stay readable where
      the two meet. */
@@ -115,6 +116,13 @@ body {
 .tab-chip:hover {
   background: var(--sf-raised);
   color: var(--tx-chip-hover);
+}
+.tab-chip[draggable="true"] {
+  cursor: grab;
+}
+.tab-chip.dragging {
+  cursor: grabbing;
+  opacity: 0.65;
 }
 .tab-chip.active {
   background: var(--sf-strip-a); /* merges into the toolbar below */
@@ -158,8 +166,12 @@ body {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 6px;
-  padding: 8px;
+  /* Tightened from 6/8. Ten pills at 6px gaps inside 12px of pill padding
+     spent more of the row on space than on labels, and the row is the widest
+     thing in the chrome -- it decides when the toolbar wraps to a second line
+     and how early the labels start dropping on a narrow window. */
+  gap: 4px;
+  padding: 6px 8px;
   background: var(--sf-strip-a);
   /* The bottom of the frame. The top is #tabstrip::before, and between them
      the chrome is bounded by the accent on both sides -- which is what makes
@@ -168,17 +180,24 @@ body {
      job: it is the boundary between the browser and the page, and the page
      is the thing you are meant to be looking at. */
   border-bottom: 1px solid var(--ln-accent-edge);
-  /* THE SECOND ROW FILLS FROM THE RIGHT.
+  /* THE SECOND ROW FILLS FROM THE LEFT BY DEFAULT.
    *
    * `justify-content` applies to every row of a wrapping flex container, but
    * it has no effect on the first: `#url` is the only `flex: 1` in the row, so
    * it eats all the free space and there is none left to distribute. The pills
    * on the second row have no grow factor, so the free space is real there and
-   * this is what pushes them to the right-hand edge -- under the address bar's
-   * end rather than under the back button.
+   * the placement attribute can align that row at either edge without moving
+   * the address row, whose growing input consumes its own free space.
    *
    * One property, one row affected, and no wrapper div to keep in step with
    * update.js and integrity.js appending at the end. */
+  justify-content: flex-start;
+}
+
+/* Only the feature row moves. The address bar owns the first row's free space,
+   so the native Windows caption controls (above this webview) and panel Close
+   controls (inside cards below the measured strip) never share its box. */
+:root[data-toolbar-placement="top_right"] #toolbar {
   justify-content: flex-end;
 }
 
@@ -257,7 +276,15 @@ body.translucent-backdrop.modal-open::before {
      paragraph above describes, reintroduced by a tint instead of by
      transparency. */
   background: var(--sf-strip-a);
-  z-index: 45;
+  /* BELOW the banners (35), above the scrim (30). It was 45, which put this
+     over the first banner's top 12.5px -- into its content box, since the
+     banner's own top padding is 10px. Backing the slack under the toolbar is
+     all this is for, and where a banner is drawn there is no slack to hide:
+     the banner paints over it. Raising its HEIGHT to the banner-inclusive
+     strip instead would have covered the warning outright. The panel (40) is
+     above this now and does not care: it starts 12px past the strip and never
+     reaches into this band. */
+  z-index: 33;
 }
 body.translucent-backdrop.modal-open::after {
   background: rgba(13, 14, 18, 0.62);
@@ -272,21 +299,51 @@ body.modal-open #toolbar {
   z-index: 50;
 }
 
+/* BANNERS STAY READABLE WHILE A PANEL IS OPEN.
+   They are static and unpositioned, so they sat under the scrim (30) while the
+   two rows directly above them were lifted to 50. On the lifted backdrop that
+   dimmed a TLS or insecure-HTTP warning to ~38% while the toolbar above it
+   stayed bright; on the legacy opaque scrim it hid them outright. A warning a
+   user cannot read is the lock-warning defect in a third costume.
+   35, not 50: above the scrim, still BELOW the panel card (40). A banner and
+   an open panel share the band between them -- the banner runs to the height
+   the strip reports and the card begins 12px after it -- and a banner over a
+   panel's title would just move the unreadable thing.
+   Selected by ROLE rather than by id: this is the same sweep toolbar-gate.js
+   uses to enumerate banners, so a new one is covered the day it is added. The
+   child combinator keeps it to the chrome's own band; an alert inside a panel
+   stays in that panel's stacking context. */
+body.modal-open > [role="alert"],
+body.modal-open > [role="status"],
+body.modal-open > [role="search"] {
+  position: relative;
+  z-index: 35;
+}
+
 .panel-modal {
   position: fixed;
   left: 50%;
   transform: translateX(-50%);
   /* Below the MEASURED chrome, not a constant. This was 96px while the
      two-row toolbar is 148, so every panel's first line rendered under the
-     toolbar (z-index 50 beats 40) and the title was unreadable. The variable
-     is kept current by the same ResizeObserver that feeds closedChromePx. */
-  top: calc(var(--chrome-closed-px, 148px) + 12px);
+     toolbar (z-index 50 beats 40) and the title was unreadable.
+     `--chrome-strip-px` is the same number the chrome reports to Rust as the
+     closed strip, banners included, and it has to be that one rather than
+     `--chrome-closed-px`: the bare value left a panel starting 52px inside a
+     visible banner's band. It is published by syncChromeInsets, which runs on
+     every banner change; the bare variable remains the fallback for the frame
+     before the first measurement. */
+  top: calc(var(--chrome-strip-px, var(--chrome-closed-px, 148px)) + 12px);
   z-index: 40;
   /* `flex: 1` is what these panels use as in-flow strips; it does nothing when
      fixed, but the width and height caps have to be restated or the card
      inherits the full window. */
   width: min(600px, calc(100vw - 32px));
-  max-height: calc(100vh - var(--chrome-closed-px, 148px) - 24px);
+  /* Moves with the top above, or a panel pushed down by a banner would run
+     off the bottom of the window by exactly the banner's height. */
+  max-height: calc(
+    100vh - var(--chrome-strip-px, var(--chrome-closed-px, 148px)) - 24px
+  );
   overflow-y: auto;
   /* THE CARD PAINTS ITS OWN SURFACE, and must: it used to have no background
      at all and simply showed whatever was behind it. That was invisible for
@@ -408,6 +465,17 @@ button.small {
   display: none;
 }
 
+/* Translated-page indicator. Same quiet register as the zoom chip above:
+   a readout, not a control competing with the feature buttons. */
+#translate-chip {
+  flex: none;
+  color: #9fb4d8;
+  border-color: #3a4557;
+}
+#translate-chip[hidden] {
+  display: none;
+}
+
 button.small.active {
   background: var(--accent-choice-bg);
   border-color: var(--accent-choice-border);
@@ -490,8 +558,14 @@ button.danger:hover {
   --pill: #7a8194;
   display: flex;
   align-items: center;
-  gap: 6px;
-  padding: 6px 12px;
+  /* 5/9, from 6/12. The icon sits closer to its label and the pill closer to
+     its neighbours. The PILL's height is unchanged; the toolbar's is not --
+     the row above also lost 4px of vertical padding and 2px of line gap, so
+     the strip is shorter than it was. Nothing is clipped by that, because the
+     strip is measured rather than assumed and the ResizeObserver watches these
+     rows, but the earlier claim that the height did not change was wrong. */
+  gap: 5px;
+  padding: 6px 9px;
   border-radius: 9px;
   position: relative;
   background: transparent;
@@ -622,7 +696,7 @@ button.danger:hover {
 /* A GLOW for the three states a user needs to know they are still in after
    walking away, asked for by name: the vault is unlocked, the tunnel is
    carrying traffic, a saved password is available for this page.
-   
+
    Same green as every other "this is on" signal, because the meaning is the
    same and this row has exactly one colour rule. The glow is an ADDITION to
    the outline above, not a replacement: it survives being looked at out of
@@ -771,33 +845,103 @@ body.loading #url {
   justify-content: flex-end;
 }
 
+/* TOP CENTRE, BOLD, and one surface for every notification.
+
+   These used to sit top-RIGHT at 12px in a 320px box. Decided: that
+   corner is easily missed, and a notification nobody reads is not a
+   notification. Centred is where the eye already is after an action, and bold
+   is the difference between noticing and scanning past.
+
+   `white-space: nowrap` and the ellipsis are GONE on purpose. At 320px they
+   silently truncated any sentence past about 47 characters -- measured, not
+   guessed -- which is the worst failure a notification surface has: it looks
+   fine and says less than it was given. Wrapping inside 520px means a long
+   message gets taller instead of getting cut.
+
+   Still `pointer-events: none`, so a notice can never swallow a click meant
+   for the toolbar underneath it. */
 #toasts {
   position: absolute;
   top: 8px;
-  right: 8px;
-  z-index: 20;
+  left: 50%;
+  transform: translateX(-50%);
+  /* ABOVE THE MODAL SCRIM (30), the panels (40) and the strip (50), below the
+     accent frame (60). At 20 a notification sat UNDER the scrim, so with any
+     panel open it was dimmed and its dismiss button could not be clicked --
+     a control the user was told to use and could not reach. The strip and
+     toolbar already get lifted to 50 for exactly this reason (see
+     `body.modal-open #toolbar`); this is the same argument for the surface
+     that now carries a button. */
+  z-index: 55;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: center;
   gap: 6px;
-  pointer-events: none; /* never block the toolbar */
+  pointer-events: none;
 }
 .toast {
-  max-width: 320px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  max-width: 520px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
   background: var(--sf-raised);
   border: 1px solid var(--ln);
   border-left: 3px solid var(--accent);
   border-radius: 4px;
-  padding: 6px 12px;
-  font-size: 12px;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
   color: var(--tx);
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
 }
+/* The ONLY part of a notification that takes clicks. Everything else stays
+   `pointer-events: none` so a notice cannot swallow a click aimed at the
+   toolbar beneath it -- which matters more now that notices sit centred, over
+   the address bar, rather than off in a corner. */
+.toast-close {
+  pointer-events: auto;
+  flex: 0 0 auto;
+  margin: -3px -6px 0 0;
+  /* Hit area, not decoration: the glyph is small, so the padding is what
+     makes this comfortable to click. Measured at 24x24 in a browser rather
+     than assumed from the font size. */
+  padding: 3px 7px;
+  background: none;
+  border: 0;
+  border-radius: 3px;
+  color: inherit;
+  opacity: 0.65;
+  font-size: 15px;
+  line-height: 1.2;
+  font-weight: 600;
+  cursor: pointer;
+}
+.toast-close:hover,
+.toast-close:focus-visible {
+  opacity: 1;
+  background: var(--sf-sunken);
+}
+.toast-text {
+  /* Takes the slack so the button stays hard against the right edge. */
+  flex: 1 1 auto;
+  /* A flex item's default `min-width: auto` refuses to shrink below its
+     content, so one long unbroken token -- a download filename, which is a
+     real input path here -- would widen the card and push the dismiss button
+     past its edge and potentially off screen. `min-width: 0` lets it shrink
+     and `overflow-wrap` breaks the token rather than the layout. */
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .toast.error {
   border-left-color: var(--st-err-strong);
   color: var(--st-err);
+  /* Restated, not redundant: the generic `.error` rule further down this file
+     sets `font-size: 12px`, and at equal specificity the later rule wins. The
+     old toast was 12px too, so the collision was invisible until this surface
+     moved to 13px and error notices started rendering a size smaller than
+     every other notice. Measured in a browser, not assumed. */
+  font-size: 13px;
 }
 
 /* EVERY panel, and the list is the point. Three of the five were in this rule
@@ -849,6 +993,13 @@ body.loading #url {
   flex-direction: column;
   gap: 9px;
   margin: 10px 0 4px;
+}
+#about-support {
+  max-width: 62ch;
+  margin-bottom: 4px;
+}
+#about-support .form-buttons {
+  margin-top: 8px;
 }
 .about-para {
   max-width: 62ch;
@@ -1114,6 +1265,20 @@ body.loading #url {
   -webkit-user-select: none;
   touch-action: none;
 }
+#region-zoom-controls {
+  align-items: center;
+  margin-bottom: 6px;
+}
+#region-zoom-level {
+  min-width: 3.5rem;
+  text-align: center;
+  font-size: 12px;
+  color: var(--st-dim, #8f909a);
+}
+#region-stage.region-panning,
+#region-stage.region-panning #region-img {
+  cursor: grabbing;
+}
 /* What the image check read. Monospace because alignment is meaning here --
    a card number split across two OCR lines should look split -- and scrolled
    rather than unbounded so a dense screenshot cannot push the findings off
@@ -1292,6 +1457,14 @@ body.loading #url {
   border-top: 1px solid var(--ln-soft2);
 }
 
+/* The "not anonymity" disclosure in the WireGuard-import line: a real,
+   explicit weight so the honest caveat stands out even where a reset would
+   otherwise flatten a bare <strong>. */
+.emph {
+  font-weight: 600;
+  color: var(--tx-body);
+}
+
 /* A warning the user must read BEFORE acting, not a footnote about what just
  * happened. Uses the same amber the state rows use for "refused", because this
  * is the same class of signal: something here will cost you if you ignore it.
@@ -1327,6 +1500,10 @@ select {
   padding: 7px 11px;
   outline: none;
   width: 100%;
+}
+option {
+  background-color: var(--native-option-bg);
+  color: var(--native-option-text);
 }
 /* Checkboxes and radios are CONTROLS, not fields. Without this they inherit
    the full-width field sizing above and stretch into a column, which pushed
@@ -1413,6 +1590,14 @@ textarea {
   color: var(--tx-dim);
 }
 
+/* A pack download that stopped, in the packs list. It REPLACES the muted
+   status text on that row rather than sitting beside it, so it takes the
+   error colour and nothing else: the row is a status line, not an alert, and
+   a border or background here would shout over a list of languages. */
+.pack-failed {
+  color: var(--st-err);
+}
+
 /* Panel forms: the vault's credential and note editors, both import forms, and
  * the backup export form. Five forms, no rule, so every field sat flush
  * against its neighbour. */
@@ -1447,6 +1632,68 @@ textarea {
   white-space: nowrap;
 }
 
+/* Translation tab. The source/target rows reuse .field-row but pair a label
+   with a <select> (not an input), so they need their own two rules: a fixed
+   label column so both dropdowns line up, and a growing select. Scoped to the
+   tab so the credential field-rows elsewhere are untouched. */
+/* The Info / Translation tab strip. Each button is an icon beside a word, so
+   it needs the same row layout the toolbar's feature buttons use -- without
+   it the svg and the label stack instead of sitting side by side. */
+#tab-tabs button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+#tab-translate-body .field-row label {
+  flex: none;
+  align-self: center;
+  white-space: nowrap;
+  width: 104px;
+  color: var(--tx-dim2);
+  font-size: 13px;
+}
+#tab-translate-body .field-row select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The install/remove list: each <li> is a name span, a `.muted` status span
+   and an action button, built in chrome.js. Without a row layout they render
+   inline and abut ("FrenchInstalled"). Card styling matches .item. */
+#translate-langs li {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--sf-item);
+  border: 1px solid var(--ln-item);
+  border-radius: 10px;
+  padding: 8px 11px;
+}
+#translate-langs li > span:first-child {
+  flex: 1;
+  font-weight: 600;
+}
+/* The tier marker on a language row. A statement of which tier the packs
+   belong to, styled like a quiet badge -- the LOCKED state lives on the
+   button, not here, so an entitled user sees the same chip un-alarmed. */
+#translate-langs li .premium-chip {
+  flex: none;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--tx-dim2);
+  border: 1px solid var(--ln-item);
+  border-radius: 6px;
+  padding: 1px 6px;
+}
+#translate-langs li .muted {
+  font-size: 12px;
+}
+#translate-langs li button {
+  flex: none;
+}
+
 /* The host a credential will actually be offered on, under its username.
    Green when there is one, muted and italic when there is not -- see
    `.cred-origin.none`, which is the case that used to be invisible. */
@@ -1459,13 +1706,6 @@ textarea {
 .cred-origin.none {
   color: var(--tx-dim);
   font-style: italic;
-}
-
-/* The certificate line in the tab-activity panel. */
-.tls-text {
-  color: var(--tx-dim);
-  font-size: 12px;
-  line-height: 1.5;
 }
 
 /* Chat message body. Chat is a private-build feature and its panel is built at
@@ -1878,29 +2118,10 @@ textarea {
    shared-context.md §3. The rules reuse existing class hooks (.ico,
    .feature-btn, .feature-label, .items/.item-*) wherever possible. */
 
-/* TLS interception warning: full-width banner directly under the toolbar,
-   danger palette, no dismiss control. It is part of the chrome document, so
-   chrome.js adds its measured height to the strip while it is visible. */
-#tls-warning {
-  display: flex;
-  gap: 10px;
-  align-items: flex-start;
-  padding: 10px 14px;
-  background: var(--st-err-bg);
-  color: var(--st-err);
-  border-bottom: 1px solid var(--ln);
-  font-size: 13px;
-  line-height: 1.4;
-}
-#tls-warning[hidden] {
-  display: none;
-}
-
-/* A site was blocked. DANGER palette, like the TLS interception banner and
-   unlike the resolver one: this is the browser saying a third party means the
-   user harm, which is the same class of statement as "someone is reading your
-   traffic". The resolver banner is amber because it only means the browser
-   cannot get online. */
+/* A site was blocked. DANGER palette rather than the resolver banner's
+   amber: this is the browser saying a third party means the user harm. The
+   resolver banner is amber because it only means the browser cannot get
+   online. */
 #blocked-warning {
   display: flex;
   gap: 10px;
@@ -1951,6 +2172,24 @@ textarea {
   flex: none;
   margin-top: 1px;
 }
+#adlist-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-warn-bg2);
+  color: var(--st-warn);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#adlist-warning[hidden] {
+  display: none;
+}
+#adlist-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
 #insecure-warning .banner-actions button.danger {
   color: var(--st-warn-text);
   border-color: var(--st-warn-border2);
@@ -1965,7 +2204,7 @@ textarea {
    has one, and without it this rendered as a bare block with no padding,
    no background and an icon that did not line up. Found while reworking
    the panel; the gate checked its copy and its BANNERS membership but
-   never that it was styled. Same error palette as #tls-warning: this
+   never that it was styled. Same error palette as #blocked-warning: this
    banner says traffic is NOT going where the user asked. */
 #tunnel-warning {
   display: flex;
@@ -2041,6 +2280,31 @@ textarea {
   resize: vertical;
 }
 
+/* The save-password offer. It had NO rule of its own: not a background, not
+   the padding, not the row layout every other banner in this file carries, so
+   it rendered as bare children against whatever was behind it. That went
+   unnoticed while the page sat directly under the strip and supplied a
+   backdrop through it. It stops being invisible the moment the page is laid
+   out BELOW the banner, because then the only thing behind those transparent
+   pixels is the native window -- a band, in the modal case, with the body
+   transparent and the opaque backing ending at the bare closed strip above.
+   Same shape and tokens as #update-banner: this is an offer, not a warning,
+   and it must not wear the error palette. */
+#save-password-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-upd-bg);
+  color: var(--st-upd-text);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#save-password-banner[hidden] {
+  display: none;
+}
+
 #update-banner {
   display: flex;
   gap: 10px;
@@ -2095,16 +2359,6 @@ textarea {
   margin: 8px 0 6px;
 }
 
-/* A setting nested under another setting. Smaller than the <h2> above it so
-   the warning reads as belonging to the timeout rather than competing with
-   it -- they are one decision made in two parts. */
-.setting-sub {
-  font-size: 12px;
-  font-weight: 600;
-  color: var(--tx-soft);
-  margin-top: 14px;
-}
-
 /* Resolver unreachable. Shares the TLS banner's shape but takes the WARNING
    palette rather than the danger one: interception means someone is reading
    traffic the user believes is private, whereas this means the browser cannot
@@ -2129,6 +2383,37 @@ textarea {
   flex: none;
   margin-top: 1px;
 }
+
+/* The engine underneath is below the security floor. The WARNING palette,
+   same as the resolver: nothing is attacking the user right now, and the
+   fix is on its way without them; the banner exists so that the days until
+   it lands are not spent unaware. Red is reserved for an adversary present
+   (TLS interception), and this is not that. */
+#engine-floor-warning {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-warn-bg2);
+  color: var(--st-warn);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#engine-floor-warning[hidden] {
+  display: none;
+}
+#engine-floor-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+/* Every banner's text column. MIN-WIDTH ZERO is load-bearing and was
+   discovered on the since-removed interception banner: a flex item defaults
+   to `min-width: auto` and refuses to shrink below its content, so one long
+   unbroken word in a banner body widens this column and pushes
+   `.banner-actions` past the window edge. Measured at 4000 characters
+   without it: the Dismiss button sat at x=1112 in an 1100px window,
+   unclickable. It applies to every banner, not the one it was found on. */
 .banner-text {
   flex: 1;
   min-width: 0;
@@ -2147,17 +2432,6 @@ textarea {
   flex: none;
   align-self: center;
 }
-#tls-warning .ico {
-  flex: none;
-  margin-top: 1px;
-}
-#tls-warning .tls-title {
-  display: block;
-  color: var(--tx-bright);
-  font-weight: 600;
-  margin-bottom: 2px;
-}
-
 /* The freeze chip's label used to turn BLUE when frozen, while `.is-active`
    turned its border and icon green -- one control saying "on" in two colours,
    and the only toolbar button that did not obey the chrome's one rule: grey is
@@ -2311,6 +2585,24 @@ textarea {
   margin-top: 10px;
 }
 
+/* One visual row, two structural roles. The nested `.form-buttons` remains
+   the complete resolver radio group; the adjacent disclosure is allowed to
+   open a card but is never styled with the selected-resolver fill. */
+#dns-panel .dns-choice-row {
+  display: flex;
+  align-items: flex-start;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+#dns-panel .dns-choice-row .form-buttons {
+  margin-top: 0;
+}
+#dnsp-managed-vpn.disclosed {
+  border-color: var(--accent);
+  box-shadow: inset 0 -2px 0 var(--accent);
+}
+
 /* The tunnel panel's chosen mode, marked by chrome.js with `active` on a
    button.small. This rule existing is the entire point: the resolver picker
    once shipped the class with NO css rule and all choices rendered
@@ -2322,7 +2614,13 @@ textarea {
   outline: 2px solid currentColor;
   outline-offset: 1px;
 }
-#dns-panel .section-head {
+/* The Theme panel shares this rule as of 2026-08-27. Its sections used to be
+   separated by the explanatory paragraphs between them; the copy pass removed
+   those, and with nothing but headings and button rows left the groups ran
+   together with no gap at all. The heading's own top margin is what separates
+   them now, which is what it was already doing in the resolver panel. */
+#dns-panel .section-head,
+#theme-panel .section-head {
   display: block;
   color: var(--tx-faint);
   font-size: 11px;
@@ -2372,19 +2670,6 @@ textarea {
 }
 #ledger-list .allowed {
   color: var(--tx-faint);
-}
-
-/* Ephemeral marker on tab chips: closing an ephemeral tab discards its site
-   data, which must not come as a surprise. */
-.chip-badge {
-  flex: none;
-  font-size: 10px;
-  line-height: 1;
-  color: var(--accent);
-  border: 1px solid var(--accent);
-  border-radius: 3px;
-  padding: 2px 3px;
-  margin-left: 6px;
 }
 
 /* ---- toolbar crowding ----
@@ -2464,7 +2749,7 @@ textarea {
    given more room: it is clipped. Measured at 1180px with every label shown,
    the pills wrapped to three rows and the strip came to 185px against the 148
    the chrome had asked for -- the bottom row simply gone.
-   
+
    So these rules keep the pill row to ONE line. That is what makes the strip's
    height predictable, and predictable is what a fixed height requires. */
 /* LIBRARY GOT ITS WORD BACK, and the reason it lost it is worth keeping.
@@ -2601,10 +2886,18 @@ textarea {
   border: 1px solid var(--ln-soft);
   border-radius: 10px;
   color: var(--tx);
-  cursor: pointer;
+  cursor: grab;
 }
 .bmm-quick-item:hover {
   border-color: var(--ln-strong);
+}
+.bmm-quick-item:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.bmm-quick-item.dragging {
+  cursor: grabbing;
+  opacity: 0.55;
 }
 .bmm-quick-name {
   max-width: 100%;
@@ -2650,7 +2943,7 @@ textarea {
   border-color: var(--ln-strong);
   color: var(--tx-bright);
 }
-/* Sets of tabs and Downloads are not bookmarks and not drop targets, so the
+/* Tab Shelf and Downloads are not bookmarks and not drop targets, so the
    sidebar says so with a rule above them rather than by looking identical. */
 .bmm-side-break {
   margin-top: 8px;
@@ -2692,6 +2985,7 @@ textarea {
 }
 .bmm-row {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
@@ -2756,6 +3050,49 @@ textarea {
   gap: 6px;
   flex: none;
   flex-wrap: wrap;
+}
+.bmm-snapshot-picker {
+  display: block;
+  max-width: 20rem;
+  margin-top: 5px;
+  font-size: 12px;
+}
+.bmm-snapshot-result {
+  flex: 1 0 100%;
+  margin-left: 71px;
+  padding: 9px 10px;
+  border-left: 3px solid var(--accent);
+  background: var(--sf-raised);
+  color: var(--tx);
+  font-size: 12px;
+  line-height: 1.45;
+}
+.bmm-snapshot-result.error {
+  border-left-color: var(--st-err-strong);
+}
+.bmm-snapshot-verdict,
+.bmm-diff-label {
+  color: var(--tx-bright);
+  font-weight: 600;
+}
+.bmm-diff-label {
+  margin-top: 7px;
+}
+.bmm-diff-passage {
+  margin-top: 3px;
+  padding: 4px 6px;
+  border-radius: 4px;
+  white-space: pre-wrap;
+}
+.bmm-diff-passage.removed {
+  background: color-mix(in srgb, var(--st-err) 14%, transparent);
+}
+.bmm-diff-passage.added {
+  background: color-mix(in srgb, var(--st-ok) 14%, transparent);
+}
+.bmm-diff-note {
+  margin-top: 6px;
+  color: var(--tx-dim);
 }
 #bmm-batch {
   display: flex;
@@ -3125,6 +3462,19 @@ textarea {
    exists to make -- so the full name has to be somewhere they will find it,
    and it is in three: `aria-label`, `title`, and the panel heading. If a
    second "XY" ever appears in this row the rule has stopped working. */
+/* Interception. THE ambient signal since the full-width banner was removed;
+   it used to be the trace that survived dismissing that banner. The danger
+   colour rather than the accent: `is-active` means the tab is doing something
+   the user chose, and this is the opposite of chosen. Border and glyph only --
+   no fill -- so it reads as a flag on a normal control rather than as a second
+   banner in the toolbar, which is the whole point of not having one. */
+#btn-tab.is-intercepted {
+  border-color: var(--st-err);
+  color: var(--st-err);
+}
+#btn-tab.is-intercepted svg {
+  stroke: var(--st-err);
+}
 #btn-tab .feature-label {
   /* Same colour as every other label, deliberately. A first draft dimmed this
      to mark it as an abbreviation rather than a word; sitting next to five
@@ -3618,6 +3968,7 @@ textarea {
    pale-on-white is invisible, Black inherits Dark's. Bars are enforced by
    scripts/theme-contrast-gate.py, which is a GATE, not a one-shot. */
 :root {
+  color-scheme: dark;
   --sf-body: #17181c;
   --sf-sunken: #121317;
   --sf-tabstrip: #191a1f;
@@ -3669,6 +4020,8 @@ textarea {
   --tx-code: #e8e8ef;
   --tx-find: #d7dae0;
   --tx-find-dim: #8b93a1;
+  --native-option-bg: var(--sf-sunken);
+  --native-option-text: var(--tx-bright);
   --st-ok: #9fd6ac;
   --st-ok-alt: #9ed08a;
   --st-ok-cred: #6fcf8e;
@@ -3705,6 +4058,7 @@ textarea {
 
 /* White scheme: black text on white. States re-tuned dark-on-light. */
 :root[data-scheme="white"] {
+  color-scheme: light;
   --sf-body: #ffffff;
   --sf-sunken: #f1f1f4;
   --sf-tabstrip: #ececef;
@@ -3793,6 +4147,7 @@ textarea {
 /* Black scheme: true black. Neutrals darken; states inherit Dark's
    values (they already sit on near-black and only gain contrast). */
 :root[data-scheme="black"] {
+  color-scheme: dark;
   --sf-body: #000000;
   --sf-sunken: #0a0a0d;
   --sf-tabstrip: #050507;
@@ -4015,7 +4370,9 @@ html {
 #page-frame {
   position: fixed;
   inset: 0;
-  border: 2px solid var(--accent);
+  /* One width with PAGE_FRAME_PX and #tabstrip::before; a guard test reads
+     this line. */
+  border: 1px solid var(--accent);
   border-top: none;
   pointer-events: none;
   /* Above the rail (50) and the panels (40): a frame is the outermost thing
@@ -4023,11 +4380,11 @@ html {
   z-index: 60;
 }
 
-/* ---- the toolbar down the left edge -------------------------------------
-   Worn as `data-toolbar-placement="left"` on the root, the same way the
+/* ---- the toolbar down either side ---------------------------------------
+   Worn as `data-toolbar-placement="left|right"` on the root, the same way the
    accent and the scheme are, and the only layout in this file that changes
    what Rust lays the PAGE out against -- chrome.js reports the rail's width
-   as a left inset, and the page starts there.
+   on the matching edge, and the page leaves that space clear.
 
    The rail is `position: absolute` rather than a flex child of the body,
    and that is load-bearing. The body is a column: tab strip, toolbar, then
@@ -4036,9 +4393,9 @@ html {
    which stays full width by design. Absolute takes the rail out of that
    flow entirely, so the top strip is unchanged and the rail simply occupies
    the space the page has been told to leave. */
-:root[data-toolbar-placement="left"] #sidebar {
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  #sidebar {
   position: absolute;
-  left: 0;
   /* Below the top strip, down to the window's floor. The top is the same
      measurement Rust was given, so the rail meets the toolbar exactly. */
   top: var(--chrome-closed-px, 88px);
@@ -4050,7 +4407,6 @@ html {
   gap: 6px;
   padding: 10px 0;
   background: var(--sf-strip-a);
-  border-right: 1px solid var(--ln-accent-edge);
   /* Above the scrim (30) and the panel (40), matching #toolbar's z-index in
      the same state: in this layout the rail IS the toolbar, and pressing a
      feature button to switch panels must reach the button. chrome.js's
@@ -4063,16 +4419,27 @@ html {
   overflow-y: auto;
   overflow-x: hidden;
 }
+:root[data-toolbar-placement="left"] #sidebar {
+  left: 0;
+  border-right: 1px solid var(--ln-accent-edge);
+}
+:root[data-toolbar-placement="right"] #sidebar {
+  right: 0;
+  border-left: 1px solid var(--ln-accent-edge);
+}
 
 /* Icon only, and square. A column wide enough for words is a column taking
    width from the page, which is the trade this layout exists to avoid; the
    name is in `title` and `aria-label`, untouched, so hovering still says
    what the button does and a screen reader still reads its full name. */
-:root[data-toolbar-placement="left"] #sidebar .feature-label {
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  #sidebar
+  .feature-label {
   display: none;
 }
-:root[data-toolbar-placement="left"] #sidebar .feature-btn,
-:root[data-toolbar-placement="left"] #sidebar .nav-btn {
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  #sidebar
+  :is(.feature-btn, .nav-btn) {
   width: 38px;
   height: 34px;
   padding: 0;
@@ -4087,22 +4454,19 @@ html {
   .feature-btn[aria-pressed="true"] {
   box-shadow: inset 2px 0 0 var(--accent-bright);
 }
-/* The counter badges (blocked requests, and the vault dot) are positioned
-   against the pill; nothing about them changes here, but a 38px pill has
-   less room, so the badge tucks into the corner rather than sitting beside
-   a label that is no longer there. */
-:root[data-toolbar-placement="left"] #sidebar .feature-btn .count {
-  position: absolute;
-  top: -3px;
-  right: -3px;
+:root[data-toolbar-placement="right"]
+  #sidebar
+  .feature-btn[aria-pressed="true"] {
+  box-shadow: inset -2px 0 0 var(--accent-bright);
 }
-
 /* The padlock becomes a corner badge instead of a glyph in the row.
    Beside the icon it fought a 38px pill for width and the two read as one
    smudged shape; in the corner it reads as a state ON the icon, which is
    what it means -- and it is the same corner the counters use, so a button
    never has to carry both in the same place. */
-:root[data-toolbar-placement="left"] #sidebar .premium-locked::after {
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  #sidebar
+  .premium-locked::after {
   position: absolute;
   bottom: 3px;
   right: 3px;
@@ -4111,39 +4475,77 @@ html {
   height: 8px;
   box-shadow: inset 0 2px 0 -1px currentColor;
 }
+:root[data-toolbar-placement="right"] #sidebar .premium-locked::after {
+  left: 3px;
+  right: auto;
+}
 
 /* The break has no row to break: with everything after it gone, it would
    leave a 6px gap at the end of the top row. */
-:root[data-toolbar-placement="left"] .toolbar-break {
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  .toolbar-break {
   display: none;
 }
 
 /* EVERYTHING THE PAGE'S EDGE MOVED, MOVES WITH IT.
    Banners and the find bar are in the chrome's flow, below the toolbar, and
    the rail is drawn over that space. Without the margin they render
-   underneath it -- the first ~56px of every warning hidden behind the
+   underneath it -- the first or last ~56px of every warning hidden behind the
    toolbar, which is the lock-warning defect in a third costume. */
-:root[data-toolbar-placement="left"] #blocked-warning,
-:root[data-toolbar-placement="left"] #update-banner,
-:root[data-toolbar-placement="left"] #resolver-warning,
-:root[data-toolbar-placement="left"] #tls-warning,
-:root[data-toolbar-placement="left"] #save-password-banner,
-:root[data-toolbar-placement="left"] #lock-warning,
-:root[data-toolbar-placement="left"] #tunnel-warning,
-:root[data-toolbar-placement="left"] #insecure-warning,
-:root[data-toolbar-placement="left"] #findbar {
+:root[data-toolbar-placement="left"]
+  :is(
+    #blocked-warning,
+    #update-banner,
+    #engine-floor-warning,
+    #resolver-warning,
+    #save-password-banner,
+    #lock-warning,
+    #tunnel-warning,
+    #insecure-warning,
+    #adlist-warning,
+    #findbar
+  ) {
   margin-left: var(--chrome-left-px, 0px);
 }
-
-/* A panel is centred on the PAGE, not on the window: centred on the window
-   it would sit 28px left of where the content it describes is, and on a
-   narrow window its left edge would slide under the rail (z 50 beats 40). */
-:root[data-toolbar-placement="left"] .panel-modal {
-  left: calc(50% + var(--chrome-left-px, 0px) / 2);
-  width: min(600px, calc(100vw - var(--chrome-left-px, 0px) - 32px));
+:root[data-toolbar-placement="right"]
+  :is(
+    #blocked-warning,
+    #update-banner,
+    #engine-floor-warning,
+    #resolver-warning,
+    #save-password-banner,
+    #lock-warning,
+    #tunnel-warning,
+    #insecure-warning,
+    #adlist-warning,
+    #findbar
+  ) {
+  margin-right: var(--chrome-right-px, 0px);
 }
-:root[data-toolbar-placement="left"] .panel-modal.panel-wide {
-  width: min(1180px, calc(100vw - var(--chrome-left-px, 0px) - 48px));
+
+/* A panel is centred on the PAGE, not on the window: a side rail moves the
+   page's centre by half its width, and on a narrow window either edge would
+   otherwise slide under the rail (z 50 beats 40). */
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  .panel-modal {
+  left: calc(
+    50% + (var(--chrome-left-px, 0px) - var(--chrome-right-px, 0px)) / 2
+  );
+  width: min(
+    600px,
+    calc(
+      100vw - var(--chrome-left-px, 0px) - var(--chrome-right-px, 0px) - 32px
+    )
+  );
+}
+:root:is([data-toolbar-placement="left"], [data-toolbar-placement="right"])
+  .panel-modal.panel-wide {
+  width: min(
+    1180px,
+    calc(
+      100vw - var(--chrome-left-px, 0px) - var(--chrome-right-px, 0px) - 48px
+    )
+  );
 }
 
 /* WHERE THE PAGE COVERS THE CHROME, THE VIEWPORT IS NOT THE CANVAS.
@@ -4162,11 +4564,117 @@ html {
    without this puts a question the user cannot see at the middle of a
    window whose middle is page. */
 body.page-covers-chrome .panel-modal {
+  /* The SAME strip the unprefixed rule uses. This is the more specific
+     selector, so leaving it on the bare value silently defeated the fix
+     above: with a 213px strip and a 148px bare height a capped card ended
+     53px BELOW the chrome the page then covers, and on GTK and Windows
+     without the lift its last rows are unreachable -- no scrollbar goes
+     there, because as far as the card is concerned it fits. */
   max-height: calc(
-    var(--chrome-height-px, 500px) - var(--chrome-closed-px, 148px) - 24px
+    var(--chrome-height-px, 500px) -
+      var(--chrome-strip-px, var(--chrome-closed-px, 148px)) - 24px
   );
 }
 body.page-covers-chrome #confirm-overlay {
   height: var(--chrome-height-px, 500px);
   bottom: auto;
+}
+
+/* DISCLOSED PARTNER CARDS. Text and one button, nothing else. There is no
+   image here on purpose: the chrome runs under `img-src 'self'` with no
+   `data:`, and `connect-src 'none'`, so a partner mark would have to be a
+   bundled asset and a beacon is impossible by construction. The card cannot
+   phone anyone; it can only offer the reader a link they choose to take.
+
+   Variables are the chrome's own (--sf-card, --ln-soft, --tx, --tx-faint,
+   --accent). An earlier draft reached for --panel, --bg and --line, none of
+   which exist in this stylesheet. */
+.pcard {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0 4px;
+  padding: 12px;
+  background: var(--sf-card);
+  border: 1px solid var(--ln-soft);
+  border-radius: 10px;
+  color: var(--tx);
+}
+.pcard-label {
+  margin: 0;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--tx-faint);
+}
+.pcard-name {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--tx-max);
+}
+.pcard-desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--tx);
+}
+.pcard-disclosure {
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--tx-faint);
+}
+.pcard-offer {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--tx);
+}
+/* The code is set apart because the reader retypes it at the partner's
+   checkout. Monospace, deliberately: a proportional face makes I/l and O/0
+   ambiguous, and a code read wrong reads as a code refused. */
+.pcard-code {
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  padding: 1px 6px;
+  border: 1px dashed var(--accent);
+  border-radius: 5px;
+  background: var(--accent-choice-bg, rgba(79, 140, 255, 0.12));
+  color: var(--tx);
+}
+.pcard-cta {
+  align-self: flex-start;
+  margin-top: 2px;
+}
+
+/* ---- Offline activation (premium panel) ----
+ * A label above the device id and the receipt box, and the device id itself
+ * set in monospace so the user reads all 32 hex characters back without
+ * I/l or O/0 ambiguity -- the same reasoning as .pcard-code above. */
+#premium-offline > summary {
+  cursor: pointer;
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--accent);
+}
+.field-label {
+  display: block;
+  margin: 8px 0 3px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  color: var(--tx-faint);
+}
+.device-id {
+  flex: 1 1 auto;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  word-break: break-all;
+  padding: 2px 6px;
+  border-radius: 5px;
+  background: var(--accent-choice-bg, rgba(79, 140, 255, 0.12));
+  color: var(--tx);
 }

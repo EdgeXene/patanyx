@@ -5,18 +5,18 @@
 //! # Why this is a separate store from the vault — do not merge them
 //!
 //! The vault holds passwords and auto-locks after 300 seconds of
-//! inactivity. Bookmarks that vanish every five minutes would be useless,
-//! so sensitivity is tiered deliberately:
+//! inactivity. The application hides and refuses Library data at that same
+//! boundary, while this lower layer stays resident for internal provenance:
 //!
 //! - **Passwords** (vault): locked aggressively; the key is dropped at
 //!   auto-lock.
 //! - **Bookmarks and provenance** (this store): encrypted at rest with a
 //!   key derived from the same passphrase, but that key is held for the
 //!   whole session. There is intentionally NO lock/timeout API on `Store` —
-//!   the session owner keeps it open, and a vault auto-lock event must not
-//!   touch it. "Bookmarks survive a vault auto-lock; passwords do not" is
-//!   realized by this separation, not by anything the store does at
-//!   runtime.
+//!   the session owner keeps it resident so a download already in flight can
+//!   still record provenance. The app's `store_open` is the user-facing gate:
+//!   it refuses bookmark, snapshot, shelf, archive and download reads while
+//!   the vault is locked.
 //!
 //! The two stores still cannot share a key: the passphrase is pre-hashed
 //! with a store-specific domain label before Argon2id (see `crypto.rs`), so
@@ -69,7 +69,7 @@ pub mod provenance;
 pub use error::StoreError;
 pub use model::{
     normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
-    DownloadRecord, RecordedDigest, Shelf, ShelfTab, StoreData,
+    DownloadRecord, PageSnapshot, RecordedDigest, Shelf, ShelfTab, StoreData,
 };
 // Re-exported so callers of the bookmark API don't need to name the
 // integrity crate in their own manifests.
@@ -279,7 +279,7 @@ impl Store {
     /// Appends a shelf and persists it through the same save path every
     /// other collection uses. On write failure the in-memory change is
     /// rolled back: Ok is the ONLY state in which the shelf exists, which
-    /// is what set-aside relies on when it closes tabs after this returns.
+    /// is what shelving relies on when it closes tabs after this returns.
     pub fn add_shelf(&mut self, name: String, tabs: Vec<ShelfTab>) -> Result<Shelf, StoreError> {
         let seq_before = self.data.next_shelf_seq;
         let shelf = self.data.plan_new_shelf(name, tabs, now_unix());
@@ -361,6 +361,7 @@ impl Store {
             created_at: now_unix(),
             tags: Vec::new(),
             quick_access: false,
+            quick_access_order: None,
             digest: None,
         });
         self.save()?;
@@ -377,6 +378,8 @@ impl Store {
         url: &str,
         title: &str,
     ) -> Result<(), StoreError> {
+        let previous = self.data.clone();
+        let mut removed_snapshots = Vec::new();
         let entry = self
             .data
             .bookmarks
@@ -386,9 +389,22 @@ impl Store {
         if entry.url != url {
             entry.url = url.to_string();
             entry.digest = None;
+            self.data.page_snapshots.retain(|snapshot| {
+                if snapshot.bookmark_id == id {
+                    removed_snapshots.push(snapshot.clone());
+                    false
+                } else {
+                    true
+                }
+            });
         }
         entry.title = title.to_string();
-        self.save()
+        if let Err(error) = self.save() {
+            self.data = previous;
+            return Err(error);
+        }
+        self.delete_snapshot_pictures(&removed_snapshots);
+        Ok(())
     }
 
     /// Replaces a bookmark's tags. `Ok(false)` means no bookmark had that id.
@@ -548,10 +564,81 @@ impl Store {
         if entry.quick_access == on {
             return Ok(Some(false));
         }
+        let previous_order = entry.quick_access_order;
         entry.quick_access = on;
+        // A newly re-pinned bookmark belongs after manually ordered ones.
+        // Keeping a stale position here could also duplicate an existing
+        // order after the bookmark spent time outside the pinned set.
+        if !on {
+            entry.quick_access_order = None;
+        }
         if let Err(err) = self.save() {
             if let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) {
                 entry.quick_access = !on;
+                entry.quick_access_order = previous_order;
+            }
+            return Err(err);
+        }
+        Ok(Some(true))
+    }
+
+    /// Reorders every currently pinned bookmark and persists the complete
+    /// result in one write. The ids must be an exact permutation of the
+    /// pinned set: unknown, unpinned, duplicate, or omitted ids return
+    /// `Ok(None)` without touching memory or disk.
+    ///
+    /// `Ok(Some(false))` means the requested order was already stored, so no
+    /// write was needed. `Ok(Some(true))` means all positions were assigned
+    /// and one save succeeded.
+    pub fn reorder_quick_access(
+        &mut self,
+        ids: &[String],
+    ) -> Result<Option<bool>, StoreError> {
+        {
+            let pinned: std::collections::HashSet<&str> = self
+                .data
+                .bookmarks
+                .iter()
+                .filter(|b| b.quick_access)
+                .map(|b| b.id.as_str())
+                .collect();
+            let mut requested = std::collections::HashSet::with_capacity(ids.len());
+            if ids.len() != pinned.len()
+                || ids
+                    .iter()
+                    .any(|id| !requested.insert(id.as_str()) || !pinned.contains(id.as_str()))
+            {
+                return Ok(None);
+            }
+        }
+
+        let previous: Vec<(String, Option<u32>)> = self
+            .data
+            .bookmarks
+            .iter()
+            .filter(|b| b.quick_access)
+            .map(|b| (b.id.clone(), b.quick_access_order))
+            .collect();
+        let mut changed = false;
+        for (order, id) in (0u32..).zip(ids.iter()) {
+            let entry = self
+                .data
+                .bookmarks
+                .iter_mut()
+                .find(|b| b.id == *id)
+                .expect("the complete pinned-id validation just found this bookmark");
+            let next = Some(order);
+            changed |= entry.quick_access_order != next;
+            entry.quick_access_order = next;
+        }
+        if !changed {
+            return Ok(Some(false));
+        }
+        if let Err(err) = self.save() {
+            for (id, order) in previous {
+                if let Some(entry) = self.data.bookmarks.iter_mut().find(|b| b.id == id) {
+                    entry.quick_access_order = order;
+                }
             }
             return Err(err);
         }
@@ -561,12 +648,27 @@ impl Store {
     /// Deleting a bookmark removes its recorded digest along with it (the
     /// digest lives inside the entry, so this cannot be forgotten).
     pub fn delete_bookmark(&mut self, id: &str) -> Result<(), StoreError> {
+        let previous = self.data.clone();
         let before = self.data.bookmarks.len();
         self.data.bookmarks.retain(|b| b.id != id);
         if self.data.bookmarks.len() == before {
             return Err(StoreError::NotFound(id.to_string()));
         }
-        self.save()
+        let mut removed_snapshots = Vec::new();
+        self.data.page_snapshots.retain(|snapshot| {
+            if snapshot.bookmark_id == id {
+                removed_snapshots.push(snapshot.clone());
+                false
+            } else {
+                true
+            }
+        });
+        if let Err(error) = self.save() {
+            self.data = previous;
+            return Err(error);
+        }
+        self.delete_snapshot_pictures(&removed_snapshots);
+        Ok(())
     }
 
     /// Empty the bookmark manager: every bookmark and every folder name.
@@ -600,9 +702,16 @@ impl Store {
             // Nothing to do, and no reason to rewrite the vault for it.
             return Ok((0, 0));
         }
+        let previous = self.data.clone();
+        let removed_snapshots = self.data.page_snapshots.clone();
         self.data.bookmarks.clear();
         self.data.bookmark_folders.clear();
-        self.save()?;
+        self.data.page_snapshots.clear();
+        if let Err(error) = self.save() {
+            self.data = previous;
+            return Err(error);
+        }
+        self.delete_snapshot_pictures(&removed_snapshots);
         Ok((bookmarks, folders))
     }
 
@@ -618,15 +727,31 @@ impl Store {
     /// id and stop at the first hit, so a duplicate is an entry the user can
     /// see and cannot remove.
     pub fn replace_bookmarks(&mut self, bookmarks: Vec<Bookmark>) -> Result<usize, StoreError> {
+        let previous = self.data.clone();
         let mut seen = std::collections::BTreeSet::new();
         self.data.bookmarks = bookmarks
             .into_iter()
             .filter(|b| !b.id.is_empty() && seen.insert(b.id.clone()))
             .collect();
+        let bookmarks_now = self.data.bookmarks.clone();
+        let mut removed_snapshots = Vec::new();
+        self.data.page_snapshots.retain(|snapshot| {
+            let keep = bookmarks_now
+                .iter()
+                .any(|bookmark| bookmark.id == snapshot.bookmark_id && bookmark.url == snapshot.url);
+            if !keep {
+                removed_snapshots.push(snapshot.clone());
+            }
+            keep
+        });
         let kept = self.data.bookmarks.len();
         // Persist-on-write, same rule as everything else here: a failed save
         // must not leave a set that exists only in memory.
-        self.save()?;
+        if let Err(error) = self.save() {
+            self.data = previous;
+            return Err(error);
+        }
+        self.delete_snapshot_pictures(&removed_snapshots);
         Ok(kept)
     }
 
@@ -652,6 +777,350 @@ impl Store {
             recorded_at: now_unix(),
         });
         self.save()
+    }
+
+    /// Save a page-integrity baseline with the visible text the digest was
+    /// computed from. The digest remains mirrored in `Bookmark::digest` so
+    /// older readers and the existing `check` API keep their one-record
+    /// behaviour; history and retention live in `page_snapshots`.
+    pub fn save_page_snapshot(
+        &mut self,
+        id: &str,
+        digest: ContentDigest,
+        visible_text: &str,
+    ) -> Result<PageSnapshot, StoreError> {
+        self.save_page_snapshot_at(id, digest, visible_text, now_unix())
+    }
+
+    /// Save the integrity evidence and, when possible, its bounded page
+    /// picture through the same encrypted blob store Deep Recall uses.
+    ///
+    /// Picture failure is deliberately soft: an oversized picture, a full or
+    /// unavailable blob store, or a failed blob write produces a normal
+    /// hashes-and-text snapshot with `has_picture == false`. The integrity
+    /// evidence is the irreplaceable part of this operation.
+    pub fn save_page_snapshot_with_picture(
+        &mut self,
+        id: &str,
+        digest: ContentDigest,
+        visible_text: &str,
+        picture: &[u8],
+        picture_scope: &str,
+    ) -> Result<PageSnapshot, StoreError> {
+        self.save_page_snapshot_at_with_picture(
+            id,
+            digest,
+            visible_text,
+            now_unix(),
+            Some((picture, picture_scope)),
+        )
+    }
+
+    fn save_page_snapshot_at(
+        &mut self,
+        id: &str,
+        digest: ContentDigest,
+        visible_text: &str,
+        recorded_at: u64,
+    ) -> Result<PageSnapshot, StoreError> {
+        self.save_page_snapshot_at_with_picture(
+            id,
+            digest,
+            visible_text,
+            recorded_at,
+            None,
+        )
+    }
+
+    fn save_page_snapshot_at_with_picture(
+        &mut self,
+        id: &str,
+        digest: ContentDigest,
+        visible_text: &str,
+        recorded_at: u64,
+        picture: Option<(&[u8], &str)>,
+    ) -> Result<PageSnapshot, StoreError> {
+        let previous = self.data.clone();
+        let url = self
+            .data
+            .bookmarks
+            .iter()
+            .find(|bookmark| bookmark.id == id)
+            .map(|bookmark| bookmark.url.clone())
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+
+        // Before the first history-aware save, promote every digest an older
+        // build left behind. This is what makes both caps describe the whole
+        // logical collection after the next save, not just new-format rows.
+        self.promote_legacy_snapshots();
+
+        let text_trimmed = visible_text.chars().count() > SNAPSHOT_TEXT_MAX_CHARS;
+        let snapshot_id = random_id();
+        // The encrypted blob adds only a fixed small header/tag, but checking
+        // plaintext against the whole budget first ensures one impossible
+        // picture never gets written merely to be deleted again. Blob-store
+        // failures are intentionally converted to `None`: the record below
+        // still lands with its digest and text.
+        let kept_picture = picture
+            .filter(|(bytes, _)| (bytes.len() as u64) <= MAX_SNAPSHOT_PICTURE_BYTES)
+            .and_then(|(bytes, scope)| {
+                let blobs = self.blobs().ok()?;
+                let stored_bytes = blobs.put(&snapshot_id, bytes).ok()?;
+                if stored_bytes > MAX_SNAPSHOT_PICTURE_BYTES {
+                    let _ = blobs.delete(&snapshot_id);
+                    return None;
+                }
+                Some((stored_bytes, scope.to_string()))
+            });
+        let (picture_bytes, picture_scope, has_picture) = match kept_picture {
+            Some((bytes, scope)) => (bytes, Some(scope), true),
+            None => (0, None, false),
+        };
+        let saved = PageSnapshot {
+            id: snapshot_id.clone(),
+            bookmark_id: id.to_string(),
+            url: url.clone(),
+            digest: digest.clone(),
+            recorded_at,
+            text: Some(cap_chars(visible_text, SNAPSHOT_TEXT_MAX_CHARS)),
+            text_trimmed,
+            picture_scope,
+            picture_bytes,
+            has_picture,
+        };
+        self.data.page_snapshots.push(saved.clone());
+
+        let mut evicted_pictures = Vec::new();
+
+        while self
+            .data
+            .page_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.url == url)
+            .count()
+            > MAX_SNAPSHOTS_PER_URL
+        {
+            if let Some(removed) = self.remove_oldest_snapshot(Some(&url)) {
+                if removed.has_picture {
+                    evicted_pictures.push(removed.id);
+                }
+            }
+        }
+        while self.data.page_snapshots.len() > MAX_PAGE_SNAPSHOTS {
+            if let Some(removed) = self.remove_oldest_snapshot(None) {
+                if removed.has_picture {
+                    evicted_pictures.push(removed.id);
+                }
+            }
+        }
+        while self.snapshot_picture_bytes() > MAX_SNAPSHOT_PICTURE_BYTES {
+            if let Some(removed) = self.remove_oldest_snapshot(None) {
+                if removed.has_picture {
+                    evicted_pictures.push(removed.id);
+                }
+            } else {
+                break;
+            }
+        }
+        self.sync_bookmark_digests();
+
+        if let Err(error) = self.save() {
+            self.data = previous;
+            if has_picture {
+                let _ = self.blobs().and_then(|blobs| blobs.delete(&snapshot_id));
+            }
+            return Err(error);
+        }
+        if let Ok(blobs) = self.blobs() {
+            for evicted in evicted_pictures {
+                let _ = blobs.delete(&evicted);
+            }
+        }
+        // In ordinary use the just-recorded current timestamp cannot be the
+        // oldest. Returning the persisted shape also keeps synthetic-clock
+        // tests honest if they deliberately make it so.
+        Ok(self
+            .data
+            .page_snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == snapshot_id)
+            .cloned()
+            .unwrap_or(PageSnapshot {
+                has_picture: false,
+                picture_scope: None,
+                picture_bytes: 0,
+                ..saved
+            }))
+    }
+
+    pub fn snapshot_picture_bytes(&self) -> u64 {
+        self.data
+            .page_snapshots
+            .iter()
+            .map(|snapshot| snapshot.picture_bytes)
+            .sum()
+    }
+
+    fn delete_snapshot_pictures(&self, snapshots: &[PageSnapshot]) {
+        let ids = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.has_picture)
+            .map(|snapshot| snapshot.id.as_str())
+            .collect::<Vec<_>>();
+        if ids.is_empty() {
+            return;
+        }
+        if let Ok(blobs) = self.blobs() {
+            for id in ids {
+                let _ = blobs.delete(id);
+            }
+        }
+    }
+
+    /// Snapshot history for the bookmark's EXACT current URL, newest first.
+    /// Pre-history stores are represented as records with `text: None`, so a
+    /// caller can report that text comparison is unavailable rather than
+    /// rendering an empty diff.
+    pub fn page_snapshots_for(&self, id: &str) -> Result<Vec<PageSnapshot>, StoreError> {
+        let bookmark = self
+            .get_bookmark(id)
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        let mut snapshots: Vec<PageSnapshot> = self
+            .data
+            .page_snapshots
+            .iter()
+            .filter(|snapshot| snapshot.url == bookmark.url)
+            .cloned()
+            .collect();
+
+        for owner in self
+            .data
+            .bookmarks
+            .iter()
+            .filter(|owner| owner.url == bookmark.url)
+        {
+            let Some(recorded) = owner.digest.as_ref() else {
+                continue;
+            };
+            let represented = snapshots.iter().any(|snapshot| {
+                snapshot.bookmark_id == owner.id
+                    && snapshot.recorded_at == recorded.recorded_at
+                    && snapshot.digest == recorded.digest
+            });
+            if !represented {
+                snapshots.push(PageSnapshot {
+                    id: format!("legacy:{}", owner.id),
+                    bookmark_id: owner.id.clone(),
+                    url: owner.url.clone(),
+                    digest: recorded.digest.clone(),
+                    recorded_at: recorded.recorded_at,
+                    text: None,
+                    text_trimmed: false,
+                    picture_scope: None,
+                    picture_bytes: 0,
+                    has_picture: false,
+                });
+            }
+        }
+        // Seconds are the persisted clock granularity, so multiple saves can
+        // tie. The later vector position is the later insertion and must win
+        // that tie for both the displayed order and the default baseline.
+        let mut ordered = snapshots.into_iter().enumerate().collect::<Vec<_>>();
+        ordered.sort_by(|(a_index, a), (b_index, b)| {
+            b.recorded_at
+                .cmp(&a.recorded_at)
+                .then_with(|| b_index.cmp(a_index))
+        });
+        Ok(ordered
+            .into_iter()
+            .map(|(_, snapshot)| snapshot)
+            .collect())
+    }
+
+    /// Resolve one selected baseline, defaulting to the newest save.
+    pub fn page_snapshot_for(
+        &self,
+        bookmark_id: &str,
+        snapshot_id: Option<&str>,
+    ) -> Result<Option<PageSnapshot>, StoreError> {
+        let snapshots = self.page_snapshots_for(bookmark_id)?;
+        Ok(match snapshot_id {
+            Some(id) => snapshots.into_iter().find(|snapshot| snapshot.id == id),
+            None => snapshots.into_iter().next(),
+        })
+    }
+
+    fn promote_legacy_snapshots(&mut self) {
+        let legacy: Vec<PageSnapshot> = self
+            .data
+            .bookmarks
+            .iter()
+            .filter_map(|bookmark| {
+                let recorded = bookmark.digest.as_ref()?;
+                let represented = self.data.page_snapshots.iter().any(|snapshot| {
+                    snapshot.bookmark_id == bookmark.id
+                        && snapshot.recorded_at == recorded.recorded_at
+                        && snapshot.digest == recorded.digest
+                });
+                (!represented).then(|| PageSnapshot {
+                    id: random_id(),
+                    bookmark_id: bookmark.id.clone(),
+                    url: bookmark.url.clone(),
+                    digest: recorded.digest.clone(),
+                    recorded_at: recorded.recorded_at,
+                    text: None,
+                    text_trimmed: false,
+                    picture_scope: None,
+                    picture_bytes: 0,
+                    has_picture: false,
+                })
+            })
+            .collect();
+        self.data.page_snapshots.extend(legacy);
+    }
+
+    fn remove_oldest_snapshot(&mut self, exact_url: Option<&str>) -> Option<PageSnapshot> {
+        let oldest = self
+            .data
+            .page_snapshots
+            .iter()
+            .enumerate()
+            .filter(|(_, snapshot)| exact_url.is_none_or(|url| snapshot.url == url))
+            .min_by_key(|(index, snapshot)| (snapshot.recorded_at, *index))
+            .map(|(index, _)| index);
+        oldest.map(|index| self.data.page_snapshots.remove(index))
+    }
+
+    /// Decrypt one snapshot picture. The metadata record is authoritative;
+    /// an old or picture-less record never probes the blob directory.
+    pub fn page_snapshot_picture(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        let record = self
+            .data
+            .page_snapshots
+            .iter()
+            .find(|snapshot| snapshot.id == id)
+            .ok_or_else(|| StoreError::NotFound(id.to_string()))?;
+        if !record.has_picture {
+            return Err(StoreError::NotFound(format!("{id} has no picture")));
+        }
+        self.blobs()?.get(id)
+    }
+
+    fn sync_bookmark_digests(&mut self) {
+        for bookmark in &mut self.data.bookmarks {
+            bookmark.digest = self
+                .data
+                .page_snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.bookmark_id == bookmark.id && snapshot.url == bookmark.url
+                })
+                .max_by_key(|snapshot| snapshot.recorded_at)
+                .map(|snapshot| RecordedDigest {
+                    digest: snapshot.digest.clone(),
+                    recorded_at: snapshot.recorded_at,
+                });
+        }
     }
 
     /// Compare freshly fetched content against the stored digest. Returns
@@ -738,6 +1207,15 @@ impl Store {
 /// means the same thing whatever script the user writes in.
 const SHELF_NAME_MAX_CHARS: usize = 120;
 const SHELF_NOTE_MAX_CHARS: usize = 2000;
+
+/// Engineering bounds for page-integrity history. Text is character-capped
+/// (never byte-sliced); retention is enforced on every history-aware save.
+pub const SNAPSHOT_TEXT_MAX_CHARS: usize = 100_000;
+pub const MAX_SNAPSHOTS_PER_URL: usize = 3;
+pub const MAX_PAGE_SNAPSHOTS: usize = 90;
+/// User-adjustable disk budget for snapshot pictures. Deep Recall keeps
+/// its separate 256 MiB cap; snapshot eviction never touches archive records.
+pub const MAX_SNAPSHOT_PICTURE_BYTES: u64 = 128 * 1024 * 1024;
 
 /// Truncates to `max` CHARACTERS, never bytes. `String::truncate` panics on a
 /// non-boundary index, and byte-slicing multi-byte text is how a cap turns
@@ -891,6 +1369,7 @@ mod tests {
         let reopened = Store::unlock(&dir.join("store.rbs"), "pw").unwrap();
         assert_eq!(reopened.archive().len(), 1);
         assert_eq!(reopened.get_archive(&id).unwrap().text, "Revenue 4,182,000");
+        assert_eq!(reopened.get_archive(&id).unwrap().scope, "visible area");
         fs::remove_dir_all(&dir).ok();
     }
 
@@ -1051,7 +1530,7 @@ mod tests {
             let mut store = make_store(&path, "correct horse");
             let shelf = store
                 .add_shelf(
-                    "Set aside 2 tabs".to_string(),
+                    "Shelf with 2 tabs".to_string(),
                     vec![ShelfTab {
                         title: "Paper".to_string(),
                         url: "https://example.com/paper".to_string(),
@@ -1197,6 +1676,67 @@ mod tests {
     }
 
     #[test]
+    fn quick_access_reorder_is_complete_atomic_and_persistent() {
+        let path = test_path("quickaccess-order");
+        let (a, b, unpinned);
+        {
+            let mut store = make_store(&path, "correct horse");
+            a = store.add_bookmark("https://a.test/", "A").unwrap();
+            b = store.add_bookmark("https://b.test/", "B").unwrap();
+            unpinned = store.add_bookmark("https://c.test/", "C").unwrap();
+            store.set_quick_access(&a, true).unwrap();
+            store.set_quick_access(&b, true).unwrap();
+
+            let before_refusal = fs::read(&path).unwrap();
+            assert_eq!(
+                store
+                    .reorder_quick_access(&[b.clone(), "missing".to_string()])
+                    .unwrap(),
+                None,
+                "an unknown id must refuse the whole reorder"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before_refusal,
+                "an unknown id must not write the encrypted store"
+            );
+            assert_eq!(
+                store
+                    .reorder_quick_access(&[b.clone(), unpinned.clone()])
+                    .unwrap(),
+                None,
+                "an unpinned id must refuse the whole reorder"
+            );
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                before_refusal,
+                "an unpinned id must not write the encrypted store"
+            );
+            assert_eq!(store.get_bookmark(&a).unwrap().quick_access_order, None);
+            assert_eq!(store.get_bookmark(&b).unwrap().quick_access_order, None);
+
+            assert_eq!(
+                store
+                    .reorder_quick_access(&[b.clone(), a.clone()])
+                    .unwrap(),
+                Some(true)
+            );
+            assert_eq!(store.get_bookmark(&b).unwrap().quick_access_order, Some(0));
+            assert_eq!(store.get_bookmark(&a).unwrap().quick_access_order, Some(1));
+        }
+        {
+            let store = Store::unlock(&path, "correct horse").unwrap();
+            assert_eq!(store.get_bookmark(&b).unwrap().quick_access_order, Some(0));
+            assert_eq!(store.get_bookmark(&a).unwrap().quick_access_order, Some(1));
+            assert_eq!(
+                store.get_bookmark(&unpinned).unwrap().quick_access_order,
+                None
+            );
+        }
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
     fn bookmark_roundtrips_through_close_and_unlock() {
         let path = test_path("roundtrip");
         let id;
@@ -1224,6 +1764,339 @@ mod tests {
                 other => panic!("expected TextDiffers, got {other:?}"),
             }
         }
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn snapshot_text_is_character_capped_and_mark_seen_still_replaces_one_digest() {
+        let path = test_path("snapshot-text-cap");
+        let mut store = make_store(&path, "pw");
+        let id = store.add_bookmark("https://cap.example/", "Cap").unwrap();
+        let first = page_digest("first baseline words");
+        let second = page_digest("second baseline words");
+        store.mark_seen(&id, first).unwrap();
+        store.mark_seen(&id, second.clone()).unwrap();
+        assert_eq!(
+            store
+                .get_bookmark(&id)
+                .unwrap()
+                .digest
+                .as_ref()
+                .unwrap()
+                .digest,
+            second
+        );
+
+        let long = "\u{1f600}".repeat(SNAPSHOT_TEXT_MAX_CHARS + 7);
+        let saved = store
+            .save_page_snapshot_at(&id, page_digest("capped snapshot"), &long, 10)
+            .unwrap();
+        let saved_id = saved.id.clone();
+        let text = saved.text.expect("new snapshots carry text");
+        assert_eq!(text.chars().count(), SNAPSHOT_TEXT_MAX_CHARS);
+        assert!(text.chars().all(|ch| ch == '\u{1f600}'));
+        assert!(saved.text_trimmed);
+        drop(store);
+        let reopened = Store::unlock(&path, "pw").unwrap();
+        let persisted = reopened
+            .page_snapshots_for(&id)
+            .unwrap()
+            .into_iter()
+            .find(|snapshot| snapshot.id == saved_id)
+            .expect("snapshot survives encrypted close/unlock");
+        assert_eq!(
+            persisted.text.unwrap().chars().count(),
+            SNAPSHOT_TEXT_MAX_CHARS
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn snapshot_picture_round_trips_through_the_archive_blob_store() {
+        let (dir, mut store) = archive_store("snapshot-picture-roundtrip");
+        let bookmark = store
+            .add_bookmark("https://picture.example/", "Picture")
+            .unwrap();
+        let png = b"\x89PNG\r\n\x1a\n bounded snapshot pixels";
+        let saved = store
+            .save_page_snapshot_with_picture(
+                &bookmark,
+                page_digest("picture words"),
+                "picture words",
+                png,
+                "visible area",
+            )
+            .unwrap();
+        assert!(saved.has_picture);
+        assert_eq!(saved.picture_scope.as_deref(), Some("visible area"));
+        assert!(saved.picture_bytes > png.len() as u64);
+        assert_eq!(&store.page_snapshot_picture(&saved.id).unwrap()[..], png);
+
+        let reopened = Store::unlock(&dir.join("store.rbs"), "pw").unwrap();
+        let persisted = reopened.page_snapshot_for(&bookmark, None).unwrap().unwrap();
+        assert!(persisted.has_picture);
+        assert_eq!(persisted.picture_scope.as_deref(), Some("visible area"));
+        assert_eq!(&reopened.page_snapshot_picture(&saved.id).unwrap()[..], png);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_still_saves_hashes_and_text_when_the_picture_store_is_unavailable() {
+        let (dir, mut store) = archive_store("snapshot-picture-unavailable");
+        // Occupy the blob directory's path with a file. This makes the shared
+        // encrypted picture store unavailable without making the metadata
+        // vault unavailable.
+        fs::write(dir.join("archive"), b"not a directory").unwrap();
+        let bookmark = store
+            .add_bookmark("https://evidence.example/", "Evidence")
+            .unwrap();
+        let digest = page_digest("irreplaceable change evidence");
+        let saved = store
+            .save_page_snapshot_with_picture(
+                &bookmark,
+                digest.clone(),
+                "irreplaceable change evidence",
+                b"\x89PNG\r\n\x1a\n pixels that cannot land",
+                "full page",
+            )
+            .unwrap();
+
+        assert!(!saved.has_picture);
+        assert_eq!(saved.picture_bytes, 0);
+        assert!(saved.picture_scope.is_none());
+        assert_eq!(saved.digest, digest);
+        assert_eq!(saved.text.as_deref(), Some("irreplaceable change evidence"));
+        assert!(store.page_snapshot_picture(&saved.id).is_err());
+
+        let reopened = Store::unlock(&dir.join("store.rbs"), "pw").unwrap();
+        let persisted = reopened
+            .page_snapshot_for(&bookmark, Some(&saved.id))
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.digest, digest);
+        assert_eq!(persisted.text, saved.text);
+        assert!(!persisted.has_picture);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn snapshot_picture_byte_cap_evicts_oldest_first_without_touching_recall() {
+        let (dir, mut store) = archive_store("snapshot-picture-byte-cap");
+        let archive_id = store
+            .add_archive(
+                "https://recall.example/",
+                "Recall",
+                "full page",
+                "independent",
+                Some(b"recall pixels"),
+            )
+            .unwrap();
+        let mut bookmarks = Vec::new();
+        let mut snapshots = Vec::new();
+        for n in 0..3 {
+            let bookmark = store
+                .add_bookmark(&format!("https://cap-{n}.example/"), "Cap")
+                .unwrap();
+            let snapshot = store
+                .save_page_snapshot_at_with_picture(
+                    &bookmark,
+                    page_digest(&format!("content {n}")),
+                    "words",
+                    10 + n,
+                    Some((b"\x89PNG\r\n\x1a\n pixels", "full page")),
+                )
+                .unwrap();
+            bookmarks.push(bookmark);
+            snapshots.push(snapshot);
+        }
+        // Model two realistic compressed-picture allocations without
+        // allocating 128 MiB in a unit test. The next save must evict the
+        // oldest whole snapshot, just as the count caps do.
+        store
+            .data
+            .page_snapshots
+            .iter_mut()
+            .find(|s| s.id == snapshots[0].id)
+            .unwrap()
+            .picture_bytes = 70 * 1024 * 1024;
+        store
+            .data
+            .page_snapshots
+            .iter_mut()
+            .find(|s| s.id == snapshots[1].id)
+            .unwrap()
+            .picture_bytes = 58 * 1024 * 1024;
+
+        let newest = store
+            .save_page_snapshot_at_with_picture(
+                &bookmarks[2],
+                page_digest("newest"),
+                "newest",
+                20,
+                Some((b"\x89PNG\r\n\x1a\n newest", "visible area")),
+            )
+            .unwrap();
+        assert!(store.page_snapshot_picture(&snapshots[0].id).is_err());
+        assert!(store
+            .data
+            .page_snapshots
+            .iter()
+            .any(|s| s.id == snapshots[1].id));
+        assert!(store.page_snapshot_picture(&newest.id).is_ok());
+        assert!(store.snapshot_picture_bytes() <= MAX_SNAPSHOT_PICTURE_BYTES);
+        assert!(store.get_archive(&archive_id).is_some());
+        assert!(store.archive_picture(&archive_id).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn fourth_snapshot_for_exact_url_evicts_the_oldest_of_three() {
+        let (dir, mut store) = archive_store("snapshot-per-url-cap");
+        let first = store
+            .add_bookmark("https://same.example/path", "One")
+            .unwrap();
+        let second = store
+            .add_bookmark("https://same.example/path", "Two")
+            .unwrap();
+        for (at, owner) in [(10, &first), (20, &second), (30, &first), (40, &second)] {
+            store
+                .save_page_snapshot_at_with_picture(
+                    owner,
+                    page_digest(&format!("page at {at}")),
+                    &format!("text {at}"),
+                    at,
+                    Some((b"\x89PNG\r\n\x1a\n pixels", "full page")),
+                )
+                .unwrap();
+        }
+        let history = store.page_snapshots_for(&first).unwrap();
+        assert_eq!(history.len(), MAX_SNAPSHOTS_PER_URL);
+        assert_eq!(
+            history
+                .iter()
+                .map(|snapshot| snapshot.recorded_at)
+                .collect::<Vec<_>>(),
+            vec![40, 30, 20]
+        );
+        assert!(!history
+            .iter()
+            .any(|snapshot| snapshot.recorded_at == 10));
+        assert!(history.iter().all(|snapshot| snapshot.has_picture));
+        assert!(store.page_snapshot_picture(&history[0].id).is_ok());
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn same_second_saves_keep_insertion_order_newest_first() {
+        let path = test_path("snapshot-same-second-order");
+        let mut store = make_store(&path, "pw");
+        let id = store
+            .add_bookmark("https://same-second.example/", "Same second")
+            .unwrap();
+        let first = store
+            .save_page_snapshot_at(&id, page_digest("first"), "first", 10)
+            .unwrap();
+        let second = store
+            .save_page_snapshot_at(&id, page_digest("second"), "second", 10)
+            .unwrap();
+        let third = store
+            .save_page_snapshot_at(&id, page_digest("third"), "third", 10)
+            .unwrap();
+
+        let history = store.page_snapshots_for(&id).unwrap();
+        assert_eq!(
+            history
+                .iter()
+                .map(|snapshot| snapshot.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![third.id.as_str(), second.id.as_str(), first.id.as_str()]
+        );
+        assert_eq!(
+            store.page_snapshot_for(&id, None).unwrap().unwrap().id,
+            third.id
+        );
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    #[test]
+    fn ninety_first_snapshot_evicts_the_oldest_overall_only() {
+        let (dir, mut store) = archive_store("snapshot-global-cap");
+        let archive_id = store
+            .add_archive(
+                "https://recall.example/",
+                "Deep Recall record",
+                "full page",
+                "kept independently",
+                None,
+            )
+            .unwrap();
+        let mut ids = Vec::new();
+        for n in 0..=MAX_PAGE_SNAPSHOTS {
+            let url = format!("https://page-{n}.example/");
+            let id = store.add_bookmark(&url, &format!("Page {n}")).unwrap();
+            store
+                .save_page_snapshot_at_with_picture(
+                    &id,
+                    page_digest(&format!("content number {n}")),
+                    &format!("visible text {n}"),
+                    n as u64 + 1,
+                    Some((b"\x89PNG\r\n\x1a\n pixels", "visible area")),
+                )
+                .unwrap();
+            ids.push(id);
+        }
+        assert_eq!(store.data.page_snapshots.len(), MAX_PAGE_SNAPSHOTS);
+        assert!(store.page_snapshots_for(&ids[0]).unwrap().is_empty());
+        assert_eq!(
+            store
+                .page_snapshots_for(ids.last().unwrap())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            store.get_archive(&archive_id).is_some(),
+            "snapshot retention never evicts an existing Deep Recall record"
+        );
+        assert!(store
+            .data
+            .page_snapshots
+            .iter()
+            .all(|snapshot| snapshot.has_picture));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn legacy_digest_loads_as_snapshot_with_unavailable_text() {
+        let legacy = serde_json::json!({
+            "schema": 1,
+            "bookmarks": [{
+                "id": "old",
+                "url": "https://old.example/",
+                "title": "Old",
+                "created_at": 1,
+                "digest": {
+                    "digest": page_digest("old visible words"),
+                    "recorded_at": 7
+                }
+            }],
+            "downloads": []
+        });
+        let data: StoreData = serde_json::from_value(legacy).unwrap();
+        assert!(data.page_snapshots.is_empty());
+
+        let path = test_path("legacy-snapshot");
+        let mut store = make_store(&path, "pw");
+        store.data = data;
+        let history = store.page_snapshots_for("old").unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(
+            history[0].text.is_none(),
+            "missing text must not become an empty diff"
+        );
+        assert!(!history[0].has_picture);
+        assert!(history[0].picture_scope.is_none());
+        assert!(store.page_snapshot_picture(&history[0].id).is_err());
         let _ = fs::remove_dir_all(&path);
     }
 
@@ -1620,13 +2493,20 @@ impl Store {
     /// through any UI is exactly the kind of thing that should not sit on
     /// disk encrypted-but-forgotten.
     pub fn reconcile_archive(&self) -> Result<usize, StoreError> {
-        let keep: Vec<String> = self
+        let mut keep: Vec<String> = self
             .data
             .archive
             .iter()
             .filter(|record| record.has_picture)
             .map(|record| record.id.clone())
             .collect();
+        keep.extend(
+            self.data
+                .page_snapshots
+                .iter()
+                .filter(|snapshot| snapshot.has_picture)
+                .map(|snapshot| snapshot.id.clone()),
+        );
         self.blobs()?.prune(&keep)
     }
 }

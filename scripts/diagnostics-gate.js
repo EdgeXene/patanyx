@@ -41,7 +41,7 @@ new Function(fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8"))();
 // The section between the two headings this control lives between, so a
 // check here cannot accidentally match markup belonging to a different
 // section of the (large) About panel.
-const sectionStart = html.indexOf('<h2 class="about-head">Diagnostics</h2>');
+const sectionStart = html.search(/<h2 class="about-head"[^>]*>Diagnostics<\/h2>/);
 const sectionEnd = html.indexOf("</section>", sectionStart);
 const SECTION = html.slice(sectionStart, sectionEnd);
 
@@ -88,7 +88,7 @@ check(
       export_suggestion: "/tmp/x.json",
       file_choice: false,
       build: { version: "0.9.53" },
-      dns_mode: "mullvad",
+      dns_mode: "quad9",
       recent_log: ["a", "b"],
     };
     global.clipboardText = null;
@@ -102,7 +102,7 @@ check(
         "are about HOW to save the report, not part of what is being reported",
     );
     assert(
-      written.dns_mode === "mullvad" && Array.isArray(written.recent_log),
+      written.dns_mode === "quad9" && Array.isArray(written.recent_log),
       "the copied report is missing real diagnostic fields -- stripping the " +
         "two UI fields must not have dropped anything else",
     );

@@ -15,7 +15,8 @@ export XDG_DATA_HOME="$SMOKE_DATA"
 # not a gate.
 cargo build --quiet
 
-xvfb-run -a --server-args="-screen 0 1280x900x24" ./target/debug/patanyx --smoke-test
+bin="${CARGO_TARGET_DIR:-target}/debug/patanyx"
+xvfb-run -a --server-args="-screen 0 1280x900x24" "$bin" --smoke-test
 
 # The smoke sequence enables ad blocking, which drives the raw-FFI content
 # filter compile. That path is ASYNCHRONOUS, so "the app did not crash" proves

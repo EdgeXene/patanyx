@@ -343,7 +343,14 @@ global.allText = () => allEls.flatMap((e) => e._text).filter(Boolean);
 const docListeners = {};
 global.document = {
   getElementById: (id) => els.get(id) || null,
-  createElement: (t) => mkEl("new-" + t),
+  createElement: (t) => {
+    const n = mkEl("new-" + t);
+    // A real DOM reports the tag; without it a gate cannot assert that a
+    // control is a <button> rather than a clickable div, which is exactly the
+    // kind of thing a gate should be able to say.
+    n.tagName = String(t).toUpperCase();
+    return n;
+  },
   createTextNode: (t) => {
     const n = { nodeType: 3, _text: [] };
     Object.defineProperty(n, "textContent", {
@@ -415,12 +422,34 @@ global.rbResolve = {};
 const request = (cmd, args) => {
   rbCalls.push({ cmd, args });
   if (global.rbReject) return Promise.reject(new Error(global.rbReject));
+  // A PER-COMMAND refusal: an Error in rbResolve rejects that one command
+  // while every other resolves, which is how a late gate refusal (the
+  // precheck passed, the arm refused) is reached.
+  if (global.rbResolve[cmd] instanceof Error) return Promise.reject(global.rbResolve[cmd]);
   return Promise.resolve(
     Object.prototype.hasOwnProperty.call(global.rbResolve, cmd)
       ? global.rbResolve[cmd]
       : {},
   );
 };
+// NODE VERSION PARITY, and the reason this gate could pass on a workstation
+// while being unrunnable in the project's own CI image.
+//
+// Node 21+ ships a built-in global `navigator`. The window object below takes
+// it by shorthand and MUTATES it, because that built-in has a setter that
+// silently discards a plain reassignment (see the comment at `navigator,`).
+// Node 20 -- which is what Debian trixie ships, and therefore what
+// packaging/Dockerfile.ci installs -- has no such global at all, so the
+// shorthand threw `ReferenceError: navigator is not defined` and
+// chrome-js-gate died before executing a single chrome script.
+//
+// So the harness creates one ONLY when it is absent, and never reassigns one
+// that exists. Both node versions then reach the same mutation path, and the
+// gate stops depending on which machine runs it.
+if (typeof globalThis.navigator === "undefined") {
+  globalThis.navigator = {};
+}
+
 global.window = {
   // The wire. chrome.js replaces window.__rb with its own request() that
   // posts here, so this is where a command is genuinely observable — asserting
@@ -437,6 +466,12 @@ global.window = {
             id: msg.id,
             ok: false,
             error: global.rbReject,
+          });
+        } else if (global.rbResolve[msg.cmd] instanceof Error) {
+          global.window.__rb_reply({
+            id: msg.id,
+            ok: false,
+            error: global.rbResolve[msg.cmd].message,
           });
         } else {
           const data = Object.prototype.hasOwnProperty.call(

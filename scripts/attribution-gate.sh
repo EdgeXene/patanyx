@@ -32,6 +32,18 @@ if [ ! -d "$LIVE" ]; then
   exit 1
 fi
 
+# The crate inventory below cannot see anything that is not a Cargo package.
+# Model weights, prebuilt WASM and vocabularies ship too, and they carry
+# licence terms of their own. Checked first, because a failure there is the
+# same class of failure as a missing crate entry and should read that way.
+python3 scripts/artifact-manifest-gate.py
+
+# The language packs served from models.patanyx.net are the same class of
+# non-crate, licence-bearing artifact -- fetched from Mozilla, redistributed
+# under MPL-2.0 -- and their register is the only place that provenance lives.
+# Checked here so it cannot drift from the shipped registry unnoticed.
+python3 scripts/langpack-provenance-gate.py
+
 echo "regenerating attribution into a scratch directory..."
 python3 scripts/shipping-licenses.py "$TMP" >/dev/null
 

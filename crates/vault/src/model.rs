@@ -61,7 +61,7 @@ use zeroize::Zeroize;
 ///
 /// ADDING A FIELD MEANS BUMPING THIS. `top_level_keys_are_pinned_to_the_schema`
 /// below fails if you forget.
-pub const SCHEMA_VERSION: u32 = 7;
+pub const SCHEMA_VERSION: u32 = 8;
 
 /// Maximum contact label length, in CHARACTERS (not bytes).
 ///
@@ -165,6 +165,25 @@ pub struct VaultData {
     /// `set_activation_records`.
     #[serde(default)]
     pub activation: Vec<ActivationRecord>,
+    /// The device ids (32 lowercase hex) the user RELEASED from their own
+    /// Vault panel. Release removes the receipt; without this the next
+    /// unlock-time evaluation would see "token present, no receipt" and
+    /// silently activate again, taking the slot back and spending a
+    /// lifetime grant the user just gave up. A LIST, because a vault can
+    /// travel between installs: releasing device B must not forget that
+    /// device A released. Each entry is cleared only by that device's own
+    /// explicit Activate, completed activation, imported receipt, or pasted
+    /// token. Bounded at `MAX_RELEASED_DEVICES`, oldest first out.
+    #[serde(default)]
+    pub released_devices: Vec<ReleasedDevice>,
+    /// The device whose release call has been STARTED and whose outcome is
+    /// not yet recorded. Written before the request leaves, so a lock, a
+    /// crash or an ordinary exit cannot lose the fact that the user asked
+    /// to release: the next unlock finds it and asks the server again.
+    /// Releasing is idempotent per device, so asking twice is free.
+    /// Cleared by the release landing, or by that device activating again.
+    #[serde(default)]
+    pub release_pending: Option<ReleasedDevice>,
 }
 
 /// One device's Premium activation receipt (schema 7). Vault-owned, like
@@ -352,6 +371,29 @@ impl VaultData {
     }
 }
 
+/// How many released devices a vault remembers. Every entry is a release
+/// the server confirmed, so the list grows only as fast as real releases
+/// across every licence the vault has carried; the bound exists so a
+/// malformed file cannot grow it without limit. It is NEVER evicted: a
+/// forgotten release would let that device activate again silently, so a
+/// full list refuses the write instead (surfaced as vault_io, and the
+/// release is retried at the next unlock like any failed write).
+pub const MAX_RELEASED_DEVICES: usize = 4096;
+
+/// A released device's id, as its own type so `VaultData`'s derived
+/// `Debug` cannot print it: a device id is the stable correlator
+/// `ActivationRecord` already redacts, and this field must not be the one
+/// place it leaks.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReleasedDevice(pub String);
+
+impl std::fmt::Debug for ReleasedDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ReleasedDevice(<redacted>)")
+    }
+}
+
 impl Default for VaultData {
     fn default() -> Self {
         Self {
@@ -364,6 +406,8 @@ impl Default for VaultData {
             tunnel: None,
             licence: None,
             activation: Vec::new(),
+            released_devices: Vec::new(),
+            release_pending: None,
         }
     }
 }
@@ -664,6 +708,8 @@ mod schema_guard_tests {
                 "licence",
                 "notes",
                 "relay",
+                "release_pending",
+                "released_devices",
                 "schema",
                 "tunnel"
             ],
@@ -673,12 +719,22 @@ mod schema_guard_tests {
             SCHEMA_VERSION
         );
         assert_eq!(
-            SCHEMA_VERSION, 7,
-            "the key set above is the one recorded for schema 7, whose new \
-             field `activation` IS a new top-level key -- like schema 6's \
-             `licence` and schema 5's `tunnel`, and unlike schema 4's \
-             `origin`, which was nested inside `credentials` and left this \
-             list unchanged; see credential_entry_keys_are_pinned_to_the_schema"
+            SCHEMA_VERSION, 8,
+            "the key set above is the one recorded for schema 8, whose new \
+             top-level keys are `released_devices` and `release_pending` \
+             (the devices the user released, and the release whose answer \
+             has not arrived, kept so an older build cannot drop them and \
+             let the next unlock take a slot back); schema 7 added `activation`, \
+             6 `licence`, 5 `tunnel`, and schema 4's `origin` was nested \
+             inside `credentials`; see credential_entry_keys_are_pinned_to_the_schema"
+        );
+        // The marker must never print: VaultData derives Debug.
+        let mut with_marker = VaultData::default();
+        with_marker.released_devices = vec![ReleasedDevice("ab".repeat(16))];
+        let printed = format!("{with_marker:?}");
+        assert!(
+            !printed.contains(&"ab".repeat(16)) && printed.contains("<redacted>"),
+            "the released device id leaked through Debug: {printed}"
         );
     }
 
@@ -743,7 +799,7 @@ mod schema_guard_tests {
             // The missing keys come back as defaults rather than failing.
             assert!(data.contacts.list().is_empty());
             data.schema = SCHEMA_VERSION;
-            assert_eq!(data.schema, 7, "the next save rewrites it current");
+            assert_eq!(data.schema, SCHEMA_VERSION, "the next save rewrites it current");
         }
     }
 
