@@ -3402,11 +3402,18 @@ impl AppState {
     /// The privileged chrome webview is built with devtools disabled in
     /// release builds and stays that way -- this method has no way to reach
     /// it, which is the point.
-    pub fn open_active_devtools(&self) {
+    /// Returns whether there was an active tab to open the inspector ON.
+    ///
+    /// NOT whether the inspector appeared: `platform::open_devtools` reports a
+    /// refusal to the diag log and returns nothing, on both backends. So this
+    /// answers the one failure the caller can honestly distinguish, and the
+    /// button's copy must not promise more than that.
+    pub fn open_active_devtools(&self) -> bool {
         let Some(webview) = self.active_webview() else {
-            return;
+            return false;
         };
         platform::open_devtools(webview);
+        true
     }
 
     /// Replaces the browser-wide privacy policy and applies it to every open

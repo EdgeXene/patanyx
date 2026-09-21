@@ -954,6 +954,21 @@
           "}catch(e){}";
         var OrigWorker = Worker;
 
+        // BLOB WORKERS REFUSED HERE? Learned once, then believed.
+        //
+        // A site whose CSP omits blob: from worker-src refuses EVERY blob
+        // worker, not the first one -- so without this, each worker the page
+        // creates repeats the whole dance: build a blob, have it refused
+        // asynchronously, wait, terminate it, build an ordinary worker. A
+        // worker-heavy page pays that per worker, and messenger.com creates
+        // enough of them for the cost to be minutes rather than milliseconds,
+        // with a CSP violation logged for each one.
+        //
+        // Scoped to the document, which is the scope CSP itself has. Set only
+        // by an observed refusal -- never guessed from the policy text, which
+        // this script cannot read.
+        var blobWorkersRefused = false;
+
         // ----- the CSP fallback -----------------------------------------------
         // The blob worker above is refused ASYNCHRONOUSLY on any site whose CSP
         // omits blob: from worker-src: the Worker object constructs fine, then
@@ -982,10 +997,15 @@
         //     Sound on Chromium; UNVERIFIED on WebKitGTK. Bounded both ways: a
         //     false "blocked" restarts the worker once then surfaces its error;
         //     a false "ran" leaves the site exactly as today -- never worse.
-        //   * A message that transferred an ArrayBuffer before the refusal
-        //     detached that buffer into the doomed worker and cannot be
-        //     replayed; that single message is lost. Narrow: CSP-refusing
-        //     sites, pre-refusal messages, transferables only.
+        //   * A transferring post made BEFORE the worker proves it is live is
+        //     delivered as a structured-clone COPY, so the page's buffer is
+        //     NOT detached for that window and `byteLength` still reads its
+        //     old value. Transfers resume with real semantics once the worker
+        //     has proved live, and the replay after a swap carries the page's
+        //     true transfer list. This REPLACED a worse limit: such a message
+        //     used to be detached into a worker CSP was about to refuse and
+        //     then lost outright with no error, which hung messenger.com's
+        //     encrypted-backup step indefinitely.
         function makeFacade(url, options, blobUrl) {
           var facade = Object.create(OrigWorker.prototype);
           var real = new OrigWorker(blobUrl, options);
@@ -1016,8 +1036,29 @@
           // is not an outbound channel -- the session token never reaches a
           // worker, whose shim carries only the canvas seed. References, never
           // copies: the engine performs the structured clone on send.
-          function forward(w, args) {
-            if (args.length > 1) {
+          // `transfer` is FALSE while the blob worker is unproved, and that is
+          // the whole fix for a site that refuses blob: workers by CSP.
+          //
+          // Honouring the page's transfer list before liveness is known hands
+          // the page's ArrayBuffer to a worker that CSP is about to kill. The
+          // buffer detaches into the doomed worker, the swap to a real worker
+          // then replays a message whose payload is already gone, the replay
+          // throws, and the catch below used to swallow it -- so the page had
+          // posted a message that no worker would ever receive and no error
+          // would ever mark. A promise waiting on the reply never settles.
+          // Observed on messenger.com's encrypted-backup PIN step, which
+          // derives a key in a worker and transfers the buffer in: the page
+          // sat on "Verifying your PIN" indefinitely.
+          //
+          // So an unproved worker gets a structured-clone COPY instead, and
+          // the page keeps its buffer for the replay that may follow. The cost
+          // is one copy per pre-liveness transferring post, and one observable
+          // deviation: for that window the page's buffer is NOT detached, so
+          // code asserting `byteLength === 0` straight after posting sees the
+          // old value. That is a narrow, visible difference in place of a
+          // silent permanent hang, which is the right way round.
+          function forward(w, args, transfer) {
+            if (args.length > 1 && transfer) {
               w.postMessage(args[0], args[1]);
             } else {
               w.postMessage(args[0]);
@@ -1120,6 +1161,10 @@
               return;
             }
             // Never ran: the blob worker was refused. Swap once.
+            //
+            // And remember it for this document: every later worker skips the
+            // blob attempt entirely instead of rediscovering the same refusal.
+            blobWorkersRefused = true;
             swapped = true;
             if (settleTimer !== null) {
               clearTimeout(settleTimer);
@@ -1146,10 +1191,30 @@
             if (q) {
               for (var i = 0; i < q.length; i++) {
                 try {
-                  forward(real, q[i]);
+                  // The real worker gets the page's true transfer semantics.
+                  // Reachable only because `forward` did NOT detach these
+                  // buffers into the refused worker.
+                  forward(real, q[i], true);
                 } catch (e5) {
-                  // A transferable posted before the refusal is already detached
-                  // and cannot be replayed; that one message is lost.
+                  // Should now be unreachable for the transferable case. If a
+                  // replay still fails the page is owed the failure rather
+                  // than a promise that never settles: surface it as an error
+                  // event, the same shape a worker failure already takes.
+                  try {
+                    dispatch("error", new ErrorEvent("error", {
+                      // UNBRANDED, deliberately. A page can reach this path on
+                      // demand -- it controls its own CSP, and a value that
+                      // cannot be cloned throws on both the forward and the
+                      // replay -- so a product name here would be a reliable
+                      // detection oracle. This file's rule at the top holds:
+                      // that something is farbling is inherent, that PATANYX
+                      // is farbling is avoidable.
+                      message: "a message to this worker could not be replayed",
+                    }));
+                  } catch (e6) {
+                    /* an engine without constructible ErrorEvent must not take
+                       the swap down with it; the replay loop continues */
+                  }
                 }
               }
             }
@@ -1181,11 +1246,14 @@
               return;
             }
             var args = Array.prototype.slice.call(arguments);
-            if (!proved && !swapped && queue) {
+            var unproved = !proved && !swapped && queue;
+            if (unproved) {
               queue.push(args); // references, not copies (see forward())
             }
             try {
-              forward(real, args);
+              // Transfer only once the worker has proved it is alive; see
+              // `forward` for why detaching earlier loses the message outright.
+              forward(real, args, !unproved);
             } catch (e) {
               /* a synchronous postMessage failure is the page's to observe as
                  today; do not throw out of here */
@@ -1293,6 +1361,16 @@
             var ok =
               (abs.protocol === "http:" || abs.protocol === "https:") &&
               sameOrigin;
+            // A refusal already observed in this document means the blob
+            // path cannot work here. Go straight to an ordinary worker: it is
+            // where the facade would land anyway, minus the refusal, the wait
+            // and the console violation. The worker is unshimmed either way --
+            // that is the pre-existing limit of this feature on such sites,
+            // recorded in the limits block above, and skipping the attempt
+            // does not widen it.
+            if (!isModule && ok && blobWorkersRefused) {
+              return new OrigWorker(url, options);
+            }
             if (!isModule && ok) {
               var blob = new Blob(
                 [
@@ -1318,11 +1396,38 @@
           }
           return new OrigWorker(url, options);
         };
-        // Preserve identity: prototype for instanceof and for the worker
-        // methods the page calls, plus name/length shape.
-        wrapped.prototype = OrigWorker.prototype;
-        keepShape(wrapped, OrigWorker);
-        self.Worker = wrapped;
+        // NOT INSTALLED. `self.Worker` is left exactly as the engine made it.
+        //
+        // WHY THIS WHOLE MECHANISM IS OFF. Shimming a worker required running
+        // it from a blob: URL, and a site whose CSP restricts `worker-src`
+        // refuses blob workers outright. facebook.com is one -- its policy is
+        // a path allowlist with no blob: at all -- and on such a site the
+        // wrapper could never deliver any protection, while still costing a
+        // refusal, a swap, and a class of edge cases the facade could only
+        // approximate: it is not a branded Worker, so a native method rebound
+        // onto it throws, and messages in flight during the swap had to be
+        // replayed rather than delivered.
+        //
+        // Measured on the real thing: messenger.com's encrypted-backup step
+        // hung indefinitely on "Verifying your PIN" for a user who could open
+        // it in every other browser. No other browser replaces the Worker
+        // constructor from page script, which is exactly why none of them
+        // breaks it. A privacy feature that stops people using their messages
+        // has not made a trade -- it has just lost.
+        //
+        // What is given up, stated plainly so the claim can match: workers get
+        // NO divergence. Canvas, audio, WebGL and geometry readings taken
+        // inside a Worker are the engine's real values. Everything in the
+        // DOCUMENT is unchanged and still shimmed. On strict-CSP origins that
+        // is not a reduction at all -- coverage there was already zero -- and
+        // elsewhere it is a real one, made deliberately.
+        //
+        // The wrapper above is retained, unreferenced, because the network-
+        // layer approach that would restore coverage without blob: (prepending
+        // the shim to the worker's own script response in the request handler,
+        // where CSP has no objection) needs the pieces it already solved:
+        // same-origin classic-worker detection and the shim body itself.
+        void wrapped;
       }
     } catch (e8) {
       /* no Worker here, or it could not be wrapped: leave it untouched */

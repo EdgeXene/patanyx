@@ -1746,7 +1746,11 @@ fn main() {
                     Shortcut::LockVault => app.lock_vault(),
                     Shortcut::OpenCommandPalette => app.open_command_palette(),
                     Shortcut::Print => app.print_active_tab(),
-                    Shortcut::OpenDeveloperTools => app.open_active_devtools(),
+                    Shortcut::OpenDeveloperTools => {
+                        // The accelerator has nowhere to report "no active tab";
+                        // the panel button is the path that surfaces it.
+                        let _ = app.open_active_devtools();
+                    }
                     // The chrome owns the bar; the key asks it to open AND
                     // takes keyboard focus off the page first, or the bar
                     // opens with a caret in it that receives nothing.

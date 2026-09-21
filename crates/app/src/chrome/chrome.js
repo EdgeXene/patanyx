@@ -1137,6 +1137,9 @@
   // placed in dataTransfer: tab ids are internal chrome addresses and must
   // not ride in a payload that can be dropped into another application.
   let draggedTabId = null;
+  // Whether the drag in progress reached a drop. Read by `dragend`, which is
+  // the only place that can tell an abandoned drag from a committed one.
+  let tabDragCommitted = false;
 
   function acceptTabItems(items) {
     lastTabItems = Array.isArray(items) ? items : [];
@@ -1176,19 +1179,107 @@
     }
   }
 
-  function previewTabReorder(wrap, targetChip, ev) {
-    const ids = tabDomIds(wrap);
-    const box = targetChip.getBoundingClientRect();
-    const pointer = typeof ev.clientX === "number" ? ev.clientX : box.left;
-    const after = pointer >= box.left + box.width / 2;
-    const next = reorderedTabIds(
-      ids,
-      draggedTabId,
-      Number(targetChip.dataset.tabId),
-      after,
+  // Where a release at this pointer position means the tab should land.
+  //
+  // Returns `[targetId, afterTarget]` for ANY x over the strip, not only for x
+  // over a chip. Walking the chips left to right, a pointer left of a chip's
+  // midpoint inserts before it, one inside its right half inserts after it,
+  // and one past every chip inserts at the END -- which is the case that had
+  // no answer at all before, because the strip past the last chip is
+  // container, not chip, and the drop event simply never fired there.
+  // NOTE ON DIRECTION. This walks the chips in DOM order and compares the
+  // pointer against their SCREEN rectangles, which are the same ordering only
+  // in a left-to-right strip. The chrome ships no RTL locale and no rtl rule
+  // today (the strip is pinned dir="ltr" in index.html), so the two agree --
+  // but the assumption is written down here rather than left to be discovered
+  // by whoever adds the first RTL locale, because the failure would be silent:
+  // nearly every drop would resolve to one end and then be persisted.
+  function tabDropTargetAt(wrap, ev) {
+    const chips = Array.from(wrap.children || []).filter((chip) =>
+      Number.isSafeInteger(Number(chip.dataset && chip.dataset.tabId)),
     );
+    if (!chips.length) return null;
+    const x = typeof ev.clientX === "number" ? ev.clientX : 0;
+    for (const chip of chips) {
+      const box = chip.getBoundingClientRect();
+      if (x < box.left + box.width / 2) {
+        return [Number(chip.dataset.tabId), false];
+      }
+      // Inside the right half. A pointer in the GAP after this chip falls
+      // through to the next chip's left-half test, which is the same answer.
+      if (x <= box.right) return [Number(chip.dataset.tabId), true];
+    }
+    return [Number(chips[chips.length - 1].dataset.tabId), true];
+  }
+
+  function previewTabReorder(wrap, ev) {
+    const ids = tabDomIds(wrap);
+    if (draggedTabId === null || ids.indexOf(draggedTabId) < 0) return null;
+    const target = tabDropTargetAt(wrap, ev);
+    // Resolving to the dragged tab itself is a dead drop -- the pointer never
+    // left the chip, or there is only one tab. The chip-level handler used to
+    // refuse this with its own `draggedTabId === tab.id` guard; without it
+    // every such release would send Rust a no-op permutation to validate.
+    if (!target || target[0] === draggedTabId) return null;
+    const next = reorderedTabIds(ids, draggedTabId, target[0], target[1]);
     putTabDomInOrder(wrap, next);
     return next;
+  }
+
+  // THE STRIP IS THE DROP TARGET, not each chip.
+  //
+  // These used to be bound per chip, so a release anywhere that was not a chip
+  // -- the empty strip past the last tab, the strip's padding -- fired no drop
+  // at all: `persistTabOrder` never ran, Rust never learned the new order, and
+  // the next repaint silently undid the move. Dragging a tab to the END of the
+  // strip, the commonest reorder there is, could not work by construction.
+  //
+  // One handler on the container covers every pointer position including over
+  // a chip, so there is also no longer a chip handler and a strip handler
+  // racing to preview the same pointer against a DOM the other just moved.
+  //
+  // Bound ONCE, and that is load-bearing: `renderTabs` rebuilds the chips but
+  // keeps the same container element, so wiring this inside the render would
+  // stack another pair of listeners on every single repaint.
+  function wireTabStripDrops(wrap) {
+    if (wrap.dataset.tabDropsWired === "1") return;
+    wrap.dataset.tabDropsWired = "1";
+    wrap.addEventListener("dragover", (ev) => {
+      if (draggedTabId === null) return;
+      ev.preventDefault();
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
+      previewTabReorder(wrap, ev);
+    });
+    wrap.addEventListener("drop", (ev) => {
+      if (draggedTabId === null) return;
+      ev.preventDefault();
+      // THE PREVIEW HAS USUALLY ALREADY MOVED IT. `previewTabReorder` returns
+      // null when the pointer resolves to the dragged tab itself -- which is
+      // the NORMAL case at drop time, because dragover just placed that tab
+      // under the pointer. Treating that as "nothing to do" cancelled every
+      // drag that landed where its own preview had put it, which is every
+      // successful drag. Found by driving a real mouse rather than synthetic
+      // drag events, which fire the handlers directly and hid it completely.
+      //
+      // So: take the preview's answer when it has one, otherwise commit the
+      // order the strip is ALREADY showing. Either way the user sees what
+      // they released, and Rust is told about it.
+      const next = previewTabReorder(wrap, ev) || tabDomIds(wrap);
+      draggedTabId = null;
+      // Set BEFORE the await in persistTabOrder: `dragend` fires immediately
+      // after this handler returns, and it must not mistake a commit already
+      // in flight for an abandoned drag and repaint the old order over it.
+      // Only on a REAL commit, though: a dead drop must still let `dragend`
+      // repaint, or a refused preview would be left standing on screen.
+      const current = lastTabItems.map((t) => t.id);
+      const changed =
+        next.length !== current.length ||
+        next.some((id, i) => id !== current[i]);
+      if (changed) {
+        tabDragCommitted = true;
+        void persistTabOrder(next);
+      }
+    });
   }
 
   async function persistTabOrder(ids, focusId) {
@@ -1214,6 +1305,7 @@
 
   function renderTabs(items) {
     const wrap = $("tabs");
+    wireTabStripDrops(wrap);
     wrap.textContent = "";
     if (tabSelectMode) {
       // A tab closed since it was ticked must not stay selected: the
@@ -1281,6 +1373,7 @@
       });
       chip.addEventListener("dragstart", (ev) => {
         draggedTabId = tab.id;
+        tabDragCommitted = false;
         chip.classList.add("dragging");
         if (ev.dataTransfer) {
           ev.dataTransfer.effectAllowed = "move";
@@ -1299,32 +1392,19 @@
           ev.dataTransfer.setData("text/plain", "tab");
         }
       });
-      chip.addEventListener("dragover", (ev) => {
-        const ids = tabDomIds(wrap);
-        if (
-          draggedTabId === null ||
-          ids.indexOf(draggedTabId) < 0 ||
-          draggedTabId === tab.id
-        ) {
-          return;
-        }
-        ev.preventDefault();
-        if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
-        previewTabReorder(wrap, chip, ev);
-      });
-      chip.addEventListener("drop", (ev) => {
-        const ids = tabDomIds(wrap);
-        if (draggedTabId === null || ids.indexOf(draggedTabId) < 0) return;
-        ev.preventDefault();
-        const next = previewTabReorder(wrap, chip, ev);
-        draggedTabId = null;
-        void persistTabOrder(next);
-      });
       chip.addEventListener("dragend", () => {
         draggedTabId = null;
         for (const candidate of wrap.querySelectorAll(".dragging")) {
           candidate.classList.remove("dragging");
         }
+        // A drag that ended without committing leaves the DOM showing the
+        // dragover PREVIEW, which Rust never agreed to. That preview used to
+        // stand until the next repaint from Rust -- a title change, a favicon,
+        // load progress -- and then the tab jumped back on its own, with no
+        // action from the user to explain it. Repaint from the last canonical
+        // list now, so the strip can never display an order Rust does not hold.
+        if (!tabDragCommitted) renderTabs(lastTabItems);
+        tabDragCommitted = false;
       });
       chip.addEventListener("keydown", (ev) => {
         if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
@@ -4718,6 +4798,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
   }
 
+  void refreshKeptSites();
+
   async function refreshTrackingPrevention() {
     try {
       applyTrackingPreventionChoice(await rb("tracking_prevention_get"));
@@ -4739,6 +4821,81 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       }
     });
   }
+
+  // ---- sites kept across launches ---------------------------------------
+  function renderKeptSites(reply) {
+    const section = $("keep-sites");
+    if (!reply || !reply.supported) {
+      section.hidden = true;
+      return;
+    }
+    section.hidden = false;
+    const list = $("keep-sites-list");
+    list.textContent = "";
+    const hosts = Array.isArray(reply.hosts) ? reply.hosts : [];
+    for (const host of hosts) {
+      const li = el("li", "kept-site");
+      li.appendChild(el("span", "kept-site-host", host));
+      const drop = el("button", "small", i18nText("chrome-js-keep-sites-remove", "Stop keeping"));
+      drop.type = "button";
+      drop.addEventListener("click", async () => {
+        try {
+          renderKeptSites(await rb("wipe_exempt_remove", { host }));
+          $("keep-sites-result").textContent = "";
+        } catch (e) {
+          $("keep-sites-result").textContent = friendly(e);
+        }
+      });
+      li.appendChild(drop);
+      list.appendChild(li);
+    }
+    if (!hosts.length) {
+      list.appendChild(
+        el("li", "kept-site-none", i18nText("chrome-js-keep-sites-none", "No sites kept. Everything is cleared at startup.")),
+      );
+    }
+  }
+
+  async function refreshKeptSites() {
+    try {
+      renderKeptSites(await rb("wipe_exempt_get"));
+    } catch (_) {
+      $("keep-sites").hidden = true;
+    }
+  }
+
+  $("keep-site-add").addEventListener("click", async () => {
+    const field = $("keep-site-host");
+    const host = (field.value || "").trim();
+    if (!host) return;
+    try {
+      renderKeptSites(await rb("wipe_exempt_add", { host }));
+      field.value = "";
+      $("keep-sites-result").textContent = "";
+    } catch (e) {
+      // bad_args means the text could never match a real host. Say so rather
+      // than leaving a typo sitting in a list that claims to keep a site.
+      $("keep-sites-result").textContent =
+        String(e && e.message) === "bad_args"
+          ? i18nText("chrome-js-keep-sites-bad", "That is not a hostname. Use a name like example.com.")
+          : friendly(e);
+    }
+  });
+
+  $("devtools-open").addEventListener("click", async () => {
+    const result = $("devtools-result");
+    try {
+      await rb("devtools_open");
+      // Say nothing on success. The inspector appearing IS the feedback, and
+      // a line claiming it opened would be a second, weaker claim that could
+      // disagree with the screen.
+      result.textContent = "";
+    } catch (e) {
+      // A failure here is exactly the case the button exists for, so it must
+      // not be silent the way the accelerator is.
+      result.textContent = friendly(e);
+    }
+  });
 
   // ---- per-site Fingerprint Divergence, and the proof ---------------------
   //

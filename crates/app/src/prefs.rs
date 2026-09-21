@@ -665,6 +665,66 @@ fn lenient_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error
     Ok(matches!(v, serde_json::Value::Bool(true)))
 }
 
+/// A host list that cannot make the file unreadable, and cannot carry a value
+/// that could never match a real host.
+///
+/// Anything that is not an array of strings reads as empty. Entries are
+/// normalized and screened by [`acceptable_wipe_exempt_host`]; a rejected
+/// entry is DROPPED rather than kept, because an entry that can never match
+/// is dead weight that still reads to the user as a site being kept.
+fn lenient_host_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let Some(items) = v.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(items
+        .iter()
+        .filter_map(|item| item.as_str())
+        .filter_map(normalize_wipe_exempt_host)
+        .collect())
+}
+
+/// Lowercases, trims a trailing dot, and refuses anything that is not a
+/// plausible host. Returns `None` for a value that could never match.
+pub fn normalize_wipe_exempt_host(raw: &str) -> Option<String> {
+    let host = raw.trim().trim_end_matches('.').to_ascii_lowercase();
+    if !acceptable_wipe_exempt_host(&host) {
+        return None;
+    }
+    Some(host)
+}
+
+/// The same shape the blocklist demands of a rule, and for the same reason: a
+/// value the engine could never hand us is not protection, it is a lie in a
+/// list. Punycode only, no scheme, no path, no port, at least two labels.
+fn acceptable_wipe_exempt_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= 253
+        && host.is_ascii()
+        && host.contains('.')
+        && !host.starts_with('.')
+        && !host.contains("..")
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
+        && host.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+}
+
+/// Whether `host` is kept by `exempt`, matching on dot boundaries.
+///
+/// The boundary is the whole point: a plain `ends_with` would make an entry
+/// for "example.com" also keep "notexample.com", which is a different site
+/// and one the user never asked to keep.
+pub fn wipe_exempts(exempt: &[String], host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    exempt.iter().any(|keep| {
+        host == *keep
+            || (host.len() > keep.len()
+                && host.as_bytes()[host.len() - keep.len() - 1] == b'.'
+                && host.ends_with(keep.as_str()))
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
@@ -698,6 +758,27 @@ pub struct Prefs {
     /// the tunnel mode or the auto-lock down with it.
     #[serde(default, deserialize_with = "lenient_bool")]
     pub resolver_chosen: bool,
+    /// Hosts whose cookies and site data SURVIVE the start-of-session wipe.
+    ///
+    /// Empty by default, and an empty list changes nothing: the wipe runs
+    /// exactly as it always has. The list exists because a browser that
+    /// arrives as a brand-new device on every launch is not merely forgetful,
+    /// it is unusable for anything that keeps keys on the client. Messenger's
+    /// end-to-end encryption stores its device keys in IndexedDB; wiping them
+    /// every start means re-downloading and re-decrypting an entire chat
+    /// history on every launch, and being challenged by the service for
+    /// looking like a new device each time. That was reported from a real
+    /// machine, and it is not a bug in the wipe -- it is the wipe working.
+    ///
+    /// Matched on DOT BOUNDARIES, so an entry covers a host and its
+    /// subdomains and nothing else: "example.com" keeps example.com and
+    /// a.example.com, never notexample.com.
+    ///
+    /// Lenient on the wire like the flags above: a malformed value reads as
+    /// an empty list rather than making the whole file unreadable, because
+    /// one bad field must not take every other preference down with it.
+    #[serde(default, deserialize_with = "lenient_host_list")]
+    pub wipe_exempt_hosts: Vec<String>,
     /// The chrome's own language, and ONLY the chrome's: this value must
     /// never reach navigator.language, Accept-Language, or any per-site
     /// surface -- the divergence non-goals carry the reasoning, and a
@@ -878,6 +959,7 @@ impl Default for Prefs {
             ui_locale: ui_locale_default(),
             translate_target: String::new(),
             tracking_prevention: TrackingPreventionLevel::default(),
+            wipe_exempt_hosts: Vec::new(),
             vault_autolock_secs: AUTOLOCK_DEFAULT_SECS,
             update_channel: UpdateChannel::default(),
             channel_reset_1_0: false,
@@ -1211,6 +1293,66 @@ mod tests {
             CapturePreference::Viewport.capture_scope(),
             crate::capture::CaptureScope::VisibleArea
         );
+    }
+
+    /// The wipe exemption list: what it keeps, what it must NOT keep, and
+    /// what a malformed file costs.
+    #[test]
+    fn a_wipe_exemption_keeps_a_host_and_its_subdomains_and_nothing_else() {
+        let keep = vec!["example.com".to_string()];
+
+        assert!(wipe_exempts(&keep, "example.com"), "the host itself");
+        assert!(wipe_exempts(&keep, "a.example.com"), "a subdomain");
+        assert!(wipe_exempts(&keep, "a.b.example.com"), "a deep subdomain");
+        assert!(wipe_exempts(&keep, "EXAMPLE.COM"), "case must not matter");
+        assert!(wipe_exempts(&keep, "example.com."), "a trailing dot is the same host");
+
+        // The boundary. A plain ends_with would keep all of these, and each
+        // one is a DIFFERENT site whose data the user never asked to spare.
+        assert!(!wipe_exempts(&keep, "notexample.com"));
+        assert!(!wipe_exempts(&keep, "example.com.evil.test"));
+        assert!(!wipe_exempts(&keep, "com"));
+        assert!(!wipe_exempts(&keep, ""));
+
+        // An empty list keeps nothing, which is what preserves today's
+        // behaviour for everyone who never opens the panel.
+        assert!(!wipe_exempts(&[], "example.com"));
+    }
+
+    #[test]
+    fn an_exemption_entry_that_could_never_match_is_refused() {
+        assert_eq!(normalize_wipe_exempt_host("  Example.COM. "), Some("example.com".into()));
+        assert_eq!(normalize_wipe_exempt_host("a.example.com"), Some("a.example.com".into()));
+
+        for bad in [
+            "",                         // nothing
+            "localhost",                // single label: would keep a whole TLD-ish space
+            "https://example.com",      // a scheme is not a host
+            "example.com/path",         // nor a path
+            "example.com:443",          // nor a port
+            "exa mple.com",             // nor a space
+            "..example.com",            // malformed
+            ".example.com",             // leading dot
+            "éxample.com",              // non-ASCII: hosts reach us punycoded
+        ] {
+            assert_eq!(normalize_wipe_exempt_host(bad), None, "accepted {bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_malformed_exemption_list_does_not_discard_the_file() {
+        // Not an array at all.
+        let p: Prefs = serde_json::from_str(r#"{"dns":"quad9","wipe_exempt_hosts":"example.com"}"#)
+            .expect("a bad list must not make the whole file unreadable");
+        assert_eq!(p.dns, DnsMode::Quad9, "the rest of the file must survive");
+        assert!(p.wipe_exempt_hosts.is_empty());
+
+        // An array with junk in it keeps the good entries and drops the rest.
+        let p: Prefs = serde_json::from_str(
+            r#"{"wipe_exempt_hosts":["example.com", 7, "localhost", "a.test.org"]}"#,
+        )
+        .expect("mixed junk must still parse");
+        assert_eq!(p.wipe_exempt_hosts, vec!["example.com", "a.test.org"]);
     }
 
     #[test]

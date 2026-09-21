@@ -2462,6 +2462,39 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // WebView2's profile-level tracker blocking. This is deliberately a
         // separate pref pair from `privacy_set`: PATANYX's own host blocker
         // and interception policy do not change when this engine layer does.
+        // Sites kept across launches. Read and written as a whole list,
+        // because a partial view of which sites survive a wipe is worse than
+        // none: the panel must always show exactly what the next launch will
+        // honour.
+        "wipe_exempt_get" => Ok(json!({
+            "hosts": crate::prefs::load().wipe_exempt_hosts,
+            "supported": cfg!(windows),
+        })),
+        "wipe_exempt_add" => {
+            if !cfg!(windows) {
+                return Err("unsupported");
+            }
+            let host = crate::prefs::normalize_wipe_exempt_host(arg_str(args, "host")?)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            if !p.wipe_exempt_hosts.iter().any(|h| h == &host) {
+                p.wipe_exempt_hosts.push(host);
+                p.wipe_exempt_hosts.sort();
+            }
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "hosts": p.wipe_exempt_hosts, "supported": true }))
+        }
+        "wipe_exempt_remove" => {
+            if !cfg!(windows) {
+                return Err("unsupported");
+            }
+            let host = arg_str(args, "host")?.trim().to_ascii_lowercase();
+            let mut p = crate::prefs::load();
+            p.wipe_exempt_hosts.retain(|h| h != &host);
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "hosts": p.wipe_exempt_hosts, "supported": true }))
+        }
+
         "tracking_prevention_get" => Ok(json!({
             "level": crate::prefs::load().tracking_prevention.as_str(),
             "supported": cfg!(windows),
@@ -2794,6 +2827,30 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let png = store.page_snapshot_picture(id).map_err(store_code)?;
             let token = crate::archive::stash_picture(id, png)?;
             Ok(json!({ "token": crate::capture::token_wire(token) }))
+        }
+
+        // Developer tools for the PAGE, from a button rather than a key.
+        //
+        // The binding (bare F12, Ctrl+Shift+I) still exists and is still the
+        // fast path. But it reaches the inspector through an accelerator, and
+        // when that delivery fails there is nothing else -- which is how a
+        // user ends up unable to inspect a page precisely when a page is
+        // misbehaving and inspecting it is the whole diagnosis. A control the
+        // user can see and click cannot be swallowed by focus.
+        //
+        // Aims at the CONTENT webview via the same `open_active_devtools`
+        // path the shortcut uses, so the chrome's own inspector stays where
+        // `chrome_devtools_opted_in` puts it and this adds no trust boundary.
+        "devtools_open" => {
+            // Reports the one failure it can actually see. A tab that exists
+            // but whose engine refuses the inspector is logged and not
+            // returned -- see `open_active_devtools`. Saying so here keeps the
+            // panel's copy from claiming a guarantee the stack cannot give.
+            if state.open_active_devtools() {
+                Ok(json!({}))
+            } else {
+                Err("no_tab")
+            }
         }
 
         "tab_status" => Ok(state.active_tab_status()),

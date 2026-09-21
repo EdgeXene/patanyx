@@ -3713,6 +3713,194 @@ pub fn forget_all_cookies(webview: &WebView) -> bool {
 /// posts SessionWipeFinished, which releases their queued initial URLs. A
 /// slow clear therefore never blocks construction or the event loop, but no
 /// first navigation can consume the half-cleared profile.
+/// The wipe for a profile that has sites the user asked to keep.
+///
+/// Returns TRUE when it has taken ownership of the wipe (the caller must then
+/// wait for `SessionWipeFinished`), and FALSE when it could not start, in
+/// which case the caller runs the ordinary profile-wide clear instead. There
+/// is deliberately no third answer: a partial clear that reported success
+/// would be the one outcome worse than not having the feature.
+///
+/// HOW MUCH THIS REACHES, stated plainly because it is a privacy control and
+/// the panel copy has to match it. Origins are discovered from the COOKIE
+/// JAR, which is the only enumerable index WebView2 offers. For each origin
+/// that is not exempt, its cookies are deleted and CDP's
+/// `Storage.clearDataForOrigin` is asked to remove its storage. An origin
+/// that holds site data but set NO cookie is therefore not enumerated and its
+/// data survives. That is a real gap against the profile-wide clear, it is
+/// the price of having exceptions at all on this engine, and it is written
+/// into the panel rather than left for someone to discover.
+fn begin_selective_session_wipe(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    exempt: &[String],
+) -> bool {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2CookieList, ICoreWebView2Profile2, ICoreWebView2_13, ICoreWebView2_2,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+    };
+    use webview2_com::{ClearBrowsingDataCompletedHandler, GetCookiesCompletedHandler};
+    use windows::core::{Interface, HSTRING, PCWSTR};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let exempt: Vec<String> = exempt.to_vec();
+    unsafe {
+        let Ok(v2) = core.cast::<ICoreWebView2_2>() else {
+            diag("session: no ICoreWebView2_2; cannot honour kept sites, falling back to the full clear");
+            return false;
+        };
+        let Ok(manager) = v2.CookieManager() else {
+            diag("session: no cookie manager; cannot honour kept sites, falling back to the full clear");
+            return false;
+        };
+
+        let done_proxy = proxy.clone();
+        let core_for_cdp = core.clone();
+        let manager_for_delete = manager.clone();
+        let handler = GetCookiesCompletedHandler::create(Box::new(
+            move |result, list: Option<ICoreWebView2CookieList>| {
+                // Anything unexpected here has already cost us the full clear
+                // (it did not run), so the only safe move is to run it now.
+                let recover = |why: &str| {
+                    diag(&format!(
+                        "session: kept-sites clear could not enumerate cookies ({why}); running the FULL clear instead"
+                    ));
+                    full_profile_clear(&core_for_cdp, &done_proxy);
+                };
+                if result.is_err() {
+                    recover("GetCookies failed");
+                    return Ok(());
+                }
+                let Some(list) = list else {
+                    recover("GetCookies returned no list");
+                    return Ok(());
+                };
+                let mut count = 0u32;
+                if list.Count(&mut count).is_err() {
+                    recover("cookie list has no count");
+                    return Ok(());
+                }
+
+                // Delete every cookie whose host the user did not keep, and
+                // remember its host so its storage can go too.
+                let mut hosts: Vec<String> = Vec::new();
+                for i in 0..count {
+                    let Ok(cookie) = list.GetValueAtIndex(i) else { continue };
+                    let mut raw = windows::core::PWSTR::null();
+                    if cookie.Domain(&mut raw).is_err() || raw.is_null() {
+                        continue;
+                    }
+                    let domain = raw.to_string().unwrap_or_default();
+                    let domain = domain.trim_start_matches('.').to_ascii_lowercase();
+                    if domain.is_empty() || crate::prefs::wipe_exempts(&exempt, &domain) {
+                        continue;
+                    }
+                    let _ = manager_for_delete.DeleteCookie(&cookie);
+                    if !hosts.iter().any(|h| h == &domain) {
+                        hosts.push(domain);
+                    }
+                }
+
+                // Storage, per origin, over CDP: ClearBrowsingData has no
+                // origin argument, and this is the only call that does.
+                for host in &hosts {
+                    for scheme in ["https", "http"] {
+                        let params = HSTRING::from(format!(
+                            "{{\"origin\":\"{scheme}://{host}\",\"storageTypes\":\"all\"}}"
+                        ));
+                        // `w!` rather than HSTRING::from: a compile-time UTF-16
+                        // literal is embedded in the binary and can be checked
+                        // for there, which a string built at runtime cannot.
+                        // Verifying the shipped artifact matters more than
+                        // usual here -- this call is the storage half of a
+                        // privacy control, and its absence would be silent.
+                        let _ = core_for_cdp.CallDevToolsProtocolMethod(
+                            windows::core::w!("Storage.clearDataForOrigin"),
+                            PCWSTR(params.as_ptr()),
+                            None,
+                        );
+                    }
+                }
+
+                diag(&format!(
+                    "session: kept {} site(s); cleared cookies and storage for {} other origin(s)",
+                    exempt.len(),
+                    hosts.len()
+                ));
+
+                // The HTTP cache carries no identity and has no exceptions,
+                // so it is cleared wholesale either way.
+                if let Ok(v13) = core_for_cdp.cast::<ICoreWebView2_13>() {
+                    if let Ok(profile) = v13.Profile() {
+                        if let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() {
+                            let end_proxy = done_proxy.clone();
+                            let cache_handler =
+                                ClearBrowsingDataCompletedHandler::create(Box::new(move |_| {
+                                    super::finish_session_wipe();
+                                    let _ = end_proxy.send_event(UserEvent::SessionWipeFinished);
+                                    Ok(())
+                                }));
+                            if profile2
+                                .ClearBrowsingData(
+                                    COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+                                    &cache_handler,
+                                )
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+                super::finish_session_wipe();
+                let _ = done_proxy.send_event(UserEvent::SessionWipeFinished);
+                Ok(())
+            },
+        ));
+
+        if manager.GetCookies(PCWSTR::null(), &handler).is_err() {
+            diag("session: GetCookies could not start; falling back to the full clear");
+            return false;
+        }
+    }
+    true
+}
+
+/// The profile-wide clear, used by the selective path when it has already
+/// taken the wipe and then cannot finish it honestly.
+fn full_profile_clear(core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2, proxy: &EventLoopProxy<UserEvent>) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Profile2, ICoreWebView2_13, COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS,
+    };
+    use webview2_com::ClearBrowsingDataCompletedHandler;
+    use windows::core::Interface;
+
+    let end = |proxy: &EventLoopProxy<UserEvent>| {
+        super::finish_session_wipe();
+        let _ = proxy.send_event(UserEvent::SessionWipeFinished);
+    };
+    unsafe {
+        let Ok(v13) = core.cast::<ICoreWebView2_13>() else { return end(proxy) };
+        let Ok(profile) = v13.Profile() else { return end(proxy) };
+        let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() else { return end(proxy) };
+        let done = proxy.clone();
+        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |_| {
+            super::finish_session_wipe();
+            let _ = done.send_event(UserEvent::SessionWipeFinished);
+            Ok(())
+        }));
+        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE;
+        if profile2.ClearBrowsingData(kinds, &handler).is_err() {
+            end(proxy);
+        }
+    }
+}
+
 fn begin_new_session_wipe(
     webview: &WebView,
     proxy: &EventLoopProxy<UserEvent>,
@@ -3737,6 +3925,25 @@ fn begin_new_session_wipe(
         super::finish_session_wipe();
         let _ = proxy.send_event(UserEvent::SessionWipeFinished);
     };
+
+    // SITES THE USER ASKED TO KEEP.
+    //
+    // Empty is the default and the whole of the old behaviour: fall straight
+    // through to the profile-wide clear below, unchanged. A non-empty list
+    // cannot use that call at all -- `ClearBrowsingData` takes kinds, not
+    // origins, so there is no "everything except these" to ask for.
+    //
+    // FAILS CLOSED, and that is the load-bearing property. The selective path
+    // enumerates the cookie jar and clears each non-exempt origin itself. If
+    // ANY part of that cannot be done -- no cookie manager, an enumeration
+    // that errors, a runtime too old -- it does not press on having cleared
+    // some of it. It returns false and the full wipe below runs instead. A
+    // user who asked to keep one site must never get a silently half-cleared
+    // profile while the panel says the session was cleaned.
+    let exempt = crate::prefs::load().wipe_exempt_hosts;
+    if !exempt.is_empty() && begin_selective_session_wipe(webview, proxy, &exempt) {
+        return true;
+    }
 
     let core = webview.webview();
     unsafe {

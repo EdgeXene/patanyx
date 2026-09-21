@@ -23,7 +23,9 @@
         <button id="tabbatch-shelf" type="button" data-msg="chrome.tabbatch.shelf.button">Shelve</button>
         <button id="tabbatch-cancel" type="button" data-msg="chrome.tabbatch.cancel.button">Cancel</button>
       </div>
-      <div id="tabs"></div>
+      <!-- dir is pinned because the drop-target walk in chrome.js compares
+           DOM order against screen rectangles; see tabDropTargetAt. -->
+      <div id="tabs" dir="ltr"></div>
       <button id="btn-newtab" type="button" title="New tab" data-msg-title="chrome.btn.newtab.title">+</button>
     </nav>
 
@@ -2100,6 +2102,48 @@
           to give the next navigation the new level from its first request.
         </p>
         <p class="panel-foot" id="tracking-prevention-result"></p>
+      </section>
+
+      <!-- Windows-only, like the tracker level above: the selective clear it
+           configures is implemented on the WebView2 cookie manager. -->
+      <section id="keep-sites" hidden>
+        <h3 class="section-head" data-msg="chrome.keep.sites.h3">Sites to keep when PATANYX starts</h3>
+        <p class="panel-foot" id="keep-sites-caption" data-msg="chrome.keep.sites.caption.p">
+          PATANYX clears cookies and site data every time it starts. A site
+          listed here is left alone, so it still knows you next time. Useful
+          for a site that signs you out or re-verifies you on every launch.
+        </p>
+        <div class="form-buttons">
+          <input id="keep-site-host" type="text" placeholder="example.com" autocomplete="off" spellcheck="false"
+                 data-msg-placeholder="chrome.keep.sites.placeholder" />
+          <button id="keep-site-add" type="button" class="small" data-msg="chrome.keep.sites.add.button">
+            Keep this site
+          </button>
+        </div>
+        <ul id="keep-sites-list" class="plain-list"></ul>
+        <p class="panel-foot" id="keep-sites-limit" data-msg="chrome.keep.sites.limit.p">
+          Keeping any site changes how the clear works. Instead of wiping the
+          whole profile at once, PATANYX clears each site it can find in the
+          cookie jar. A site that stored data but set no cookie is not found
+          that way, so its data can survive. With no sites kept, the whole
+          profile is cleared as before.
+        </p>
+        <p class="panel-foot" id="keep-sites-result"></p>
+      </section>
+
+      <section id="devtools-choice">
+        <h3 class="section-head" data-msg="chrome.devtools.choice.h3">Developer tools</h3>
+        <p class="panel-foot" id="devtools-caption" data-msg="chrome.devtools.caption.p">
+          Opens the inspector for the page you are looking at, the same as
+          Ctrl+Shift+I. Here as a button as well, because a keyboard shortcut
+          has to reach the right window and a button does not.
+        </p>
+        <div class="form-buttons">
+          <button id="devtools-open" type="button" class="small" data-msg="chrome.devtools.open.button">
+            Open developer tools
+          </button>
+        </div>
+        <p class="panel-foot" id="devtools-result"></p>
       </section>
 
       <!-- PER-SITE DIVERGENCE + THE PROOF. Sibling section to

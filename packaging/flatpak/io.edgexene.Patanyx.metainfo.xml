@@ -48,6 +48,14 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.1" date="2026-09-20">
+      <description>
+        <p>Messenger and other sites that do their work in background workers load again. Fingerprint Divergence used to run a page's worker from a generated address so it could add its noise inside it. A site whose security policy refuses those addresses could not start such a worker at all, and a message sent to one could be lost with no error, leaving the page waiting forever. Divergence no longer touches workers: readings taken inside a worker are now the real ones, and everything in the page itself is unchanged.</p>
+        <p>Dragging a tab keeps it where you dropped it, including when you drop it past the last tab.</p>
+        <p>On Windows, sites can be named in the privacy panel so their cookies and site data survive a restart, for a service that signs you out or re-verifies you on every launch. Naming any site changes how the startup clear works: instead of clearing the whole profile at once, PATANYX clears each site it can find in the cookie jar, so a site that stored data but set no cookie can survive. With no sites named, the whole profile is cleared as before.</p>
+        <p>The privacy panel can open developer tools for the page you are looking at.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-09-20">
       <description>
         <p>First stable release. Page translation runs on your own computer with language packs that download once and work offline. Notifications are centered, bold, dismissible, and no longer truncate. A locked vault now says why a password was not saved, a password the vault already holds is not offered for saving twice, and forty-four interface strings that stayed English in every language now translate.</p>
