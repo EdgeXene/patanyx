@@ -20,6 +20,8 @@
 
 **Leave less behind.**
 
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14499/badge)](https://www.bestpractices.dev/projects/14499)
+
 > **Prerelease.** PATANYX is pre-1.0 software under active development. Behavior, interfaces, and formats may change between releases.
 
 PATANYX is a lightweight, Rust-based desktop browser built with privacy at its core. Protection is part of the architecture from the start, not something buried behind a maze of settings.
