@@ -62,13 +62,41 @@ Third-Party Acknowledgements
    a permissive label on an aggregate cannot pass on rights its upstreams
    withheld.)
 
-5. PP-OCR detection, angle-classification, and recognition models (bundled,
+5. CERT Polska / NASK Dangerous Websites Warning List (NOT bundled;
+   delivered only through the signed blocklist update channel)
+   The data comes from CERT Polska. Source: https://cert.pl/lista-ostrzezen/
+   Feed: https://hole.cert.pl/domains/v2/domains.txt
+   The list publishes no licence text. On 2026-09-01 EdgeXene LLC asked
+   CERT Polska in writing whether commercial software may use the list for
+   phishing and malicious-domain protection, process or convert it into
+   another technical format, and redistribute an updated copy of the
+   resulting list to its users, with attribution to CERT Polska / NASK and
+   without representing the data as its own or selling the list. On
+   2026-09-11 CSIRT NASK / CERT Polska replied that "All the conditions
+   described are certainly sufficient for implementation" and asked, in
+   addition to stating that the data comes from CERT Polska, for a link to
+   https://cert.pl/lista-ostrzezen/. Both requests are met here, in the
+   acknowledgements shown inside every PATANYX Browser build that includes
+   this file, and on the About page at patanyx.net. The update channel
+   carries the entries as hashed host records, not plaintext and without
+   this text, which is why the attribution is given in those places.
+   The CERT Polska entries travel ONLY in that signed update channel, as the
+   request to CERT Polska described. They are not in the committed
+   crates/app/src/blocklist.txt, so they are not compiled into releases and
+   are not published in this repository; scripts/test-certpl.sh refuses a
+   tree whose committed list contains them. Where they do appear they are
+   included by CERT Polska's permission and are not licensed under the
+   Apache 2.0 licence that covers this repository.
+   (Wired in 2026-09-11 behind BLOCKLIST_ENABLE_CERTPL, which the publisher
+   enables in its own environment and which stays off in this tree.)
+
+6. PP-OCR detection, angle-classification, and recognition models (bundled,
    compiled into the binary)
    Copyright (c) Baidu, Inc.
    Licensed under the Apache License 2.0, code and weights.
    (Model files and provenance: models/ocr/)
 
-6. Bergamot translation engine and its emscripten glue (bundled)
+7. Bergamot translation engine and its emscripten glue (bundled)
    Copyright (c) Mozilla Foundation and contributors; bergamot-translator
    contributors
    Licensed under the Mozilla Public License 2.0, code and compiled
@@ -81,7 +109,7 @@ Third-Party Acknowledgements
    a file whose bytes no longer match, and refuse a shipped file with no
    entry at all.)
 
-7. Mozilla Public Suffix List (bundled, compiled into the binary)
+8. Mozilla Public Suffix List (bundled, compiled into the binary)
    Copyright (c) the Mozilla Foundation and contributors
    Licensed under the Mozilla Public License 2.0.
    Source: https://publicsuffix.org/list/public_suffix_list.dat
@@ -92,18 +120,18 @@ Third-Party Acknowledgements
    to decide which saved password a page may be offered -- see
    crates/app/src/psl.rs.)
 
-8. WebKitGTK (Linux) -- NOT distributed with this software
+9. WebKitGTK (Linux) -- NOT distributed with this software
    Copyright (c) the WebKit contributors
    LGPL-2.1-or-later and BSD-2-Clause, dynamically linked against the system
    library so a user may substitute their own build.
 
-9. Microsoft Edge WebView2 Runtime (Windows) -- NOT distributed with this
+10. Microsoft Edge WebView2 Runtime (Windows) -- NOT distributed with this
    software
    Copyright (c) Microsoft Corporation
    Supplied by Microsoft under its own terms. PATANYX links the loader and
    calls the runtime; it neither contains nor redistributes it.
 
-10. Rust crate dependencies (466 packages)
+11. Rust crate dependencies (466 packages)
    Copyright (c) their respective authors
    All permissive. Five are MPL-2.0 (cssparser, cssparser-macros, dtoa-short,
    option-ext, selectors), used unmodified.

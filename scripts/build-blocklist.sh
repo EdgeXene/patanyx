@@ -70,6 +70,41 @@ SHADOWWHISPERER_MALWARE_URL="https://raw.githubusercontent.com/ShadowWhisperer/B
 # asserts.
 ENABLE_SW="${BLOCKLIST_ENABLE_SHADOWWHISPERER:-1}"
 
+# CERT Polska (CSIRT NASK) Dangerous Websites Warning List, added 2026-09-11.
+# ONE feed, ~136k hosts, statutory basis, six-month expiry handled upstream, a
+# formal appeal route -- and, measured 2026-09-11 before wiring: 134,416 of
+# 136,279 hosts absent from the published list, ZERO exact hits in the Tranco
+# top 10,000, one in the 10k-100k report band. Domains are bare lowercase ASCII
+# (IDNs arrive as punycode), one per line, no comment header.
+#
+# WHY IT IS REDISTRIBUTABLE. The list publishes no licence text. Permission
+# was asked for in writing on 2026-09-01 (use for phishing protection,
+# processing into another format, redistribution of the refreshed list to
+# PATANYX users, attribution to CERT Polska / NASK, never sold) and granted by
+# CSIRT NASK / CERT Polska on 2026-09-11: "All the conditions described are
+# certainly sufficient for implementation", with one request -- state that the
+# data comes from CERT Polska and link https://cert.pl/lista-ostrzezen/. Both
+# are honoured in NOTICE and in the header this script writes.
+#
+# OFF BY DEFAULT, PERMANENTLY, and the reason is the shape of the grant. It
+# covers redistribution of the refreshed list TO PATANYX USERS through the
+# update channel. It does not describe publishing the hosts in plain text in
+# a public source repository, and crates/app/src/blocklist.txt is exactly
+# that: committed, compiled into releases, and mirrored to GitHub. So the
+# committed dataset never carries CERT Polska entries; a plain run of this
+# script produces it. The hourly publisher enables the source through its own
+# environment (BLOCKLIST_ENABLE_CERTPL=1 in the service's environment file),
+# and the signed list it ships is the only place the entries travel.
+# scripts/test-certpl.sh refuses a tree whose committed list contains them.
+#
+# When 0, NOTHING here runs: no fetch, no freshness entry, no snapshot, no
+# merge contribution, no header block, and the licensing sentence keeps its
+# pre-change wording, so the output is byte-identical to a build from before
+# this source existed. The first enabled publish needs one run with
+# BLOCKLIST_EXPECT_ENTRIES, because +21% trips the delta gate.
+CERTPL_URL="https://hole.cert.pl/domains/v2/domains.txt"
+ENABLE_CERTPL="${BLOCKLIST_ENABLE_CERTPL:-0}"
+
 # HTTPS only, including across redirects; a bounded size so a runaway response
 # cannot fill the disk; retries because this will run unattended and a single
 # transient 5xx should not freeze the fleet's list for an hour.
@@ -90,6 +125,10 @@ PHISHDESTROY_FLOOR=120000
 # cannot pass for a real list.
 SW_SCAM_FLOOR=5000
 SW_MALWARE_FLOOR=30000
+# Measured 2026-09-11: 136,279 hosts. Entries expire after six months upstream,
+# so the size drifts; the floor sits well under that drift and far above what a
+# truncated fetch could return.
+CERTPL_FLOOR=60000
 
 # Freshness ceilings, in hours. The floors above catch a TRUNCATED feed; these
 # catch a FROZEN one, which the floors structurally cannot. Measured 2026-08-06:
@@ -131,6 +170,11 @@ SW_SCAM_STALE_HOURS=336
 SW_SCAM_DEAD_HOURS=720
 SW_MALWARE_STALE_HOURS=72
 SW_MALWARE_DEAD_HOURS=168
+# CERT.pl republishes continuously (Last-Modified moved within the day it was
+# measured, cache-control max-age=10). Two days unchanged is outside cadence;
+# a week says the feed has stopped.
+CERTPL_STALE_HOURS=48
+CERTPL_DEAD_HOURS=168
 
 # phishunt is a ROLLING WINDOW, not a corpus. Measured 2026-08-10: the whole
 # dataset is ~714 entries, every one of them currently-live, and their API has
@@ -265,6 +309,20 @@ if [ "$ENABLE_SW" = "1" ]; then
   SW_MALWARE_SHA="$(sha256sum "$WORK/sw-malware.txt" 2>/dev/null | awk '{print $1}')" || true
 fi
 
+: > "$WORK/certpl.hosts"
+CERTPL_N=0
+CERTPL_SHA=""
+if [ "$ENABLE_CERTPL" = "1" ]; then
+  say "fetching CERT.pl warning list ..."
+  $CURL --max-time 120 --max-filesize 20000000 -o "$WORK/certpl.txt" \
+    "$CERTPL_URL" || {
+    say "FAIL: could not fetch $CERTPL_URL"
+    say "  $OUT is unchanged."
+    exit 1
+  }
+  CERTPL_SHA="$(sha256sum "$WORK/certpl.txt" 2>/dev/null | awk '{print $1}')" || true
+fi
+
 # --- source freshness -------------------------------------------------------
 #
 # WHY LOCAL CONTENT TRACKING, and not the two obvious alternatives.
@@ -380,6 +438,13 @@ check_source_freshness() {
       # Narrow on purpose: the other three keep their timelines rather than the
       # whole tracker skipping itself over one unhashable file.
       say "  freshness: could not hash ShadowWhisperer; it is untracked this run"
+    fi
+  fi
+  if [ "$ENABLE_CERTPL" = "1" ]; then
+    if [ -n "$CERTPL_SHA" ]; then
+      src_args+=("CERT.pl:$CERTPL_SHA:$((CERTPL_STALE_HOURS * 3600)):$((CERTPL_DEAD_HOURS * 3600)):")
+    else
+      say "  freshness: could not hash CERT.pl; it is untracked this run"
     fi
   fi
 
@@ -635,6 +700,21 @@ if [ "$ENABLE_SW" = "1" ]; then
   fi
   if [ "$SW_MALWARE_N" -lt "$SW_MALWARE_FLOOR" ]; then
     say "FAIL: ShadowWhisperer Malware returned $SW_MALWARE_N hosts, floor is $SW_MALWARE_FLOOR."
+    say "  $OUT is unchanged."
+    exit 1
+  fi
+fi
+
+if [ "$ENABLE_CERTPL" = "1" ]; then
+  # Bare hosts today, but the full extraction runs anyway: a feed's shape is a
+  # fact about this pull, not a promise. No declared count to cross-check; the
+  # floor is the guard.
+  grep -vE '^\s*(#|$)' "$WORK/certpl.txt" | tr -d '\r' | last_field | strip_to_host \
+    | tr 'A-Z' 'a-z' | sort -u > "$WORK/certpl.hosts"
+  CERTPL_N=$(wc -l < "$WORK/certpl.hosts")
+  say "  CERT.pl           : $CERTPL_N hosts"
+  if [ "$CERTPL_N" -lt "$CERTPL_FLOOR" ]; then
+    say "FAIL: CERT.pl returned $CERTPL_N hosts, floor is $CERTPL_FLOOR."
     say "  $OUT is unchanged."
     exit 1
   fi
@@ -1038,11 +1118,11 @@ if [ "$ALLOW_N" -gt "$ALLOW_CEILING" ]; then
   exit 1
 fi
 
-# sw.hosts is empty unless ShadowWhisperer is enabled, so this line is
-# unconditional on purpose: one merge, one place to read, and no second copy of
+# sw.hosts and certpl.hosts are empty unless their sources are enabled, so this
+# line is unconditional on purpose: one merge, one place to read, and no second copy of
 # the enable test that could drift out of step with the first.
 cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" "$WORK/phishdestroy.hosts" \
-  "$WORK/archive.hosts" "$WORK/sw.hosts" | sort -u | filter_acceptable > "$WORK/merged.prepsl"
+  "$WORK/archive.hosts" "$WORK/sw.hosts" "$WORK/certpl.hosts" | sort -u | filter_acceptable > "$WORK/merged.prepsl"
 
 # --- bare public suffixes ---------------------------------------------------
 #
@@ -1324,6 +1404,12 @@ NEW_FROM_SW=$(comm -13 \
   <(cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" "$WORK/phishdestroy.hosts" \
     "$WORK/archive.hosts" | sort -u | filter_acceptable) \
   <(filter_acceptable < "$WORK/sw.hosts") | wc -l)
+# What CERT.pl adds over every other input. Measured 2026-09-11 before wiring:
+# 134,416 of 136,279 absent from the published list.
+NEW_FROM_CERTPL=$(comm -13 \
+  <(cat "$WORK/pdb.hosts" "$WORK/phishunt.hosts" "$WORK/phishdestroy.hosts" \
+    "$WORK/archive.hosts" "$WORK/sw.hosts" | sort -u | filter_acceptable) \
+  <(filter_acceptable < "$WORK/certpl.hosts") | wc -l)
 
 # PERSIST THE PER-SOURCE HOST LISTS. They only ever existed inside $WORK, which
 # meant nothing downstream could answer "how many feeds report this host" --
@@ -1339,6 +1425,9 @@ if mkdir -p "$SNAPSHOT_DIR" 2>/dev/null; then
   # "uncorroborated" for every host rather than "not consulted".
   if [ "$ENABLE_SW" = "1" ]; then
     snapshot_pairs+=("ShadowWhisperer.Scam:sw-scam" "ShadowWhisperer.Malware:sw-malware")
+  fi
+  if [ "$ENABLE_CERTPL" = "1" ]; then
+    snapshot_pairs+=("CERT.pl:certpl")
   fi
   for pair in "${snapshot_pairs[@]}"; do
     name="${pair%%:*}" file="${pair##*:}"
@@ -1396,6 +1485,52 @@ if [ "$ENABLE_SW" = "1" ]; then
 # nine to blocklist-confirm.txt. The Malware list also reaches into adware and
 # PUP territory, which a phishing list has no business shipping -- entries of
 # that kind belong in the allowlist, and clickadu.net is the worked example.
+#
+"
+fi
+
+# Same discipline as SW_SOURCE_BLOCK: empty when off, carries its own trailing
+# newline, interpolated on the same line as the text that follows it.
+CERTPL_SOURCE_BLOCK=""
+# The sentence under WHY THESE SOURCES must stay true in both builds. Four
+# sources are permissively licensed; CERT.pl is not, it is redistributed under
+# written permission, so the wording switches with the flag and a disabled
+# build keeps the exact pre-change text.
+LICENSING_BASIS="permissively licensed
+# and redistributable inside a shipped browser"
+if [ "$ENABLE_CERTPL" = "1" ]; then
+  LICENSING_BASIS="either permissively
+# licensed or redistributed under written permission from their publisher, and
+# so may ship inside a browser"
+  CERTPL_ORDINAL=4
+  [ "$ENABLE_SW" = "1" ] && CERTPL_ORDINAL=5
+  SOURCE_COUNT_WORD="four"
+  [ "$ENABLE_SW" = "1" ] && SOURCE_COUNT_WORD="five"
+  CERTPL_SOURCE_BLOCK="# $CERTPL_ORDINAL. CERT Polska (CSIRT NASK) Dangerous Websites Warning List --
+#    https://cert.pl/lista-ostrzezen/ -- $CERTPL_N hosts, of which $NEW_FROM_CERTPL
+#    were not already covered by any list above.
+#
+# THE DATA COMES FROM CERT POLSKA. That sentence and the link above are the two
+# things CERT Polska asked for when it granted permission, and they travel with
+# every copy of this TEXT list. The signed update payload is hashed host records
+# with no header, so users see the attribution in NOTICE (shown in the app) and
+# on the About page. The feed publishes no licence text; redistribution
+# rests on written permission from CSIRT NASK / CERT Polska, 2026-09-11 (\"All
+# the conditions described are certainly sufficient for implementation\"), for
+# exactly what this script does: fetch the official feed, process it into
+# this format, and ship the refreshed list to PATANYX users, attributed and
+# never sold. The full exchange is summarised in NOTICE. The CERT Polska
+# entries in this list are included by that permission and are NOT licensed
+# under the Apache 2.0 licence that covers the rest of the repository.
+#
+# PUBLISH-ONLY BUILD. This list was generated for the signed update channel.
+# The committed crates/app/src/blocklist.txt must never contain the CERT
+# Polska entries; do not commit this file.
+#
+# WHAT IT IS. A national CSIRT's warning list with a statutory basis, entries
+# expiring after six months, and a formal appeal route for a listed site.
+# Measured before wiring: zero exact hits in the Tranco top 10,000, one in the
+# 10k-100k report band.
 #
 "
 fi
@@ -1526,8 +1661,7 @@ cat > "$WORK/out.txt" <<HEADER
 # resolves nowhere cannot be serving a phishing page. The per-tab override in
 # the blocked banner exists for the cases this still gets wrong.
 #
-${SW_SOURCE_BLOCK}# WHY THESE SOURCES. All $SOURCE_COUNT_WORD of the sources ABOVE are permissively licensed
-# and redistributable inside a shipped browser; a further input, described
+${SW_SOURCE_BLOCK}${CERTPL_SOURCE_BLOCK}# WHY THESE SOURCES. All $SOURCE_COUNT_WORD of the sources ABOVE are ${LICENSING_BASIS}; a further input, described
 # under REMOVED ENTRIES, is only ever subtracted and is never redistributed.
 #
 # Feeds that are not redistributable were evaluated and rejected: OpenPhish

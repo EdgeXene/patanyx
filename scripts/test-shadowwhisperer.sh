@@ -52,7 +52,7 @@ has "  the merge reads sw.hosts" '"$WORK/archive.hosts" "$WORK/sw.hosts" | sort 
 # one blank line in the shipped header -- a diff nobody would understand a
 # month later, in a file whose whole job is to be reviewable in a diff.
 check "  header block cannot leave a blank line when empty" "yes" \
-  "$(grep -qF '${SW_SOURCE_BLOCK}# WHY THESE SOURCES.' "$SCRIPT" && echo yes || echo no)"
+  "$(grep -qF '${SW_SOURCE_BLOCK}${CERTPL_SOURCE_BLOCK}# WHY THESE SOURCES.' "$SCRIPT" && echo yes || echo no)"
 check "  and it carries a literal trailing newline, not \$( ) which strips it" "no" \
   "$(grep -qE 'SW_SOURCE_BLOCK="\$\(' "$SCRIPT" && echo yes || echo no)"
 
