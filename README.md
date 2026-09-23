@@ -26,7 +26,7 @@ PATANYX is a lightweight, Rust-based desktop browser built with privacy at its c
 
 EdgeXene designed PATANYX around transparency, local control, and verifiable protection while staying honest about what no browser can hide.
 
-PATANYX runs on Windows and Linux and is actively under development.
+PATANYX runs on Windows and Linux and is actively maintained.
 
 ## Source policy
 
