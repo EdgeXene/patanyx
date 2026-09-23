@@ -22,8 +22,6 @@
 
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/14499/badge)](https://www.bestpractices.dev/projects/14499)
 
-> **Prerelease.** PATANYX is pre-1.0 software under active development. Behavior, interfaces, and formats may change between releases.
-
 PATANYX is a lightweight, Rust-based desktop browser built with privacy at its core. Protection is part of the architecture from the start, not something buried behind a maze of settings.
 
 EdgeXene designed PATANYX around transparency, local control, and verifiable protection while staying honest about what no browser can hide.
@@ -111,7 +109,7 @@ Official Windows binaries are cross-compiled from Linux with `scripts/build-wind
 
 ## Downloads
 
-Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/download/](https://patanyx.edgexene.io/download/). Releases here are marked prerelease while PATANYX is pre-1.0.
+Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/download/](https://patanyx.edgexene.io/download/).
 
 Every published binary carries a [Sigstore](https://www.sigstore.dev/) bundle. Verify a download before running it:
 

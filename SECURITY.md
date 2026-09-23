@@ -24,10 +24,9 @@ anonymous will not be named.
 
 ## Supported versions
 
-PATANYX is pre-1.0 software under active development. Only the current release
-line receives security fixes; there are no long-term support branches, and older
-prerelease versions are not patched. Fixes ship in the next release rather than
-as backports.
+Only the current release line receives security fixes; there are no long-term
+support branches, and older versions are not patched. Fixes ship in the next
+release rather than as backports.
 
 ## Scope
 
