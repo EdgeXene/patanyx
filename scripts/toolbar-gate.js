@@ -52,30 +52,44 @@ const flush = async () => {
 
 let chromeJs = fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8");
 // Planted-defect mode: keep the renderer and every source assertion intact,
-// but rename the one listener this feature needs. The normal run never edits
-// a workspace file; running with PATANYX_TAB_REORDER_OMIT_DROP_HANDLER=1 must
-// fail the behavioral check below.
+// but rename the one listener this feature needs -- the tab STRIP's drop,
+// which is where the drop target lives now that it is no longer bound per
+// chip. The normal run never edits a workspace file; running with
+// PATANYX_TAB_REORDER_OMIT_DROP_HANDLER=1 must fail the behavioral check below.
+//
+// Anchored on the guard line too, and required to match exactly once:
+// chrome.js has a second `wrap.addEventListener("drop"` for the bookmark
+// organizer's cards, and renaming that one would prove nothing about tabs.
 if (process.env.PATANYX_TAB_REORDER_OMIT_DROP_HANDLER) {
-  const callSite = 'chip.addEventListener("drop", (ev) => {';
+  const guard = "\n      if (draggedTabId === null) return;";
+  const callSite = 'wrap.addEventListener("drop", (ev) => {' + guard;
   assert(
-    chromeJs.includes(callSite),
-    "cannot plant defect: tab drop handler spelling changed",
+    chromeJs.split(callSite).length === 2,
+    "cannot plant defect: the tab strip's drop handler spelling changed",
   );
   chromeJs = chromeJs.replace(
     callSite,
-    'chip.addEventListener("drop-removed", (ev) => {',
+    'wrap.addEventListener("drop-removed", (ev) => {' + guard,
   );
 }
 // WP-V plant proofs. Each removes one live behavior while leaving the markup
 // and source-level contracts intact, so the behavioral assertions below must
 // be what turn red.
+//
+// The right inset is measured once into a local in syncChromeInsets and handed
+// to set_chrome_insets as shorthand, so zeroing that local zeroes exactly what
+// Rust is told. The stylesheet's --chrome-right-px comes from its own call in
+// publishChromeMetric and is left alone: "all four layouts report symmetric
+// insets to Rust" is the check that must turn red. Required to match exactly
+// once, as the tab-drop plant is: a second spelling means this no longer names
+// the one value Rust is sent.
 if (process.env.PATANYX_TOOLBAR_OMIT_RIGHT_INSET) {
-  const callSite = "right: closedChromeRightPx(),";
+  const callSite = "const right = closedChromeRightPx();";
   assert(
-    chromeJs.includes(callSite),
-    "cannot plant defect: right inset call changed",
+    chromeJs.split(callSite).length === 2,
+    "cannot plant defect: the right inset sent to Rust changed spelling",
   );
-  chromeJs = chromeJs.replace(callSite, "right: 0,");
+  chromeJs = chromeJs.replace(callSite, "const right = 0;");
 }
 if (process.env.PATANYX_TOOLBAR_OMIT_LABEL_GRAY) {
   const callSite = "if (choice) choice.disabled = vertical;";
@@ -177,14 +191,34 @@ check(
     // strip between dragstart and drop.
     await flush();
     fireChrome("tabs_changed", { items: tabItems([11, 22, 33], 22) });
+    const strip = global.$("tabs");
     const [first, , third] = tabChips();
     assert(first && third, "setup did not render three tab chips");
+    // THE DRAG HAS TWO ENDS, AND THEY LIVE ON DIFFERENT ELEMENTS.
+    //
+    // A chip is the SOURCE: draggable, named by dragstart, cleaned up after by
+    // dragend. The STRIP is the target: one dragover and one drop on the
+    // container. The target used to be each chip, so a release past the last
+    // tab -- the commonest reorder there is -- landed on container, fired no
+    // drop, and the next repaint undid the move. This check went on demanding
+    // the per-chip target after it moved, so it failed a correct build at its
+    // first assertion and said nothing about the drag itself.
     assert(
       first.getAttribute("draggable") === "true" &&
         first._has("dragstart") &&
-        third._has("dragover") &&
-        third._has("drop"),
-      "tab chips are not draggable through dragstart/dragover/drop",
+        first._has("dragend"),
+      "tab chips are not drag sources through draggable/dragstart/dragend",
+    );
+    assert(
+      strip._has("dragover") && strip._has("drop"),
+      "the tab strip is not the drop target through dragover/drop, so a " +
+        "release past the last tab would fire nothing",
+    );
+    // And ONLY the strip. A chip-level pair beside it is two handlers
+    // previewing one pointer against a DOM the other has just rearranged.
+    assert(
+      !tabChips().some((chip) => chip._has("dragover") || chip._has("drop")),
+      "a tab chip carries its own dragover/drop beside the strip's",
     );
 
     const carried = [];
@@ -201,12 +235,35 @@ check(
       items: tabItems([22, 33, 11], 22),
     };
     first._fire("dragstart", { dataTransfer });
-    third._fire("dragover", { clientX: 1, dataTransfer });
+    // Dispatched on the strip, because that is where the listeners are and
+    // this stub does not bubble. Nothing is lost by it: the handlers read the
+    // pointer's clientX and never the event's target, so a release over a
+    // chip (which bubbles up to the strip) and one past the last chip (which
+    // starts there) reach the same code. Every chip measures zero here, so
+    // clientX 1 is past the last of them.
+    strip._fire("dragover", { clientX: 1, dataTransfer });
     assert(
       tabChipIds().join(",") === "22,33,11",
       "dragover did not preview the order; got " + tabChipIds().join(","),
     );
-    third._fire("drop", { clientX: 1, dataTransfer });
+    // By the drop, the preview has already put the dragged tab under the
+    // pointer, so the drop's own preview resolves to that tab and returns
+    // nothing. That is the ordinary successful drag, and it must commit the
+    // order the strip is showing rather than read it as "nothing to do".
+    strip._fire("drop", { clientX: 1, dataTransfer });
+    assert(
+      global.rbCalls.some((call) => call.cmd === "tab_reorder"),
+      "the drop sent no tab_reorder, so the order it showed was never committed",
+    );
+    // dragend fires on the source right after the drop, before Rust replies.
+    // It repaints only an ABANDONED drag; repainting here would put the old
+    // order back over a commit that is still in flight.
+    first._fire("dragend", { dataTransfer });
+    assert(
+      tabChipIds().join(",") === "22,33,11",
+      "dragend repainted the pre-drag order over a committed drop; got " +
+        tabChipIds().join(","),
+    );
     await flush();
 
     const calls = global.rbCalls.filter((call) => call.cmd === "tab_reorder");
@@ -223,6 +280,18 @@ check(
     assert(
       activeChipId() === 22,
       "active chip changed identity after reorder: " + activeChipId(),
+    );
+    // Bound once, on a container every repaint keeps. The strip has been
+    // rendered at least twice by now (this test's tabs_changed and the
+    // reorder reply), so wiring inside the render would show as a second pair.
+    const wired = (type) => (strip._listeners[type] || []).length;
+    assert(
+      wired("dragover") === 1 && wired("drop") === 1,
+      "the strip holds " +
+        wired("dragover") +
+        " dragover and " +
+        wired("drop") +
+        " drop listeners; the pair is being re-wired on every repaint",
     );
     // A drag MUST write something, and it must not be the tab id.
     //
@@ -623,35 +692,47 @@ check("all four layouts report symmetric insets to Rust", async () => {
 });
 
 check("the stylesheet is told what Rust was told", async () => {
-  await wear("left");
+  // Compared against the PAYLOAD, not checked for being set. Rust and the
+  // stylesheet are told from separate measurements: syncChromeInsets sends
+  // its own `left` and `right` locals, while publishChromeMetric calls
+  // closedChromeLeftPx/RightPx again for --chrome-left-px/--chrome-right-px.
+  // Each side can look plausible alone while the two disagree. This used to
+  // assert only zero or non-zero on the variables, so with Rust sent right:0
+  // and the stylesheet 56px (PATANYX_TOOLBAR_OMIT_RIGHT_INSET) it passed.
+  // Which sides SHOULD be non-zero is the check above; this one is agreement.
+  //
+  // The log is cleared before each wear so the payload read is that wear's,
+  // and --chrome-height-px is written after the send from the same `top`.
   const vars = global.document.documentElement.style;
-  const left = vars.getPropertyValue("--chrome-left-px");
-  assert(
-    left && left !== "0px",
-    "--chrome-left-px is " +
-      JSON.stringify(left) +
-      ". Banners, the find bar " +
-      "and every panel position off it; unset, they render underneath the " +
-      "sidebar.",
-  );
-  assert(
-    vars.getPropertyValue("--chrome-height-px"),
-    "--chrome-height-px is unset. Where the page draws over the chrome, a " +
-      "modal card sized against the viewport extends underneath it and its " +
-      "lower half is simply not on screen.",
-  );
-  await wear("right");
-  assert(
-    vars.getPropertyValue("--chrome-left-px") === "0px" &&
-      vars.getPropertyValue("--chrome-right-px") !== "0px",
-    "Right did not mirror the published sidebar inset",
-  );
-  await wear("top_left");
-  assert(
-    vars.getPropertyValue("--chrome-left-px") === "0px" &&
-      vars.getPropertyValue("--chrome-right-px") === "0px",
-    "side CSS variables did not return to 0px in the top layout",
-  );
+  for (const placement of ["left", "right", "top_left", "top_right"]) {
+    global.rbCalls.length = 0;
+    await wear(placement);
+    const insets = global.rbCalls.filter((c) => c.cmd === "set_chrome_insets");
+    assert(insets.length > 0, placement + " reported no insets to Rust");
+    const sent = insets[insets.length - 1].args;
+    for (const [arg, name] of [
+      ["left", "--chrome-left-px"],
+      ["right", "--chrome-right-px"],
+      ["top", "--chrome-height-px"],
+    ]) {
+      const told = vars.getPropertyValue(name);
+      assert(
+        /^\d+px$/.test(told) && parseInt(told, 10) === sent[arg],
+        placement +
+          ": " +
+          name +
+          " is " +
+          JSON.stringify(told) +
+          " but Rust was sent " +
+          arg +
+          ": " +
+          JSON.stringify(sent[arg]) +
+          ". Banners, the find bar and panels are laid out from the " +
+          "stylesheet's number and the page from Rust's, so a mismatch draws " +
+          "one underneath the other.",
+      );
+    }
+  }
 });
 
 check("CSS gives all four placements distinct, mirrored geometry", () => {

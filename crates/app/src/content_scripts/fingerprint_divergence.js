@@ -44,15 +44,15 @@
  * Function.prototype.toString on the patched functions: toString returns
  * source text, and closure VALUES are not in it.
  *
- * The worker wrapper (below) does build a Blob and a Worker, and neither is
- * a channel that carries the token OUT. The worker blob's source contains
+ * The Worker wrapper (below) is retained but NOT INSTALLED since 1.0.1, so
+ * this script builds no Blob and no Worker when it runs. Were it revived, it
+ * would still carry nothing secret OUT: the worker blob's source contains
  * ONLY the per-(site,"canvas") seed -- four numbers a determined same-site
  * page can already recover on the main thread, because the canvas mask is
  * position-keyed and low-bit XOR is self-inverse -- and it importScripts the
  * page's OWN, already-loadable worker. The session token and everything
- * audio-derived stay in this closure and never reach a worker; Web Audio
- * does not exist in workers, so the one genuinely-secret key has no reason
- * to travel.
+ * audio-derived stay in this closure; Web Audio does not exist in workers,
+ * so the one genuinely-secret key has no reason to travel.
  *
  * Deliberate non-goals, so nobody "fixes" them:
  *   - No stealth. A page that probes for patched natives can tell this is
@@ -73,15 +73,18 @@
  *     localized user a smaller anonymity set as the price of a cosmetic
  *     preference. Interface language and site-visible language are two
  *     settings, and only the user connects them.
- *   - WORKERS, PARTIAL. Neither engine injects registered scripts into
- *     worker contexts, so the Worker constructor is wrapped here to hand the
- *     real worker a shim that installs the OffscreenCanvas and WebGL hooks
- *     before importScripts-ing it. This covers CLASSIC, same-origin
- *     (http/https) workers. It does NOT cover module workers (cannot
- *     importScripts), data:/blob: worker URLs, SharedWorker, or
- *     ServiceWorker, and the /fingerprint-divergence/ limits section names
- *     those exactly. Every failure path constructs the worker unwrapped, so
- *     the worst case is the old behavior, never a broken worker.
+ *   - WORKERS, NOT COVERED AT ALL since 1.0.1. Neither engine injects
+ *     registered scripts into worker contexts, and self.Worker is left
+ *     exactly as the engine made it, so OffscreenCanvas, WebGL and the
+ *     navigator hardware hints read inside ANY worker -- classic, module,
+ *     shared or service -- are the engine's real values. 0.9.62 through
+ *     1.0.0 wrapped the Worker constructor to run classic same-origin
+ *     workers from a blob: shim; a site whose CSP refuses blob: workers got
+ *     no protection from that and a broken worker instead (messenger.com
+ *     hung on "Verifying your PIN"), so 22ea1a3 stopped installing it. The
+ *     /fingerprint-divergence/ limits section says so, and
+ *     scripts/divergence-worker-gate.js pins it: re-installing the wrapper
+ *     means replacing that gate, not loosening it.
  *   - readPixels is NOT noised: real WebGL apps read back exact ID-encoded
  *     pixels for object picking, and the common fingerprint path (hash the
  *     rendered canvas) goes through toDataURL, which is covered.
@@ -554,13 +557,6 @@
     };
 
     try {
-      // getChannelData: scale IN PLACE, ONCE per returned array. In place
-      // because Web Audio code writes into the live array it gets back --
-      // returning a scaled copy breaks synthesis. Once, tracked by WeakSet,
-      // because repeated reads must not compound the fudge into something
-      // audible. Mixing getChannelData with copyFromChannel on the same
-      // buffer can scale a sample twice (0.9801 worst case); still
-      // inaudible, accepted.
       // Which (buffer, channel) pairs getChannelData has already perturbed
       // in place. In place because Web Audio code writes into the live array
       // it gets back, so handing out a perturbed copy would break synthesis;
@@ -882,32 +878,34 @@
       noteProbe,
     );
 
-    // ----- workers ---------------------------------------------------------
-    // Classic same-origin workers are brought under the same noise. A page's
-    // fingerprinting increasingly runs on a worker thread, where a browser
-    // built on a system web engine cannot inject a registered script -- so we
-    // wrap the Worker constructor and hand the real script a shim that
-    // installs the OffscreenCanvas and WebGL hooks first, then importScripts
-    // the page's own worker.
+    // ----- workers: NOT INSTALLED since 1.0.1 ------------------------------
+    // Nothing in this section changes what a page sees. It builds the Worker
+    // wrapper and then leaves it unreferenced (the `void wrapped` statement
+    // at the end, where the reason is written out), so self.Worker is the
+    // engine's own and every worker reads real values.
+    // scripts/divergence-worker-gate.js pins that.
     //
-    // WHY THIS IS SAFE, and never worse than not doing it:
+    // What the retained code did from 0.9.62 through 1.0.0: wrap the Worker
+    // constructor and hand a classic same-origin worker a shim that installed
+    // the OffscreenCanvas and WebGL hooks first, then importScripts the
+    // page's own worker. Module workers (cannot importScripts), data:/blob:
+    // worker URLs, SharedWorker and ServiceWorker were never covered.
+    //
+    // The properties it was built to keep, which any revival must keep too:
     //   * The shim carries ONLY the per-(site,"canvas") seed -- four numbers a
     //     determined same-site page can already recover on the main thread by
     //     reading back known content (the canvas mask is position-keyed, and
     //     low-bit XOR is self-inverse). It does NOT carry the session token or
     //     anything audio-derived. Web Audio does not exist in workers, so the
     //     one genuinely-secret key never travels.
-    //   * The worker applies the IDENTICAL mask to the main thread (parity
-    //     gate proves it), so rendering the same content in both realms and
-    //     diffing yields nothing. A mismatched key would be the leak; we never
-    //     ship one -- if the seed is missing we do not wrap.
-    //   * Every failure path constructs the ORIGINAL worker unwrapped, which
-    //     is exactly today's behavior. A privacy courtesy must not break a
-    //     worker-using site.
-    //
-    // NOT COVERED, and the /fingerprint-divergence/ limits section says so:
-    // module workers (cannot importScripts), data:/blob: worker URLs,
-    // SharedWorker and ServiceWorker.
+    //   * The worker must apply the IDENTICAL mask to the main thread, or a
+    //     page renders the same content in both realms and reads the noised
+    //     pixels off the diff. The gate that proved that parity was retired
+    //     with the install (git show cf55400:scripts/divergence-worker-gate.js)
+    //     and a revival needs it back.
+    //   * It must not break a worker-using site. The fail-open paths below
+    //     were meant to guarantee that; with them in place, messenger.com
+    //     still hung on a Windows build (22ea1a3).
     try {
       if (
         typeof Worker === "function" &&

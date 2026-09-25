@@ -2324,14 +2324,17 @@ mod divergence_tests {
             );
         }
         // postMessage is the one nuance, and this mirrors the shell channel
-        // gate (scripts/chrome-js-gate.sh). The CSP fallback hands the page a
-        // facade over a worker THE PAGE created and forwards the page's own
-        // messages to it -- real.postMessage(...). That is not a channel out of
-        // the page: the token never reaches a worker, whose shim carries only
-        // the canvas seed. So postMessage is allowed ONLY as a method call on a
-        // local receiver, and is still forbidden as a bare/implicit call or on
-        // any page-reachable global (self/window/parent/top/opener), which
-        // WOULD carry data out of the page.
+        // gate (scripts/chrome-js-gate.sh). The Worker wrapper's facade
+        // forwards the page's own messages onto a worker THE PAGE created --
+        // w.postMessage(...). Since 1.0.1 (22ea1a3) that wrapper is never
+        // installed: its code is retained but the wrapper and its facade are
+        // never called. The call sites are still in the template, so this check
+        // still has to allow them. Were it revived, it would still not be a channel out of
+        // the page: the shim carries only the canvas seed, never the token. So
+        // postMessage is allowed ONLY as a method call on a local receiver, and
+        // is still forbidden as a bare/implicit call or on any page-reachable
+        // global (self/window/parent/top/opener), which WOULD carry data out of
+        // the page.
         const BANNED_RECEIVERS: [&str; 5] = ["self", "window", "parent", "top", "opener"];
         for (i, line) in DIVERGENCE_TEMPLATE.lines().enumerate() {
             let mut from = 0usize;

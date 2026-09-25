@@ -526,15 +526,16 @@ fi
 # bar is higher than autofill's: its only outbound data is a delayed batch of
 # four integer probe counts. fetch/XMLHttpRequest/import remain forbidden.
 #
-# postMessage has two nuances. The CSP fallback (the Worker wrapper) hands the
-# page a facade over a worker THE PAGE ITSELF created, and forwards the page's
-# own messages to it -- real.postMessage(...). That is not a channel out of the
-# page: the token never reaches a worker, whose shim carries only the canvas
-# seed (the worker gate proves the token is absent from the shim source). So
-# postMessage is allowed ONLY as a method call on a local receiver, and is still
-# banned as a bare/implicit call or directly on self/window/parent/top/opener.
-# The two nested native host bridges are exercised and schema-checked by
-# fingerprint-probe-gate.js below.
+# postMessage has two nuances. The Worker wrapper's facade forwards the page's
+# own messages onto a worker THE PAGE ITSELF created -- w.postMessage(...).
+# Since 1.0.1 (22ea1a3) that wrapper is never installed: its code is retained
+# but the wrapper and its facade are never called. The call sites are still in
+# the file, so this grep still has to allow them. Were it revived, it would still not be a
+# channel out of the page: the shim it builds carries only the canvas seed,
+# never the token. So postMessage is allowed ONLY as a method call on a local
+# receiver, and is still banned as a bare/implicit call or directly on
+# self/window/parent/top/opener. The two nested native host bridges are
+# exercised and schema-checked by fingerprint-probe-gate.js below.
 DIVERGENCE_SCRIPT="crates/app/src/content_scripts/fingerprint_divergence.js"
 if [ -f "$DIVERGENCE_SCRIPT" ]; then
   if grep -nE '\b(fetch|XMLHttpRequest|import)\s*\(' "$DIVERGENCE_SCRIPT"; then
@@ -560,10 +561,10 @@ if [ -f "$DIVERGENCE_SCRIPT" ]; then
   # so a change in either direction has to be made on purpose.
   node scripts/divergence-detect-gate.js
 
-  # Worker coverage: the shim the Worker wrapper builds must apply noise
-  # byte-identical to the main thread (or a page could diff the two realms
-  # and read the mask off), and every non-classic case must fall back to an
-  # unwrapped worker rather than a broken or mismatched one.
+  # Workers get NO divergence since 1.0.1 (22ea1a3): the Worker wrapper broke
+  # sites whose CSP refuses blob: workers. This pins that self.Worker is the
+  # engine's own and no worker is ever built from a blob, with a planted
+  # re-install as its negative control, so coverage returns only on purpose.
   node scripts/divergence-worker-gate.js
 
   # The count-only exception above is narrow and live: drive all four main-

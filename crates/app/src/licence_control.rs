@@ -618,10 +618,13 @@ pub fn gate_state() -> &'static str {
     }
 }
 
-/// Whether this build carries a usable verification key ring. P1 ships an
-/// EMPTY ring, so this is false in every real build today: paste can never
-/// succeed and unlock-time evaluation lands FREE. Reported on the read
-/// payload so the panel never has to guess.
+/// Whether this build carries a usable verification key ring. Every build
+/// since the 2026-08-05 key ceremony does: `LICENCE_KEYS` in
+/// crates/licence/src/keys.rs holds the real key at key_id 0, pinned by
+/// `the_real_ring_builds_and_carries_key_id_zero`. It is false only for a
+/// ring that fails to build (empty, unparsable, or the all-zeros
+/// placeholder); then paste can never succeed and unlock-time evaluation
+/// lands FREE. Reported on the read payload so the panel never has to guess.
 pub fn keys_available() -> bool {
     patanyx_licence::licence_keys().is_ok()
 }

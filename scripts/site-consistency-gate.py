@@ -66,53 +66,224 @@ BANNED_SYNONYMS = (
 # claim itself, so it would have re-seeded the error at the next edit.
 #
 # THE SHAPE OF THE RULE, and why it is a phrase ban rather than a truth table.
-# Worker coverage is PARTIAL: ordinary same-origin workers are covered, module
-# workers, data:/blob: workers, SharedWorker and service workers are not. Both
-# absolute sentences are therefore false, in opposite directions, and the
-# honest copy has to name the split. A ban on both absolutes is checkable; "is
-# this sentence a fair summary of a partial capability" is not.
+# From 0.9.62 through 1.0.0 worker coverage was PARTIAL (ordinary same-origin
+# workers only), so this table banned BOTH absolutes. 1.0.1 (commit 22ea1a3)
+# stopped installing the Worker wrapper: a site whose CSP refuses blob: workers
+# was broken by it, messenger.com among them. Workers now get NO divergence,
+# so "workers are not covered" is the TRUE sentence -- the live limits section
+# says exactly that -- and every positive claim, in any degree ("partially
+# covered", "reaches ordinary background workers", "coverage of ordinary
+# workers"), is false. The old negative ban now fired on the correct copy and
+# its remedy told the editor to reinstate the false claim; it is gone.
 #
 # Extend this table when a capability's coverage CHANGES, in the same commit
-# that changes it. An entry is (compiled pattern, what to say instead).
+# that changes it. An entry is (compiled pattern, what to say instead, excuse):
+# `excuse(before, after, matched)` sees up to 160 characters on each side of a
+# match, and the match itself, and returns True when the match is not a claim
+# (None: nothing excuses it).
+#
+# PRESENT TENSE ONLY for the worker patterns, on purpose: "0.9.62 reached
+# ordinary workers" is true history, and the live article tells it.
+_WORKER_WORDS = (
+    r"((all|any|some|most|many|the|your|its|their|every|each|ordinary|classic|"
+    r"background|same-origin|dedicated|shared|service|module|web|page"
+    r"|data:/blob:|data:|blob:)\s+)*"
+    r"(shared|service)?workers?\b"
+)
+_COVERED_MODIFIERS = (
+    r"((now|also|still|fully|partially|partly|largely|mostly|entirely|"
+    r"completely|already)\s+){0,3}"
+)
+
+# A NEGATED positive is the honest sentence, and it contains the banned phrase:
+# "the protection no longer reaches workers", "no workers are covered",
+# "PATANYX doesn't cover workers" (straight or curly apostrophe), "nothing
+# here reaches workers". At most two words, and no comma, may sit between the
+# negation and the match: a negation in an earlier clause ("No setup is
+# required, workers are covered") negates something else. "not only" / "not
+# just" are NOT negations -- "not only covers workers but also canvases" is an
+# affirmative claim -- and neither are "no doubt" or "no matter". A QUALIFIER
+# is not an excuse either: "some workers are covered" is as false on 1.0.1 as
+# "workers are covered". Known cost of the tight window: "does not, on any
+# site, reach workers" is flagged; its remedy points at a true sentence.
+_NOT_A_NEGATION = r"(?!\s+(only|just|merely|simply|doubt|question|matter)\b)"
+_NEGATED_BEFORE = re.compile(
+    r"(n['’]t|\b(not|never|no|nor|cannot|without|nothing|none|neither))\b"
+    + _NOT_A_NEGATION
+    + r"(\s+[\w'’-]+){0,2}\s*$",
+    re.I,
+)
+# A removal verb only negates the claim it sits directly on: "1.0.1 withdrew
+# coverage of workers", "dropped its coverage of workers" -- not "we removed
+# bugs and now cover workers".
+_REMOVED_BEFORE = re.compile(
+    r"\b(withdr[ae]w|withdrawn|removed?|dropped|ended|disabled|lost)\s+"
+    r"((its|the|all|their)\s+)?$",
+    re.I,
+)
+# ...or the negation follows and denies AVAILABILITY: "coverage for workers is
+# not available", "coverage of workers was removed in 1.0.1". Negating
+# anything else asserts coverage: "is not optional", "isn't limited to classic
+# workers", "is not only available but enabled".
+_ABSENT = r"(available|supported|provided|offered|included|enabled|active|present)\b"
+_NEGATED_AFTER = re.compile(
+    r"^\s*(((is|are)\s+(not|no\s+longer|never)|(isn|aren)['’]t)\s+" + _ABSENT
+    + r"|(is|are)\s+(unavailable|gone|off)\b"
+    r"|(was|were|has\s+been|have\s+been)\s+(removed|withdrawn|dropped|disabled)\b)",
+    re.I,
+)
+
+# DATED HISTORY, for the coverage noun only: "0.9.62 provided coverage for
+# ordinary workers", "coverage for ordinary workers was available in 0.9.62".
+# Needs BOTH a version number in the sentence and a past-tense frame, so
+# "since 0.9.62 PATANYX provides coverage for workers" is still a claim.
+_VERSION = re.compile(r"\b\d+\.\d+\.\d+\b")
+_PAST_BEFORE = re.compile(
+    r"\b(provided|gave|had|offered|shipped|added|brought|introduced)\s+"
+    r"((its|the|some)\s+)?$",
+    re.I,
+)
+_PAST_AFTER = re.compile(r"^\s*(was|were|had\s+been)\b", re.I)
+
+
+# Sentence ends are punctuation FOLLOWED BY SPACE, so "0.9.62" stays whole.
+_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+
+
+def _sentence(before: str, match: str, after: str) -> str:
+    return _SENTENCE_END.split(before)[-1] + match + _SENTENCE_END.split(after, 1)[0]
+
+
+# "Not all workers are covered", "does not cover every worker" deny UNIVERSAL
+# coverage, which says some workers ARE covered: a partial claim, not a
+# denial. ("not ... any" stays a denial: "does not cover any workers".)
+_PARTIAL_QUANTIFIER = re.compile(r"\b(all|every|each)\b", re.I)
+_BARE_NOT = re.compile(r"(n['’]t|\bnot)\s*$", re.I)
+
+
+def _worker_claim_negated(before: str, after: str, matched: str = "") -> bool:
+    if _PARTIAL_QUANTIFIER.search(matched) and _BARE_NOT.search(before):
+        return False
+    return bool(
+        _NEGATED_BEFORE.search(before)
+        or _REMOVED_BEFORE.search(before)
+        or _NEGATED_AFTER.search(after)
+    )
+
+
+def _coverage_negated_or_dated(before: str, after: str, matched: str = "") -> bool:
+    if _worker_claim_negated(before, after, matched):
+        return True
+    return bool(
+        _VERSION.search(_sentence(before, " ", after))
+        and (_PAST_BEFORE.search(before) or _PAST_AFTER.search(after))
+    )
+
+
+# An enumeration of the exotic kinds is excused when the SAME SENTENCE also
+# names the ordinary kind, or all kinds, AS WORKERS: "ordinary, module and
+# shared workers", "nor are ordinary workers" -- not "on all platforms".
+_ALL_KINDS_LISTED = re.compile(
+    r"\b(ordinary|classic|dedicated|all|every|any)\b"
+    r"([\s,/]+(and|or|nor|are|kinds?|sorts?|types?|of|module|shared|service|"
+    r"dedicated|classic|ordinary|background|web|data:/blob:|data:|blob:)){0,6}?"
+    r"[\s,/]+workers?\b",
+    re.I,
+)
+
+
+# The qualifier rule the two NON-worker entries have always had, kept verbatim
+# so this change does not alter them. It was written for the pre-1.0.1 worker
+# rule ("several kinds of worker are not covered" was the honest sentence then);
+# whether it should excuse anything for these two is a separate decision.
+CLAIM_QUALIFIERS = re.compile(
+    r"("
+    r"several|some|certain|a few|kinds? of|sorts? of|other"
+    r"|module|data:|blob:|sharedworker|service"
+    r")\s*[/,]?\s*(workers?\s*)?(and\s+)?(kinds? of\s+)?(background\s+)?$",
+    re.I,
+)
+
+
+def _legacy_qualified(before: str, after: str, matched: str = "") -> bool:
+    return bool(CLAIM_QUALIFIERS.search(before))
+
+
+_PARTIAL_REMEDY = (
+    "this implies the other workers ARE covered; since 1.0.1 (22ea1a3) none "
+    "are. Say that workers are not covered"
+)
+_WORKER_REMEDY = (
+    "workers get NO divergence since 1.0.1 (22ea1a3 stopped installing the "
+    "Worker wrapper). Say that workers are not covered"
+)
+
 BANNED_CAPABILITY_CLAIMS = (
     (
-        re.compile(r"(code running in a workers?|workers?)\s+(is|are)\s+not\s+covered", re.I),
-        "worker coverage is partial, not absent: ordinary workers are covered "
-        "since 0.9.62. Name the split (module, data:/blob:, SharedWorker, "
-        "service workers) instead",
+        re.compile(
+            r"\b" + _WORKER_WORDS + r"\s+(is|are)\s+" + _COVERED_MODIFIERS
+            + r"(covered|protected)\b",
+            re.I,
+        ),
+        _WORKER_REMEDY,
+        _worker_claim_negated,
     ),
     (
-        re.compile(r"\bworkers?\s+(is|are)\s+covered\b", re.I),
-        "worker coverage is partial, not complete. Say which workers, or say "
-        "ordinary background workers",
+        re.compile(
+            r"\b(reach(es)?|cover(s)?|protects?|extends?\s+(in)?to"
+            r"|appl(y|ies)\s+(to|in|inside|within))"
+            r"\s+(into\s+)?" + _WORKER_WORDS,
+            re.I,
+        ),
+        _WORKER_REMEDY,
+        _worker_claim_negated,
+    ),
+    (
+        re.compile(r"\bcoverage\s+(of|for|in)\s+" + _WORKER_WORDS, re.I),
+        _WORKER_REMEDY,
+        _coverage_negated_or_dated,
+    ),
+    # PARTIAL coverage, stated negatively: "a few kinds of background worker
+    # stay out of reach", "some workers are not covered". True-looking, and the
+    # house wording from 0.9.62 to 1.0.0, but it tells the reader the OTHER
+    # workers are covered, and since 1.0.1 none are.
+    (
+        re.compile(
+            r"\b(a\s+few|some|several|certain|other|most|many)\s+"
+            r"((kinds?|sorts?|types?)\s+of\s+)?"
+            r"((background|web|shared|service|module|dedicated)\s+)*workers?\s+"
+            r"(are|is|stay|stays|remain|remains)\s+"
+            r"(not\s+covered|uncovered|unprotected|out\s+of\s+reach)\b",
+            re.I,
+        ),
+        _PARTIAL_REMEDY,
+        None,
+    ),
+    # ...or by listing only the exotic kinds: "module workers, SharedWorker and
+    # service workers are not covered". Excused when the list also names the
+    # ordinary kind (or all of them), since then nothing is implied covered.
+    (
+        re.compile(
+            r"\b(module\s+workers?|shared\s*workers?|service\s*workers?"
+            r"|(data:/blob:|data:|blob:)\s+workers?)\b[^.]{0,120}?"
+            r"\b(are|is|stay|remain)\s+(not\s+covered|uncovered|out\s+of\s+reach)\b",
+            re.I,
+        ),
+        _PARTIAL_REMEDY,
+        "enumeration",
     ),
     (
         re.compile(r"cannot be fingerprinted", re.I),
         'the site may never claim this; the approved frame is "noise, not '
         'invisibility"',
+        _legacy_qualified,
     ),
     (
         re.compile(r"\bwas never free\b", re.I),
         "banned from user-facing copy: it reads as an accusation. State the "
         "mechanics instead (asks for a licence from day one)",
+        _legacy_qualified,
     ),
-)
-
-# A ban on an ABSOLUTE claim must not fire on the QUALIFIED one that replaces
-# it. "several kinds of worker are not covered" is the honest sentence the
-# worker rule asks for, and it contains the banned absolute as a substring;
-# failing it would push an editor back toward the false version. So a match is
-# excused when one of these sits immediately before it.
-CLAIM_QUALIFIERS = re.compile(
-    r"("
-    r"several|some|certain|a few|kinds? of|sorts? of|other"
-    # An explicit enumeration of the uncovered kinds is the most precise honest
-    # form there is, and it ends in the banned substring by construction:
-    # "module workers, data:/blob: workers, SharedWorker and service workers
-    # are not covered". Naming them is exactly what the remedy asks for.
-    r"|module|data:|blob:|sharedworker|service"
-    r")\s*[/,]?\s*(workers?\s*)?(and\s+)?(kinds? of\s+)?(background\s+)?$",
-    re.I,
 )
 
 # The same problem one layer up: the comments that ENFORCE these bans quote the
@@ -132,19 +303,92 @@ CLAIM_GUARD_MARKERS = re.compile(
 )
 
 
-def claim_hits(text: str, pattern: re.Pattern[str], guard: re.Pattern[str] | None) -> list[str]:
-    """Matches of `pattern` in `text` that are neither qualified nor quoted-as-banned."""
+def claim_hits(
+    text: str,
+    pattern: re.Pattern[str],
+    guard: re.Pattern[str] | None,
+    excuse=None,
+) -> list[str]:
+    """Matches of `pattern` in `text` that are neither excused nor quoted-as-banned."""
     out: list[str] = []
     for match in pattern.finditer(text):
         before = text[max(0, match.start() - 160) : match.start()]
-        if CLAIM_QUALIFIERS.search(before):
-            continue
-        if guard is not None:
-            window = before + text[match.end() : match.end() + 160]
-            if guard.search(window):
+        after = text[match.end() : match.end() + 160]
+        if excuse == "enumeration":
+            # The list, from the start of its sentence, names the ordinary
+            # kind (or all kinds) too.
+            if _ALL_KINDS_LISTED.search(_sentence(before, match.group(0), after)):
                 continue
+        elif excuse is not None and excuse(before, after, match.group(0)):
+            continue
+        if guard is not None and guard.search(before + after):
+            continue
         out.append(match.group(0))
     return out
+
+
+# The capability rules judged against known sentences before they judge the
+# site, so a regex edit that stops catching a false claim -- or starts failing
+# the true one the live limits section carries -- fails this gate instead of
+# passing it quietly. (sentence, True if it must be flagged as visible copy.)
+CAPABILITY_SELF_TEST = (
+    ("Workers are not covered.", False),  # the live limits section's heading
+    ("screen size, fonts, and background workers are not covered.", False),
+    ("The protection no longer reaches workers.", False),
+    ("PATANYX doesn’t cover workers.", False),
+    ("Coverage for workers is not available.", False),
+    ("0.9.62 reached ordinary workers.", False),  # true history
+    ("The protection reaches ordinary background workers.", True),
+    ("Workers are now partially covered.", True),
+    ("We cover some workers.", True),
+    ("It covers service workers.", True),
+    ("PATANYX not only covers workers but also canvases.", True),
+    ("Some cannot be fingerprinted by naive scripts.", False),  # legacy excuse
+    ("You cannot be fingerprinted.", True),
+    ("Web workers are not covered.", False),  # what-a-browser-fingerprint-is
+    ("and a few kinds of background worker stay out of reach.", True),  # old About
+    ("Module workers, SharedWorker and service workers are not covered.", True),
+    ("Ordinary, module and shared workers are not covered.", False),
+    ("Workers are protected.", True),
+    ("The noise applies inside workers.", True),
+    ("Nothing here reaches workers.", False),
+    ("It does not yet reach workers.", False),
+    ("No setup is required, workers are covered.", True),
+    ("We removed bugs and now cover workers.", True),
+    ("Coverage for workers is not only available but enabled.", True),
+    ("It covers data:/blob: workers.", True),
+    ("On all platforms, module workers are not covered.", True),
+    ("Module workers are not covered, nor are ordinary workers.", False),
+    ("Shared memory and screen size are not covered.", False),
+    ("0.9.62 provided coverage for ordinary workers.", False),
+    ("Since 0.9.62 PATANYX provides coverage for workers.", True),
+    ("Coverage for workers was added in this release.", True),  # undated: a claim
+    ("Coverage for workers isn't only available but enabled.", True),
+    ("Coverage for workers isn’t just available; it is enabled by default.", True),
+    ("Not all workers are covered.", True),  # a partial claim
+    ("Not every worker is covered.", True),
+    ("No workers are covered.", False),
+    ("Not each worker is covered.", True),
+    ("PATANYX does not cover every worker.", True),
+    ("PATANYX does not cover any workers.", False),
+    ("Coverage for workers isn't limited to classic workers.", True),
+    ("Coverage for workers is not optional.", True),
+    ("Coverage for workers is not available.", False),
+    ("1.0.1 withdrew coverage of workers.", False),
+)
+
+
+def capability_self_test() -> list[str]:
+    wrong: list[str] = []
+    for sentence, must_flag in CAPABILITY_SELF_TEST:
+        flagged = any(
+            claim_hits(sentence, pattern, guard=None, excuse=excuse)
+            for pattern, _remedy, excuse in BANNED_CAPABILITY_CLAIMS
+        )
+        if flagged != must_flag:
+            verdict = "passed" if must_flag else "was flagged"
+            wrong.append(f'capability rules self-test: "{sentence}" {verdict}')
+    return wrong
 
 # AMERICAN ENGLISH. Settled 2026-08-14, after "licence" and
 # "colours" reached the live site: the product is written in American English,
@@ -358,16 +602,18 @@ def main() -> int:
     # does warn: the comment above the limits section is what re-seeds the
     # error into the next edit, which is exactly how the worker contradiction
     # survived a rewrite that had the correct fact three sections away.
+    failures.extend(capability_self_test())
     for page in pages:
         text = visible_text(raw[page])
         note = comments(raw[page])
-        for pattern, remedy in BANNED_CAPABILITY_CLAIMS:
-            # Visible text: a qualifier excuses it, nothing else does. A guard
-            # marker must NOT excuse visible copy -- "we never say X" printed on
-            # the page is still the page saying X to a reader skimming it.
-            for hit in claim_hits(text, pattern, guard=None):
+        for pattern, remedy, excuse in BANNED_CAPABILITY_CLAIMS:
+            # Visible text: the entry's own excuse (a negation, for the worker
+            # claims) and nothing else. A guard marker must NOT excuse visible
+            # copy -- "we never say X" printed on the page is still the page
+            # saying X to a reader skimming it.
+            for hit in claim_hits(text, pattern, guard=None, excuse=excuse):
                 failures.append(f'{name(page)}: says "{hit}" in visible text. {remedy}.')
-            for hit in claim_hits(note, pattern, guard=CLAIM_GUARD_MARKERS):
+            for hit in claim_hits(note, pattern, guard=CLAIM_GUARD_MARKERS, excuse=excuse):
                 warnings.append(
                     f'{name(page)}: an HTML comment still says "{hit}"; '
                     f"it will be copied back into the page by the next editor. {remedy}"

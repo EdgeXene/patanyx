@@ -106,7 +106,10 @@ fi
 python3 ./scripts/check-cargo-sources.py
 # The app version and the AppStream version must be the same number. They
 # drifted 0.9.0 -> 0.9.52 unnoticed because nothing compared them.
-EXPECTED_VERSION=1.0.0 ./scripts/check-version.sh
+# The literal is deliberate and moves by hand with every Cargo bump (release
+# procedure step 1). Deriving it from Cargo.toml would reduce the release-identity check
+# to comparing Cargo.toml with itself; 1.0.1 shipped with this still at 1.0.0.
+EXPECTED_VERSION=1.0.1 ./scripts/check-version.sh
 # The About panel names every third-party package compiled into the binary, and
 # that list is a checked-in file. Add a dependency without regenerating it and
 # the browser confidently attributes a set of software it is no longer built
