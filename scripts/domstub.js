@@ -237,6 +237,19 @@ function mkEl(id) {
     focus() {},
     select() {},
     blur() {},
+    // Pointer capture, RECORDED: the tab drag captures the pointer on the
+    // press and must let it go at the end, and a gate can only say so if the
+    // stub remembers which pointer an element holds.
+    _capture: null,
+    setPointerCapture(pointerId) {
+      this._capture = pointerId;
+    },
+    releasePointerCapture(pointerId) {
+      if (this._capture === pointerId) this._capture = null;
+    },
+    hasPointerCapture(pointerId) {
+      return this._capture === pointerId;
+    },
     click() {
       this._fire("click");
     },

@@ -175,6 +175,10 @@ fn counts_as_presence(cmd: &str) -> bool {
             // (`cred_autofill_fill`) is a real click and is deliberately NOT
             // listed here.
             | "cred_autofill_offer_get"
+            // Fired once by the chrome when it finishes loading, to put the
+            // keyboard in the address bar (or the page, for a URL launch).
+            // The browser starting is not the user doing something.
+            | "startup_focus"
     )
 }
 
@@ -775,6 +779,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let raw = arg_str(args, "url")?;
             let url = normalize_input(raw);
             state.navigate(&url)?;
+            // Enter in the address bar -- its only caller -- hands the keyboard
+            // to the page, as every browser does: the next keystroke scrolls or
+            // fills in that page rather than editing the URL just submitted.
+            state.focus_active_content();
             Ok(json!({}))
         }
         "back" => {
@@ -933,9 +941,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             state.close_tab(id)?;
             Ok(json!({}))
         }
+        // A chip click or a quick-switcher pick: both are the user going TO
+        // a tab, so choosing the one already showing puts the keyboard in it.
         "tab_switch" => {
             let id = args.get("id").and_then(Value::as_u64).ok_or("bad_args")?;
-            state.switch_tab(id)?;
+            state.click_tab(id)?;
             Ok(json!({}))
         }
         "tab_reorder" => {
@@ -1162,6 +1172,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         "startup_info" => Ok(json!({
             "opened_with_url": state.opened_with_url,
         })),
+        // Asked once by the chrome when it has loaded: put the keyboard where
+        // a launch should leave it (the address bar, or the page a link
+        // opened). See AppState::startup_focus. Moves focus; changes nothing.
+        "startup_focus" => {
+            state.startup_focus();
+            Ok(json!({}))
+        }
         "vault_create" => {
             let passphrase = arg_str(args, "passphrase")?;
             // The recovery key is returned exactly once and never recoverable
@@ -2249,7 +2266,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 }
             }
             // The chrome opens the ordinary bar and adopts the live
-            // session; counts arrive as ordinary find_state events.
+            // session; counts arrive as ordinary find_state events. The
+            // switch just gave the page the keyboard, and the bar's own
+            // findInput.focus() cannot take it back, so the chrome widget is
+            // focused first (the same two-step as Ctrl+F's open_find_bar).
+            state.focus_chrome();
             state.emit("find_adopt", json!({ "query": query }));
             Ok(json!({}))
         }
@@ -3864,7 +3885,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             }
             tab.blocked_pending.borrow_mut().take();
             tab.allow_malicious_host(&host);
-            tab.webview.load_url(&format!("https://{host}/")).ok();
+            tab.load_url(&format!("https://{host}/")).ok();
             Ok(json!({ "allowed": host }))
         }
 
@@ -6689,6 +6710,8 @@ mod tests {
             // to decide which controls render locked. None of that is the
             // user doing anything.
             "premium_status",
+            // Fired once by the chrome at boot to place the keyboard.
+            "startup_focus",
         ] {
             assert!(
                 !super::counts_as_presence(cmd),

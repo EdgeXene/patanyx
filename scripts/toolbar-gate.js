@@ -51,26 +51,22 @@ const flush = async () => {
 };
 
 let chromeJs = fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8");
-// Planted-defect mode: keep the renderer and every source assertion intact,
-// but rename the one listener this feature needs -- the tab STRIP's drop,
-// which is where the drop target lives now that it is no longer bound per
-// chip. The normal run never edits a workspace file; running with
-// PATANYX_TAB_REORDER_OMIT_DROP_HANDLER=1 must fail the behavioral check below.
+// Planted-defect mode: keep the renderer, every handler and every source
+// assertion intact, but drop the one line that turns a release into a
+// tab_reorder. The strip still SHOWS the new order, which is exactly the
+// defect worth catching: Rust never learns it, and the next repaint undoes
+// the move. The normal run never edits a workspace file; running with
+// PATANYX_TAB_REORDER_OMIT_RELEASE=1 must fail the behavioral check below.
 //
-// Anchored on the guard line too, and required to match exactly once:
-// chrome.js has a second `wrap.addEventListener("drop"` for the bookmark
-// organizer's cards, and renaming that one would prove nothing about tabs.
-if (process.env.PATANYX_TAB_REORDER_OMIT_DROP_HANDLER) {
-  const guard = "\n      if (draggedTabId === null) return;";
-  const callSite = 'wrap.addEventListener("drop", (ev) => {' + guard;
+// Required to match exactly once, so a second spelling elsewhere cannot be
+// removed in its place and prove nothing about tabs.
+if (process.env.PATANYX_TAB_REORDER_OMIT_RELEASE) {
+  const callSite = "if (changed) void persistTabOrder(next);";
   assert(
     chromeJs.split(callSite).length === 2,
-    "cannot plant defect: the tab strip's drop handler spelling changed",
+    "cannot plant defect: the drag's commit on release changed spelling",
   );
-  chromeJs = chromeJs.replace(
-    callSite,
-    'wrap.addEventListener("drop-removed", (ev) => {' + guard,
-  );
+  chromeJs = chromeJs.replace(callSite, "if (changed) void 0;");
 }
 // WP-V plant proofs. Each removes one live behavior while leaving the markup
 // and source-level contracts intact, so the behavioral assertions below must
@@ -168,12 +164,26 @@ const fireChrome = (event, data) => global.window.__rb_event({ event, data });
 const tabChips = () => Array.from(global.$("tabs").children || []);
 const tabChipIds = () => tabChips().map((chip) => Number(chip.dataset.tabId));
 const activeChipId = () => {
+  // classList, because chrome.js now toggles "active" on a chip it keeps
+  // rather than writing a fresh className on a chip it just built; the stub
+  // keeps the two apart, which a real DOM does not.
   const chip = tabChips().find((candidate) =>
-    String(candidate.className || "")
-      .split(/\s+/)
-      .includes("active"),
+    candidate.classList.contains("active"),
   );
   return chip ? Number(chip.dataset.tabId) : null;
+};
+// Gives each chip the box layout would: by its CURRENT place in the strip,
+// 100px apart and 96 wide. The stub measures everything at zero, and a drag
+// measured against zeros has nowhere to go -- every assertion below would be
+// about the harness rather than the strip.
+const layOutChips = () => {
+  const strip = global.$("tabs");
+  for (const chip of tabChips()) {
+    chip.getBoundingClientRect = () => {
+      const i = strip.children.indexOf(chip);
+      return { left: i * 100, width: 96, right: i * 100 + 96, top: 0, height: 28 };
+    };
+  }
 };
 const tabItems = (ids, active) =>
   ids.map((id) => ({
@@ -188,89 +198,118 @@ check(
   async () => {
     // Let the boot-time tab_list promise settle before publishing the test's
     // authoritative event; otherwise its empty stub reply could clear the
-    // strip between dragstart and drop.
+    // strip in the middle of the drag.
     await flush();
     fireChrome("tabs_changed", { items: tabItems([11, 22, 33], 22) });
+    layOutChips();
     const strip = global.$("tabs");
-    const [first, , third] = tabChips();
-    assert(first && third, "setup did not render three tab chips");
-    // THE DRAG HAS TWO ENDS, AND THEY LIVE ON DIFFERENT ELEMENTS.
-    //
-    // A chip is the SOURCE: draggable, named by dragstart, cleaned up after by
-    // dragend. The STRIP is the target: one dragover and one drop on the
-    // container. The target used to be each chip, so a release past the last
-    // tab -- the commonest reorder there is -- landed on container, fired no
-    // drop, and the next repaint undid the move. This check went on demanding
-    // the per-chip target after it moved, so it failed a correct build at its
-    // first assertion and said nothing about the drag itself.
+    const [first, second, third] = tabChips();
+    assert(first && second && third, "setup did not render three tab chips");
+    // A POINTER DRAG, NOT HTML5 DRAG AND DROP. The HTML5 version jumped the
+    // strip under a ghost image and depended on WebView2 drop-target plumbing
+    // that broke twice on hardware; a chip that is draggable again, or a
+    // strip that is a drop target again, is that design coming back.
     assert(
-      first.getAttribute("draggable") === "true" &&
-        first._has("dragstart") &&
-        first._has("dragend"),
-      "tab chips are not drag sources through draggable/dragstart/dragend",
+      first.getAttribute("draggable") !== "true" &&
+        !first._has("dragstart") &&
+        !strip._has("drop"),
+      "the tab strip is an HTML5 drag again (draggable/dragstart/drop)",
     );
-    assert(
-      strip._has("dragover") && strip._has("drop"),
-      "the tab strip is not the drop target through dragover/drop, so a " +
-        "release past the last tab would fire nothing",
-    );
-    // And ONLY the strip. A chip-level pair beside it is two handlers
-    // previewing one pointer against a DOM the other has just rearranged.
-    assert(
-      !tabChips().some((chip) => chip._has("dragover") || chip._has("drop")),
-      "a tab chip carries its own dragover/drop beside the strip's",
-    );
+    for (const type of [
+      "pointerdown",
+      "pointermove",
+      "pointerup",
+      "pointercancel",
+      "lostpointercapture",
+    ]) {
+      assert(first._has(type), "tab chips have no " + type + " handler");
+    }
 
-    const carried = [];
-    const dataTransfer = {
-      effectAllowed: "",
-      dropEffect: "",
-      setData(type, value) {
-        carried.push([type, value]);
-      },
-    };
     global.rbCalls.length = 0;
     global.rbResolve.tab_reorder = {
       ids: [22, 33, 11],
       items: tabItems([22, 33, 11], 22),
     };
-    first._fire("dragstart", { dataTransfer });
-    // Dispatched on the strip, because that is where the listeners are and
-    // this stub does not bubble. Nothing is lost by it: the handlers read the
-    // pointer's clientX and never the event's target, so a release over a
-    // chip (which bubbles up to the strip) and one past the last chip (which
-    // starts there) reach the same code. Every chip measures zero here, so
-    // clientX 1 is past the last of them.
-    strip._fire("dragover", { clientX: 1, dataTransfer });
+    first._fire("pointerdown", { button: 0, pointerId: 1, clientX: 48 });
     assert(
-      tabChipIds().join(",") === "22,33,11",
-      "dragover did not preview the order; got " + tabChipIds().join(","),
+      first._capture === 1,
+      "the press did not capture the pointer, so a quick flick off the chip " +
+        "would lose the drag",
     );
-    // By the drop, the preview has already put the dragged tab under the
-    // pointer, so the drop's own preview resolves to that tab and returns
-    // nothing. That is the ordinary successful drag, and it must commit the
-    // order the strip is showing rather than read it as "nothing to do".
-    strip._fire("drop", { clientX: 1, dataTransfer });
+    // Under the threshold a shaky click is still a click.
+    first._fire("pointermove", { pointerId: 1, clientX: 51 });
     assert(
-      global.rbCalls.some((call) => call.cmd === "tab_reorder"),
-      "the drop sent no tab_reorder, so the order it showed was never committed",
+      !first.classList.contains("dragging"),
+      "a 3px wobble started a drag",
     );
-    // dragend fires on the source right after the drop, before Rust replies.
-    // It repaints only an ABANDONED drag; repainting here would put the old
-    // order back over a commit that is still in flight.
-    first._fire("dragend", { dataTransfer });
+    // Well past the end: the chip is held inside the strip, and held there
+    // it has taken the last place.
+    first._fire("pointermove", { pointerId: 1, clientX: 400 });
     assert(
-      tabChipIds().join(",") === "22,33,11",
-      "dragend repainted the pre-drag order over a committed drop; got " +
+      first.classList.contains("dragging") &&
+        strip.classList.contains("tab-dragging"),
+      "moving past the threshold did not start a drag",
+    );
+    assert(
+      first.style.transform === "translateX(200px)",
+      "the dragged chip does not follow the pointer, held to the strip: " +
+        first.style.transform,
+    );
+    assert(
+      second.style.transform === "translateX(-100px)" &&
+        third.style.transform === "translateX(-100px)",
+      "the neighbors did not slide aside for the dragged tab: " +
+        second.style.transform +
+        " / " +
+        third.style.transform,
+    );
+    assert(
+      tabChipIds().join(",") === "11,22,33",
+      "the drag rearranged the DOM mid-drag instead of sliding the chips; got " +
         tabChipIds().join(","),
+    );
+    // A repaint that changes no order (a title, a load) must not end the
+    // drag or replace the chip the pointer is holding.
+    fireChrome("tabs_changed", {
+      items: tabItems([11, 22, 33], 22).map((t) =>
+        t.id === 33 ? Object.assign({}, t, { title: "Renamed" }) : t,
+      ),
+    });
+    assert(
+      tabChips()[0] === first && first.classList.contains("dragging"),
+      "a title repaint mid-drag replaced the dragged chip or ended the drag",
+    );
+    assert(
+      !global.rbCalls.some((call) => call.cmd === "tab_reorder"),
+      "the drag committed before the release",
+    );
+
+    first._fire("pointerup", { pointerId: 1, clientX: 400 });
+    assert(
+      tabChipIds().join(",") === "22,33,11",
+      "the release did not put the strip in the order it showed; got " +
+        tabChipIds().join(","),
+    );
+    assert(
+      !first.classList.contains("dragging") &&
+        !strip.classList.contains("tab-dragging") &&
+        first._capture === null,
+      "the release left the drag styling or the pointer capture behind",
+    );
+    // The engine follows the release with a click on the chip. It must not
+    // switch to the tab that was just moved.
+    first._fire("click");
+    assert(
+      !global.rbCalls.some((call) => call.cmd === "tab_switch"),
+      "the click that follows a drag switched tabs",
     );
     await flush();
 
     const calls = global.rbCalls.filter((call) => call.cmd === "tab_reorder");
-    assert(calls.length === 1, "one drop sent " + calls.length + " reorders");
+    assert(calls.length === 1, "one drag sent " + calls.length + " reorders");
     assert(
       calls[0].args.ids.join(",") === "22,33,11",
-      "drop did not send the full previewed permutation: " +
+      "the release did not send the full permutation: " +
         JSON.stringify(calls[0].args),
     );
     assert(
@@ -281,35 +320,20 @@ check(
       activeChipId() === 22,
       "active chip changed identity after reorder: " + activeChipId(),
     );
+    // KEYED: the reply repainted the strip without replacing a single chip.
+    // A rebuilt chip has no previous position, so nothing could slide.
+    assert(
+      tabChips()[2] === first && tabChips()[0] === second,
+      "the reorder reply rebuilt the chips instead of moving the ones it had",
+    );
     // Bound once, on a container every repaint keeps. The strip has been
-    // rendered at least twice by now (this test's tabs_changed and the
-    // reorder reply), so wiring inside the render would show as a second pair.
+    // rendered three times by now.
     const wired = (type) => (strip._listeners[type] || []).length;
     assert(
-      wired("dragover") === 1 && wired("drop") === 1,
+      wired("dblclick") === 1,
       "the strip holds " +
-        wired("dragover") +
-        " dragover and " +
-        wired("drop") +
-        " drop listeners; the pair is being re-wired on every repaint",
-    );
-    // A drag MUST write something, and it must not be the tab id.
-    //
-    // This assertion used to demand `carried.length === 0`, and that is how a
-    // gate enforced a defect: an HTML5 drag with an empty dataTransfer is
-    // abandoned by both engines, which fall back to selecting the text under
-    // the cursor. The tab strip did exactly that on real hardware -- press,
-    // move, and the tab TITLE highlighted while the tab stayed put. The
-    // property actually worth protecting was never "carry nothing", it was
-    // "never carry an internal address", so that is what is checked now.
-    assert(
-      carried.length > 0,
-      "tab drag wrote NO dataTransfer payload, so no drag can start",
-    );
-    const ids = ["11", "22", "33"];
-    assert(
-      !carried.some(([, value]) => ids.includes(String(value))),
-      "an internal tab id rode in dataTransfer: " + JSON.stringify(carried),
+        wired("dblclick") +
+        " dblclick listeners; it is being re-wired on every repaint",
     );
 
     // Re-rendering after a drop must not cost the two existing direct actions.

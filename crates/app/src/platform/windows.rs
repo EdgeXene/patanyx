@@ -76,7 +76,8 @@ fn without_default_context_menu(builder: WebViewBuilder<'_>) -> WebViewBuilder<'
 fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
     use webview2_com::AcceleratorKeyPressedEventHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
-        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_PHYSICAL_KEY_STATUS,
+        COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN, COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN,
+        COREWEBVIEW2_PHYSICAL_KEY_STATUS,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_MENU, VK_SHIFT};
     use wry::WebViewExtWindows;
@@ -90,10 +91,25 @@ fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                 let Some(args) = args else {
                     return Ok(());
                 };
-                // Key-up would fire a second time for the same press.
+                // Key-up would fire a second time for the same press, so only
+                // the two DOWN kinds pass.
+                //
+                // SYSTEM key-downs count too. Windows reports an Alt
+                // combination as WM_SYSKEYDOWN, so accepting only KEY_DOWN
+                // meant no Alt shortcut ever reached this handler. Alt+D --
+                // focus the address bar -- resolved in the table and could
+                // never arrive. Alt+Left and Alt+Right went back or forward
+                // natively instead, and that navigation carries no mark from
+                // the browser, so the local-network boundary could not tell it
+                // from a page's own history.back() and refused the user's
+                // Alt+Left back to a local page (hardware run, 2026-09-24). An
+                // unbound system key (Alt+F4, F10) resolves to nothing below
+                // and is left alone.
                 let mut kind = COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN;
                 args.KeyEventKind(&mut kind)?;
-                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN {
+                if kind != COREWEBVIEW2_KEY_EVENT_KIND_KEY_DOWN
+                    && kind != COREWEBVIEW2_KEY_EVENT_KIND_SYSTEM_KEY_DOWN
+                {
                     return Ok(());
                 }
                 let mut virtual_key = 0u32;
@@ -137,6 +153,35 @@ fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                     let _ = proxy.send_event(UserEvent::Shortcut(action));
                     args.SetHandled(true)?;
                 }
+                Ok(())
+            })),
+            &mut token,
+        );
+    }
+}
+
+/// Reports which surface the keyboard just went to, so the next window
+/// activation can put it back there (AppState::restore_focus).
+///
+/// WebView2's GotFocus fires on the controller whenever its webview takes the
+/// keyboard: a click into the page or the bar, and our own `focus()` calls
+/// alike. Both are the truth about where the keyboard is, so both are
+/// recorded. Only WHICH surface travels -- nothing about the page.
+fn connect_focus_tracking(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    surface: crate::state::FocusSurface,
+) {
+    use webview2_com::FocusChangedEventHandler;
+    use wry::WebViewExtWindows;
+
+    let proxy = proxy.clone();
+    let controller = webview.controller();
+    let mut token = Default::default();
+    unsafe {
+        let _ = controller.add_GotFocus(
+            &FocusChangedEventHandler::create(Box::new(move |_sender, _args| {
+                let _ = proxy.send_event(UserEvent::SurfaceFocused(surface));
                 Ok(())
             })),
             &mut token,
@@ -389,6 +434,15 @@ const BROWSER_ARGS: &str = concat!(
     // Device APIs, removed rather than prompted -- see the block comment
     // above this constant.
     ",WebBluetooth,WebUSB,WebSerial,WebHID",
+    // The back-forward cache restores a page without the commit event the
+    // local-network boundary reads to learn which document is on screen, so
+    // a restored plain-HTTP page could run under the standing of the HTTPS
+    // page before it. Off, every back and forward is a real navigation that
+    // reports its commit (final review 3, R-005). The tab also resets to an
+    // unnamed standing when a navigation completes without one, so a flag
+    // the engine ignores fails closed rather than open. HARDWARE CHECK: a
+    // back navigation must put a new request on the server.
+    ",BackForwardCache",
     " --disable-blink-features=WebBluetooth,WebUSB,Serial,HID",
     " --disable-background-networking",
     " --disable-domain-reliability",
@@ -777,6 +831,7 @@ pub fn build_chrome(
         crate::prefs::load().tracking_prevention,
     );
     connect_shortcuts(&webview, proxy);
+    connect_focus_tracking(&webview, proxy, crate::state::FocusSurface::Chrome);
     // Child webviews get no automatic layout; the chrome strip gets its
     // initial bounds here and layout() keeps them current from then on.
     // A top strip with no sidebar: the chrome has not measured itself yet, so
@@ -1610,6 +1665,12 @@ pub fn build_content(
     // The translation seam, added the same way and for the same reason. It
     // reads nothing and sends nothing until the host asks -- see its header.
     let builder = builder.with_initialization_script(CONTENT_TRANSLATE_SCRIPT);
+    // Built WITHOUT the keyboard. wry defaults to focused, which MoveFocus-es
+    // every new webview as it is created -- a background tab a page opened,
+    // or a tab built while a panel covers the window, took the keyboard
+    // before anything could check. Whether a page gets focus is decided in
+    // one place, AppState::show_and_focus_tab.
+    let builder = builder.with_focused(false);
     let webview = builder.build_as_child(&hosts.window)?;
     note_running_environment(&webview);
     let hardening = harden_privacy(
@@ -1618,6 +1679,7 @@ pub fn build_content(
         crate::prefs::load().tracking_prevention,
     );
     connect_shortcuts(&webview, proxy);
+    connect_focus_tracking(&webview, proxy, crate::state::FocusSurface::Content);
     // Tabs start hidden; AppState activates one via show_tab + layout. A
     // fresh WebView2 child defaults to visible, so hide it before it can
     // paint over the chrome strip or another tab.
@@ -1682,6 +1744,11 @@ pub fn build_content(
     // below for the same reason the handlers are: the first document must
     // not be created before the registration lands.
     install_divergence_script(&webview, policy.ephemeral);
+    // The local-network boundary's WebSocket half. CONTENT webviews only,
+    // which is also what keeps it away from Private Chat: the chat UI is the
+    // chrome webview, and Chat and Relay themselves are native Rust sockets
+    // that no page script can see (the guard's gate pins all three).
+    install_local_network_guard(&webview, &state, proxy, id);
     // The page-scrollbar courtesy: same registration category, same
     // all-frames path, same place in the order so the first document
     // already has it.
@@ -1705,19 +1772,23 @@ pub fn build_content(
     // page cannot start before ClearBrowsingData completes, and a fast second
     // tab cannot outrun the first tab's clear. An ephemeral tab neither needs
     // nor claims the saved-profile wipe; the first ordinary tab still does it.
-    let initial_navigation_pending = if policy.ephemeral {
+    let waiting_for_wipe = if policy.ephemeral {
         false
     } else {
         begin_new_session_wipe(&webview, proxy)
     };
-    if !initial_navigation_pending {
-        if let Err(error) = super::load_initial_url(&webview, id, url) {
-            diag(&format!(
-                "build: initial navigation to {url} failed ({error})"
-            ));
-        }
-    }
-    Ok((webview, TabView { state }, initial_navigation_pending))
+    // THE FIRST PAGE ALSO WAITS FOR THE WEBSOCKET GUARD, so it is never
+    // issued here. It is released through AppState
+    // (`Tab::finish_initial_navigation`) once the wipe, if this tab waits on
+    // it, and the guard's registration have BOTH settled, whichever is last:
+    // see `TabState::initial_navigation_ready` for why (final review 5,
+    // R-006). The URL travels back to AppState with the tab, as it already
+    // did for the wipe. The browser issues that navigation, and a page's
+    // request for this new tab was judged by the page that asked
+    // (`new_tab_allowed`) before the tab existed.
+    let _ = url;
+    state.borrow_mut().waiting_for_wipe = waiting_for_wipe;
+    Ok((webview, TabView { state }, true))
 }
 
 /// Registers the Fingerprint Divergence script for every document this
@@ -1746,6 +1817,73 @@ pub fn build_content(
 /// for the unix side, where the script is active but WebKitGTK offers no
 /// readback (renderEngineConfirmed's own comment forbids growing special
 /// cases). Same no-row shape as GPC_SCRIPT.
+/// Registers the local-network boundary's WebSocket guard
+/// (`privacy::LOCAL_NETWORK_GUARD_SCRIPT`) for every document and frame this
+/// tab will create, through the same raw all-frames API as the divergence
+/// script, and records the engine's answer in `TabState::local_network_guard`.
+///
+/// Unlike the divergence script, the outcome is RECORDED, not only diagnosed:
+/// this script is a protection the boundary claims, and a tab where the engine
+/// refused it can have a plain-HTTP page open a WebSocket into the user's
+/// network. A failed call is Failed at once; the completion callback records
+/// Applied or Failed.
+fn install_local_network_guard(
+    webview: &WebView,
+    state: &Rc<RefCell<TabState>>,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+) {
+    use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let source: Vec<u16> = privacy::LOCAL_NETWORK_GUARD_SCRIPT
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    // NotAttempted until the engine answers: there is no pending state, and
+    // the callback is the only thing entitled to say Applied. Either answer
+    // releases the tab's first page (`TabState::initial_navigation_ready`).
+    let done_state = state.clone();
+    let done_proxy = proxy.clone();
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |hr, _script_id| {
+            let applied = hr.is_ok();
+            done_state.borrow_mut().local_network_guard = if applied {
+                SettingState::Applied
+            } else {
+                SettingState::Failed
+            };
+            if !applied {
+                diag("local-network guard: registration REFUSED by the engine; plain-HTTP pages in this tab can open WebSockets to the local network");
+            }
+            let _ = done_proxy.send_event(UserEvent::LocalNetworkGuardSettled(id));
+            Ok(())
+        },
+    ));
+    let result = unsafe {
+        core.AddScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(source.as_ptr()), &handler)
+    };
+    if result.is_err() {
+        state.borrow_mut().local_network_guard = SettingState::Failed;
+        diag("local-network guard: AddScriptToExecuteOnDocumentCreated call failed; plain-HTTP pages in this tab can open WebSockets to the local network");
+        // No callback will come; the answer is already in.
+        let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(id));
+    } else {
+        // The first page waits for the answer, so an answer that never comes
+        // must not leave the tab blank for good (final review 6, R-003).
+        let overdue_proxy = proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(LOCAL_NETWORK_GUARD_ANSWER_WAIT);
+            let _ = overdue_proxy.send_event(UserEvent::LocalNetworkGuardOverdue(id));
+        });
+    }
+}
+
+/// How long a tab's first page waits for the engine to answer the WebSocket
+/// guard's registration. The answer normally takes milliseconds.
+const LOCAL_NETWORK_GUARD_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn install_divergence_script(webview: &WebView, ephemeral: bool) {
     use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
     use wry::WebViewExtWindows;
@@ -2457,7 +2595,8 @@ fn connect_request_interception(
                         // A failed context read is None, and None is not a
                         // document: the held-page path fails CLOSED on an
                         // unclassifiable request, which then gets the ordinary
-                        // silent refusal below rather than a banner.
+                        // silent refusal below rather than a banner, and it is
+                        // never exempted from the local-network boundary.
                         let is_document = context == Some(COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
                         // These bindings return the object rather than
                         // filling an out-param. take_pwstr converts and
@@ -2547,15 +2686,24 @@ fn connect_request_interception(
                         // WebView2 can re-enter on the UI thread, and a
                         // RefCell held across a COM call is a panic waiting
                         // for the right page.
-                        let decision = {
+                        //
+                        // The top-level correlation is consulted INSIDE this
+                        // call and BEFORE the decision, because the
+                        // local-network boundary exempts the tab's own
+                        // document. `nav_url` is that correlation's answer:
+                        // the complete navigation URL when this request is the
+                        // page, None otherwise. Every DOCUMENT request consumes
+                        // its slot there, allowed or refused (R-001, round 4).
+                        let (decision, nav_url) = {
                             let mut st = handler_state.borrow_mut();
                             // The tab's ad-list override, or None. Read here
                             // rather than inside the decision so the rule
                             // stays a function of its arguments: see
                             // `decide_request`'s own doc.
                             let override_host = st.adlist_override_host();
-                            st.decide_request(
+                            st.decide_intercepted(
                                 uri.as_deref(),
+                                is_document,
                                 websocket,
                                 privacy::bundled_rules(),
                                 Instant::now(),
@@ -2579,23 +2727,16 @@ fn connect_request_interception(
                         // (toplevel_request.rs explains what it will not
                         // expose). The borrow is released before any COM
                         // call, per this file's standing hazard.
-                        // EVERY document request consumes its correlation
-                        // slot, allowed or refused, and it does so before the
-                        // decision is looked at. Consuming only on refusal
-                        // left an allowed page's slot armed, and a same-URL
-                        // iframe requested after blocking was switched on
-                        // took it: banner raised, placeholder in the frame,
-                        // real page still on screen (review R-001, round 4).
-                        // The correlation hands back the COMPLETE navigation
-                        // URL, fragment included; the request URI never
-                        // carries one (R-006).
-                        let nav_url = if is_document {
-                            uri.as_deref().and_then(|u| {
-                                handler_state.borrow_mut().toplevel.take_top_level_document(u)
-                            })
-                        } else {
-                            None
-                        };
+                        // The slot was consumed above, inside
+                        // `decide_intercepted`, for every document request
+                        // allowed or refused: consuming only on refusal left
+                        // an allowed page's slot armed, and a same-URL iframe
+                        // requested after blocking was switched on took it:
+                        // banner raised, placeholder in the frame, real page
+                        // still on screen (review R-001, round 4). The
+                        // correlation hands back the COMPLETE navigation URL,
+                        // fragment included; the request URI never carries
+                        // one (R-006).
                         if let privacy::RequestDecision::Block(privacy::BlockReason::AdRule) = decision {
                             let held = nav_url;
                             // No nonce means the placeholder cannot be told
@@ -2891,7 +3032,10 @@ fn connect_navigation_events(
     proxy: &EventLoopProxy<UserEvent>,
 ) {
     let record = state.clone();
-    use webview2_com::{NavigationCompletedEventHandler, NavigationStartingEventHandler};
+    use webview2_com::{
+        ContentLoadingEventHandler, NavigationCompletedEventHandler, NavigationStartingEventHandler,
+        NewWindowRequestedEventHandler,
+    };
     use wry::WebViewExtWindows;
 
     let core = webview.webview();
@@ -2942,14 +3086,22 @@ fn connect_navigation_events(
                         // recorder treats each hop as its own document
                         // request, so a redirect INTO a listed host lands on
                         // the banner rather than an engine error.
-                        {
+                        //
+                        // The same call decides whether this hop may take the
+                        // tab into the user's network: a plain-HTTP page may
+                        // not send it there (`on_top_level_navigation_starting`
+                        // has the rule).
+                        // An unreadable id is passed as None, never as 0: a
+                        // made-up id would turn a redirect hop into a first
+                        // hop and judge it by the page on screen (final review
+                        // 3, R-003).
+                        let start = {
                             let mut nav_id: u64 = 0;
-                            let _ = args.NavigationId(&mut nav_id);
+                            let nav_id = args.NavigationId(&mut nav_id).ok().map(|()| nav_id);
                             starting_state
                                 .borrow_mut()
-                                .toplevel
-                                .on_navigation_starting(nav_id, &uri);
-                        }
+                                .on_top_level_navigation_starting(nav_id, &uri)
+                        };
                         // TRACKING-PARAM STRIPPING, top-level only.
                         //
                         // This event is the TOP FRAME: WebView2 has a separate
@@ -3006,6 +3158,13 @@ fn connect_navigation_events(
                             let mut wide: Vec<u16> =
                                 clean.encode_utf16().chain(std::iter::once(0)).collect();
                             let target = windows::core::PCWSTR(wide.as_mut_ptr());
+                            // The clean navigation is the same request under
+                            // another URL, so it carries this hop's decision,
+                            // not a fresh one: a fresh one would be judged as a
+                            // first hop against the page on screen, which could
+                            // let a refused redirect through or refuse an
+                            // allowed one (plan review 2, M-5).
+                            starting_state.borrow_mut().expect_navigation(&clean, start);
                             match navigating.Navigate(target) {
                                 Ok(()) => {
                                     let _ = args.SetCancel(true);
@@ -3013,10 +3172,15 @@ fn connect_navigation_events(
                                 }
                                 // Navigate refused: let the ORIGINAL proceed
                                 // rather than cancelling into a blank tab. A
-                                // tracked page beats no page.
-                                Err(error) => diag(&format!(
-                                    "nav-strip: Navigate FAILED ({error}); letting the tracked URL through"
-                                )),
+                                // tracked page beats no page. The carried
+                                // expectation goes with the navigation that
+                                // never started.
+                                Err(error) => {
+                                    starting_state.borrow_mut().forget_expected_navigation();
+                                    diag(&format!(
+                                        "nav-strip: Navigate FAILED ({error}); letting the tracked URL through"
+                                    ));
+                                }
                             }
                         }
                         if let Some(host) = privacy::host_of(&uri) {
@@ -3038,6 +3202,142 @@ fn connect_navigation_events(
             })),
             &mut token,
         );
+        // SUBFRAMES, for the local-network exemption only: a document request
+        // is withheld the exemption while a frame navigation to the same URL
+        // may be in flight (`decide_intercepted` says why). WebView2 fires
+        // these for subframes only, the split the top-level handler above
+        // relies on. Everything here fails CLOSED for the exemption: until
+        // registration is recorded no document request is exempted, and a
+        // frame event that cannot be read counts as a frame going anywhere
+        // (final review R-001). The cost of a failure is local plain-HTTP
+        // pages refusing to open, which is diagnosed below; the cost of the
+        // other direction would be a page's frame reaching the router.
+        {
+            let frame_state = state.clone();
+            let mut frame_token = Default::default();
+            match core.add_FrameNavigationStarting(
+                &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
+                    use webview2_com::take_pwstr;
+                    use windows::core::PWSTR;
+                    let target = args.as_ref().and_then(|args| {
+                        let mut uri = PWSTR::null();
+                        args.Uri(&mut uri).ok()?;
+                        // Owned, and the COM string freed, before the next
+                        // getter can fail and skip it (final review R-003).
+                        let uri = take_pwstr(uri);
+                        let mut nav_id: u64 = 0;
+                        args.NavigationId(&mut nav_id).ok()?;
+                        Some((nav_id, uri))
+                    });
+                    let mut st = frame_state.borrow_mut();
+                    match target {
+                        Some((nav_id, uri)) => st.toplevel.on_frame_navigation_starting(nav_id, &uri),
+                        None => st.toplevel.on_frame_navigation_unreadable(),
+                    }
+                    Ok(())
+                })),
+                &mut frame_token,
+            ) {
+                Ok(()) => state.borrow_mut().toplevel.on_frame_tracking_registered(),
+                Err(error) => diag(&format!(
+                    "navigation: add_FrameNavigationStarting FAILED ({error}); plain-HTTP pages at local addresses will be refused in this tab"
+                )),
+            }
+            let frame_state = state.clone();
+            let mut frame_token = Default::default();
+            if let Err(error) = core.add_FrameNavigationCompleted(
+                &NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
+                    // By the FRAME's navigation id, which the args carry. The
+                    // sender is the WebView and its Source is the TOP-LEVEL
+                    // document, so removing by that would remove the wrong
+                    // entry (R-005).
+                    if let Some(args) = args.as_ref() {
+                        let mut nav_id: u64 = 0;
+                        if args.NavigationId(&mut nav_id).is_ok() {
+                            frame_state
+                                .borrow_mut()
+                                .toplevel
+                                .on_frame_navigation_completed(nav_id);
+                        }
+                    }
+                    Ok(())
+                })),
+                &mut frame_token,
+            ) {
+                diag(&format!(
+                    "navigation: add_FrameNavigationCompleted FAILED ({error}); finished frames clear only when a new page loads"
+                ));
+            }
+            // The old document's frames leave with it. ContentLoading, not
+            // NavigationCompleted: see `on_document_committed` for why
+            // (final review R-002). By the navigation's id, which must be a
+            // top-level hop in flight; an unreadable id clears nothing.
+            let frame_state = state.clone();
+            let mut frame_token = Default::default();
+            if let Err(error) = core.add_ContentLoading(
+                &ContentLoadingEventHandler::create(Box::new(move |_sender, args| {
+                    // Also where the local-network boundary learns which
+                    // document is on screen (`TabState::committed`). An
+                    // unreadable id or missing args commit an unnamed
+                    // document, which reaches nothing private; an unreadable
+                    // error-page flag counts as an error page, which gets no
+                    // own address. Both fail closed: a local page that loses
+                    // its own address looks broken, it does not leak.
+                    let (nav_id, error_page) = match args.as_ref() {
+                        Some(args) => {
+                            let mut nav_id: u64 = 0;
+                            let nav_id = args.NavigationId(&mut nav_id).ok().map(|()| nav_id);
+                            let mut error_page = windows::core::BOOL::default();
+                            let error_page = args
+                                .IsErrorPage(&mut error_page)
+                                .map_or(true, |()| error_page.as_bool());
+                            (nav_id, error_page)
+                        }
+                        None => (None, true),
+                    };
+                    frame_state.borrow_mut().on_document_committed(nav_id, error_page);
+                    Ok(())
+                })),
+                &mut frame_token,
+            ) {
+                // Without commits the tab never learns which document is on
+                // screen, so every document is held to the boundary with no
+                // address of its own (plan review 2, H-3).
+                state.borrow_mut().on_commit_tracking_unavailable();
+                diag(&format!(
+                    "navigation: add_ContentLoading FAILED ({error}); local pages will not load from their own address in this tab, and frames that never report completion keep their address refused"
+                ));
+            }
+            // A PAGE'S NEW TAB is judged by the page that asked, WHEN it
+            // asked. wry takes this event's deferral and runs the app's
+            // callback later from the message loop (wry 0.55.1
+            // webview2/mod.rs, `dispatch_handler`), by which time a
+            // navigation already in flight may have committed a more
+            // permissive page (final review 6, R-002). This handler runs in
+            // the event itself, like wry's, before that callback can, and
+            // records only refusals (`TabState::on_new_window_requested`).
+            // Until it is registered, no private address opens in a new tab.
+            let window_state = state.clone();
+            let mut window_token = Default::default();
+            match core.add_NewWindowRequested(
+                &NewWindowRequestedEventHandler::create(Box::new(move |_sender, args| {
+                    let url = args.as_ref().and_then(|args| {
+                        let mut uri = windows::core::PWSTR::null();
+                        args.Uri(&mut uri).ok()?;
+                        Some(webview2_com::take_pwstr(uri))
+                    });
+                    window_state.borrow_mut().on_new_window_requested(url.as_deref());
+                    Ok(())
+                })),
+                &mut window_token,
+            ) {
+                Ok(()) => state.borrow_mut().new_window_tracking = true,
+                Err(error) => diag(&format!(
+                    "navigation: add_NewWindowRequested FAILED ({error}); pages in this tab cannot open a local address in a new tab"
+                )),
+            }
+        }
+
         let mut token = Default::default();
         let nav_proxy = proxy.clone();
         let completed = core.add_NavigationCompleted(
@@ -3048,12 +3348,26 @@ fn connect_navigation_events(
                 // A finished navigation can no longer explain a request;
                 // leaving it would let a later same-URL iframe be taken for
                 // the page.
-                if let Some(args) = args.as_ref() {
-                    let mut nav_id: u64 = 0;
-                    if args.NavigationId(&mut nav_id).is_ok() {
-                        state.borrow_mut().toplevel.on_navigation_completed(nav_id);
+                //
+                // The same call notices a navigation that succeeded without a
+                // commit event, which leaves a document the tab cannot name
+                // (`on_top_level_navigation_completed`). An unreadable verdict
+                // is passed as a success so that check errs closed.
+                // A completion with no arguments at all is passed as an
+                // unreadable id and a success: the standing resets to unnamed.
+                let (nav_id, success) = match args.as_ref() {
+                    Some(args) => {
+                        let mut nav_id: u64 = 0;
+                        let nav_id = args.NavigationId(&mut nav_id).ok().map(|()| nav_id);
+                        let mut success = windows::core::BOOL::default();
+                        let success = args.IsSuccess(&mut success).map_or(true, |()| success.as_bool());
+                        (nav_id, success)
                     }
-                }
+                    None => (None, true),
+                };
+                state
+                    .borrow_mut()
+                    .on_top_level_navigation_completed(nav_id, success);
 
                 // The args used to be discarded. They carry the engine's own
                 // verdict on this navigation, which is the only evidence the
@@ -5558,6 +5872,71 @@ pub fn blocked_total(view: &TabView) -> u64 {
     view.state.borrow().ledger.blocked_total()
 }
 
+/// The browser itself is about to navigate this tab to `url`. Called
+/// immediately before every app-issued content navigation, so the
+/// local-network boundary can tell the user's navigation from the page's
+/// (`TabState::note_app_navigation`).
+pub fn note_app_navigation(view: &TabView, url: &str) {
+    view.state.borrow_mut().note_app_navigation(url);
+}
+
+/// The navigation just announced with `note_app_navigation` did not start.
+pub fn forget_app_navigation(view: &TabView) {
+    view.state.borrow_mut().forget_expected_navigation();
+}
+
+/// Whether this tab's first page may be issued now
+/// (`TabState::initial_navigation_ready`).
+pub fn initial_navigation_ready(view: &TabView) -> bool {
+    view.state.borrow().initial_navigation_ready()
+}
+
+/// The engine has not answered the WebSocket guard's registration in time
+/// (`LOCAL_NETWORK_GUARD_ANSWER_WAIT`): record it Failed, which releases the
+/// first page (`TabState::on_local_network_guard_overdue`).
+pub fn note_local_network_guard_overdue(view: &TabView) {
+    if view.state.borrow_mut().on_local_network_guard_overdue() {
+        diag("local-network guard: the engine did not answer the registration in time; plain-HTTP pages in this tab may open WebSockets to the local network");
+    }
+}
+
+/// A tab's first navigation could not be issued (host only:
+/// `super::initial_navigation_failure_line`).
+pub fn report_initial_navigation_failure(url: &str, error: &wry::Error) {
+    diag(&super::initial_navigation_failure_line(url, error));
+}
+
+/// The session wipe finished; this tab no longer waits on it.
+pub fn note_session_wipe_finished(view: &TabView) {
+    view.state.borrow_mut().waiting_for_wipe = false;
+}
+
+/// Whether closing this still-blank tab must wait for the session wipe it
+/// holds. On Windows a first page can also be waiting for the WebSocket
+/// guard, which is no reason to keep a closed tab alive.
+pub fn holds_session_wipe(view: &TabView, _first_page_pending: bool) -> bool {
+    view.state.borrow().waiting_for_wipe
+}
+
+/// The tab's standing, handed to the new-window callback so a page's request
+/// for a new tab is judged by the document that asked, when it asked.
+pub struct NewTabGate(Rc<RefCell<TabState>>);
+
+pub fn new_tab_gate(view: &TabView) -> NewTabGate {
+    NewTabGate(view.state.clone())
+}
+
+/// Whether the page that asked may open a new tab at `url`: judged when the
+/// engine raised the request AND by the page on screen now
+/// (`TabState::take_new_window_verdict`). Called once per request wry
+/// queues. No gate yet means no page yet, and nothing private is vouched for.
+pub fn new_tab_allowed(gate: Option<&NewTabGate>, url: &str) -> bool {
+    match gate {
+        Some(gate) => gate.0.borrow_mut().take_new_window_verdict(url),
+        None => privacy::TabState::new(&TabPolicy::default()).take_new_window_verdict(url),
+    }
+}
+
 /// Whether the current document was loaded over plain HTTP. For the Info tab's
 /// "not encrypted" row.
 pub fn page_insecure(view: &TabView) -> bool {
@@ -5663,15 +6042,22 @@ pub fn interception_state(view: &TabView) -> &'static str {
 /// exist (and would not compile) here.
 pub fn fix_downloads(_webview: &WebView) {}
 
+/// Shows the tab. It does NOT give its page the keyboard: each WebView2 child
+/// has its own HWND, so focus has to be moved explicitly, and that is a
+/// separate decision (`focus_content`) taken by AppState::show_and_focus_tab,
+/// which refuses it while a modal covers the window.
 pub fn show_tab(_view: &TabView, webview: &WebView) {
     let _ = webview.set_visible(true);
-    // Each WebView2 child has its own HWND, so keyboard focus must be moved
-    // explicitly when a tab becomes visible (best-effort).
-    let _ = webview.focus();
 }
 
 pub fn hide_tab(_view: &TabView, webview: &WebView) {
     let _ = webview.set_visible(false);
+}
+
+/// Give a tab's page the keyboard. Each WebView2 child is its own HWND, so
+/// this is never implied by anything else (best-effort).
+pub fn focus_content(webview: &WebView) {
+    let _ = webview.focus();
 }
 
 // ---- find in page ----

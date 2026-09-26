@@ -112,17 +112,37 @@ body {
   color: var(--tx-chip);
   cursor: pointer;
   font-size: 12px;
+  /* The chip is dragged with pointer events. A press that selected the title
+     text instead is what the HTML5 drag used to do; touch-action hands a
+     finger's movement to the drag rather than to panning. */
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: none;
 }
 .tab-chip:hover {
   background: var(--sf-raised);
   color: var(--tx-chip-hover);
 }
-.tab-chip[draggable="true"] {
-  cursor: grab;
-}
+/* The chip under the pointer follows it, above the neighbors sliding
+   underneath and above the active chip's own layer (z-index 1). A flex item
+   takes a z-index without needing a position. */
 .tab-chip.dragging {
   cursor: grabbing;
-  opacity: 0.65;
+  z-index: 2;
+  opacity: 0.92;
+}
+#tabs.tab-dragging {
+  cursor: grabbing;
+}
+/* Neighbors slide aside during a drag, and every chip slides into place
+   after a drop, a keyboard move or a close. The dragged chip itself has no
+   transition: it is wherever the pointer is. Same 150ms as TAB_SLIDE_MS in
+   chrome.js. */
+@media (prefers-reduced-motion: no-preference) {
+  #tabs.tab-dragging .tab-chip:not(.dragging),
+  #tabs.tab-settling .tab-chip {
+    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1);
+  }
 }
 .tab-chip.active {
   background: var(--sf-strip-a); /* merges into the toolbar below */

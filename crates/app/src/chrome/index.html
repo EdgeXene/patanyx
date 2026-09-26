@@ -23,8 +23,8 @@
         <button id="tabbatch-shelf" type="button" data-msg="chrome.tabbatch.shelf.button">Shelve</button>
         <button id="tabbatch-cancel" type="button" data-msg="chrome.tabbatch.cancel.button">Cancel</button>
       </div>
-      <!-- dir is pinned because the drop-target walk in chrome.js compares
-           DOM order against screen rectangles; see tabDropTargetAt. -->
+      <!-- dir is pinned because the tab drag in chrome.js compares
+           DOM order against screen rectangles; see startTabDrag. -->
       <div id="tabs" dir="ltr"></div>
       <button id="btn-newtab" type="button" title="New tab" data-msg-title="chrome.btn.newtab.title">+</button>
     </nav>
@@ -3094,7 +3094,7 @@
                in the markup, hidden, so the submit handler and its gate
                survive; the arm refuses anyway. Returns with the wrapped
                Library key in 1.0.1. -->
-          <p class="panel-foot" id="bk-pw-unavailable" data-msg="chrome.bk.pw.unavailable.p">Changing the passphrase is not available in this version. Your current passphrase and your recovery key keep working. It returns in the next update.</p>
+          <p class="panel-foot" id="bk-pw-unavailable" data-msg="chrome.bk.pw.unavailable.p">Changing the passphrase is not available in this version. Your current passphrase and your recovery key keep working. It returns in a later update.</p>
           <!-- The form's own description, hidden with the form: read under
                the unavailability note it sounded like a remaining step. -->
           <p class="panel-intro" data-msg="chrome.pane.backup.p.n4" hidden>

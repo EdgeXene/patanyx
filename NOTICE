@@ -131,7 +131,7 @@ Third-Party Acknowledgements
    Supplied by Microsoft under its own terms. PATANYX links the loader and
    calls the runtime; it neither contains nor redistributes it.
 
-11. Rust crate dependencies (466 packages)
+11. Rust crate dependencies
    Copyright (c) their respective authors
    All permissive. Five are MPL-2.0 (cssparser, cssparser-macros, dtoa-short,
    option-ext, selectors), used unmodified.

@@ -215,6 +215,36 @@ else
 fi
 
 echo
+echo "=== gate 1f1: the tab strip and the address bar ==="
+# Keyed chips, the pointer drag and its every way of being abandoned, the
+# slide, middle-click and double-click, and the address bar's edit, Escape,
+# first-click and launch-focus behavior. Every property is proven against a
+# planted defect ON EVERY RUN: each plant below must turn the gate red, and a
+# plant that passes means the gate has stopped testing what it names.
+if [ -f scripts/tab-strip-gate.js ]; then
+  if ! grep -q 'id="tabs"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/tab-strip-gate.js exists but index.html has no" >&2
+    echo "  #tabs; the strip was removed and this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/tab-strip-gate.js
+  for plant in $(PATANYX_TAB_STRIP_LIST_PLANTS=1 node scripts/tab-strip-gate.js); do
+    # CAUGHT means a named check failed. A plant whose anchor text no longer
+    # matches makes the gate throw before any check runs, which also exits
+    # non-zero -- and would pass this loop while proving nothing.
+    if plant_out="$(PATANYX_TAB_STRIP_PLANT="$plant" node scripts/tab-strip-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^TAB STRIP GATE FAILED'; then
+      echo "GATE FAIL: tab-strip-gate did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  (every planted defect was caught)"
+else
+  echo "  (no tab strip gate in this tree)"
+fi
+
+echo
 echo "=== gate 1d: vault import ==="
 # Import REPLACES the vault on this machine and the vault crate no longer
 # refuses when one exists. The panel's warning is what took the refusal's
@@ -572,6 +602,16 @@ if [ -f "$DIVERGENCE_SCRIPT" ]; then
   # its real button so dead reporting/rendering call sites fail.
   node scripts/fingerprint-probe-gate.js
 fi
+
+echo
+echo "=== gate 1m2: the local-network boundary's WebSocket guard ==="
+# WebView2 never shows the request handler a WebSocket handshake, so on
+# Windows this page script is the whole of the boundary for sockets. Runs the
+# real script against stub realms: the shared host vectors, the top-document
+# standing, base-URL and one-shot conversion, tampering, constructor shape,
+# child realms, and that it never reaches the chrome webview (Private Chat)
+# or Linux.
+node scripts/local-network-guard-gate.js
 
 echo
 echo "=== gate 1n: the malicious-site blocked banner ==="

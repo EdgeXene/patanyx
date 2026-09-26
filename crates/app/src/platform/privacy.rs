@@ -892,28 +892,34 @@ fn is_private_ipv4(o: [u8; 4]) -> bool {
     }
 }
 
+/// PARSED, not pattern-matched. The engine hands over URLs in canonical
+/// form, and the canonical form of an IPv4-mapped address is HEX:
+/// `http://[::ffff:192.168.1.1]/` arrives as `[::ffff:c0a8:101]`. The string
+/// checks this replaced only recognised the dotted spelling, so the form a
+/// real request carries went through as public, and the tests, written with
+/// the dotted spelling, passed. `private_host_vectors.json` now holds both
+/// spellings, shared with the page-world guard's classifier.
+///
+/// Ranges: loopback and unspecified; an embedded IPv4 address (mapped
+/// `::ffff:a.b.c.d`, or the deprecated compatible `::a.b.c.d`) judged as that
+/// IPv4 address; unique-local fc00::/7; link-local fe80::/10 and the
+/// deprecated site-local fec0::/10 (both still mean "this network"). The old
+/// check took every `fe` prefix, which also swept in fe00::/9, unassigned
+/// global space, so this is narrower there and wider for mapped addresses.
 fn is_private_ipv6(addr: &str) -> bool {
     let a = addr.split('%').next().unwrap_or(addr); // drop any zone id
-    if a == "::1" || a == "::" {
+    let Ok(ip) = a.parse::<std::net::Ipv6Addr>() else {
+        // Not an address the engine could connect to.
+        return false;
+    };
+    if ip.is_loopback() || ip.is_unspecified() {
         return true;
     }
-    // IPv4-mapped: judge the embedded address.
-    if let Some(v4) = a.rsplit(':').next() {
-        if v4.contains('.') {
-            if let Some(o) = parse_ipv4(v4) {
-                return is_private_ipv4(o);
-            }
-        }
+    if let Some(v4) = ip.to_ipv4() {
+        return is_private_ipv4(v4.octets());
     }
-    let head = a.split(':').next().unwrap_or("");
-    if head.len() >= 2 {
-        let prefix = &head[..2];
-        // fc00::/7 unique-local, fe80::/10 link-local.
-        if prefix == "fc" || prefix == "fd" || prefix == "fe" {
-            return true;
-        }
-    }
-    false
+    let head = ip.segments()[0];
+    (head & 0xfe00) == 0xfc00 || (head & 0xff80) == 0xfe80
 }
 
 pub struct TabState {
@@ -948,7 +954,35 @@ pub struct TabState {
     /// defaults to FALSE so a tab whose page URL could not be read does not
     /// start blocking its own subresources: this feature must not break an
     /// ordinary page when it cannot tell what kind of page it is.
+    ///
+    /// Set from the navigation TARGET, while the old document is still on
+    /// screen, which is right for the "not encrypted" row and wrong for the
+    /// boundary: see `committed`, which the boundary prefers.
     pub page_insecure: bool,
+    /// The document this tab has actually LOADED, as the local-network
+    /// boundary sees it. Set when a top-level document commits (WebView2
+    /// ContentLoading), not when a navigation starts, because until the commit
+    /// the old document is still running. Keyed to the target instead, an old
+    /// public page polling the router would get through in the moment the user
+    /// types the router's address, and an old plain-HTTP page would get
+    /// through while the tab navigates to any HTTPS page.
+    ///
+    /// None until a document commits, and forever on a backend that does not
+    /// report commits; the boundary then falls back to `page_insecure` with no
+    /// own address, which is the behavior before commits were tracked.
+    committed: Option<Standing>,
+    /// The top-level navigation about to start whose standing is already
+    /// known: one the BROWSER is issuing (the address bar, a bookmark, the
+    /// toolbar's back, forward and reload, a new tab), or the clean re-issue of
+    /// a hop the tracking-parameter strip cancelled. One-shot: the next
+    /// top-level first hop consumes it whether or not it matches, so an
+    /// expectation that went unused cannot be ridden later by a page
+    /// navigating to the same address.
+    expected_navigation: Option<ExpectedNavigation>,
+    /// The navigation whose ContentLoading set `committed`, so a navigation
+    /// that completes WITHOUT one is noticed (see
+    /// `on_top_level_navigation_completed`).
+    commit_seen: Option<u64>,
     /// Verdict recorded by the TLS-failure signal, for when the live
     /// certificate can no longer be read after the load failed. Cleared on
     /// every navigation so an http page never shows a stale https verdict.
@@ -1031,6 +1065,25 @@ pub struct TabState {
     /// batched count deltas registered for this tab. This says only that the
     /// channel exists; the counts themselves remain untrusted page claims.
     pub fingerprint_probe_reporting: SettingState,
+    /// Whether the engine accepted this tab's WebSocket guard
+    /// (`LOCAL_NETWORK_GUARD_SCRIPT`). WINDOWS ONLY; unix leaves it
+    /// NotAttempted, because the local-network boundary is not enforced
+    /// there at all. `Failed` means a plain-HTTP page in this tab can open a
+    /// WebSocket into the user's network, which is diagnosed and recorded
+    /// here rather than left for the copy to cover.
+    pub local_network_guard: SettingState,
+    /// This tab's first navigation waits for the once-per-process session
+    /// wipe. WINDOWS ONLY; see `initial_navigation_ready`.
+    pub waiting_for_wipe: bool,
+    /// A page's requests for a new tab at a PRIVATE address, oldest first,
+    /// each with the verdict of the page that asked when the engine raised
+    /// it, waiting for wry's own callback, which runs later from the message
+    /// loop (`on_new_window_requested`). WINDOWS ONLY.
+    new_window_requests: Vec<(String, bool)>,
+    /// Whether the event-time handler that fills `new_window_requests` is
+    /// registered and still trusted. Until it is, and after it stops being,
+    /// no page may open a private address in a new tab. WINDOWS ONLY.
+    pub new_window_tracking: bool,
     /// See `EngineSettings::permissions_registered`.
     pub permissions_registered: SettingState,
     /// WebView2's id for this tab's registered page-scrollbar script
@@ -1041,6 +1094,88 @@ pub struct TabState {
     /// swapped through the content manager instead, and on a tab whose
     /// registration the engine refused.
     pub scrollbar_script_id: Option<String>,
+}
+
+/// A committed document's standing for the local-network boundary.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Standing {
+    /// Loaded over plain HTTP: the boundary applies to what it requests.
+    insecure: bool,
+    /// The private host this document itself was loaded from, if any. The
+    /// document may load from its own address (exact host, any port or
+    /// scheme), and from no other private address.
+    own_host: Option<String>,
+}
+
+impl Standing {
+    /// An engine error page is never given an own address: nothing on it
+    /// asked for one, and the address it shows is often the one that was
+    /// just refused.
+    fn of(url: &str, error_page: bool) -> Self {
+        let insecure = is_insecure_page_url(url);
+        let own_host = match classify_uri(url) {
+            UriClass::Network(host) if insecure && !error_page && is_private_host(&host) => Some(host),
+            _ => None,
+        };
+        Standing { insecure, own_host }
+    }
+
+    /// For a commit the tab cannot attribute to a navigation it saw start:
+    /// treated as a plain-HTTP page with no address of its own, so it reaches
+    /// nothing private until a document the tab can name replaces it.
+    fn unknown() -> Self {
+        Standing {
+            insecure: true,
+            own_host: None,
+        }
+    }
+}
+
+/// How a top-level navigation hop started, as far as the local-network
+/// boundary cares. See `TabState::on_top_level_navigation_starting`.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HopStart {
+    /// The browser issued it, not the page.
+    pub app: bool,
+    /// It may take the tab to a private address.
+    pub reaches_private: bool,
+}
+
+/// The key a top-level hop is recorded under when the engine's navigation id
+/// could not be read. Such a hop is never looked up as anyone's previous hop,
+/// and it reaches nothing private (final review 3, R-003).
+const UNREADABLE_NAVIGATION_ID: u64 = u64::MAX;
+
+/// How many new-tab requests for private addresses may wait for wry's
+/// callback before the tab stops vouching for private addresses in new tabs
+/// (`on_new_window_requested`).
+const MAX_NEW_WINDOW_REQUESTS: usize = 64;
+
+/// See `TabState::expected_navigation`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExpectedNavigation {
+    identity: String,
+    start: HopStart,
+}
+
+/// What the top-level correlation concluded about one request, for the
+/// local-network boundary.
+#[cfg_attr(not(windows), allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TopLevelRole {
+    /// Not the tab's own document as far as anything can tell: a subresource,
+    /// a frame, an unmatched or contended document request. The ordinary
+    /// boundary applies, judged against the page on screen.
+    NotTopLevel,
+    /// The tab's own document, sent by someone allowed to send it into the
+    /// network. The boundary does not apply.
+    Permitted,
+    /// The tab's own document, sent into the network by someone who may not.
+    /// Refused whatever the page on screen may reach: an HTTPS page on screen
+    /// does not make a plain-HTTP redirector's hop acceptable (plan review 2,
+    /// H-2).
+    Refused,
 }
 
 /// One intercepted request's fate.
@@ -1123,6 +1258,9 @@ impl TabState {
             toplevel: crate::toplevel_request::TopLevelRequests::default(),
             last_top_level_method: "GET".to_string(),
             page_insecure: false,
+            committed: None,
+            expected_navigation: None,
+            commit_seen: None,
             tls_error_verdict: None,
             tls_issuer: None,
             freeze_json: None,
@@ -1137,6 +1275,10 @@ impl TabState {
             content_script_registered: SettingState::NotAttempted,
             translate_page_ready: false,
             fingerprint_probe_reporting: SettingState::NotAttempted,
+            local_network_guard: SettingState::NotAttempted,
+            waiting_for_wipe: false,
+            new_window_requests: Vec::new(),
+            new_window_tracking: false,
             permissions_registered: SettingState::NotAttempted,
             scrollbar_script_id: None,
         }
@@ -1179,6 +1321,315 @@ impl TabState {
         self.freeze.on_load_finished(now);
     }
 
+    /// The browser is about to start a top-level navigation to `url` itself.
+    /// Called immediately before every app-issued content navigation; see
+    /// `expected_navigation`.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn note_app_navigation(&mut self, url: &str) {
+        self.expect_navigation(
+            url,
+            HopStart {
+                app: true,
+                reaches_private: true,
+            },
+        );
+    }
+
+    /// The next top-level navigation to `url` continues one that already
+    /// started, and keeps its standing: the tracking-parameter strip cancels a
+    /// hop and re-issues it clean, and the clean navigation must be neither
+    /// more nor less allowed than the hop it replaces (plan review 2, M-5).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn expect_navigation(&mut self, url: &str, start: HopStart) {
+        self.expected_navigation = Some(ExpectedNavigation {
+            identity: crate::toplevel_request::normalized_identity(url),
+            start,
+        });
+    }
+
+    /// The navigation the browser announced did not start (the engine
+    /// refused it). Forgotten at once, so no later navigation can match it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn forget_expected_navigation(&mut self) {
+        self.expected_navigation = None;
+    }
+
+    /// WebView2 `NavigationStarting` for the top frame, first hop or redirect
+    /// hop. Records the hop for the correlation together with whether it may
+    /// take the tab to a private address, and returns that decision so the
+    /// tracking-parameter strip can carry it to the clean URL.
+    ///
+    /// A PLAIN-HTTP PAGE MAY NOT SEND THE TAB INTO THE USER'S NETWORK. By
+    /// link, `location=`, form POST, `target=_top` from a frame, a redirect,
+    /// or `history.back()`, a top-level navigation is the page's request as
+    /// much as a `fetch` is, and the router cannot tell the difference. A hop
+    /// to a private address may go ahead when:
+    ///
+    /// - FIRST HOP: the browser started it (typed, bookmark, the toolbar's
+    ///   back, forward and reload, a new tab), or the document on screen may
+    ///   send the tab there (`may_send_tab_to`). A reload or back/forward the
+    ///   engine starts on its own is NOT the browser's: page script can start
+    ///   one too, and the engine reports both the same way (plan review 2,
+    ///   H-1). The toolbar's buttons are marked, so they work.
+    /// - REDIRECT HOP: the hop redirecting was not plain HTTP (HTTPS pages are
+    ///   outside this boundary, as they are for everything else here), or it
+    ///   was the same private host redirecting to itself. A plain-HTTP public
+    ///   address redirecting into the network is refused even when the user
+    ///   typed that public address: they asked for it, not for the router.
+    ///
+    /// A hop that may not go ahead is REFUSED at its document request, whatever
+    /// the page on screen may reach (`TopLevelRole::Refused`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ///
+    /// `navigation_id` is None when the engine's id could not be read. The hop
+    /// is then of unknown provenance: it might be a redirect of a navigation
+    /// that was refused, and it reaches nothing private (final review 3,
+    /// R-003). It is still recorded, under `UNREADABLE_NAVIGATION_ID`, so the
+    /// correlation can find it.
+    pub fn on_top_level_navigation_starting(&mut self, navigation_id: Option<u64>, uri: &str) -> HopStart {
+        let Some(navigation_id) = navigation_id else {
+            // The hop cannot be tied to its navigation, so a later hop of the
+            // same navigation will look like a first hop, and this entry can be
+            // overwritten by the next unreadable one. Until a document the tab
+            // can name commits, nothing is vouched for: the page on screen is
+            // treated as an unnamed one, so first hops and ordinary requests to
+            // a private address are refused too (final review 4, R-002).
+            self.expected_navigation = None;
+            self.committed = Some(Standing::unknown());
+            let start = HopStart {
+                app: false,
+                reaches_private: !matches!(classify_uri(uri), UriClass::Network(host) if is_private_host(&host)),
+            };
+            self.toplevel
+                .on_navigation_starting(UNREADABLE_NAVIGATION_ID, uri, start.reaches_private);
+            return start;
+        };
+        let previous = self.toplevel.hop_url(navigation_id).map(str::to_string);
+        // A redirect hop leaves the expectation for the navigation it belongs
+        // to. A first hop takes it only when it MATCHES: an unrelated first hop
+        // arriving before the browser's own one must not use it up and leave
+        // the user's navigation looking like the page's (final review 4,
+        // R-005). An unused expectation goes when any document commits, so a
+        // page can ride it only by navigating to exactly the address the user
+        // just asked for, before anything else loads.
+        let expected = if previous.is_none() {
+            let wanted = crate::toplevel_request::normalized_identity(uri);
+            if self.expected_navigation.as_ref().is_some_and(|e| e.identity == wanted) {
+                self.expected_navigation.take().map(|e| e.start)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let start = match expected {
+            Some(start) => start,
+            None => HopStart {
+                app: false,
+                reaches_private: match classify_uri(uri) {
+                    UriClass::Network(host) if is_private_host(&host) => match previous {
+                        Some(previous) => {
+                            !is_insecure_page_url(&previous)
+                                || matches!(classify_uri(&previous), UriClass::Network(from) if from == host)
+                        }
+                        None => self.may_send_tab_to(uri),
+                    },
+                    // Not a private address, so there is nothing to permit.
+                    _ => true,
+                },
+            },
+        };
+        self.toplevel
+            .on_navigation_starting(navigation_id, uri, start.reaches_private);
+        start
+    }
+
+    /// Whether the document on screen may take the tab, or open a new one,
+    /// at `url`. Anything that is not a private address may. A private address
+    /// may be reached from an HTTPS document (outside this boundary), or from a
+    /// local page going to its own address. Before any document has committed
+    /// there is no page that could be asking, so nothing is vouched for.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn may_send_tab_to(&self, url: &str) -> bool {
+        let UriClass::Network(host) = classify_uri(url) else {
+            return true;
+        };
+        if !is_private_host(&host) {
+            return true;
+        }
+        match &self.committed {
+            Some(standing) => !standing.insecure || standing.own_host.as_deref() == Some(host.as_str()),
+            None => false,
+        }
+    }
+
+    /// Whether this tab's first navigation may be issued: the session wipe it
+    /// waits on (if any) has finished, AND the engine has answered the
+    /// WebSocket guard's registration. WebView2 documents that a script added
+    /// with AddScriptToExecuteOnDocumentCreated is ready only once its
+    /// completion handler has run, so a first page issued before that could
+    /// open a socket before the guard exists (final review 5, R-006). A
+    /// refused registration still releases the page (Failed is an answer, and
+    /// it is recorded and diagnosed); only "no answer yet" holds it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn initial_navigation_ready(&self) -> bool {
+        !self.waiting_for_wipe && self.local_network_guard != SettingState::NotAttempted
+    }
+
+    /// The engine accepted the guard's registration call but has not
+    /// answered it in time. Recorded as Failed, which releases the first
+    /// page: a tab must not stay blank forever on an answer that never comes
+    /// (final review 6, R-003). Returns whether this changed anything; a late
+    /// answer still records what the engine said.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn on_local_network_guard_overdue(&mut self) -> bool {
+        if self.local_network_guard != SettingState::NotAttempted {
+            return false;
+        }
+        self.local_network_guard = SettingState::Failed;
+        true
+    }
+
+    /// WebView2 `NewWindowRequested`, raised while the page that asked is
+    /// still the one on screen. wry takes the event's deferral and runs the
+    /// app's callback later, from the message loop, by which time a
+    /// navigation already in flight may have committed a more permissive page
+    /// (final review 6, R-002). So every request for a private address is
+    /// recorded HERE with the verdict of the page that asked, for
+    /// `take_new_window_verdict` to honour.
+    ///
+    /// Allowed requests are recorded as well as refused ones: a callback that
+    /// found no record of its own could otherwise spend another request's
+    /// refusal (final review 7, R-001). An address the engine would not give
+    /// cannot be paired with anything, so the tab stops vouching for private
+    /// addresses in new tabs.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn on_new_window_requested(&mut self, url: Option<&str>) {
+        if !self.new_window_tracking {
+            return;
+        }
+        let Some(url) = url else {
+            self.stop_new_window_tracking();
+            return;
+        };
+        let UriClass::Network(host) = classify_uri(url) else {
+            return;
+        };
+        if !is_private_host(&host) {
+            return; // a public address opens whatever the page
+        }
+        // WebView2 holds the asking script until the request is answered, so
+        // only a handful can be outstanding. More than this means wry's
+        // callback is not arriving.
+        if self.new_window_requests.len() >= MAX_NEW_WINDOW_REQUESTS {
+            self.stop_new_window_tracking();
+            return;
+        }
+        let allowed = self.may_send_tab_to(url);
+        self.new_window_requests.push((url.to_owned(), allowed));
+    }
+
+    fn stop_new_window_tracking(&mut self) {
+        self.new_window_requests.clear();
+        self.new_window_tracking = false;
+    }
+
+    /// wry's deferred callback asks whether the request it queued may open
+    /// a new tab at `url`. A public address may. A private one may only if
+    /// its request was recorded, NO outstanding request for that address was
+    /// refused when it was made (which of them is this one cannot be told
+    /// apart, so a refusal refuses them all), and the page on screen now
+    /// would allow it too. The oldest record for the address is spent.
+    ///
+    /// THIS RELIES ON ORDER: wry answers requests in the order the engine
+    /// raised them. It posts every callback to the same window with
+    /// PostMessageW (wry 0.55.1 webview2/mod.rs, `dispatch_handler`), and a
+    /// thread's posted messages are delivered first in, first out. Were two
+    /// requests for one address answered out of order, an allowed request's
+    /// callback could spend a refused one's record (final review 8, R-003).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn take_new_window_verdict(&mut self, url: &str) -> bool {
+        let UriClass::Network(host) = classify_uri(url) else {
+            return true;
+        };
+        if !is_private_host(&host) {
+            return true;
+        }
+        if !self.new_window_tracking {
+            return false;
+        }
+        let refused = self
+            .new_window_requests
+            .iter()
+            .any(|(asked, allowed)| asked == url && !allowed);
+        let Some(index) = self.new_window_requests.iter().position(|(asked, _)| asked == url) else {
+            return false; // no record of this request: nothing vouches for it
+        };
+        self.new_window_requests.remove(index);
+        !refused && self.may_send_tab_to(url)
+    }
+
+    /// The commit event could not be wired, so this tab will never learn
+    /// which document is on screen. Every document is then treated as a
+    /// plain-HTTP page with no address of its own: private subresources are
+    /// refused everywhere, and only the user's own navigations reach a local
+    /// address (plan review 2, H-3). Broken local pages, never a leak.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn on_commit_tracking_unavailable(&mut self) {
+        self.committed = Some(Standing::unknown());
+    }
+
+    /// WebView2 `ContentLoading` for the top frame: a new document replaced
+    /// the old one. Its standing is taken from the hop the navigation
+    /// actually landed on, and the old document's frames leave with it.
+    ///
+    /// `navigation_id` is None when the engine's id could not be read. Then
+    /// the new document cannot be named, so it gets `Standing::unknown` (it
+    /// reaches nothing private) and the frame set is kept (a stale entry
+    /// withholds an exemption; a forgotten live one could grant it).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn on_document_committed(&mut self, navigation_id: Option<u64>, error_page: bool) {
+        let url = navigation_id.and_then(|id| self.toplevel.hop_url(id));
+        self.committed = Some(match url {
+            Some(url) => Standing::of(url, error_page),
+            None => Standing::unknown(),
+        });
+        self.commit_seen = navigation_id;
+        // Whatever the browser announced and never started is over.
+        self.expected_navigation = None;
+        if let Some(id) = navigation_id {
+            self.toplevel.on_document_committed(id);
+        }
+    }
+
+    /// WebView2 `NavigationCompleted` for the top frame. The hop leaves the
+    /// correlation, and a navigation that SUCCEEDED without the commit event
+    /// this tab relies on (a page restored from the back-forward cache, say)
+    /// left a document on screen the tab cannot name: it gets
+    /// `Standing::unknown` rather than keeping the previous page's standing
+    /// (final review 3, R-005). The caller passes an unreadable verdict as a
+    /// success, so the reset errs closed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    ///
+    /// An unreadable id, or a completion event with no arguments at all
+    /// (passed as `None, true`), cannot be checked against `commit_seen`, so a
+    /// success resets the standing too (final review 4, R-003).
+    pub fn on_top_level_navigation_completed(&mut self, navigation_id: Option<u64>, success: bool) {
+        match navigation_id {
+            Some(id) => {
+                if success && self.commit_seen != Some(id) {
+                    self.committed = Some(Standing::unknown());
+                }
+                self.toplevel.on_navigation_completed(id);
+            }
+            None => {
+                if success {
+                    self.committed = Some(Standing::unknown());
+                }
+            }
+        }
+    }
+
     /// Decides one intercepted request and does the ledger accounting.
     /// This is the WHOLE decision — the engine handler contributes COM
     /// plumbing only, so every rule here is provable under `cargo test`
@@ -1204,6 +1655,12 @@ impl TabState {
     /// `tracker.example` and the user consented to one of them. The WebKitGTK
     /// side anchors its exception rule to the exact host for the same reason,
     /// so the two engines agree about what was consented to.
+    ///
+    /// `top_level` decides the local-network boundary for the tab's own
+    /// document and touches nothing else (see `TopLevelRole`). It must come
+    /// from the top-level correlation, never from the URL: an iframe's
+    /// document request carries a URL too. `decide_intercepted` is the one
+    /// place that computes it; everything else passes `NotTopLevel`.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn decide_request(
         &mut self,
@@ -1212,6 +1669,7 @@ impl TabState {
         rules: &RuleSet,
         now: Instant,
         override_host: Option<&str>,
+        top_level: TopLevelRole,
     ) -> RequestDecision {
         // Every call proves the engine pipeline delivered an event. The
         // freeze diagnostic prints this; it is NOT an enforcement gate
@@ -1228,17 +1686,43 @@ impl TabState {
         // host, an ad-rule exemption -- none of them should be able to hand a
         // plain-HTTP page a route to the router.
         //
-        // It applies to SUBRESOURCES only. A top-level navigation to a local
-        // address is the user typing their router's address, which must keep
-        // working; this handler never sees those on Windows (NavigationStarting
-        // owns them) and the class check keeps it true on both backends.
-        if self.page_insecure {
+        // The tab's own top-level document is decided by `top_level`, which
+        // the correlation computes, never the URL: a subframe or a fetch to
+        // the same address is still the page reaching out. The user typing
+        // their router's address must work. The Windows handler DOES see that
+        // document -- its filter is CONTEXT_ALL, and `page_insecure` is already
+        // set from the navigation URL when the request arrives -- so without
+        // the exemption every plain-HTTP local address was refused with the
+        // synthesized 403 (observed on hardware 2026-09-24:
+        // http://localhost:18765/ never reached the server). A navigation the
+        // PAGE starts (a link, `location=`, a form POST, a redirect,
+        // `history.back()`) is exempted only where the page may send the tab
+        // there; see `on_top_level_navigation_starting`, and
+        // `decide_intercepted` for what the correlation can and cannot prove.
+        //
+        // Judged against the COMMITTED document (`committed`), which may load
+        // from its own address: a router's settings page needs its own styles
+        // and scripts, and a local development server its own API port and
+        // live-reload socket. Exact host, so localhost and 127.0.0.1 are two
+        // addresses, and another device on the network is never "own".
+        let refuse = match &class {
+            Some(UriClass::Network(host)) if is_private_host(host) => match top_level {
+                TopLevelRole::Permitted => false,
+                TopLevelRole::Refused => true,
+                TopLevelRole::NotTopLevel => match &self.committed {
+                    Some(standing) => {
+                        standing.insecure && standing.own_host.as_deref() != Some(host.as_str())
+                    }
+                    None => self.page_insecure,
+                },
+            },
+            _ => false,
+        };
+        if refuse {
             if let Some(UriClass::Network(host)) = &class {
-                if is_private_host(host) {
-                    self.ledger.record(host, true);
-                    return RequestDecision::Block(BlockReason::LocalNetwork);
-                }
+                self.ledger.record(host, true);
             }
+            return RequestDecision::Block(BlockReason::LocalNetwork);
         }
         let decision = self.decide_inner(class, websocket, rules, now, override_host);
         // An AUTO-freeze transitions lazily inside should_block, so it never
@@ -1258,6 +1742,69 @@ impl TabState {
             self.freeze.note_enforcement_failed();
         }
         decision
+    }
+
+    /// The Windows request handler's whole question for one intercepted
+    /// request: which request is this, and then what happens to it. Returns
+    /// the decision and, when the correlation matched this request to an
+    /// in-flight top-level hop, that hop's complete navigation URL (fragment
+    /// included), which the held-page banner resumes.
+    ///
+    /// ORDER IS THE POINT, and it lives here rather than in COM glue so that
+    /// `cargo test` can see it. The correlation is consulted BEFORE the
+    /// decision because the local-network boundary needs its answer; asking
+    /// afterwards is what refused every typed local address on Windows.
+    ///
+    /// EVERY document request consumes its correlation slot, allowed or
+    /// refused. Consuming only on refusal left an allowed page's slot armed,
+    /// and a same-URL iframe requested later took it (review R-001, round 4).
+    /// A non-document request never consumes one: `is_document` is the
+    /// engine's ResourceContext, and a failed read is false, so an
+    /// unclassifiable request can neither take the page's slot nor be
+    /// exempted.
+    ///
+    /// WHAT THE CORRELATION PROVES IS NOT ENOUGH FOR THE EXEMPTION ON ITS OWN.
+    /// It matches on URL and arrival order, because the engine offers nothing
+    /// better (toplevel_request.rs lists what it will not expose). For the
+    /// banner that is sufficient: a frame that wins the race loses a banner
+    /// and cannot raise one. For the local-network boundary it is not: a frame
+    /// of the OLD page to the URL the tab is navigating to could win the race
+    /// and be the request that reaches the router. So the exemption is also
+    /// refused whenever a subframe navigation to the same URL is in flight,
+    /// and whenever the frame events cannot vouch for that (not wired, or a
+    /// frame whose target could not be read). Both requests are then blocked,
+    /// which costs a local page its load in a case no ordinary page produces
+    /// (an insecure page's frame to that local address is refused anyway), and
+    /// never hands a frame the page's pass.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn decide_intercepted(
+        &mut self,
+        uri: Option<&str>,
+        is_document: bool,
+        websocket: bool,
+        rules: &RuleSet,
+        now: Instant,
+        override_host: Option<&str>,
+    ) -> (RequestDecision, Option<String>) {
+        let top_level = match uri {
+            Some(uri) if is_document => self.toplevel.take_top_level_hop(uri),
+            _ => None,
+        };
+        // Three conditions, each its own way to be wrong: the correlation says
+        // this is the page; whoever sent the tab here was allowed to send it
+        // into the network (`on_top_level_navigation_starting`); and no frame
+        // may be racing the page to the same URL. A hop that was NOT allowed is
+        // refused outright, contended or not: that it may also be a frame's
+        // request only adds a second reason.
+        let role = match &top_level {
+            Some(hop) if !hop.reaches_private => TopLevelRole::Refused,
+            Some(_) if !uri.is_some_and(|uri| self.toplevel.frame_may_be_navigating_to(uri)) => {
+                TopLevelRole::Permitted
+            }
+            _ => TopLevelRole::NotTopLevel,
+        };
+        let decision = self.decide_request(uri, websocket, rules, now, override_host, role);
+        (decision, top_level.map(|hop| hop.url))
     }
 
     fn decide_inner(
@@ -2100,6 +2647,16 @@ const DIVERGENCE_TOKEN_PLACEHOLDER: &str = "__DIVERGENCE_TOKEN__";
 /// like GPC_SCRIPT (WebView2 document-created script on Windows, WebKitGTK
 /// UserScript at Start on Linux), never via evaluate_script.
 pub const DIVERGENCE_TEMPLATE: &str = include_str!("../content_scripts/fingerprint_divergence.js");
+
+/// The local-network boundary's WebSocket half, a page-world script, because
+/// WebView2 never shows the request handler a WebSocket handshake (hardware,
+/// 2026-09-24). Windows content webviews only, every frame; see the script's
+/// own header for the rule, what it cannot cover, and why it captures its
+/// tools before any page script runs. Gated by
+/// scripts/local-network-guard-gate.js, which also pins that it never reaches
+/// the chrome webview (Private Chat's UI) or Linux.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub const LOCAL_NETWORK_GUARD_SCRIPT: &str = include_str!("../content_scripts/local_network_guard.js");
 
 /// (normal, ephemeral). `None` inside the OnceLock records that OS
 /// randomness failed at first use; every later call then skips divergence
@@ -3753,7 +4310,7 @@ mod request_decision_tests {
         classify_uri, host_of,
         host_url_filter, BlockReason, FreezeEnforcement, FreezePhase,
         InterceptionFailure, InterceptionState, RequestDecision, RuleSet, SettingState, TabPolicy,
-        TabState, TrackingPreventionState, UriClass, FREEZE_GRACE,
+        TabState, TopLevelRole, TrackingPreventionState, UriClass, FREEZE_GRACE,
     };
     use std::time::Instant;
 
@@ -3860,7 +4417,7 @@ mod request_decision_tests {
             Some("http://doubleclick.net:8090/pixel.png"),
             false,
             &rules(),
-            Instant::now(), None);
+            Instant::now(), None, TopLevelRole::NotTopLevel);
         assert!(
             matches!(decision, RequestDecision::Block(BlockReason::AdRule)),
             "a ported URL to a blocked host must still be blocked, got {decision:?}"
@@ -3871,7 +4428,7 @@ mod request_decision_tests {
     fn a_frozen_tab_blocks_and_ledgers_an_ordinary_request() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None);
+        let d = st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         let rows = st.ledger.snapshot();
         assert_eq!(rows.len(), 1);
@@ -3886,14 +4443,14 @@ mod request_decision_tests {
     fn an_unreadable_uri_fails_closed_only_while_frozen() {
         let mut live = registered_tab(TabPolicy::default());
         assert_eq!(
-            live.decide_request(None, false, &rules(), Instant::now(), None),
+            live.decide_request(None, false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
 
         let mut frozen = registered_tab(TabPolicy::default());
         frozen.freeze.freeze();
         assert_eq!(
-            frozen.decide_request(None, false, &rules(), Instant::now(), None),
+            frozen.decide_request(None, false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::FrozenOpaque)
         );
         // Not ledgered: there is no host to key a user-facing row on.
@@ -3909,7 +4466,7 @@ mod request_decision_tests {
                 Some("https:///no-authority"),
                 false,
                 &rules(),
-                Instant::now(), None),
+                Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::FrozenOpaque)
         );
 
@@ -3919,7 +4476,7 @@ mod request_decision_tests {
                 Some("https:///no-authority"),
                 false,
                 &rules(),
-                Instant::now(), None),
+                Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
     }
@@ -3953,6 +4510,7 @@ mod request_decision_tests {
                 &rules(),
                 now,
                 Some("tracker.example"),
+                TopLevelRole::NotTopLevel,
             ),
             RequestDecision::Allow,
             "the override did not let its own host through"
@@ -3978,6 +4536,7 @@ mod request_decision_tests {
                 &rules(),
                 now,
                 Some("tracker.example"),
+                TopLevelRole::NotTopLevel,
             ),
             RequestDecision::Block(BlockReason::AdRule),
             "allowing one host also allowed another listed host"
@@ -3992,6 +4551,7 @@ mod request_decision_tests {
                 &rules(),
                 now,
                 Some("tracker.example"),
+                TopLevelRole::NotTopLevel,
             ),
             RequestDecision::Block(BlockReason::AdRule),
             "the override covered a subdomain; it must be the exact host, or \
@@ -4008,6 +4568,7 @@ mod request_decision_tests {
                 &rules(),
                 now,
                 Some("tracker.example"),
+                TopLevelRole::NotTopLevel,
             ),
             RequestDecision::Block(BlockReason::Freeze),
             "an ad-list override lifted a FREEZE; they are different promises"
@@ -4017,7 +4578,7 @@ mod request_decision_tests {
         let mut st = registered_tab(blocking_policy());
         let reserved = format!("https://{}/x", super::super::CHROME_RESERVED_HOST);
         assert_eq!(
-            st.decide_request(Some(&reserved), false, &rules(), now, Some(super::super::CHROME_RESERVED_HOST)),
+            st.decide_request(Some(&reserved), false, &rules(), now, Some(super::super::CHROME_RESERVED_HOST), TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::ReservedOrigin),
             "an override reached the browser's own UI origin"
         );
@@ -4030,12 +4591,12 @@ mod request_decision_tests {
         let now = Instant::now();
         let mut st = registered_tab(blocking_policy());
         assert_eq!(
-            st.decide_request(Some("https://tracker.example/p"), false, &rules(), now, None),
+            st.decide_request(Some("https://tracker.example/p"), false, &rules(), now, None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::AdRule)
         );
         let mut st = registered_tab(blocking_policy());
         assert_eq!(
-            st.decide_request(Some("https://unlisted.example/p"), false, &rules(), now, None),
+            st.decide_request(Some("https://unlisted.example/p"), false, &rules(), now, None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
     }
@@ -4054,7 +4615,7 @@ mod request_decision_tests {
             "file:///etc/hostname",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
                 RequestDecision::Allow,
                 "{uri} carries no network traffic and must stay allowed"
             );
@@ -4071,7 +4632,7 @@ mod request_decision_tests {
     fn a_manual_freeze_blocks_new_websocket_upgrades() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None);
+        let d = st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         let rows = st.ledger.snapshot();
         assert_eq!(
@@ -4089,7 +4650,7 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.freeze.set_auto(true);
         st.on_load_finished(t0);
-        let d = st.decide_request(Some("wss://live.example/s"), true, &rules(), t0, None);
+        let d = st.decide_request(Some("wss://live.example/s"), true, &rules(), t0, None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Allow);
         let rows = st.ledger.snapshot();
         assert_eq!(
@@ -4106,7 +4667,7 @@ mod request_decision_tests {
         st.freeze.add_override("live.example");
         st.freeze.freeze();
         assert_eq!(
-            st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None),
+            st.decide_request(Some("ws://live.example/s"), true, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
     }
@@ -4118,7 +4679,7 @@ mod request_decision_tests {
     fn an_unreadable_context_does_not_inherit_the_socket_path() {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
-        let d = st.decide_request(Some("ws://live.example/s"), false, &rules(), Instant::now(), None);
+        let d = st.decide_request(Some("ws://live.example/s"), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
         // ...and no live-channel inhibition was recorded from it.
         st.freeze.unfreeze(Instant::now());
@@ -4144,7 +4705,7 @@ mod request_decision_tests {
                 Some("https://ads.doubleclick.net/x"),
                 false,
                 &rules(),
-                Instant::now(), None),
+                Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
 
@@ -4154,7 +4715,7 @@ mod request_decision_tests {
                 Some("https://ads.doubleclick.net/x"),
                 false,
                 &rules(),
-                Instant::now(), None),
+                Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::AdRule)
         );
 
@@ -4173,11 +4734,11 @@ mod request_decision_tests {
                 Some("https://app.example.com/x"),
                 false,
                 &rules(),
-                Instant::now(), None),
+                Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
         assert_eq!(
-            st.decide_request(Some("https://other.com/x"), false, &rules(), Instant::now(), None),
+            st.decide_request(Some("https://other.com/x"), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::Freeze)
         );
     }
@@ -4194,11 +4755,11 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.on_load_finished(t0);
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), t0, None),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), t0, None, TopLevelRole::NotTopLevel),
             RequestDecision::Allow
         );
         assert_eq!(
-            st.decide_request(Some("https://x.com/b"), false, &rules(), t0 + FREEZE_GRACE, None),
+            st.decide_request(Some("https://x.com/b"), false, &rules(), t0 + FREEZE_GRACE, None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::Freeze)
         );
         assert_eq!(st.freeze.phase(), FreezePhase::Frozen);
@@ -4275,7 +4836,7 @@ mod request_decision_tests {
     fn a_registered_tab_stays_pending_until_a_block_is_confirmed() {
         let mut st = registered_tab(TabPolicy::default());
         // Events having fired proves nothing about the block path.
-        st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None);
+        st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel);
         assert!(st.handler_events > 0);
 
         st.freeze.freeze_with_interception(st.interception);
@@ -4360,7 +4921,7 @@ mod request_decision_tests {
             let t0 = Instant::now();
             st.on_load_finished(t0);
             // Past the grace period: this request performs the auto-freeze.
-            let d = st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None);
+            let d = st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None, TopLevelRole::NotTopLevel);
             assert_eq!(d, RequestDecision::Block(BlockReason::Freeze), "{state:?}");
             assert_eq!(st.freeze.phase(), FreezePhase::Frozen);
             assert_eq!(
@@ -4382,7 +4943,7 @@ mod request_decision_tests {
         let t0 = Instant::now();
         st.on_load_finished(t0);
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), t0 + FREEZE_GRACE, None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::Freeze)
         );
         assert_eq!(st.freeze.enforcement(), FreezeEnforcement::Pending);
@@ -4398,7 +4959,7 @@ mod request_decision_tests {
         let mut st = registered_tab(TabPolicy::default());
         st.freeze.freeze();
         assert_eq!(
-            st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None),
+            st.decide_request(Some("https://x.com/a"), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
             RequestDecision::Block(BlockReason::Freeze)
         );
         let before = st.ledger.snapshot();
@@ -4424,7 +4985,7 @@ mod request_decision_tests {
         for uri in ["", "   ", "HTTPS://Tracker.example/x", "HtTp://x.test/y"] {
             assert!(
                 matches!(
-                    st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
+                    st.decide_request(Some(uri), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
                     RequestDecision::Block(_)
                 ),
                 "{uri:?} escaped a freeze"
@@ -4434,7 +4995,7 @@ mod request_decision_tests {
         // case, because they put no bytes on the wire.
         for uri in ["DATA:text/plain,x", "About:Blank"] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
                 RequestDecision::Allow,
                 "{uri:?} carries no traffic and must stay allowed"
             );
@@ -4459,7 +5020,7 @@ mod request_decision_tests {
             "http://rbchrome.localhost:80/",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
                 RequestDecision::Block(BlockReason::ReservedOrigin),
                 "{uri:?} reached the browser's own UI origin from content"
             );
@@ -4474,7 +5035,7 @@ mod request_decision_tests {
             "https://example.com/rbchrome.localhost",
         ] {
             assert_eq!(
-                st.decide_request(Some(uri), false, &rules(), Instant::now(), None),
+                st.decide_request(Some(uri), false, &rules(), Instant::now(), None, TopLevelRole::NotTopLevel),
                 RequestDecision::Allow,
                 "{uri:?} is an ordinary address and must not be blocked"
             );
@@ -4555,7 +5116,7 @@ mod local_network_tests {
         ] {
             let mut st = insecure_tab();
             let uri = format!("http://{host}/status");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None, TopLevelRole::NotTopLevel);
             assert_eq!(
                 d,
                 RequestDecision::Block(BlockReason::LocalNetwork),
@@ -4572,7 +5133,7 @@ mod local_network_tests {
         for host in ["127.0.0.1", "192.168.1.1", "169.254.169.254"] {
             let mut st = secure_tab();
             let uri = format!("http://{host}/status");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None, TopLevelRole::NotTopLevel);
             assert_eq!(
                 d,
                 RequestDecision::Allow,
@@ -4600,7 +5161,7 @@ mod local_network_tests {
         ] {
             let mut st = insecure_tab();
             let uri = format!("http://{host}/page");
-            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None);
+            let d = st.decide_request(Some(&uri), false, &RuleSet::default(), Instant::now(), None, TopLevelRole::NotTopLevel);
             assert_eq!(d, RequestDecision::Allow, "{host} is public");
         }
     }
@@ -4615,7 +5176,7 @@ mod local_network_tests {
             Some("http://192.168.1.1/"),
             false,
             &RuleSet::default(),
-            Instant::now(), None);
+            Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Allow);
     }
 
@@ -4640,8 +5201,48 @@ mod local_network_tests {
             Some("ws://192.168.1.1:8080/"),
             true,
             &RuleSet::default(),
-            Instant::now(), None);
+            Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork));
+    }
+
+    /// The vectors file shared with the page-world guard's gate.
+    #[test]
+    fn the_shared_host_vectors_classify_as_written() {
+        // The same file the page-world guard's gate reads, so the Rust
+        // classifier and the JavaScript one cannot come to disagree about
+        // what counts as the user's own network.
+        let vectors: serde_json::Value = serde_json::from_str(include_str!(
+            "../content_scripts/private_host_vectors.json"
+        ))
+        .expect("vectors parse");
+        for (key, expected) in [("private", true), ("public", false)] {
+            let hosts = vectors[key].as_array().expect("array");
+            assert!(!hosts.is_empty());
+            for host in hosts {
+                let host = host.as_str().expect("string");
+                assert_eq!(is_private_host(host), expected, "{host:?} should be {key}");
+            }
+        }
+    }
+
+    /// The form a real request carries. The engine's URL parser rewrites a
+    /// mapped address to hex (`[::ffff:192.168.1.1]` -> `[::ffff:c0a8:101]`),
+    /// and the boundary must refuse THAT, not only the spelling a test author
+    /// would type.
+    #[test]
+    fn a_hex_mapped_private_address_is_refused_as_the_engine_sends_it() {
+        let mut st = insecure_tab();
+        for uri in ["http://[::ffff:c0a8:101]/admin", "ws://[::ffff:7f00:1]:8080/"] {
+            let d = st.decide_request(
+                Some(uri),
+                uri.starts_with("ws"),
+                &RuleSet::default(),
+                Instant::now(),
+                None,
+                TopLevelRole::NotTopLevel,
+            );
+            assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork), "{uri}");
+        }
     }
 
     /// THE DOCUMENTED LIMIT. A hostname that resolves to a private address is
@@ -4654,11 +5255,1115 @@ mod local_network_tests {
             Some("http://rebind.attacker.example/"),
             false,
             &RuleSet::default(),
-            Instant::now(), None);
+            Instant::now(), None, TopLevelRole::NotTopLevel);
         assert_eq!(
             d,
             RequestDecision::Allow,
             "documented limit: DNS rebinding needs a post-resolution hook this browser has not got"
         );
+    }
+
+    // --- the tab's own top-level document, through the Windows entry point ---
+    //
+    // These drive `decide_intercepted`, the one call the WebView2 request
+    // handler makes, in the order the WebView2 events arrive: NavigationStarting
+    // (which sets `page_insecure` and records the hop) before the document's
+    // WebResourceRequested.
+
+    /// A tab as the Windows backend leaves it once its frame events and its
+    /// new-window handler registered.
+    fn tab() -> TabState {
+        let mut st = TabState::new(&TabPolicy::default());
+        st.toplevel.on_frame_tracking_registered();
+        st.new_window_tracking = true;
+        st
+    }
+
+    /// The USER starts a navigation (address bar, bookmark, a new tab): the
+    /// browser marks it, then NavigationStarting runs.
+    fn navigate(st: &mut TabState, id: u64, url: &str) {
+        st.note_app_navigation(url);
+        hop(st, id, url);
+    }
+
+    /// A navigation the PAGE starts: a link, `location=`, a form,
+    /// `history.back()`, or the engine's own reload and back/forward. No mark.
+    fn page_navigates(st: &mut TabState, id: u64, url: &str) {
+        hop(st, id, url);
+    }
+
+    /// windows.rs NavigationStarting for the top frame, first hop or redirect
+    /// hop, in its order.
+    fn hop(st: &mut TabState, id: u64, url: &str) -> HopStart {
+        st.on_load_started(Some(url));
+        st.on_top_level_navigation_starting(Some(id), url)
+    }
+
+    /// windows.rs ContentLoading for navigation `id`: that document is now the
+    /// one on screen.
+    fn commit(st: &mut TabState, id: u64) {
+        st.on_document_committed(Some(id), false);
+    }
+
+    /// A navigation that loaded: its document commits and it completes.
+    fn loaded(st: &mut TabState, id: u64) {
+        commit(st, id);
+        st.on_top_level_navigation_completed(Some(id), true);
+    }
+
+    /// What follows a refused top-level document on WebView2: the engine's
+    /// error page commits, and the navigation completes unsuccessfully (a 4xx
+    /// is not a success).
+    fn refused_navigation_ends(st: &mut TabState, id: u64) {
+        st.on_document_committed(Some(id), true);
+        st.on_top_level_navigation_completed(Some(id), false);
+    }
+
+    /// A DOCUMENT-context request, top level or frame: the engine cannot say
+    /// which, and that is the whole difficulty.
+    fn document(st: &mut TabState, url: &str) -> (RequestDecision, Option<String>) {
+        st.decide_intercepted(Some(url), true, false, &RuleSet::default(), Instant::now(), None)
+    }
+
+    /// Anything that is not a document: a subresource, a fetch, a worker's.
+    fn subresource(st: &mut TabState, url: &str) -> RequestDecision {
+        st.decide_intercepted(Some(url), false, false, &RuleSet::default(), Instant::now(), None)
+            .0
+    }
+
+    /// THE REPORTED DEFECT (hardware, 2026-09-24). Typing a plain-HTTP local
+    /// address showed the engine's 403 page, the server saw no request, and
+    /// Tab Activity read "localhost 0 allowed, 1 blocked": the tab's own
+    /// document was refused as if the page had reached for the network.
+    #[test]
+    fn the_tabs_own_document_at_a_local_address_is_allowed() {
+        for (url, host) in [
+            ("http://localhost:18765/index.html", "localhost"),
+            ("http://192.168.1.1/", "192.168.1.1"),
+            ("http://10.0.0.5:9000/admin", "10.0.0.5"),
+            ("http://router.localhost/", "router.localhost"),
+            ("http://[::1]:8080/", "::1"),
+        ] {
+            let mut st = tab();
+            navigate(&mut st, 1, url);
+            assert!(st.page_insecure, "{url} is a plain-HTTP page");
+            let (d, top) = document(&mut st, url);
+            assert_eq!(d, RequestDecision::Allow, "typing {url} must open it");
+            assert_eq!(top.as_deref(), Some(url), "{url} was not taken for the page");
+            let row = st
+                .ledger
+                .snapshot()
+                .into_iter()
+                .find(|r| r.host == host)
+                .unwrap_or_else(|| panic!("{host} was not ledgered"));
+            assert_eq!((row.allowed, row.blocked), (1, 0), "{url}");
+        }
+    }
+
+    /// A router answers its root with a redirect to its login page. Each hop
+    /// re-fires NavigationStarting with the same id, and each is the page.
+    #[test]
+    fn a_local_pages_own_redirect_hop_is_still_the_page() {
+        let mut st = tab();
+        navigate(&mut st, 7, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        hop(&mut st, 7, "http://192.168.1.1/login.html");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/login.html").0,
+            RequestDecision::Allow,
+            "the hop the user lands on was refused"
+        );
+    }
+
+    /// The boundary's whole purpose, unchanged: an iframe is a DOCUMENT
+    /// request too, and with no top-level hop to match it is still the page
+    /// reaching for the network.
+    #[test]
+    fn a_subframe_to_a_local_address_is_still_blocked() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        let (d, top) = document(&mut st, "http://192.168.1.1/admin");
+        assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork));
+        assert_eq!(top, None);
+    }
+
+    /// One navigation, one exemption. A page that embeds its own URL: the
+    /// first document request is the page, the second is a frame.
+    #[test]
+    fn a_same_url_frame_after_the_page_is_still_blocked() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "one navigation exempted two document requests"
+        );
+    }
+
+    /// Plan review, round 1. The correlation matches on URL and arrival
+    /// order, so a frame of the OLD page to the URL the tab is navigating to
+    /// can arrive first and take the slot. For the banner that only loses a
+    /// banner; here it would hand the frame the page's pass to the router.
+    /// While a frame navigation to that URL is in flight, neither request is
+    /// exempted. The two requests are indistinguishable to the handler, which
+    /// is exactly why arrival order cannot be allowed to decide.
+    #[test]
+    fn a_frame_racing_the_page_to_the_same_local_url_is_not_exempted() {
+        const X: &str = "http://192.168.1.1/apply.cgi?reboot=1";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        st.toplevel.on_navigation_completed(1);
+        // The old page embeds X, and the top level starts navigating to X.
+        st.toplevel.on_frame_navigation_starting(9, X);
+        navigate(&mut st, 2, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the first document request for X was exempted while a frame to X was in flight"
+        );
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the second document request for X was exempted"
+        );
+    }
+
+    /// The contention refusal must not outlive the frame: once it finishes,
+    /// the user's next navigation to that address opens.
+    #[test]
+    fn a_finished_frame_no_longer_withholds_the_exemption() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        st.toplevel.on_frame_navigation_starting(9, X);
+        navigate(&mut st, 1, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+        st.toplevel.on_frame_navigation_completed(9);
+        st.toplevel.on_navigation_completed(1);
+        navigate(&mut st, 2, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Allow, "the retry was refused");
+    }
+
+    /// A superseded navigation must not clear the frame set: a page could
+    /// start a navigation to X, embed X, and replace the first navigation
+    /// with a second one to X, so that its frame's request meets a fresh slot.
+    #[test]
+    fn a_failed_top_level_navigation_does_not_forget_the_frame() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, X);
+        st.toplevel.on_frame_navigation_starting(9, X);
+        navigate(&mut st, 2, X);
+        // The first navigation is cancelled by the second: completed, NOT
+        // committed, so `on_document_committed` is not called.
+        st.toplevel.on_navigation_completed(1);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the frame's request met the second navigation's slot and was exempted"
+        );
+    }
+
+    /// Final review R-002, the reviewer's sequence. The NEW page's frame starts
+    /// toward X before that page's own navigation completes; the completion
+    /// must not forget it, or a top-level navigation to X that starts next
+    /// meets a frame nobody is watching.
+    #[test]
+    fn a_new_pages_frame_survives_that_pages_completion() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1); // ContentLoading: old frames go
+        st.toplevel.on_frame_navigation_starting(9, X); // the new page's frame
+        st.toplevel.on_navigation_completed(1);
+        navigate(&mut st, 2, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the new page's frame was forgotten and its request would take the exemption"
+        );
+    }
+
+    /// Final review R-001. Frame events not wired means no evidence about
+    /// frames, and no evidence means no exemption: the typed local page is
+    /// refused, which is the defect this change fixes, deliberately kept as the
+    /// failure mode of a registration that did not happen.
+    #[test]
+    fn without_frame_tracking_no_document_is_exempted() {
+        const X: &str = "http://localhost:18765/index.html";
+        let mut st = TabState::new(&TabPolicy::default());
+        navigate(&mut st, 1, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+    }
+
+    /// Final review R-001. A frame navigation whose target could not be read
+    /// may be heading for the page's URL, so the exemption waits for the next
+    /// page, and comes back with it.
+    #[test]
+    fn an_unreadable_frame_withholds_the_exemption_until_the_next_page() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        st.toplevel.on_frame_navigation_unreadable();
+        navigate(&mut st, 1, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+        st.on_document_committed(Some(1), true); // the engine's error page loads
+        st.toplevel.on_navigation_completed(1);
+        navigate(&mut st, 2, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Allow, "the retry was refused");
+    }
+
+    /// Only a DOCUMENT request may take the page's slot or its exemption. A
+    /// fetch to the exact URL being navigated to is still the page reaching
+    /// out, and it must not cost the real document its slot either.
+    #[test]
+    fn a_non_document_request_can_neither_use_nor_take_the_pages_slot() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, X);
+        assert_eq!(subresource(&mut st, X), RequestDecision::Block(BlockReason::LocalNetwork));
+        assert_eq!(document(&mut st, X).0, RequestDecision::Allow, "the fetch consumed the slot");
+    }
+
+    /// The exemption is for the document and does not carry to what that
+    /// document then asks for from elsewhere on the network.
+    #[test]
+    fn the_exempted_pages_requests_elsewhere_on_the_network_stay_blocked() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        assert_eq!(
+            subresource(&mut st, "http://127.0.0.1:9000/probe"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+        let (ws, _) = st.decide_intercepted(
+            Some("ws://127.0.0.1:9000/"),
+            false,
+            true,
+            &RuleSet::default(),
+            Instant::now(),
+            None,
+        );
+        assert_eq!(ws, RequestDecision::Block(BlockReason::LocalNetwork));
+    }
+
+    /// A finished navigation explains nothing, so it exempts nothing.
+    #[test]
+    fn a_completed_navigation_no_longer_exempts() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, X);
+        st.toplevel.on_navigation_completed(1);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+    }
+
+    /// The exemption lifts the local-network rule and NOTHING ELSE. The
+    /// reserved chrome origin is itself a `.localhost` name, so it is the case
+    /// most likely to slip through; a manual freeze survives navigation; and
+    /// an ad-listed page still gets the held-page path, with the slot consumed
+    /// and the complete URL, fragment included, handed back for the banner.
+    #[test]
+    fn the_exemption_lifts_the_local_network_rule_and_nothing_else() {
+        let reserved = format!("http://{}/", super::super::CHROME_RESERVED_HOST);
+        let mut st = tab();
+        navigate(&mut st, 1, &reserved);
+        assert_eq!(document(&mut st, &reserved).0, RequestDecision::Block(BlockReason::ReservedOrigin));
+
+        let mut st = tab();
+        st.freeze.freeze();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        let (d, top) = document(&mut st, "http://192.168.1.1/");
+        assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
+        assert!(top.is_some(), "a refused page must still consume its slot");
+
+        let mut st = TabState::new(&TabPolicy {
+            block_ads: true,
+            ..TabPolicy::default()
+        });
+        st.toplevel.on_frame_tracking_registered();
+        navigate(&mut st, 1, "http://ads.localhost/page#section");
+        let (d, top) = st.decide_intercepted(
+            Some("http://ads.localhost/page"),
+            true,
+            false,
+            &RuleSet::from_lines("ads.localhost\n"),
+            Instant::now(),
+            None,
+        );
+        assert_eq!(d, RequestDecision::Block(BlockReason::AdRule));
+        assert_eq!(top.as_deref(), Some("http://ads.localhost/page#section"));
+    }
+
+    // --- a local page and its own address ---
+
+    /// A plain-HTTP page opened at a local address loads from that address:
+    /// its styles, scripts, API on another port, live-reload socket. Any other
+    /// private address stays refused, and "own" is the exact host, so
+    /// localhost and 127.0.0.1 are two addresses.
+    #[test]
+    fn a_local_page_loads_from_its_own_address_and_nowhere_else_local() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        for own in [
+            "http://192.168.1.1/style.css",
+            "http://192.168.1.1:8080/api",
+            "https://192.168.1.1/secure-part",
+        ] {
+            assert_eq!(subresource(&mut st, own), RequestDecision::Allow, "{own} is its own address");
+        }
+        let (ws, _) = st.decide_intercepted(
+            Some("ws://192.168.1.1/live"),
+            false,
+            true,
+            &RuleSet::default(),
+            Instant::now(),
+            None,
+        );
+        assert_eq!(ws, RequestDecision::Allow, "its own socket");
+        for other in ["http://192.168.1.2/", "http://127.0.0.1/", "http://169.254.169.254/latest"] {
+            assert_eq!(
+                subresource(&mut st, other),
+                RequestDecision::Block(BlockReason::LocalNetwork),
+                "{other} is not its own address"
+            );
+        }
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://localhost:3000/");
+        assert_eq!(document(&mut st, "http://localhost:3000/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        assert_eq!(subresource(&mut st, "http://localhost:5173/@vite/client"), RequestDecision::Allow);
+        assert_eq!(
+            subresource(&mut st, "http://127.0.0.1:3000/"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "a different name for the same machine is a different address"
+        );
+    }
+
+    /// THE REASON THE STANDING WAITS FOR THE COMMIT. A public plain-HTTP page
+    /// is still on screen, and still running, while the user's navigation to
+    /// the router is in flight. Keyed to the navigation target, the page's
+    /// requests to the router would pass as "the page's own address".
+    #[test]
+    fn the_own_address_is_the_loaded_pages_not_the_navigations() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        // The user types the router's address; news.example is still loaded.
+        navigate(&mut st, 2, "http://192.168.1.1/");
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/apply.cgi?reboot=1"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the old page's poll reached the router during the navigation"
+        );
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        commit(&mut st, 2);
+        assert_eq!(subresource(&mut st, "http://192.168.1.1/style.css"), RequestDecision::Allow);
+    }
+
+    /// The same window, in the direction that existed before own addresses:
+    /// navigating a plain-HTTP page's tab to an HTTPS page must not lift the
+    /// boundary while the plain-HTTP page is still the one running.
+    #[test]
+    fn the_boundary_holds_until_the_next_page_has_loaded() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        navigate(&mut st, 2, "https://secure.example/");
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the plain-HTTP page reached the network while the tab was leaving it"
+        );
+        assert_eq!(document(&mut st, "https://secure.example/").0, RequestDecision::Allow);
+        commit(&mut st, 2);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/"),
+            RequestDecision::Allow,
+            "HTTPS pages are outside this boundary"
+        );
+    }
+
+    /// An engine error page names the address that failed, often the one that
+    /// was just refused. It gets no own address.
+    #[test]
+    fn an_error_page_has_no_own_address() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        st.on_document_committed(Some(1), true);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/x"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+    }
+
+    /// A commit the tab cannot attribute (unreadable id, or an id it never saw
+    /// start) is a page it cannot name, and it reaches nothing private, even
+    /// when the page before it was a local page with an address of its own.
+    #[test]
+    fn an_unattributed_commit_reaches_nothing_private() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        st.on_document_committed(None, false);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/x"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+        st.on_document_committed(Some(99), false);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/x"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+    }
+
+    // --- a plain-HTTP page may not send the tab there ---
+
+    /// Router CSRF by navigation: a link, `location=`, a form POST. The tab's
+    /// own document is exempt only when whoever sent it may send it into the
+    /// network, and a plain-HTTP public page may not.
+    #[test]
+    fn a_plain_http_page_cannot_send_the_tab_to_a_local_address() {
+        const X: &str = "http://192.168.1.1/apply.cgi?reboot=1";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        page_navigates(&mut st, 2, X);
+        let (d, top) = document(&mut st, X);
+        assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork));
+        assert!(top.is_some(), "it was the page's document, refused, not a frame");
+    }
+
+    /// Who may: an HTTPS page (outside this boundary), and a local page moving
+    /// around its own address. A local page may not send the tab to ANOTHER
+    /// device.
+    #[test]
+    fn https_pages_and_a_local_pages_own_address_may_send_the_tab() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        page_navigates(&mut st, 2, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        page_navigates(&mut st, 2, "http://192.168.1.1/wifi.html");
+        assert_eq!(document(&mut st, "http://192.168.1.1/wifi.html").0, RequestDecision::Allow);
+        commit(&mut st, 2);
+        page_navigates(&mut st, 3, "http://192.168.1.2/");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.2/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+    }
+
+    /// A redirect is the redirecting server's choice, not the user's. A
+    /// plain-HTTP public address redirecting into the network is refused even
+    /// when the user typed the public address; HTTPS redirecting in is outside
+    /// this boundary; a device redirecting to itself is its own business.
+    #[test]
+    fn a_redirect_into_the_network_is_judged_by_who_redirected() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://short.example/x");
+        assert_eq!(document(&mut st, "http://short.example/x").0, RequestDecision::Allow);
+        hop(&mut st, 1, "http://192.168.1.1/apply.cgi");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/apply.cgi").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "a plain-HTTP server sent the tab into the network"
+        );
+
+        let mut st = tab();
+        navigate(&mut st, 1, "https://login.example/");
+        assert_eq!(document(&mut st, "https://login.example/").0, RequestDecision::Allow);
+        hop(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+    }
+
+    /// Plan review 2, H-1. `history.back()` is the page's choice, and the
+    /// engine reports it exactly like the mouse's back button, so neither is
+    /// treated as the user's. The toolbar's back, forward and reload are the
+    /// browser's own navigations and are marked, so they still work.
+    #[test]
+    fn history_navigation_counts_as_the_users_only_from_the_toolbar() {
+        const L: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, L);
+        assert_eq!(document(&mut st, L).0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        navigate(&mut st, 2, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        loaded(&mut st, 2);
+        page_navigates(&mut st, 3, L); // history.back(), or the engine's own back
+        assert_eq!(
+            document(&mut st, L).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "a plain-HTTP page sent the tab back into the network"
+        );
+        refused_navigation_ends(&mut st, 3);
+        navigate(&mut st, 4, L); // the toolbar's back button
+        assert_eq!(document(&mut st, L).0, RequestDecision::Allow);
+    }
+
+    /// The browser's mark is one-shot and short-lived. A navigation it marked
+    /// that never happened leaves nothing for a page to ride once any other
+    /// document has loaded; a redirect hop of another navigation does not use
+    /// it up.
+    #[test]
+    fn the_browsers_mark_cannot_be_ridden_by_a_page() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        st.note_app_navigation(X);
+        page_navigates(&mut st, 2, "http://news.example/next");
+        assert_eq!(document(&mut st, "http://news.example/next").0, RequestDecision::Allow);
+        commit(&mut st, 2); // a document loaded; the user's navigation never started
+        page_navigates(&mut st, 3, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "a stale mark let the page's navigation pass as the user's"
+        );
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        st.note_app_navigation(X);
+        hop(&mut st, 1, "http://news.example/landing");
+        page_navigates(&mut st, 2, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Allow,
+            "a redirect hop of another navigation used up the user's mark"
+        );
+        // The mark was used. The navigation fails without loading anything,
+        // and a page's navigation to the same address is the page's.
+        st.on_top_level_navigation_completed(Some(2), false);
+        page_navigates(&mut st, 3, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "a used mark vouched for a second navigation"
+        );
+    }
+
+    /// Plan review 2, H-2. A refused hop is refused at its document request
+    /// whatever the page on screen may reach. With an HTTPS page on screen, a
+    /// plain-HTTP redirector's hop into the network must not pass because
+    /// HTTPS pages are outside the boundary: the HTTPS page did not send it.
+    /// Nor may a hop to an HTTPS private address pass because the fallback
+    /// flag is keyed on the target's scheme.
+    #[test]
+    fn a_refused_hop_is_refused_whatever_the_page_on_screen_may_reach() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        navigate(&mut st, 2, "http://short.example/x");
+        assert_eq!(document(&mut st, "http://short.example/x").0, RequestDecision::Allow);
+        hop(&mut st, 2, "http://192.168.1.1/apply.cgi");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/apply.cgi").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the HTTPS page on screen let a plain-HTTP redirector into the network"
+        );
+
+        let mut st = tab();
+        page_navigates(&mut st, 1, "https://192.168.1.1/");
+        assert_eq!(
+            document(&mut st, "https://192.168.1.1/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "nothing vouched for this hop, and the target's scheme must not"
+        );
+    }
+
+    /// Plan review 2, H-3. A tab that cannot learn which document is on screen
+    /// treats every document as a plain-HTTP page with no address of its own.
+    /// The user's own navigations still open; nothing else reaches the network.
+    #[test]
+    fn without_commit_tracking_every_page_is_held_to_the_boundary() {
+        let mut st = tab();
+        st.on_commit_tracking_unavailable();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/style.css"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "an own address was granted without knowing which page is on screen"
+        );
+        navigate(&mut st, 2, "https://dashboard.example/");
+        assert_eq!(
+            subresource(&mut st, "http://10.0.0.5/"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+        page_navigates(&mut st, 3, "http://10.0.0.5/");
+        assert_eq!(
+            document(&mut st, "http://10.0.0.5/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+    }
+
+    /// Plan review 2, M-4. The user's GET and the page's POST to one URL, both
+    /// in flight: the request cannot say which it is, so it is refused.
+    #[test]
+    fn two_navigations_to_one_url_that_disagree_are_refused() {
+        const X: &str = "http://192.168.1.1/apply.cgi";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        navigate(&mut st, 2, X);
+        page_navigates(&mut st, 3, X);
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the page's navigation borrowed the user's permission"
+        );
+    }
+
+    /// Plan review 2, M-4. A navigation the browser announced but the engine
+    /// refused must not leave its mark for the page's next navigation.
+    #[test]
+    fn a_forgotten_expectation_cannot_be_ridden() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        st.note_app_navigation(X);
+        st.forget_expected_navigation(); // load_url failed
+        page_navigates(&mut st, 2, X);
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+    }
+
+    /// Plan review 2, M-5. The tracking-parameter strip cancels a hop and
+    /// re-issues it clean as a NEW navigation. That navigation carries the
+    /// original hop's decision in both directions: a refused redirect stays
+    /// refused, an allowed one stays allowed, whatever the page on screen is.
+    #[test]
+    fn the_tracking_strip_carries_the_hops_decision_to_the_clean_url() {
+        // Refused, with a permissive page on screen.
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        navigate(&mut st, 2, "http://short.example/x");
+        assert_eq!(document(&mut st, "http://short.example/x").0, RequestDecision::Allow);
+        let start = hop(&mut st, 2, "http://192.168.1.1/?utm_source=x");
+        assert!(!start.reaches_private);
+        st.expect_navigation("http://192.168.1.1/", start); // strip: carry, then Navigate
+        hop(&mut st, 3, "http://192.168.1.1/");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the strip laundered a refused redirect into a fresh navigation"
+        );
+
+        // Allowed, with a plain-HTTP page on screen.
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        commit(&mut st, 1);
+        page_navigates(&mut st, 2, "https://login.example/");
+        assert_eq!(document(&mut st, "https://login.example/").0, RequestDecision::Allow);
+        let start = hop(&mut st, 2, "http://192.168.1.1/?utm_source=x");
+        assert!(start.reaches_private);
+        st.expect_navigation("http://192.168.1.1/", start);
+        hop(&mut st, 3, "http://192.168.1.1/");
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/").0,
+            RequestDecision::Allow,
+            "the strip turned an allowed HTTPS redirect into a refusal"
+        );
+    }
+
+    /// Final review 3, R-002. The user's navigation and the page's to one URL,
+    /// in either id order: BOTH requests are refused, because the second
+    /// request cannot be told from the first either.
+    #[test]
+    fn a_refusal_for_a_url_outlives_the_request_that_met_it() {
+        const X: &str = "http://192.168.1.1/apply.cgi";
+        for user_first in [true, false] {
+            let mut st = tab();
+            navigate(&mut st, 1, "http://news.example/");
+            assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+            commit(&mut st, 1);
+            if user_first {
+                navigate(&mut st, 2, X);
+                page_navigates(&mut st, 3, X);
+            } else {
+                page_navigates(&mut st, 2, X);
+                navigate(&mut st, 3, X);
+            }
+            for n in 1..=2 {
+                assert_eq!(
+                    document(&mut st, X).0,
+                    RequestDecision::Block(BlockReason::LocalNetwork),
+                    "request {n} passed (user_first={user_first})"
+                );
+            }
+        }
+    }
+
+    /// Final review 3, R-002. A frame takes a refused redirect hop's slot, and
+    /// the hop's real request arrives after it. With an HTTPS page on screen,
+    /// judging that request as an ordinary one would let it through.
+    #[test]
+    fn a_refused_hops_request_after_a_frame_took_its_slot_is_still_refused() {
+        const X: &str = "http://192.168.1.1/apply.cgi";
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        navigate(&mut st, 2, "http://short.example/x");
+        assert_eq!(document(&mut st, "http://short.example/x").0, RequestDecision::Allow);
+        hop(&mut st, 2, X); // refused: a plain-HTTP redirect into the network
+        assert_eq!(document(&mut st, X).0, RequestDecision::Block(BlockReason::LocalNetwork));
+        assert_eq!(
+            document(&mut st, X).0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the redirect's own request passed as an ordinary request from the HTTPS page"
+        );
+    }
+
+    /// Final review 3, R-003. A hop whose id cannot be read may be a redirect
+    /// of a refused navigation; it must not be taken for a first hop and
+    /// judged by the (HTTPS) page on screen.
+    #[test]
+    fn a_hop_with_an_unreadable_id_reaches_nothing_private() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        commit(&mut st, 1);
+        st.on_load_started(Some("http://192.168.1.1/"));
+        let start = st.on_top_level_navigation_starting(None, "http://192.168.1.1/");
+        assert!(!start.reaches_private);
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/").0,
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+        let start = st.on_top_level_navigation_starting(None, "https://public.example/");
+        assert!(start.reaches_private, "a public address needs no permission");
+    }
+
+    /// Final review 4, R-002, the reviewer's sequence. With an HTTPS page on
+    /// screen, a plain-HTTP redirector's first hop has an unreadable id, so its
+    /// redirect into the network, id readable again, looks like a FIRST hop
+    /// the HTTPS page might send. After an unreadable id nothing is vouched
+    /// for until a document the tab can name commits, so it is refused, and
+    /// so is an ordinary request to a private address in the meantime.
+    #[test]
+    fn after_an_unreadable_id_nothing_private_is_vouched_for_until_a_page_loads() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        st.on_load_started(Some("http://short.example/x"));
+        st.on_top_level_navigation_starting(None, "http://short.example/x");
+        assert_eq!(document(&mut st, "http://short.example/x").0, RequestDecision::Allow);
+        page_navigates(&mut st, 42, "http://192.168.1.1/apply.cgi"); // the redirect, id readable
+        assert_eq!(
+            document(&mut st, "http://192.168.1.1/apply.cgi").0,
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the redirect passed as a first hop the HTTPS page sent"
+        );
+        assert_eq!(
+            subresource(&mut st, "http://10.0.0.5/"),
+            RequestDecision::Block(BlockReason::LocalNetwork)
+        );
+        // The user's own navigation still opens.
+        navigate(&mut st, 43, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+    }
+
+    /// Final review 4, R-003. A completion that cannot be tied to its
+    /// navigation (unreadable id, or no arguments at all) cannot prove the
+    /// commit was seen, so a success resets the standing too.
+    #[test]
+    fn an_unattributable_successful_completion_leaves_an_unnamed_page() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        assert_eq!(subresource(&mut st, "http://10.0.0.5/"), RequestDecision::Allow);
+        st.on_top_level_navigation_completed(None, true);
+        assert_eq!(
+            subresource(&mut st, "http://10.0.0.5/"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "an unattributable completion kept the HTTPS standing"
+        );
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        st.on_top_level_navigation_completed(None, false);
+        assert_eq!(subresource(&mut st, "http://10.0.0.5/"), RequestDecision::Allow, "a failure changes nothing");
+    }
+
+    /// Final review 5, R-006. The first page waits for the session wipe it
+    /// holds AND for the engine's answer on the WebSocket guard: until then a
+    /// first page could open a socket before the guard exists. Either answer
+    /// releases it; a refusal is recorded, not waited on forever.
+    #[test]
+    fn the_first_page_waits_for_the_guard_and_the_wipe() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.initial_navigation_ready(), "released before the guard answered");
+        st.waiting_for_wipe = true;
+        st.local_network_guard = SettingState::Applied;
+        assert!(!st.initial_navigation_ready(), "released before the wipe finished");
+        st.waiting_for_wipe = false;
+        assert!(st.initial_navigation_ready());
+        st.local_network_guard = SettingState::Failed;
+        assert!(st.initial_navigation_ready(), "a refused guard must not hold the page forever");
+    }
+
+    /// Final review 6, R-003. An answer that never comes releases the page
+    /// too, recorded as Failed; an answer that did come is not overwritten.
+    #[test]
+    fn an_unanswered_guard_is_recorded_failed_and_releases_the_page() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.initial_navigation_ready());
+        assert!(st.on_local_network_guard_overdue());
+        assert_eq!(st.local_network_guard, SettingState::Failed);
+        assert!(st.initial_navigation_ready());
+        let mut st = TabState::new(&TabPolicy::default());
+        st.local_network_guard = SettingState::Applied;
+        assert!(!st.on_local_network_guard_overdue());
+        assert_eq!(st.local_network_guard, SettingState::Applied);
+    }
+
+    /// Final review 4, R-005. An unrelated first hop that starts before the
+    /// browser's own must not use up the browser's mark.
+    #[test]
+    fn an_unrelated_navigation_does_not_use_up_the_users_mark() {
+        const X: &str = "http://192.168.1.1/";
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        st.note_app_navigation(X); // the user typed X
+        page_navigates(&mut st, 2, "http://news.example/ad"); // the page got in first
+        hop(&mut st, 3, X); // the user's navigation starts
+        assert_eq!(document(&mut st, X).0, RequestDecision::Allow, "the user's navigation was taken for the page's");
+    }
+
+    /// Final review 3, R-004. The user types an address the way people do; the
+    /// engine reports it normalized. The browser's mark must still match, or
+    /// typing a router's address without the trailing slash is refused.
+    #[test]
+    fn the_browsers_mark_matches_the_engines_normalized_url() {
+        for (typed, reported) in [
+            ("http://192.168.1.1", "http://192.168.1.1/"),
+            ("HTTP://Router.LOCALHOST:80/admin", "http://router.localhost/admin"),
+            ("http://[::1]:8080", "http://[::1]:8080/"),
+        ] {
+            let mut st = tab();
+            navigate(&mut st, 1, "http://news.example/");
+            assert_eq!(document(&mut st, "http://news.example/").0, RequestDecision::Allow);
+            loaded(&mut st, 1);
+            st.note_app_navigation(typed);
+            page_navigates(&mut st, 2, reported); // NavigationStarting reports it normalized
+            assert_eq!(document(&mut st, reported).0, RequestDecision::Allow, "typed {typed}");
+        }
+    }
+
+    /// Final review 3, R-005. A navigation that succeeds without the commit
+    /// event (a back-forward-cache restore) leaves a page the tab cannot name.
+    /// It must not keep the previous page's standing; it gets none.
+    #[test]
+    fn a_navigation_that_completes_without_a_commit_leaves_an_unnamed_page() {
+        // After an HTTPS page, whose standing reaches everything: a plain-HTTP
+        // page restored without a commit must not inherit it.
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        assert_eq!(document(&mut st, "https://dashboard.example/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        page_navigates(&mut st, 2, "http://news.example/");
+        st.on_top_level_navigation_completed(Some(2), true); // restored, no commit
+        assert_eq!(
+            subresource(&mut st, "http://10.0.0.5/"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the restored plain-HTTP page ran under the HTTPS page's standing"
+        );
+        // After a local page, whose standing includes its own address: a public
+        // page restored without a commit must not inherit that address.
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        page_navigates(&mut st, 2, "http://news.example/");
+        st.on_top_level_navigation_completed(Some(2), true);
+        assert_eq!(
+            subresource(&mut st, "http://192.168.1.1/x"),
+            RequestDecision::Block(BlockReason::LocalNetwork),
+            "the restored page used the local page's own address"
+        );
+        // A navigation that failed leaves the page on screen as it was.
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        assert_eq!(document(&mut st, "http://192.168.1.1/").0, RequestDecision::Allow);
+        loaded(&mut st, 1);
+        page_navigates(&mut st, 2, "http://news.example/");
+        st.on_top_level_navigation_completed(Some(2), false);
+        assert_eq!(subresource(&mut st, "http://192.168.1.1/x"), RequestDecision::Allow);
+    }
+
+    /// A page's new tab (window.open, target=_blank) is judged by the page
+    /// that asked, before the tab exists. Before any page has loaded, no page
+    /// is asking, so nothing local is vouched for.
+    #[test]
+    fn a_page_opens_a_local_address_in_a_new_tab_only_where_it_could_send_its_own() {
+        let st = tab();
+        assert!(!st.may_send_tab_to("http://192.168.1.1/"));
+        assert!(st.may_send_tab_to("http://news.example/"));
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        commit(&mut st, 1);
+        assert!(!st.may_send_tab_to("http://192.168.1.1/"));
+        assert!(!st.may_send_tab_to("HTTP://LOCALHOST:8080/"));
+        assert!(st.may_send_tab_to("http://other.example/"));
+
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        commit(&mut st, 1);
+        assert!(st.may_send_tab_to("http://192.168.1.1/"));
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://192.168.1.1/");
+        commit(&mut st, 1);
+        assert!(st.may_send_tab_to("http://192.168.1.1:8443/"));
+        assert!(!st.may_send_tab_to("http://192.168.1.2/"));
+    }
+
+    /// Final review 6, R-002. wry answers a new-tab request from the message
+    /// loop, after the engine event. A plain-HTTP page asks for a private
+    /// address and, before wry's callback runs, a navigation already in
+    /// flight commits an HTTPS page. The request is still the plain-HTTP
+    /// page's, and is refused.
+    #[test]
+    fn a_new_tab_is_judged_by_the_page_that_asked_not_the_page_that_followed() {
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        loaded(&mut st, 1);
+        page_navigates(&mut st, 2, "https://dashboard.example/");
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        commit(&mut st, 2);
+        assert!(
+            !st.take_new_window_verdict("http://192.168.1.1/"),
+            "the HTTPS page that committed after the request vouched for it"
+        );
+        // The HTTPS page's own request, raised after it committed, opens.
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://192.168.1.1/"));
+        // And the other direction: allowed when asked, refused if the page on
+        // screen when wry answers would refuse it. Both must allow.
+        st.on_new_window_requested(Some("http://10.0.0.5/"));
+        page_navigates(&mut st, 3, "http://news.example/");
+        commit(&mut st, 3);
+        assert!(!st.take_new_window_verdict("http://10.0.0.5/"));
+    }
+
+    /// Final review 7, R-001. An allowed request and a refused one for the
+    /// same address are outstanding together. The allowed one's callback
+    /// runs first and must not spend the refusal and leave the refused
+    /// request to be judged by whatever page is on screen when its own
+    /// callback runs. A refusal refuses every request it cannot be told
+    /// apart from.
+    #[test]
+    fn an_allowed_request_cannot_spend_another_requests_refusal() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        st.on_new_window_requested(Some("http://192.168.1.1/")); // A, allowed
+        page_navigates(&mut st, 2, "http://news.example/");
+        commit(&mut st, 2);
+        st.on_new_window_requested(Some("http://192.168.1.1/")); // B, refused
+        assert!(
+            !st.take_new_window_verdict("http://192.168.1.1/"),
+            "A cannot be told from B while B's refusal stands, which errs closed"
+        );
+        page_navigates(&mut st, 3, "https://dashboard.example/");
+        commit(&mut st, 3);
+        assert!(
+            !st.take_new_window_verdict("http://192.168.1.1/"),
+            "B was opened on the strength of the HTTPS page that followed it"
+        );
+        // Both spent: the HTTPS page's own next request opens.
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://192.168.1.1/"));
+    }
+
+    /// A request the event never recorded is vouched for by nothing, and a
+    /// refusal whose callback never came costs one later request, then
+    /// clears. A public address is never held up.
+    #[test]
+    fn an_unrecorded_or_leftover_request_never_allows_anything() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        assert!(!st.take_new_window_verdict("http://192.168.1.1/"), "no record, no vouching");
+        page_navigates(&mut st, 2, "http://news.example/");
+        loaded(&mut st, 2);
+        st.on_new_window_requested(Some("http://192.168.1.1/")); // wry never dispatches this one
+        navigate(&mut st, 3, "https://dashboard.example/");
+        loaded(&mut st, 3);
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(!st.take_new_window_verdict("http://192.168.1.1/"), "the leftover refusal still stands");
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://192.168.1.1/"), "and is spent after one");
+        st.on_new_window_requested(Some("http://other.example/"));
+        assert!(st.take_new_window_verdict("http://other.example/"));
+    }
+
+    /// Final review 5, R-002: an address the engine would not give cannot be
+    /// paired with any callback, so the tab stops vouching for private new
+    /// tabs at all. Public addresses still open.
+    #[test]
+    fn an_unreadable_request_ends_private_new_tabs_for_the_tab() {
+        let mut st = tab();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        st.on_new_window_requested(None);
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(!st.take_new_window_verdict("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://news.example/"));
+    }
+
+    /// Without the event-time handler, and after more requests pile up than
+    /// any page could have outstanding, no page opens a private address in a
+    /// new tab. Public addresses still open.
+    #[test]
+    fn without_event_time_tracking_no_private_new_tab_opens() {
+        let mut st = TabState::new(&TabPolicy::default());
+        st.toplevel.on_frame_tracking_registered();
+        navigate(&mut st, 1, "https://dashboard.example/");
+        loaded(&mut st, 1);
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(!st.take_new_window_verdict("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://news.example/"));
+
+        let mut st = tab();
+        navigate(&mut st, 1, "http://news.example/");
+        loaded(&mut st, 1);
+        for _ in 0..=MAX_NEW_WINDOW_REQUESTS {
+            st.on_new_window_requested(Some("http://192.168.1.1/never-answered"));
+        }
+        assert!(!st.new_window_tracking);
+        navigate(&mut st, 2, "https://dashboard.example/");
+        loaded(&mut st, 2);
+        st.on_new_window_requested(Some("http://192.168.1.1/"));
+        assert!(!st.take_new_window_verdict("http://192.168.1.1/"));
+        assert!(st.take_new_window_verdict("http://news.example/"));
     }
 }

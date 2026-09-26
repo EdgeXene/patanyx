@@ -48,6 +48,14 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.2" date="2026-09-25">
+      <description>
+        <p>Once you have been through the first-run tour, PATANYX opens with the cursor in the address bar and the address selected, so you can start typing right away. When another app opens PATANYX on a link, the keyboard goes to that page instead. On Windows, switching back to PATANYX returns the keyboard to the page or the address bar, whichever had it last. Alt+D and F6 now move the keyboard to the address bar, as Ctrl+L already did. Clicking the tab you are on puts the keyboard in its page, and switching to a blank tab puts it in the address bar.</p>
+        <p>The first click in the address bar selects the whole address; a second click places the cursor. After you start typing, Escape puts the page's address back, and a page that redirects while you type no longer replaces what you typed.</p>
+        <p>A tab follows the pointer while you drag it, and the other tabs slide aside to make room. Escape during a drag puts everything back. Middle-click closes a tab, and a double-click on the empty space beside the tabs opens a new one. If your system is set to reduce motion, tabs move without sliding.</p>
+        <p>On Windows, a local address you type, like 192.168.1.1, now opens instead of being refused, and that page can load from its own address. Also on Windows, a page served over plain HTTP can no longer open a live connection (WebSocket) to localhost or a numeric address on your own network, or send you to one, and a home-network address written in IPv6 form is now recognized. Live connections opened from a page's background worker are still not covered.</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-09-20">
       <description>
         <p>Messenger and other sites that do their work in background workers load again. Fingerprint Divergence used to run a page's worker from a generated address so it could add its noise inside it. A site whose security policy refuses those addresses could not start such a worker at all, and a message sent to one could be lost with no error, leaving the page waiting forever. Divergence no longer touches workers: readings taken inside a worker are now the real ones, and everything in the page itself is unchanged.</p>
@@ -116,7 +124,7 @@
       <description>
         <p>Hovering a link now shows where it goes, in a small readout at the bottom left. Deceptive characters that could make a link read as a different site are stripped before anything is shown.</p>
         <p>Camera, microphone, location and notification requests are refused until you allow them, and an allowed site has to ask again next time you start the browser. Changing a permission reloads the page, with a warning first so you can save your work.</p>
-        <p>Pages loaded over plain HTTP can no longer reach devices on your own network.</p>
+        <p>On Windows, pages served over plain HTTP can no longer load anything from localhost or a numeric address on your own network. Live connections (WebSockets) were not covered, and neither was a home-network address written in IPv6 form.</p>
         <p>Copying a link without tracking parameters now also unwraps known redirect wrappers, so the address you copy is where the link actually goes.</p>
         <p>The browser warns when its phishing blocklist sources go stale.</p>
       </description>

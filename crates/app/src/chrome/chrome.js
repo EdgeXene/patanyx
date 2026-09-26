@@ -410,8 +410,39 @@
     if (!msg || typeof msg.event !== "string") return;
     switch (msg.event) {
       case "url_changed": {
-        const url = (msg.data && msg.data.url) || "";
-        urlInput.value = url === "about:blank" ? "" : url;
+        const data = msg.data || {};
+        const url = data.url || "";
+        const shown = url === "about:blank" ? "" : url;
+        const tab = typeof data.tab === "number" ? data.tab : null;
+        // Someone typing in the bar keeps what they typed while the SAME tab
+        // redirects or finishes loading underneath them. A different tab (a
+        // switch, or a close that exposed a neighbor) always shows its own
+        // address, and so does an event that names no tab.
+        const keepEdit =
+          urlEdited &&
+          tab !== null &&
+          tab === urlBarTabId &&
+          document.activeElement === urlInput;
+        // A bar holding the keyboard with ALL of its text selected (launch,
+        // Ctrl+L, a blank tab) is waiting for the first keystroke to replace
+        // it. Assigning the value collapses the selection to a caret at the
+        // end, so an address arriving a moment after the focus -- the start
+        // page committing just after launch -- turned the first thing typed
+        // into an append. Put the selection back.
+        const selectedAll =
+          document.activeElement === urlInput &&
+          urlInput.selectionStart === 0 &&
+          urlInput.selectionEnd === urlInput.value.length;
+        urlBarTabId = tab;
+        urlCommitted = shown;
+        if (!keepEdit) {
+          urlInput.value = shown;
+          urlEdited = false;
+          urlDeferred = false;
+          if (selectedAll) urlInput.select();
+        } else {
+          urlDeferred = true;
+        }
         // The page under the bar changed (navigation or tab switch, both
         // land here). The old session's highlights died with the page;
         // leaving the bar open would show a query and count describing a
@@ -473,6 +504,22 @@
         urlInput.focus();
         urlInput.select();
         break;
+      // The window came back to the front with the keyboard last in the
+      // chrome (AppState::restore_focus). The engine returns it to whatever
+      // element had it; when that was nothing, it goes to the address bar,
+      // the one field someone returning to a browser is likely to type into.
+      case "focus_restore": {
+        const current = document.activeElement;
+        if (
+          !current ||
+          current === document.body ||
+          current === document.documentElement
+        ) {
+          urlInput.focus();
+          urlInput.select();
+        }
+        break;
+      }
       // A Rust-side failure on something the USER asked for, surfaced where
       // they can see it. Deliberately narrow: only user-initiated paths emit
       // this. A page's window.open() failing is dropped in Rust instead,
@@ -1030,6 +1077,27 @@
 
   // ---- element handles ---------------------------------------------------------
   const urlInput = $("url");
+  // What the bar shows for the page, as opposed to what someone typed: the
+  // text Escape puts back.
+  let urlCommitted = "";
+  // The tab that address belongs to, when url_changed names it.
+  let urlBarTabId = null;
+  // True from the first keystroke until the edit is submitted, abandoned, or
+  // the bar loses focus. Only an edit in progress survives a url_changed.
+  let urlEdited = false;
+  // A url_changed arrived during an edit and was held back (see url_changed);
+  // leaving the bar shows it.
+  let urlDeferred = false;
+  // Set by a press that is about to focus the bar; see the mouseup handler.
+  let urlSelectOnMouseUp = false;
+  // When the bar last received focus. A click that brings the keyboard BACK
+  // from the page lands on a bar that is already this document's active
+  // element (a document keeps it while another webview has the keyboard), so
+  // "was it active on the press" cannot tell that click from one inside a bar
+  // being typed in. The focus event the returning click causes can: it arrives
+  // with the click.
+  let urlFocusedAt = -Infinity;
+  const URL_CLICK_FOCUS_MS = 400;
   const panel = $("vault-panel");
   const statePanes = {
     none: $("vault-none"),
@@ -1133,292 +1201,528 @@
   }
 
   let lastTabItems = []; // last canonical tab payload from Rust
-  // Stable id held in module state for the lifetime of one drag. Nothing is
-  // placed in dataTransfer: tab ids are internal chrome addresses and must
-  // not ride in a payload that can be dropped into another application.
-  let draggedTabId = null;
-  // Whether the drag in progress reached a drop. Read by `dragend`, which is
-  // the only place that can tell an abandoned drag from a committed one.
-  let tabDragCommitted = false;
+  // ONE CHIP PER TAB, KEPT ACROSS REPAINTS.
+  //
+  // The strip used to be torn down and rebuilt on every tabs_changed, and that
+  // event fires on every title, every load and every switch. Nothing on it
+  // could move smoothly: each repaint was a new set of elements with no
+  // previous position to move FROM, and a repaint during a drag threw away the
+  // chip the pointer was holding. Chips are now keyed by tab id; a repaint
+  // updates each one in place and moves only the ones whose place changed.
+  const tabChipsById = new Map();
+  // The pointer drag in progress, or null. It holds a tab id and some
+  // geometry, never a payload: this is pointer events on our own elements,
+  // not HTML5 drag and drop, so nothing is ever placed where another
+  // application could receive it on a drop.
+  let tabDrag = null;
+  // A drag ends with the button coming up ON the chip, and the engine follows
+  // that with a click, which would switch to the tab that was just moved. Set
+  // when a drag ends, consumed by that click, and cleared by the next press in
+  // case the click never comes (a release outside the window).
+  let tabClickSuppressed = false;
+  // How far the pointer travels before a press becomes a drag. Below it, a
+  // slightly shaky click is still a click.
+  const TAB_DRAG_THRESHOLD_PX = 5;
+  // Matches the transition on #tabs.tab-settling in chrome.css.
+  const TAB_SLIDE_MS = 150;
+  let tabSettleTimer = 0;
 
   function acceptTabItems(items) {
     lastTabItems = Array.isArray(items) ? items : [];
+    // The first tab's url_changed can fire before this script has loaded, so
+    // the bar may never have been told which tab its address belongs to --
+    // and without that, the first redirect after launch replaced whatever was
+    // being typed. The strip knows which tab is showing.
+    if (urlBarTabId === null) {
+      const showing = lastTabItems.find((tab) => tab.active);
+      if (showing) urlBarTabId = showing.id;
+    }
     renderTabs(lastTabItems);
   }
 
-  function tabDomIds(wrap) {
-    return Array.from(wrap.children || [])
-      .map((chip) => Number(chip.dataset && chip.dataset.tabId))
-      .filter((id) => Number.isSafeInteger(id));
-  }
-
-  function reorderedTabIds(ids, draggedId, targetId, afterTarget) {
-    if (
-      draggedId === targetId ||
-      ids.indexOf(draggedId) < 0 ||
-      ids.indexOf(targetId) < 0
-    ) {
-      return ids.slice();
-    }
-    const next = ids.filter((id) => id !== draggedId);
-    const target = next.indexOf(targetId);
-    next.splice(target + (afterTarget ? 1 : 0), 0, draggedId);
-    return next;
-  }
-
-  function putTabDomInOrder(wrap, ids) {
-    const byId = new Map(
-      Array.from(wrap.children || []).map((chip) => [
-        Number(chip.dataset && chip.dataset.tabId),
-        chip,
-      ]),
-    );
-    for (const id of ids) {
-      const chip = byId.get(id);
-      if (chip) wrap.appendChild(chip);
-    }
-  }
-
-  // Where a release at this pointer position means the tab should land.
-  //
-  // Returns `[targetId, afterTarget]` for ANY x over the strip, not only for x
-  // over a chip. Walking the chips left to right, a pointer left of a chip's
-  // midpoint inserts before it, one inside its right half inserts after it,
-  // and one past every chip inserts at the END -- which is the case that had
-  // no answer at all before, because the strip past the last chip is
-  // container, not chip, and the drop event simply never fired there.
-  // NOTE ON DIRECTION. This walks the chips in DOM order and compares the
-  // pointer against their SCREEN rectangles, which are the same ordering only
-  // in a left-to-right strip. The chrome ships no RTL locale and no rtl rule
-  // today (the strip is pinned dir="ltr" in index.html), so the two agree --
-  // but the assumption is written down here rather than left to be discovered
-  // by whoever adds the first RTL locale, because the failure would be silent:
-  // nearly every drop would resolve to one end and then be persisted.
-  function tabDropTargetAt(wrap, ev) {
-    const chips = Array.from(wrap.children || []).filter((chip) =>
+  function tabChipList(wrap) {
+    return Array.from(wrap.children || []).filter((chip) =>
       Number.isSafeInteger(Number(chip.dataset && chip.dataset.tabId)),
     );
-    if (!chips.length) return null;
-    const x = typeof ev.clientX === "number" ? ev.clientX : 0;
-    for (const chip of chips) {
-      const box = chip.getBoundingClientRect();
-      if (x < box.left + box.width / 2) {
-        return [Number(chip.dataset.tabId), false];
-      }
-      // Inside the right half. A pointer in the GAP after this chip falls
-      // through to the next chip's left-half test, which is the same answer.
-      if (x <= box.right) return [Number(chip.dataset.tabId), true];
-    }
-    return [Number(chips[chips.length - 1].dataset.tabId), true];
   }
 
-  function previewTabReorder(wrap, ev) {
-    const ids = tabDomIds(wrap);
-    if (draggedTabId === null || ids.indexOf(draggedTabId) < 0) return null;
-    const target = tabDropTargetAt(wrap, ev);
-    // Resolving to the dragged tab itself is a dead drop -- the pointer never
-    // left the chip, or there is only one tab. The chip-level handler used to
-    // refuse this with its own `draggedTabId === tab.id` guard; without it
-    // every such release would send Rust a no-op permutation to validate.
-    if (!target || target[0] === draggedTabId) return null;
-    const next = reorderedTabIds(ids, draggedTabId, target[0], target[1]);
-    putTabDomInOrder(wrap, next);
+  function tabDomIds(wrap) {
+    return tabChipList(wrap).map((chip) => Number(chip.dataset.tabId));
+  }
+
+  function sameTabIds(a, b) {
+    return a.length === b.length && a.every((id, i) => id === b[i]);
+  }
+
+  function movedTabIds(ids, from, to) {
+    const next = ids.slice();
+    const [moved] = next.splice(from, 1);
+    next.splice(to, 0, moved);
     return next;
   }
 
-  // THE STRIP IS THE DROP TARGET, not each chip.
-  //
-  // These used to be bound per chip, so a release anywhere that was not a chip
-  // -- the empty strip past the last tab, the strip's padding -- fired no drop
-  // at all: `persistTabOrder` never ran, Rust never learned the new order, and
-  // the next repaint silently undid the move. Dragging a tab to the END of the
-  // strip, the commonest reorder there is, could not work by construction.
-  //
-  // One handler on the container covers every pointer position including over
-  // a chip, so there is also no longer a chip handler and a strip handler
-  // racing to preview the same pointer against a DOM the other just moved.
-  //
-  // Bound ONCE, and that is load-bearing: `renderTabs` rebuilds the chips but
-  // keeps the same container element, so wiring this inside the render would
-  // stack another pair of listeners on every single repaint.
-  function wireTabStripDrops(wrap) {
-    if (wrap.dataset.tabDropsWired === "1") return;
-    wrap.dataset.tabDropsWired = "1";
-    wrap.addEventListener("dragover", (ev) => {
-      if (draggedTabId === null) return;
-      ev.preventDefault();
-      if (ev.dataTransfer) ev.dataTransfer.dropEffect = "move";
-      previewTabReorder(wrap, ev);
-    });
-    wrap.addEventListener("drop", (ev) => {
-      if (draggedTabId === null) return;
-      ev.preventDefault();
-      // THE PREVIEW HAS USUALLY ALREADY MOVED IT. `previewTabReorder` returns
-      // null when the pointer resolves to the dragged tab itself -- which is
-      // the NORMAL case at drop time, because dragover just placed that tab
-      // under the pointer. Treating that as "nothing to do" cancelled every
-      // drag that landed where its own preview had put it, which is every
-      // successful drag. Found by driving a real mouse rather than synthetic
-      // drag events, which fire the handlers directly and hid it completely.
-      //
-      // So: take the preview's answer when it has one, otherwise commit the
-      // order the strip is ALREADY showing. Either way the user sees what
-      // they released, and Rust is told about it.
-      const next = previewTabReorder(wrap, ev) || tabDomIds(wrap);
-      draggedTabId = null;
-      // Set BEFORE the await in persistTabOrder: `dragend` fires immediately
-      // after this handler returns, and it must not mistake a commit already
-      // in flight for an abandoned drag and repaint the old order over it.
-      // Only on a REAL commit, though: a dead drop must still let `dragend`
-      // repaint, or a refused preview would be left standing on screen.
-      const current = lastTabItems.map((t) => t.id);
-      const changed =
-        next.length !== current.length ||
-        next.some((id, i) => id !== current[i]);
-      if (changed) {
-        tabDragCommitted = true;
-        void persistTabOrder(next);
+  function hasClassName(node, name) {
+    if (!node) return false;
+    if (node.classList && node.classList.contains(name)) return true;
+    return String(node.className || "")
+      .split(/\s+/)
+      .includes(name);
+  }
+
+  // Moves only the chips that are out of place. Re-appending every chip, as
+  // this used to, detached each one in turn, and a detached element loses the
+  // keyboard focus a Left/Right reorder is being driven from.
+  function putTabDomInOrder(wrap, ids) {
+    ids.forEach((id, i) => {
+      const chip = tabChipsById.get(id);
+      if (chip && wrap.children[i] !== chip) {
+        wrap.insertBefore(chip, wrap.children[i] || null);
       }
     });
+  }
+
+  function prefersReducedMotion() {
+    try {
+      return !!window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  // Changes the strip and lets the chips SLIDE to their new places instead of
+  // jumping there (first, last, invert, play). `mutate` makes the DOM change;
+  // every chip that ends up somewhere else is drawn back where it was on
+  // screen and then released, and the stylesheet's transition carries it
+  // across. Under prefers-reduced-motion the chips simply land.
+  function slideTabs(wrap, mutate) {
+    const before = new Map();
+    for (const chip of tabChipList(wrap)) {
+      before.set(chip, chip.getBoundingClientRect().left);
+    }
+    // No transition while the new layout is measured, or the measurement
+    // would read the START of a slide instead of where the chip now lives.
+    wrap.classList.remove("tab-settling");
+    mutate();
+    for (const chip of tabChipList(wrap)) chip.style.transform = "";
+    if (prefersReducedMotion()) return;
+    const moved = [];
+    for (const chip of tabChipList(wrap)) {
+      if (!before.has(chip)) continue;
+      const dx = before.get(chip) - chip.getBoundingClientRect().left;
+      if (Math.abs(dx) < 1) continue;
+      chip.style.transform = "translateX(" + dx + "px)";
+      moved.push(chip);
+    }
+    if (!moved.length) return;
+    // Commit the inverted frame before releasing it. Without a layout read in
+    // between, the engine folds both writes into one and nothing slides.
+    void wrap.offsetWidth;
+    wrap.classList.add("tab-settling");
+    for (const chip of moved) chip.style.transform = "";
+    clearTimeout(tabSettleTimer);
+    tabSettleTimer = setTimeout(
+      () => wrap.classList.remove("tab-settling"),
+      TAB_SLIDE_MS + 50,
+    );
+  }
+
+  // THE TAB DRAG IS A POINTER DRAG.
+  //
+  // It used to be HTML5 drag and drop. That could only show where a tab WOULD
+  // go by rearranging the strip under a ghost image, it jumped when it did,
+  // and it depended on engine drop-target plumbing that WebView2 broke for us
+  // twice (see drag-regression-gate.js). Now the chip itself follows the
+  // pointer, its neighbors slide aside, and the release commits the order the
+  // strip is showing.
+  //
+  // NOTE ON DIRECTION. Slots are measured in DOM order and compared as screen
+  // x positions, which agree only in a left-to-right strip. The strip is
+  // pinned dir="ltr" in index.html and the chrome ships no RTL rule; this is
+  // written down so whoever adds the first RTL locale finds it here rather
+  // than by watching every drop land at one end.
+  function beginTabPress(wrap, chip, ev) {
+    tabClickSuppressed = false;
+    if (ev.button !== 0 || tabDrag) return;
+    // The close button and the select-mode tick are controls of their own.
+    const target = ev.target;
+    if (
+      target &&
+      target !== chip &&
+      (hasClassName(target, "chip-close") || hasClassName(target, "chip-select"))
+    ) {
+      return;
+    }
+    tabDrag = {
+      id: Number(chip.dataset.tabId),
+      chip,
+      wrap,
+      pointerId: ev.pointerId,
+      startX: typeof ev.clientX === "number" ? ev.clientX : 0,
+      started: false,
+      from: -1,
+      to: -1,
+      ids: [],
+      slots: [],
+    };
+    // Captured from the press, so a quick flick that leaves the chip before
+    // the threshold still reaches this chip's handlers.
+    try {
+      chip.setPointerCapture(ev.pointerId);
+    } catch (_) {
+      // No capture: the drag still works while the pointer stays over the chip.
+    }
+  }
+
+  function startTabDrag(drag) {
+    const chips = tabChipList(drag.wrap);
+    drag.from = chips.indexOf(drag.chip);
+    if (drag.from < 0 || chips.length < 2) return false;
+    // A drag can begin while the last slide is still settling. Measure the
+    // strip at rest, not mid-flight.
+    drag.wrap.classList.remove("tab-settling");
+    for (const chip of chips) chip.style.transform = "";
+    drag.slots = chips.map((chip) => {
+      const box = chip.getBoundingClientRect();
+      return { chip, left: box.left, width: box.width };
+    });
+    drag.ids = chips.map((chip) => Number(chip.dataset.tabId));
+    // Widths frozen for the drag. A chip is as wide as its title, and a
+    // title repaint mid-drag (a page finishing its load) would resize chips
+    // under slots measured here, leaving the dragged one off the pointer.
+    for (const slot of drag.slots) {
+      slot.chip.style.flex = "0 0 " + slot.width + "px";
+    }
+    drag.to = drag.from;
+    drag.started = true;
+    drag.chip.classList.add("dragging");
+    drag.wrap.classList.add("tab-dragging");
+    return true;
+  }
+
+  function moveTabDrag(ev) {
+    const drag = tabDrag;
+    if (!drag || ev.pointerId !== drag.pointerId) return;
+    const x = typeof ev.clientX === "number" ? ev.clientX : drag.startX;
+    let dx = x - drag.startX;
+    if (!drag.started) {
+      if (Math.abs(dx) < TAB_DRAG_THRESHOLD_PX) return;
+      if (!startTabDrag(drag)) {
+        tabDrag = null;
+        releaseTabCapture(drag);
+        return;
+      }
+    }
+    const { slots, from } = drag;
+    const own = slots[from];
+    const last = slots[slots.length - 1];
+    // Held inside the strip: past either end there is nowhere to put it.
+    dx = Math.max(
+      slots[0].left - own.left,
+      Math.min(last.left + last.width - (own.left + own.width), dx),
+    );
+    drag.chip.style.transform = "translateX(" + dx + "px)";
+    // The chip takes a neighbor's place once it covers half of it: its
+    // LEADING edge reaches that neighbor's center. Not the chip's own center,
+    // which is what this first compared and what failed on a real strip:
+    // chips differ in width, and a wide tab held against the end of the
+    // strip has its center short of a narrower last tab's center, so it could
+    // never be moved to the end. Its leading edge is at the strip's end
+    // there, past any neighbor's center, whatever the widths.
+    const left = own.left + dx;
+    const right = left + own.width;
+    let to = from;
+    for (let i = from + 1; i < slots.length; i += 1) {
+      if (right >= slots[i].left + slots[i].width / 2) to = i;
+    }
+    for (let i = from - 1; i >= 0; i -= 1) {
+      if (left <= slots[i].left + slots[i].width / 2) to = i;
+    }
+    if (to !== drag.to) {
+      drag.to = to;
+      layoutTabDrag(drag);
+    }
+  }
+
+  // Where every OTHER chip sits while the dragged one is at slot `to`: the
+  // new order laid out left to right from the first slot, each chip shifted
+  // from its resting place to its place in that order.
+  function layoutTabDrag(drag) {
+    const { slots, from, to } = drag;
+    const order = movedTabIds(
+      slots.map((_, i) => i),
+      from,
+      to,
+    );
+    const gap =
+      slots.length > 1 ? slots[1].left - (slots[0].left + slots[0].width) : 0;
+    let left = slots[0].left;
+    for (const i of order) {
+      const slot = slots[i];
+      if (i !== from) {
+        const shift = left - slot.left;
+        slot.chip.style.transform = shift ? "translateX(" + shift + "px)" : "";
+      }
+      left += slot.width + gap;
+    }
+  }
+
+  function releaseTabCapture(drag) {
+    try {
+      drag.chip.releasePointerCapture(drag.pointerId);
+    } catch (_) {
+      // Already released (the button came up), or never captured.
+    }
+  }
+
+  function endTabDrag(ev) {
+    const drag = tabDrag;
+    if (!drag || ev.pointerId !== drag.pointerId) return;
+    tabDrag = null;
+    releaseTabCapture(drag);
+    if (!drag.started) return; // a click: it goes on to switch tabs
+    tabClickSuppressed = true;
+    const next = movedTabIds(drag.ids, drag.from, drag.to);
+    const changed = !sameTabIds(
+      next,
+      lastTabItems.map((tab) => tab.id),
+    );
+    settleTabDrag(drag, changed ? next : null);
+    // Committed on release, not on every crossing: Rust revalidates the whole
+    // permutation once, and its reply is the order the strip keeps.
+    if (changed) void persistTabOrder(next);
+  }
+
+  // An abandoned drag: Escape, the window losing focus, the engine cancelling
+  // the pointer, or the strip changing underneath it (a tab opened or closed
+  // mid-drag). Everything slides back to the order Rust holds; nothing is
+  // sent.
+  function cancelTabDrag() {
+    const drag = tabDrag;
+    if (!drag) return;
+    tabDrag = null;
+    releaseTabCapture(drag);
+    if (!drag.started) return;
+    // The button may still be down, and its release must not become a click.
+    tabClickSuppressed = true;
+    settleTabDrag(drag, null);
+  }
+
+  function settleTabDrag(drag, next) {
+    slideTabs(drag.wrap, () => {
+      for (const slot of drag.slots) slot.chip.style.flex = "";
+      drag.chip.classList.remove("dragging");
+      drag.wrap.classList.remove("tab-dragging");
+      if (next) putTabDomInOrder(drag.wrap, next);
+    });
+  }
+
+  // Bound ONCE: renderTabs keeps the same container across repaints, so
+  // wiring these inside the render would stack another set every time.
+  function wireTabStrip(wrap) {
+    if (wrap.dataset.tabStripWired === "1") return;
+    wrap.dataset.tabStripWired = "1";
+    // A double-click on the empty strip opens a tab, as in other browsers.
+    // Only the strip itself: a double-click on a chip is two clicks on a tab.
+    wrap.addEventListener("dblclick", (ev) => {
+      if (ev.target !== wrap) return;
+      rb("tab_new").catch(() => {});
+    });
+    // Escape abandons a drag. Captured, so it is answered here before the
+    // panel manager's Escape handling can close something as well.
+    document.addEventListener(
+      "keydown",
+      (ev) => {
+        if (ev.key !== "Escape" || !tabDrag || !tabDrag.started) return;
+        ev.preventDefault();
+        ev.stopPropagation();
+        cancelTabDrag();
+      },
+      true,
+    );
+    // Alt+Tab mid-drag: the release would happen in another window.
+    window.addEventListener("blur", () => cancelTabDrag());
   }
 
   async function persistTabOrder(ids, focusId) {
     try {
       const reply = await rb("tab_reorder", { ids });
       if (!reply || !Array.isArray(reply.items)) throw new Error("bad_reply");
-      // The dragover order was only a preview. Rust has revalidated the full
+      // The strip's order was only a preview. Rust has revalidated the full
       // permutation and this is its canonical order, including active flags.
       acceptTabItems(reply.items);
       if (focusId !== undefined && focusId !== null) {
-        const chip = Array.from($("tabs").children || []).find(
-          (candidate) => Number(candidate.dataset.tabId) === focusId,
-        );
+        const chip = tabChipsById.get(focusId);
         if (chip) chip.focus();
       }
     } catch (e) {
       // A concurrent open/close makes the preview stale. Restore the latest
-      // authoritative list; the refused permutation changed no Rust state.
+      // authoritative list (it slides back); the refused permutation changed
+      // no Rust state.
       renderTabs(lastTabItems);
       toast(friendly(e), true);
     }
   }
 
+  function buildTabChip(wrap, id) {
+    const chip = el("div", "tab-chip");
+    chip.setAttribute("tabindex", "0");
+    chip.dataset.tabId = String(id);
+    chip.appendChild(el("span", "chip-title", ""));
+    const close = el("button", "chip-close", "×");
+    close.type = "button";
+    close.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      rb("tab_close", { id }).catch(() => {});
+    });
+    chip.appendChild(close);
+    chip.addEventListener("click", () => {
+      if (tabClickSuppressed) {
+        tabClickSuppressed = false;
+        return;
+      }
+      if (tabSelectMode) {
+        // In select mode the whole chip is the toggle: aiming for a
+        // small checkbox is how ticks get lost, and switching tabs
+        // mid-selection would abandon the set being built.
+        if (tabSelection.has(id)) tabSelection.delete(id);
+        else tabSelection.add(id);
+        const tick = chip.querySelector(".chip-select");
+        if (tick) tick.checked = tabSelection.has(id);
+        renderTabBatchBar();
+        return;
+      }
+      // Sent for the ACTIVE tab too: Rust answers that by putting the
+      // keyboard in its page, which is what clicking the current tab does in
+      // other browsers.
+      rb("tab_switch", { id }).catch(() => {});
+    });
+    // Middle-click closes, as in every other browser. The middle PRESS is
+    // refused as well, so the engine does not start autoscroll on the strip.
+    chip.addEventListener("mousedown", (ev) => {
+      if (ev.button === 1) ev.preventDefault();
+    });
+    chip.addEventListener("auxclick", (ev) => {
+      if (ev.button !== 1) return;
+      ev.preventDefault();
+      rb("tab_close", { id }).catch(() => {});
+    });
+    chip.addEventListener("pointerdown", (ev) => beginTabPress(wrap, chip, ev));
+    chip.addEventListener("pointermove", moveTabDrag);
+    chip.addEventListener("pointerup", endTabDrag);
+    chip.addEventListener("pointercancel", cancelTabDrag);
+    // Capture can go without a pointerup (the engine taking the pointer
+    // away). The drag cannot finish then, so it is abandoned. After a normal
+    // release this finds no drag and does nothing.
+    chip.addEventListener("lostpointercapture", cancelTabDrag);
+    chip.addEventListener("keydown", (ev) => {
+      if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+      if (tabDrag && tabDrag.started) return;
+      const ids = tabDomIds(wrap);
+      const from = ids.indexOf(id);
+      const to = from + (ev.key === "ArrowLeft" ? -1 : 1);
+      if (from < 0 || to < 0 || to >= ids.length) return;
+      ev.preventDefault();
+      const next = movedTabIds(ids, from, to);
+      slideTabs(wrap, () => putTabDomInOrder(wrap, next));
+      // Moving a focused element can drop its focus; the key that moved it
+      // must still be able to move it again.
+      chip.focus();
+      void persistTabOrder(next, id);
+    });
+    return chip;
+  }
+
+  function paintTabChip(chip, tab) {
+    chip.classList.toggle("active", !!tab.active);
+    const label = chipLabel(tab);
+    chip.title =
+      (tab.title || tab.url || label) + " -- Drag or press Left/Right to reorder";
+    // Truncation itself is CSS (max-width + ellipsis). Written only when it
+    // changed: an unchanged title is the commonest repaint there is.
+    const title = chip.querySelector(".chip-title");
+    if (title && title.textContent !== label) title.textContent = label;
+    const close = chip.querySelector(".chip-close");
+    if (close) close.title = i18nText("chrome-js-tabs-close-title", "Close tab");
+    let tick = chip.querySelector(".chip-select");
+    if (!tabSelectMode) {
+      if (tick) chip.removeChild(tick);
+      return;
+    }
+    if (!tick) {
+      const id = tab.id;
+      const box = document.createElement("input");
+      box.type = "checkbox";
+      box.className = "chip-select";
+      box.addEventListener("click", (ev) => ev.stopPropagation());
+      box.addEventListener("change", () => {
+        if (box.checked) tabSelection.add(id);
+        else tabSelection.delete(id);
+        renderTabBatchBar();
+      });
+      chip.insertBefore(box, title || null);
+      tick = box;
+    }
+    tick.checked = tabSelection.has(tab.id);
+    tick.setAttribute("aria-label", "Select " + label);
+    if (currentUiLocale !== "en") {
+      const box = tick;
+      i18nResolve(
+        "chrome-js-tabs-select-aria",
+        { label },
+        "Select " + label,
+      ).then((t) => box.setAttribute("aria-label", t));
+    }
+  }
+
   function renderTabs(items) {
     const wrap = $("tabs");
-    wireTabStripDrops(wrap);
-    wrap.textContent = "";
+    wireTabStrip(wrap);
+    const list = Array.isArray(items) ? items : [];
+    const ids = list.map((tab) => tab.id);
     if (tabSelectMode) {
       // A tab closed since it was ticked must not stay selected: the
       // count would name tabs that no longer exist and the batch actions
       // would aim at ids that can only fail.
-      const live = new Set();
-      for (const tab of items || []) live.add(tab.id);
+      const live = new Set(ids);
       for (const id of Array.from(tabSelection)) {
         if (!live.has(id)) tabSelection.delete(id);
       }
     }
-    for (const tab of items || []) {
-      const chip = el("div", "tab-chip" + (tab.active ? " active" : ""));
-      chip.setAttribute("draggable", "true");
-      chip.setAttribute("tabindex", "0");
-      chip.dataset.tabId = String(tab.id);
-      chip.title =
-        (tab.title || tab.url || chipLabel(tab)) +
-        " -- Drag or press Left/Right to reorder";
-      // Truncation itself is CSS (max-width + ellipsis).
-      if (tabSelectMode) {
-        const tick = document.createElement("input");
-        tick.type = "checkbox";
-        tick.className = "chip-select";
-        tick.checked = tabSelection.has(tab.id);
-        const label = chipLabel(tab);
-        tick.setAttribute("aria-label", "Select " + label);
-        if (currentUiLocale !== "en") {
-          i18nResolve(
-            "chrome-js-tabs-select-aria",
-            { label },
-            "Select " + label,
-          ).then((t) => tick.setAttribute("aria-label", t));
-        }
-        tick.addEventListener("click", (ev) => ev.stopPropagation());
-        tick.addEventListener("change", () => {
-          if (tick.checked) tabSelection.add(tab.id);
-          else tabSelection.delete(tab.id);
-          renderTabBatchBar();
-        });
-        chip.appendChild(tick);
+    // A drag holds the order it started from. Any change to that order (a tab
+    // opened, closed, or moved by a shortcut) leaves its geometry describing a
+    // strip that no longer exists, so the drag is abandoned rather than
+    // committed against the wrong tabs. A title or a load changes no order,
+    // and the drag carries on through it.
+    if (
+      tabDrag &&
+      (!ids.includes(tabDrag.id) ||
+        (tabDrag.started && !sameTabIds(tabDrag.ids, ids)))
+    ) {
+      cancelTabDrag();
+    }
+    const firstPaint = tabChipsById.size === 0;
+    for (const tab of list) {
+      let chip = tabChipsById.get(tab.id);
+      if (!chip) {
+        chip = buildTabChip(wrap, tab.id);
+        tabChipsById.set(tab.id, chip);
       }
-      chip.appendChild(el("span", "chip-title", chipLabel(tab)));
-      const close = el("button", "chip-close", "\u00D7");
-      close.type = "button";
-      close.title = i18nText("chrome-js-tabs-close-title", "Close tab");
-      close.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        rb("tab_close", { id: tab.id }).catch(() => {});
-      });
-      chip.appendChild(close);
-      chip.addEventListener("click", () => {
-        if (tabSelectMode) {
-          // In select mode the whole chip is the toggle: aiming for a
-          // small checkbox is how ticks get lost, and switching tabs
-          // mid-selection would abandon the set being built.
-          if (tabSelection.has(tab.id)) tabSelection.delete(tab.id);
-          else tabSelection.add(tab.id);
-          const tick = chip.querySelector(".chip-select");
-          if (tick) tick.checked = tabSelection.has(tab.id);
-          renderTabBatchBar();
-          return;
+      paintTabChip(chip, tab);
+    }
+    const live = new Set(ids);
+    const stale = Array.from(tabChipsById).filter(([id]) => !live.has(id));
+    if (stale.length || !sameTabIds(tabDomIds(wrap), ids)) {
+      const apply = () => {
+        for (const [id, chip] of stale) {
+          tabChipsById.delete(id);
+          if (chip.parentNode === wrap) wrap.removeChild(chip);
         }
-        if (!tab.active) rb("tab_switch", { id: tab.id }).catch(() => {});
-      });
-      chip.addEventListener("dragstart", (ev) => {
-        draggedTabId = tab.id;
-        tabDragCommitted = false;
-        chip.classList.add("dragging");
-        if (ev.dataTransfer) {
-          ev.dataTransfer.effectAllowed = "move";
-          // A drag with NOTHING in dataTransfer is not a drag. Both engines
-          // abandon it and fall back to selecting the text under the cursor,
-          // which is exactly what the tab strip did: press, move, and the
-          // tab title highlighted instead of the tab moving. The other three
-          // drags in this file (bookmarks, Quick Access tiles, bookmark rows)
-          // all call setData and all worked; this one did not and did not.
-          //
-          // The constant is deliberately meaningless. The rule this file set
-          // out to keep still holds -- the tab id is an internal chrome
-          // address and must not ride in a payload another application could
-          // receive on drop -- so the id travels in `draggedTabId` and what
-          // goes on the wire is a word that identifies nothing.
-          ev.dataTransfer.setData("text/plain", "tab");
-        }
-      });
-      chip.addEventListener("dragend", () => {
-        draggedTabId = null;
-        for (const candidate of wrap.querySelectorAll(".dragging")) {
-          candidate.classList.remove("dragging");
-        }
-        // A drag that ended without committing leaves the DOM showing the
-        // dragover PREVIEW, which Rust never agreed to. That preview used to
-        // stand until the next repaint from Rust -- a title change, a favicon,
-        // load progress -- and then the tab jumped back on its own, with no
-        // action from the user to explain it. Repaint from the last canonical
-        // list now, so the strip can never display an order Rust does not hold.
-        if (!tabDragCommitted) renderTabs(lastTabItems);
-        tabDragCommitted = false;
-      });
-      chip.addEventListener("keydown", (ev) => {
-        if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
-        const ids = tabDomIds(wrap);
-        const from = ids.indexOf(tab.id);
-        const to = from + (ev.key === "ArrowLeft" ? -1 : 1);
-        if (from < 0 || to < 0 || to >= ids.length) return;
-        ev.preventDefault();
-        const next = ids.slice();
-        [next[from], next[to]] = [next[to], next[from]];
-        putTabDomInOrder(wrap, next);
-        void persistTabOrder(next, tab.id);
-      });
-      wrap.appendChild(chip);
+        putTabDomInOrder(wrap, ids);
+      };
+      // Chips already on screen slide to where a close or a reorder left
+      // them; the first paint just lands.
+      if (firstPaint) apply();
+      else slideTabs(wrap, apply);
     }
     if (tabSelectMode) renderTabBatchBar();
   }
@@ -1762,8 +2066,71 @@
   urlInput.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter") {
       const url = urlInput.value.trim();
-      if (url) rb("navigate", { url }).catch(() => {});
+      if (url) {
+        urlEdited = false;
+        urlDeferred = false;
+        // Submitting an address is choosing to go there. A panel still open
+        // over the page (typically the vault prompt that opens at launch) is
+        // closed first, through the panel manager so its onClose runs -- the
+        // vault wipes its fields there. Left open, the page would load behind
+        // a dialog that looks like it holds the keyboard; Rust also refuses to
+        // hand the keyboard to a page a panel still covers.
+        if (openPanelName) closeOpenPanel();
+        rb("navigate", { url }).catch(() => {});
+      }
+      return;
     }
+    // Escape abandons the edit, not the bar: the page's own address comes
+    // back, selected, so the next keystroke replaces it. Only when there is
+    // an edit to abandon; otherwise Escape goes on to close the find bar or a
+    // panel, one layer per press, as it always has.
+    if (ev.key === "Escape" && urlInput.value !== urlCommitted) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      urlInput.value = urlCommitted;
+      urlEdited = false;
+      urlInput.select();
+    }
+  });
+  urlInput.addEventListener("input", () => {
+    urlEdited = true;
+  });
+  urlInput.addEventListener("blur", () => {
+    urlEdited = false;
+    urlSelectOnMouseUp = false;
+    // An edit that outlived a change of page: leaving the bar ends it, and
+    // the bar goes back to naming the page actually showing rather than an
+    // address nobody submitted.
+    if (urlDeferred) {
+      urlDeferred = false;
+      urlInput.value = urlCommitted;
+    }
+  });
+  // The first click into the bar selects the whole address, as in every
+  // other browser, so typing replaces it instead of landing mid-URL. Done on
+  // the mouseup, because the press itself places the caret. A click in a bar
+  // that already has the keyboard just moves the caret, and a press that
+  // dragged out a partial selection keeps it.
+  urlInput.addEventListener("focus", () => {
+    urlFocusedAt = performance.now();
+  });
+  urlInput.addEventListener("mousedown", () => {
+    urlSelectOnMouseUp = document.activeElement !== urlInput;
+  });
+  urlInput.addEventListener("mouseup", (ev) => {
+    // The press focused the bar, or the keyboard came back to it with this
+    // click (typed an address, pressed Enter, read the page, clicked the bar:
+    // the commonest way back, and the one the first check alone missed).
+    const focusedByThisClick =
+      urlSelectOnMouseUp ||
+      performance.now() - urlFocusedAt < URL_CLICK_FOCUS_MS;
+    urlSelectOnMouseUp = false;
+    // One focus, one click: a quick second click must place the cursor.
+    urlFocusedAt = -Infinity;
+    if (!focusedByThisClick) return;
+    if (urlInput.selectionStart !== urlInput.selectionEnd) return;
+    ev.preventDefault();
+    urlInput.select();
   });
   // ---- panel manager ----
   // One panel visible at a time. With three of them, letting two open at once
@@ -1941,7 +2308,9 @@
     // its layout() applies the arrangement itself.
   }
 
-  function togglePanelNamed(name) {
+  // `opts.focus === false` opens a panel WITHOUT moving the keyboard into it.
+  // Only the launch-time vault uses it; see the boot sequence.
+  function togglePanelNamed(name, opts) {
     const target = panels.get(name);
     if (!target) return;
     const wasOpen = openPanelName === name;
@@ -1981,8 +2350,13 @@
       //
       // Deferred a tick because `onOpen` may still be populating the panel; the
       // Close control is injected by registerPanel and is always present.
+      //
+      // Not for a panel the BROWSER opened on its own at launch: that one
+      // must leave the keyboard where the launch put it (see the boot vault
+      // opener). Tab still reaches the panel through the trap below.
+      const takeFocus = !(opts && opts.focus === false);
       setTimeout(() => {
-        if (openPanelName !== name) return;
+        if (!takeFocus || openPanelName !== name) return;
         const items = focusablesIn(target.el);
         if (items.length) items[0].focus();
       }, 0);
@@ -6909,6 +7283,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     .then((data) => {
       if (data && data.url && data.url !== "about:blank" && !urlInput.value) {
         urlInput.value = data.url;
+        urlCommitted = data.url;
+        // Launch may already have put the keyboard in the (then empty) bar;
+        // keep it waiting to be replaced, not appended to.
+        if (document.activeElement === urlInput) urlInput.select();
       }
     })
     .catch(() => {});
@@ -6918,6 +7296,14 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   rb("tab_list")
     .then((data) => acceptTabItems(data && data.items))
     .catch(() => {});
+
+  // Put the keyboard where a launch means it: the address bar, or the page
+  // when another application opened PATANYX on a link (Rust decides; see
+  // AppState::startup_focus). Asked for only now, because until this script
+  // has run there is no address bar to put it in. Nothing below takes it
+  // back: the vault prompt opens without focus, and wearing the toolbar
+  // placement no longer detaches the bar.
+  rb("startup_focus").catch(() => {});
 
   // First-run tour. Runs after everything above has registered -- this is an
   // async callback, so by the time it fires every registerPanel call in this
@@ -6960,8 +7346,12 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
           // Unlocked cannot happen at launch, but it is checked rather than
           // assumed. `openPanelName` guards the case where something else got
           // there first, so this can never close a panel a user opened.
+          // Opened WITHOUT focus. The comment above always said the address
+          // bar keeps the keyboard, but togglePanelNamed moves focus into
+          // every panel it opens, so the vault's Close button took it a tick
+          // later and the first thing typed after launch went nowhere.
           if (status && !status.unlocked && !openPanelName) {
-            togglePanelNamed("vault");
+            togglePanelNamed("vault", { focus: false });
           }
         });
       });
@@ -10523,12 +10913,30 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       // Nothing was ever moved, so there is nothing to restore.
       return;
     }
-    // Re-append in source order. Elements added at runtime after the order
-    // was captured are appended by the loop below rather than lost.
-    for (const el of toolbarOrder) {
-      if (el.parentNode === bar || el.parentNode === rail) bar.appendChild(el);
-    }
-    for (const el of Array.from(rail.children)) bar.appendChild(el);
+    // Source order, with elements added at runtime after the order was
+    // captured kept rather than lost: anything in the bar the capture never
+    // saw stays first, the captured elements follow in source order, and
+    // anything else in the rail goes last.
+    const captured = new Set(toolbarOrder);
+    const wanted = Array.from(bar.children)
+      .filter((el) => !captured.has(el))
+      .concat(
+        toolbarOrder.filter(
+          (el) => el.parentNode === bar || el.parentNode === rail,
+        ),
+        Array.from(rail.children).filter((el) => !captured.has(el)),
+      );
+    // MOVING ONLY WHAT IS OUT OF PLACE. This used to re-append every child,
+    // and every launch comes through here (the Top placement is worn once at
+    // boot, just after the order is first captured, so "nothing was ever
+    // moved" above never applies). Re-appending detaches each element in
+    // turn -- the address bar included -- and a detached element loses the
+    // keyboard WITHOUT a blur event. That is why the launch rule "the address
+    // bar keeps the keyboard" never held: the bar had it, then silently did
+    // not, and the first thing typed went nowhere.
+    wanted.forEach((el, i) => {
+      if (bar.children[i] !== el) bar.insertBefore(el, bar.children[i] || null);
+    });
   }
 
   function wearToolbarPlacement(placement) {

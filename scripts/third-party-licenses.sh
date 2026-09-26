@@ -26,8 +26,11 @@ import json, sys, collections, pathlib
 out = pathlib.Path(sys.argv[1])
 meta = json.load(open("/tmp/patanyx-meta.json"))
 
-# Workspace members have no `source`; they are ours and are not third party.
-ours = {p["id"] for p in meta["packages"] if p.get("source") is None}
+# Only the WORKSPACE MEMBERS are ours. "No `source`" used to stand in for
+# that, and it also matched vendor/wry, which is a path patch of a third-party
+# crate: wry silently dropped out of this inventory while it stayed in every
+# in-binary attribution file.
+ours = set(meta["workspace_members"])
 deps = [p for p in meta["packages"] if p["id"] not in ours]
 deps.sort(key=lambda p: (p["name"].lower(), p["version"]))
 
@@ -60,13 +63,16 @@ lines.append("table says nothing about whether a crate is compiled into any rele
 lines.append("binary.")
 lines.append("")
 lines.append("That distinction is load-bearing when reading the licence column. As of")
-lines.append("2026-07-29 the only GPL-family string anywhere below is `r-efi`'s")
-lines.append("`MIT OR Apache-2.0 OR LGPL-2.1-or-later`; `r-efi` targets UEFI and is in")
+lines.append("2026-09-25 two GPL-family strings appear below. `r-efi`'s")
+lines.append("`MIT OR Apache-2.0 OR LGPL-2.1-or-later`: `r-efi` targets UEFI and is in")
 lines.append("NEITHER shipped binary -- `cargo tree --target x86_64-unknown-linux-gnu -i")
 lines.append("r-efi` and the same for `x86_64-pc-windows-msvc` both report no such")
-lines.append("package. No copyleft code is distributed. Confirm the same way before")
-lines.append("acting on a licence seen here, rather than assuming the table describes")
-lines.append("what a user receives.")
+lines.append("package. And `self_cell`'s `Apache-2.0 OR GPL-2.0-only`: it ships in")
+lines.append("both binaries (through `fluent-bundle`, the interface translations), and")
+lines.append("PATANYX takes it under Apache-2.0, the option that matches its own licence.")
+lines.append("No GPL-family code is distributed. Confirm the same way before acting on a")
+lines.append("licence seen here, rather than assuming the table describes what a user")
+lines.append("receives.")
 lines.append("")
 lines.append("PATANYX itself is Apache-2.0; see LICENSE. Attributions that must travel")
 lines.append("with a redistribution -- bundled data, the platform engines -- are in")

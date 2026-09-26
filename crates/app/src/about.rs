@@ -696,21 +696,39 @@ const DISCLOSURE_HEAD: &str = "What it is built from";
 /// browser opens PATANYX Search at patanyx.com (main.rs, HOME_URL), a site we
 /// operate. Same reasoning: it is self-initiated, a capture finds it, and the
 /// sentence says "only". Named as what it is -- a page you can see open, not
-/// a check -- and with the fact that lets it be harmless: the server writes
-/// no log line for that page or what it loads.
+/// a check.
+///
+/// WHAT THE SERVER KEEPS OF THAT LAUNCH, as privacy policy s2.2 and B.5 state
+/// it: no line with the address (the front page, its assets and a refused
+/// launch's /429.html are all excluded from the address log), but one row in
+/// the addressless visit record, with the time, the page, the response and a
+/// place worked out from the address. This sentence used to say the server
+/// "keeps no log of that page", which was only true of the address, so it
+/// now says which record exists and what it lacks.
+///
+/// "Collects nothing about you" went for the same reason. marker.rs sends two
+/// fixed headers to our own two sites -- the request came from PATANYX, and
+/// whether it is the launch page -- identical in every copy (policy s18.4).
+/// They are named rather than denied.
 ///
 /// Partner destinations do not join this list: `partner_open` runs only after
 /// the user presses a labeled card. That navigation is user-initiated, not
 /// something PATANYX reaches out for on its own.
-const DISCLOSURE: &str = "One Rust program, with nothing downloaded at runtime. PATANYX itself \
-collects nothing about you. The only things it reaches out for on its own are \
-an anonymous, signed update check and blocklist refreshes, plus an occasional \
+const DISCLOSURE: &str = "One Rust program. The only things \
+it reaches out for on its own are an anonymous, signed update check, the \
+update itself when there is one, and blocklist refreshes, plus an occasional \
 check that the resolver is still reachable if you have chosen an encrypted \
-one. Started without a page, it opens PATANYX Search at patanyx.com, which \
-we run and which keeps no log of that page or what it loads. Web pages are \
-drawn by software your computer already has and updates itself. One caveat: \
-on Windows, Microsoft's WebView2 engine reports a minimum of component health \
-data that no application is allowed to switch off.";
+one. Downloading an update tells our server which version you are upgrading \
+from. Started without a page, it \
+opens PATANYX Search at patanyx.com, which we run. That launch leaves no \
+record of your address on our side; its visit record keeps the time and an \
+approximate place instead. PATANYX itself reports nothing about how you use it, beyond \
+two marks every copy sends to our own websites: that a request came from \
+PATANYX, and whether it is the launch page. Web pages are drawn by software \
+your computer already has, and its security fixes come from your system's \
+own updates, not from PATANYX. One caveat: on Windows, \
+Microsoft's WebView2 engine reports a minimum of component health data that \
+no application is allowed to switch off.";
 
 fn pairs(list: &[(&str, &str)]) -> Vec<Value> {
     list.iter()
@@ -1095,6 +1113,47 @@ mod tests {
              sentence listing what the browser reaches out for on its own has \
              to include it."
         );
+        // Retracted in 1.0.2, when the privacy policy of 2026-09-26 described
+        // what actually happens. Each was false: the browser does send two
+        // fixed marks to our own sites, the launch IS written (without an
+        // address) to the visit record, and updates, blocklists and language
+        // packs are all downloaded at runtime. None may come back.
+        for retracted in [
+            "collects nothing about you",
+            "keeps no log of that page",
+            "nothing downloaded at runtime",
+            // False on Linux: WebKitGTK does not update itself, which is why
+            // a release build refuses to start below its floor (main.rs) and
+            // the engine banner omits the "on its own" sentence there.
+            "updates itself",
+        ] {
+            assert!(
+                !lowered.contains(retracted),
+                "the disclosure carries a retracted claim: {retracted:?}"
+            );
+        }
+        assert!(
+            lowered.contains("two marks every copy sends to our own websites")
+                && lowered.contains("leaves no record of your address")
+                && lowered.contains("visit record")
+                && lowered.contains("approximate place")
+                && lowered.contains("security fixes come from your system's own updates"),
+            "the disclosure must name the two marks and what the launch leaves"
+        );
+        // The background update download is on by default (prefs.rs), is a
+        // separate request from the check, and is the one automatic request
+        // that is not the same for every copy: policy s2.1 says it tells the
+        // server which version you are upgrading from. Leave it out and
+        // "the only things" is false again.
+        assert!(
+            lowered.contains("the update itself when there is one")
+                && lowered.contains("version you are upgrading from"),
+            "the disclosure must name the background update download and what it tells the server"
+        );
+        // "No record of your address" holds only for this exact URL: the
+        // nginx map excludes "/" and its own assets from the address log,
+        // and any other path, such as /us, is logged with the address.
+        assert_eq!(crate::HOME_URL, "https://patanyx.com/");
         // The session reset is a start-of-next-launch clear, not an exit-time
         // shred. Both halves stay in the same public paragraph: what the next
         // page inherits, and what someone inspecting the disk between runs

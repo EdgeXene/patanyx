@@ -11,23 +11,23 @@
   "exclusions": [
     {
       "pair": "az-en",
-      "reason": "alpha-only upstream (Firefox ships these to Nightly only)"
+      "reason": "alpha-only upstream (shipped to its nightly channel only)"
     },
     {
       "pair": "be-en",
-      "reason": "alpha-only upstream (Firefox ships these to Nightly only)"
+      "reason": "alpha-only upstream (shipped to its nightly channel only)"
     },
     {
       "pair": "en-sq",
-      "reason": "alpha-only upstream (Firefox ships these to Nightly only)"
+      "reason": "alpha-only upstream (shipped to its nightly channel only)"
     },
     {
       "pair": "mt-en",
-      "reason": "alpha-only upstream (Firefox ships these to Nightly only)"
+      "reason": "alpha-only upstream (shipped to its nightly channel only)"
     },
     {
       "pair": "nn-en",
-      "reason": "alpha-only upstream (Firefox ships these to Nightly only)"
+      "reason": "alpha-only upstream (shipped to its nightly channel only)"
     }
   ],
   "pairs": {

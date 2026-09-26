@@ -68,6 +68,20 @@ function bootWith(replies) {
       }
       realPost(raw);
     };
+    // Which panels had focus MOVED into them. The stub answers the
+    // focusable-elements query with nothing, so no panel could ever be seen
+    // taking focus; each boot panel is given one spy element instead.
+    const panelFocus = {};
+    for (const id of ["vault-panel", "onboarding-panel"]) {
+      const el = global.$(id);
+      if (!el) continue;
+      panelFocus[id] = 0;
+      const own = el.querySelectorAll.bind(el);
+      el.querySelectorAll = (sel) =>
+        String(sel).includes("button:not([disabled])")
+          ? [{ hidden: false, offsetParent: {}, focus() { panelFocus[id] += 1; } }]
+          : own(sel);
+    }
     new Function(chromeSrc)();
     (async () => {
       for (let i = 0; i < 40; i += 1) {
@@ -78,15 +92,19 @@ function bootWith(replies) {
         const el = global.$(id);
         if (el && el.hidden === false) open.push(id);
       }
-      console.log(JSON.stringify(open));
+      console.log(JSON.stringify({ open, panelFocus }));
     })();
   `;
   const out = execFileSync(process.execPath, ["-e", script], {
     encoding: "utf8",
     cwd: root,
   });
-  const last = out.trim().split("\n").pop();
-  return JSON.parse(last);
+  const last = JSON.parse(out.trim().split("\n").pop());
+  // Still an array of open panel ids, as every check expects, carrying the
+  // focus counts beside it.
+  const open = last.open;
+  open.panelFocus = last.panelFocus;
+  return open;
 }
 
 check("the vault opens itself when PATANYX was opened on its own", () => {
@@ -191,6 +209,44 @@ check("a failed status read opens nothing", () => {
   assert(
     open.indexOf("vault-panel") < 0,
     "a failed vault_status still opened the panel; got " + JSON.stringify(open),
+  );
+});
+
+check("the launch vault leaves the keyboard in the address bar", () => {
+  // The rule below has always been written down; it was not true. The boot
+  // opener went through togglePanelNamed, which moves focus into every panel
+  // it opens, so the vault's Close button took the keyboard a tick after
+  // launch and the first thing typed went nowhere. Behavioral, because the
+  // source check below could not see it: the focus call was never in
+  // refreshVault.
+  const open = bootWith({
+    onboarding_seen_get: { seen: true },
+    startup_info: { opened_with_url: false },
+    vault_status: { exists: true, unlocked: false },
+  });
+  assert(
+    open.indexOf("vault-panel") >= 0,
+    "setup: the vault did not open at launch; got " + JSON.stringify(open),
+  );
+  assert(
+    open.panelFocus["vault-panel"] === 0,
+    "the launch vault moved the keyboard into itself (" +
+      open.panelFocus["vault-panel"] +
+      " focus call); typing after launch no longer reaches the address bar",
+  );
+  // Positive control: a panel opened on purpose still takes focus, so the
+  // spy above is live and a zero means something.
+  const tour = bootWith({
+    onboarding_seen_get: { seen: false },
+    startup_info: { opened_with_url: false },
+    vault_status: { exists: true, unlocked: false },
+  });
+  assert(
+    tour.indexOf("onboarding-panel") >= 0 &&
+      tour.panelFocus["onboarding-panel"] > 0,
+    "control failed: the first-run tour did not take focus either, so this " +
+      "check can no longer see focus at all: " +
+      JSON.stringify(tour.panelFocus),
   );
 });
 

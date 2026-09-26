@@ -148,6 +148,14 @@ enum UserEvent {
     /// plainly which data were NOT cleared instead of turning an unavailable
     /// privacy primitive into a browser that never loads.
     SessionWipeFinished,
+    /// The engine answered tab N's WebSocket guard registration (Windows):
+    /// its first page may be released.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    LocalNetworkGuardSettled(u64),
+    /// The engine has not answered it in time (Windows): recorded as Failed,
+    /// and the first page is released anyway.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    LocalNetworkGuardOverdue(u64),
     UrlChanged(u64, String),
     /// A message a CONTENT webview's translation script posted UP.
     ///
@@ -159,7 +167,11 @@ enum UserEvent {
     ContentTranslate(u64, String),
     LoadState(u64, bool),
     TitleChanged(u64, String),
-    OpenInNewTab(String),
+    /// A page asked for a new tab (window.open, target=_blank). `allowed` is
+    /// the verdict on a local address, taken in the callback that queued this
+    /// from what the engine event recorded when the page asked
+    /// (`platform::new_tab_allowed`).
+    OpenInNewTab { url: String, allowed: bool },
     /// The behavioural blocking probe has had long enough to load.
     ProbeDone,
     DownloadStarted(String),
@@ -169,6 +181,12 @@ enum UserEvent {
         success: bool,
     },
     Shortcut(shortcuts::Shortcut),
+    /// The keyboard went to the chrome or to a page (a click, or our own
+    /// focus call). Carries WHICH surface and nothing else, so the next
+    /// window activation can put the keyboard back there.
+    // Sent only by the WebView2 backend; GTK restores focus by itself.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SurfaceFocused(state::FocusSurface),
     /// A key was pressed inside a PAGE. Carries nothing -- not the key, not a
     /// timestamp -- because the only thing it is used for is "a human is
     /// here", and a keystroke stream crossing this boundary would be a
@@ -931,7 +949,7 @@ fn window_title() -> &'static str {
 /// The page the first tab opens when the browser is started on its own:
 /// PATANYX Search, which we operate. Its front page and that page's own
 /// assets are served without access logging, so a launch does not write the
-/// person's address anywhere; the privacy policy (Part A s2.1, Part B B.2)
+/// person's address anywhere; the privacy policy (Part A s2.2, Part B B.2)
 /// says so and this constant is what has to stay true for it to be right.
 pub(crate) const HOME_URL: &str = "https://patanyx.com/";
 
@@ -1433,6 +1451,19 @@ fn main() {
                 event: WindowEvent::ScaleFactorChanged { .. },
                 ..
             } => app.relayout(),
+            // The window was activated (launch, taskbar click, Alt+Tab). On
+            // Windows the keyboard lands on the top-level window, which holds
+            // no field, so it is put back where it was; see restore_focus.
+            // GTK restores a window's focus widget itself, so Linux does not
+            // second-guess it.
+            Event::WindowEvent {
+                event: WindowEvent::Focused(true),
+                ..
+            } => {
+                #[cfg(windows)]
+                app.restore_focus();
+            }
+            Event::UserEvent(UserEvent::SurfaceFocused(surface)) => app.note_focus(surface),
             // A key was pressed inside a page. The ONLY effect is to say a
             // human is here; see UserEvent::UserPresence.
             Event::UserEvent(UserEvent::UserPresence) => app.touch(),
@@ -1489,6 +1520,12 @@ fn main() {
             Event::UserEvent(UserEvent::SessionWipeFinished) => {
                 app.finish_session_wipe()
             }
+            Event::UserEvent(UserEvent::LocalNetworkGuardSettled(id)) => {
+                app.on_local_network_guard_settled(id)
+            }
+            Event::UserEvent(UserEvent::LocalNetworkGuardOverdue(id)) => {
+                app.on_local_network_guard_overdue(id)
+            }
             Event::UserEvent(UserEvent::UrlChanged(id, url)) => app.on_url_changed(id, url),
             Event::UserEvent(UserEvent::LoadState(id, loading)) => app.on_load_state(id, loading),
             // Text a CONTENT page's extractor posted up. UNTRUSTED, and
@@ -1518,7 +1555,7 @@ fn main() {
             Event::UserEvent(UserEvent::TitleChanged(id, title)) => {
                 app.on_title_changed(id, title)
             }
-            Event::UserEvent(UserEvent::OpenInNewTab(url)) => {
+            Event::UserEvent(UserEvent::OpenInNewTab { url, allowed }) => {
                 // Re-checked at the sink as well as at the source. The source
                 // is a wry callback on the content webview, so it is the half
                 // of this path an untrusted page gets to talk to; validating
@@ -1526,7 +1563,13 @@ fn main() {
                 // lost. new_tab() calls with_url directly, and a new webview's
                 // initial load is not a navigation, so this is the last point
                 // at which anything checks.
-                if state::is_allowed_content_url(&url) && app.tabs.len() < state::MAX_TABS {
+                //
+                // The opener's standing is applied here too: the new tab's
+                // first navigation is issued by the browser, so this is the
+                // only place a plain-HTTP page's attempt to open a local
+                // address in a new tab can be told from the user's own. The
+                // verdict itself was taken when the page asked.
+                if allowed && state::is_allowed_content_url(&url) && app.tabs.len() < state::MAX_TABS {
                     // THE REMOTE PATH. A page reaches this with window.open(),
                     // so a refusal here must cost the page its tab and nothing
                     // else. Dropped deliberately rather than surfaced: the

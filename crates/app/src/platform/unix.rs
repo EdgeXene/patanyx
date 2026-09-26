@@ -610,8 +610,13 @@ fn gdk_key(value: gtk::gdk::keys::Key) -> Option<Key> {
         // Ctrl+Shift+I, developer tools on the page. Both cases, because GDK
         // reports the shifted keyval and this binding always carries Shift.
         k::i | k::I => Key::I,
+        // Alt+D, the other spelling of "focus the address bar". Both cases,
+        // for the same reason as the letters above.
+        k::d | k::D => Key::D,
         k::Tab | k::ISO_Left_Tab => Key::Tab,
         k::F5 => Key::F5,
+        // F6, the third spelling of "focus the address bar".
+        k::F6 => Key::F6,
         k::F3 => Key::F3,
         k::F12 => Key::F12,
         k::Left => Key::Left,
@@ -815,6 +820,10 @@ pub fn build_content(
     let translate_script =
         CONTENT_TRANSLATE_SCRIPT.replace("__PATANYX_POLL_REQUEST__", &format!("{TRANSLATE_POLL_REQUEST}:{poll_token}"));
     let builder = builder.with_initialization_script(translate_script.as_str());
+    // Built WITHOUT the keyboard: wry defaults to focused, which grab_focus-es
+    // every new webview as it is created. Whether a page gets focus is decided
+    // in one place, AppState::show_and_focus_tab.
+    let builder = builder.with_focused(false);
     let webview = builder.build_gtk(&container)?;
     // Register the page-to-host channel the extractor posts through. If the
     // engine gives us no content manager the channel simply does not exist and
@@ -2906,6 +2915,51 @@ pub fn blocked_total(view: &TabView) -> u64 {
     view.state.borrow().ledger.blocked_total()
 }
 
+/// No-op: the local-network boundary is enforced by the WebView2 request
+/// handler only, and WebKitGTK has no per-request veto to enforce it with.
+pub fn note_app_navigation(_view: &TabView, _url: &str) {}
+
+/// No-op, as `note_app_navigation`.
+pub fn forget_app_navigation(_view: &TabView) {}
+
+/// Always: nothing but the session wipe holds a first page on WebKitGTK, and
+/// AppState already waits for that.
+pub fn initial_navigation_ready(_view: &TabView) -> bool {
+    true
+}
+
+/// No-op: the WebSocket guard is Windows-only, so nothing here is overdue.
+pub fn note_local_network_guard_overdue(_view: &TabView) {}
+
+/// A tab's first navigation could not be issued (host only:
+/// `super::initial_navigation_failure_line`).
+pub fn report_initial_navigation_failure(url: &str, error: &wry::Error) {
+    diag(&super::initial_navigation_failure_line(url, error));
+}
+
+/// No-op: the tab's pending flag is the whole wipe state here.
+pub fn note_session_wipe_finished(_view: &TabView) {}
+
+/// A pending first page here means the tab waits for the session wipe.
+pub fn holds_session_wipe(_view: &TabView, first_page_pending: bool) -> bool {
+    first_page_pending
+}
+
+/// No standing to hand over: the local-network boundary is not enforced on
+/// WebKitGTK (see `note_app_navigation`).
+pub struct NewTabGate;
+
+pub fn new_tab_gate(_view: &TabView) -> NewTabGate {
+    NewTabGate
+}
+
+/// Always true, for the same reason as `note_app_navigation`: refusing a
+/// page's new tab here while the page itself may reach the same address would
+/// be a rule with nothing behind it.
+pub fn new_tab_allowed(_gate: Option<&NewTabGate>, _url: &str) -> bool {
+    true
+}
+
 /// Whether the current document was loaded over plain HTTP. For the Info tab's
 /// "not encrypted" row.
 pub fn page_insecure(view: &TabView) -> bool {
@@ -3677,9 +3731,17 @@ pub fn capture_page(
     );
 }
 
+/// Shows the tab. It does NOT give its page the keyboard: that is a separate
+/// decision (`focus_content`), taken by AppState::show_and_focus_tab, which
+/// refuses it while a modal covers the window.
 pub fn show_tab(view: &TabView, _webview: &WebView) {
     // show_all (not show): a background tab may never have been visible.
     view.container.show_all();
+}
+
+/// Give a tab's page the keyboard (grab_focus on its WebKitGTK widget).
+pub fn focus_content(webview: &WebView) {
+    let _ = webview.focus();
 }
 
 pub fn hide_tab(view: &TabView, _webview: &WebView) {
@@ -3975,6 +4037,9 @@ mod key_table_tests {
             (k::Tab, Key::Tab),
             (k::F5, Key::F5),
             (k::F3, Key::F3),
+            (k::F6, Key::F6),
+            (k::d, Key::D),
+            (k::D, Key::D),
             (k::F12, Key::F12),
             (k::Left, Key::Left),
             (k::Right, Key::Right),

@@ -63,11 +63,36 @@ check(
     "target and kills in-page dragging.",
 );
 
+// The chrome's remaining HTML5 drags (bookmarks, Quick Access tiles, bookmark
+// rows) must still write SOMETHING into dataTransfer: both engines abandon a
+// drag with nothing in it and select the text under the cursor instead. The
+// tab drag used to be one of them and is not any more -- see the next check.
 check(
-  "the tab drag still carries a payload",
+  "the HTML5 drags still carry a payload",
   /setData\(\s*"text\/plain"/.test(chromeJs),
-  "the tab dragstart writes nothing into dataTransfer, so both engines " +
-    "abandon the drag and select text instead.",
+  "no dragstart in chrome.js writes into dataTransfer, so both engines " +
+    "abandon the bookmark drags and select text instead.",
+);
+
+// The TAB drag is pointer events on the chip, so it depends on none of the
+// engine drop-target plumbing checks 1 and 2 protect -- the plumbing that
+// broke tab dragging on Windows three times. Turning it back into an HTML5
+// drag would put tab reordering back at the mercy of both.
+const chipBuilderAt = chromeJs.indexOf("function buildTabChip");
+const chipBuilder =
+  chipBuilderAt < 0
+    ? ""
+    : chromeJs.slice(
+        chipBuilderAt,
+        chromeJs.indexOf("\n  function ", chipBuilderAt + 1),
+      );
+check(
+  "the tab drag is a pointer drag, not an HTML5 one",
+  chipBuilder.length > 200 &&
+    /"pointerdown"/.test(chipBuilder) &&
+    !/draggable|"dragstart"|dataTransfer/.test(chipBuilder),
+  "buildTabChip is missing, has no pointerdown, or makes the chip an HTML5 " +
+    "drag source again (draggable / dragstart / dataTransfer).",
 );
 
 check(
@@ -82,4 +107,4 @@ if (failures.length) {
   for (const f of failures) console.error(`  - ${f}`);
   process.exit(1);
 }
-console.log(`drag-regression-gate OK (4 checks)`);
+console.log(`drag-regression-gate OK (5 checks)`);

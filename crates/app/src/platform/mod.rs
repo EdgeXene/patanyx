@@ -90,6 +90,47 @@ pub(crate) fn load_initial_url(
     }
 }
 
+/// The exportable log's line for a first navigation that could not be
+/// issued. The host only, like every release-build line in that log:
+/// `diagnostics_snapshot` promises no other page's full URL, and a path,
+/// query, fragment or userinfo can carry a secret.
+///
+/// The URL here is the tab's own, possibly as the user typed it, so the host
+/// comes from a WHATWG parse, which ends the authority where the engine does
+/// (a backslash included), not from `privacy::host_of`, which is written for
+/// the engine's already-canonical request URLs (final review 9, R-001).
+pub(crate) fn initial_navigation_failure_line(url: &str, error: &dyn std::fmt::Display) -> String {
+    let host = url::Url::parse(url)
+        .ok()
+        .and_then(|parsed| parsed.host_str().map(str::to_ascii_lowercase))
+        .unwrap_or_else(|| "<no host>".to_string());
+    format!("build: initial navigation to {host} failed ({error})")
+}
+
+#[cfg(test)]
+mod initial_navigation_line_tests {
+    use super::initial_navigation_failure_line;
+
+    #[test]
+    fn a_failed_first_page_is_logged_by_host_alone() {
+        let line = initial_navigation_failure_line(
+            "http://admin:hunter2@Router.Example:8080/setup/wifi?token=s3cret#pin-1234",
+            &"E_FAIL",
+        );
+        assert_eq!(line, "build: initial navigation to router.example failed (E_FAIL)");
+        for secret in ["admin", "hunter2", "8080", "setup", "token", "s3cret", "pin-1234"] {
+            assert!(!line.contains(secret), "{secret:?} reached the log: {line}");
+        }
+        // A backslash ends the authority for the engine, so it does here.
+        let line = initial_navigation_failure_line("http://Router.Example\\reset\\s3cret-token", &"E_FAIL");
+        assert_eq!(line, "build: initial navigation to router.example failed (E_FAIL)");
+        let line = initial_navigation_failure_line("about:blank", &"E_FAIL");
+        assert_eq!(line, "build: initial navigation to <no host> failed (E_FAIL)");
+        let line = initial_navigation_failure_line("not a url at all /secret", &"E_FAIL");
+        assert_eq!(line, "build: initial navigation to <no host> failed (E_FAIL)");
+    }
+}
+
 #[cfg(test)]
 mod session_wipe_tests {
     use super::{SessionWipeEntry, SessionWipeGate};

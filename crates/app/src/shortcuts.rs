@@ -37,9 +37,13 @@ pub enum Key {
     P,
     /// Developer tools, on the PAGE. Both spellings every browser binds.
     I,
+    /// Alt+D, one of the three spellings of "focus the address bar".
+    D,
     Tab,
     F5,
     F3,
+    /// F6, another spelling of "focus the address bar".
+    F6,
     F12,
     Left,
     Right,
@@ -178,9 +182,11 @@ pub fn vk_key(virtual_key: u32) -> Option<Key> {
         0x46 => Key::F,
         0x50 => Key::P,
         0x49 => Key::I,
+        0x44 => Key::D,
         VK_TAB => Key::Tab,
         VK_F5 => Key::F5,
         0x72 => Key::F3,
+        0x75 => Key::F6,
         VK_F12 => Key::F12,
         VK_LEFT => Key::Left,
         VK_RIGHT => Key::Right,
@@ -211,6 +217,11 @@ pub fn resolve(mods: Mods, key: Key) -> Option<Shortcut> {
         // shift-first so the more specific binding wins.
         Key::L if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::LockVault),
         Key::L if mods.ctrl && !mods.alt => Some(Shortcut::FocusUrlBar),
+        // The other two spellings every browser accepts. Alt+D is exactly Alt
+        // (no Ctrl, no Shift), so an AltGr layout -- which reports Ctrl+Alt --
+        // still types its character; F6 is unmodified by convention.
+        Key::D if mods.alt && !mods.ctrl && !mods.shift => Some(Shortcut::FocusUrlBar),
+        Key::F6 if !mods.ctrl && !mods.shift && !mods.alt => Some(Shortcut::FocusUrlBar),
 
         Key::T if mods.ctrl && !mods.alt => Some(Shortcut::NewTab),
         Key::W if mods.ctrl && !mods.alt => Some(Shortcut::CloseTab),
@@ -509,6 +520,8 @@ mod tests {
             (0x09, Key::Tab),
             (0x74, Key::F5),
             (0x72, Key::F3),
+            (0x44, Key::D),
+            (0x75, Key::F6),
             (0x25, Key::Left),
             (0x27, Key::Right),
         ];
@@ -543,6 +556,23 @@ mod tests {
             vk_key(0x50).and_then(|k| resolve(ctrl, k)),
             Some(Shortcut::Print)
         );
+    }
+
+    #[test]
+    fn alt_d_and_f6_focus_the_url_bar_like_every_browser() {
+        assert_eq!(resolve(ALT, Key::D), Some(Shortcut::FocusUrlBar));
+        assert_eq!(resolve(NONE, Key::F6), Some(Shortcut::FocusUrlBar));
+        // Typing "d" belongs to the page, and so does Ctrl+D (unbound here).
+        assert_eq!(resolve(NONE, Key::D), None, "typing \"d\" belongs to the page");
+        assert_eq!(resolve(CTRL, Key::D), None);
+        // AltGr reports as Ctrl+Alt on many layouts; it must still type its
+        // character rather than jump to the address bar.
+        assert_eq!(resolve(Mods::new(true, false, true), Key::D), None);
+        // Shift+F6 is not the same key in any browser.
+        assert_eq!(resolve(Mods::new(false, true, false), Key::F6), None);
+        // And both keys can actually arrive from Windows.
+        assert_eq!(vk_key(0x44).and_then(|k| resolve(ALT, k)), Some(Shortcut::FocusUrlBar));
+        assert_eq!(vk_key(0x75).and_then(|k| resolve(NONE, k)), Some(Shortcut::FocusUrlBar));
     }
 
     #[test]

@@ -997,11 +997,39 @@ impl Tab {
         if !self.initial_navigation_pending {
             return;
         }
+        // On Windows the first page also waits for the WebSocket guard's
+        // registration (`platform::initial_navigation_ready`); this runs again
+        // when that settles.
+        if !platform::initial_navigation_ready(&self.view) {
+            return;
+        }
         self.initial_navigation_pending = false;
         if self.close_after_session_wipe {
             return;
         }
-        let _ = platform::load_initial_url(&self.webview, self.id, &self.url);
+        platform::note_app_navigation(&self.view, &self.url);
+        if let Err(error) = platform::load_initial_url(&self.webview, self.id, &self.url) {
+            // No navigation started, so nothing may inherit the mark
+            // (final review 6, R-004).
+            platform::forget_app_navigation(&self.view);
+            platform::report_initial_navigation_failure(&self.url, &error);
+        }
+    }
+
+    /// Every navigation the BROWSER issues on this tab's content goes through
+    /// here, so the local-network boundary knows it was not the page: a
+    /// plain-HTTP page may not send the tab to a local address, the user may
+    /// (`TabState::on_top_level_navigation_starting`). A call site that
+    /// bypasses this still works for public addresses and fails closed for
+    /// local ones, which is the direction a missed call site should fail in.
+    pub(crate) fn load_url(&self, url: &str) -> Result<(), wry::Error> {
+        platform::note_app_navigation(&self.view, url);
+        let loaded = self.webview.load_url(url);
+        if loaded.is_err() {
+            // No navigation started, so nothing may inherit the mark.
+            platform::forget_app_navigation(&self.view);
+        }
+        loaded
     }
 
     fn queue_or_navigate(&mut self, url: &str) -> Result<(), &'static str> {
@@ -1010,7 +1038,7 @@ impl Tab {
             self.url.push_str(url);
             return Ok(());
         }
-        self.webview.load_url(url).map_err(|_| "io")
+        self.load_url(url).map_err(|_| "io")
     }
 
     pub fn record_history(&mut self, url: String) {
@@ -1039,7 +1067,7 @@ impl Tab {
         let url = self.history[index - 1].clone();
         self.history_index = Some(index - 1);
         self.suppress_history = true;
-        self.webview.load_url(&url).map_err(|_| "io")
+        self.load_url(&url).map_err(|_| "io")
     }
 
     pub fn history_forward(&mut self) -> Result<(), &'static str> {
@@ -1050,7 +1078,7 @@ impl Tab {
         let url = self.history[index + 1].clone();
         self.history_index = Some(index + 1);
         self.suppress_history = true;
-        self.webview.load_url(&url).map_err(|_| "io")
+        self.load_url(&url).map_err(|_| "io")
     }
 
     pub fn history_reload(&mut self) -> Result<(), &'static str> {
@@ -1067,7 +1095,16 @@ impl Tab {
         // reload semantics on every engine (Chromium revalidates the main
         // document; WebKitGTK likewise), which is what a button drawn as a
         // circular arrow promises.
-        self.webview.reload().map_err(|_| "io")
+        //
+        // Marked as the browser's own navigation: the engine reports a reload
+        // the same way whoever asked for it, and the button is the user
+        // asking (TabState::on_top_level_navigation_starting).
+        platform::note_app_navigation(&self.view, &self.url);
+        let reloaded = self.webview.reload();
+        if reloaded.is_err() {
+            platform::forget_app_navigation(&self.view);
+        }
+        reloaded.map_err(|_| "io")
     }
 }
 
@@ -1426,6 +1463,13 @@ fn build_tab(
     let load_proxy = proxy.clone();
     let title_proxy = proxy.clone();
     let new_window_proxy = proxy.clone();
+    // A page's request for a new tab is judged by the document that asked, IN
+    // the callback that queues it: nothing is recorded to be paired up later,
+    // so nothing can be paired with the wrong request (final review 5,
+    // R-002). Filled once the platform view exists; before that there is no
+    // page that could be asking.
+    let new_tab_gate: Rc<RefCell<Option<platform::NewTabGate>>> = Rc::new(RefCell::new(None));
+    let window_gate = new_tab_gate.clone();
     let download_start_proxy = proxy.clone();
     let download_done_proxy = proxy.clone();
 
@@ -1538,8 +1582,13 @@ fn build_tab(
             // opened bypassed the navigation handler entirely because a new
             // webview's initial with_url is not a navigation. An untrusted
             // page ended up on the origin that holds IPC and the vault.
+            //
+            // The local-network verdict is taken first, for every request, so
+            // the refusal the engine event recorded for it is spent here
+            // (`platform::new_tab_allowed`).
+            let allowed = platform::new_tab_allowed(window_gate.borrow().as_ref(), &url);
             if is_allowed_content_url(&url) {
-                let _ = new_window_proxy.send_event(UserEvent::OpenInNewTab(url));
+                let _ = new_window_proxy.send_event(UserEvent::OpenInNewTab { url, allowed });
             }
             wry::NewWindowResponse::Deny
         })
@@ -1595,6 +1644,7 @@ fn build_tab(
             id,
             permissions.clone(),
         )?;
+    *new_tab_gate.borrow_mut() = Some(platform::new_tab_gate(&view));
     // The engine zooms on keys this process never sees; this is how the
     // indicator learns about it.
     platform::connect_zoom_changed(&webview, proxy, id);
@@ -1859,6 +1909,15 @@ fn check_download_file_in(dir: &Path, filename: &str, sha256: &[u8; 32]) -> File
     }
 }
 
+/// The two places keyboard focus can usefully be. The chrome is ONE webview
+/// holding the address bar, the find bar and every panel field; the page is
+/// whichever content webview belongs to the active tab.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FocusSurface {
+    Chrome,
+    Content,
+}
+
 pub struct AppState {
     /// The string catalog. English-only until the locale setting exists;
     /// lives here because resolution is per-call on the UI thread and a
@@ -2032,6 +2091,10 @@ pub struct AppState {
     /// service. Set from the positional argument in `main`, which is how a
     /// default browser is handed a link on both platforms.
     pub opened_with_url: bool,
+    /// Where the keyboard should be when the window is next activated: the
+    /// chrome (the address bar, the find bar, a panel field) or the active
+    /// tab's page. See `restore_focus`.
+    pub focus_intent: std::cell::Cell<FocusSurface>,
     pub smoke_mode: bool,
     /// Set once the behavioural blocking probe has navigated, so the smoke
     /// exit does not fire before the page has had a chance to make requests.
@@ -2436,6 +2499,9 @@ impl AppState {
             // Defaults to "opened on its own"; `main` sets it from the
             // positional argument once that has been parsed.
             opened_with_url: false,
+            // The address bar, until something says otherwise: a launch on its
+            // own is someone about to type where to go.
+            focus_intent: std::cell::Cell::new(FocusSurface::Chrome),
             smoke_mode,
             probe_started: false,
             ping_count: 0,
@@ -3096,6 +3162,25 @@ impl AppState {
         self.picked_paths.remove(at).map(|(_, path)| path)
     }
 
+    /// The engine answered tab `id`'s WebSocket guard registration; its first
+    /// page may now be released (`Tab::finish_initial_navigation` checks the
+    /// rest). A tab already gone has nothing to release.
+    pub fn on_local_network_guard_settled(&mut self, id: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            tab.finish_initial_navigation();
+        }
+    }
+
+    /// The engine did not answer the guard's registration in time
+    /// (`platform::note_local_network_guard_overdue`); the first page goes
+    /// ahead, recorded and diagnosed.
+    pub fn on_local_network_guard_overdue(&mut self, id: u64) {
+        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
+            platform::note_local_network_guard_overdue(&tab.view);
+            tab.finish_initial_navigation();
+        }
+    }
+
     /// Creates a tab and returns its id. `switch` selects and shows it;
     /// otherwise it stays hidden in the background.
     ///
@@ -3120,7 +3205,7 @@ impl AppState {
         self.tabs.push(tab);
         if was_empty {
             self.active = 0;
-            platform::show_tab(&self.tabs[0].view, &self.tabs[0].webview);
+            self.show_and_focus_tab(0);
             self.relayout();
         } else if switch {
             let index = self.tabs.len() - 1;
@@ -3149,7 +3234,9 @@ impl AppState {
         // process gate in Running and every newer tab permanently blank.
         // The event-loop remains responsive; only destruction of this blank
         // pending tab waits for the clear's result.
-        if self.tabs[index].initial_navigation_pending {
+        if self.tabs[index].initial_navigation_pending
+            && platform::holds_session_wipe(&self.tabs[index].view, true)
+        {
             self.tabs[index].close_after_session_wipe = true;
             return Ok(());
         }
@@ -3193,11 +3280,11 @@ impl AppState {
             drop(self.tabs.remove(index)); // detaches (unix) / destroys (windows)
             self.tabs.push(fresh);
             self.active = 0;
-            platform::show_tab(&self.tabs[0].view, &self.tabs[0].webview);
+            self.show_and_focus_tab(0);
             self.relayout();
             self.emit_tabs_changed();
-            let url = self.tabs[0].url.clone();
-            self.emit("url_changed", json!({ "url": url }));
+            let (url, tab_id) = (self.tabs[0].url.clone(), self.tabs[0].id);
+            self.emit("url_changed", json!({ "url": url, "tab": tab_id }));
             self.emit_tab_status();
             self.focus_url_bar_for_blank_tab(true, "about:blank");
             return Ok(());
@@ -3215,17 +3302,15 @@ impl AppState {
             self.active = index.min(self.tabs.len() - 1);
         }
         if was_active {
-            platform::show_tab(
-                &self.tabs[self.active].view,
-                &self.tabs[self.active].webview,
-            );
+            self.show_and_focus_tab(self.active);
             self.relayout();
         }
         self.emit_tabs_changed();
         if was_active {
-            let url = self.tabs[self.active].url.clone();
-            self.emit("url_changed", json!({ "url": url }));
+            let tab = &self.tabs[self.active];
+            self.emit("url_changed", json!({ "url": tab.url, "tab": tab.id }));
             self.emit_tab_status();
+            self.focus_url_bar_if_active_is_blank();
         }
         Ok(())
     }
@@ -3238,7 +3323,27 @@ impl AppState {
             .ok_or("not_found")?;
         self.set_active(index);
         self.emit_tabs_changed();
+        self.focus_url_bar_if_active_is_blank();
         Ok(())
+    }
+
+    /// A click on a tab chip. A different tab is an ordinary `switch_tab`.
+    /// The tab you are ALREADY on gets the keyboard put in its page (the
+    /// address bar, for a blank tab), which is what that click means in every
+    /// other browser -- and it is often how someone coming back to the window
+    /// says where they want to type. Only the click does this: find-in-tabs
+    /// also lands through `switch_tab`, and its find bar needs the keyboard.
+    pub fn click_tab(&mut self, id: u64) -> Result<(), &'static str> {
+        if self.tabs.get(self.active).map(|tab| tab.id) == Some(id) {
+            let blank = self.tabs[self.active].url == "about:blank";
+            if blank {
+                self.focus_url_bar();
+            } else {
+                self.focus_active_content();
+            }
+            return Ok(());
+        }
+        self.switch_tab(id)
     }
 
     /// Reorders the strip by stable tab id while preserving the active tab's
@@ -3287,6 +3392,7 @@ impl AppState {
         if index < self.tabs.len() {
             self.set_active(index);
             self.emit_tabs_changed();
+            self.focus_url_bar_if_active_is_blank();
         }
     }
 
@@ -3328,6 +3434,7 @@ impl AppState {
         // focused (grab_focus / MoveFocus), then the script places the caret.
         // Best-effort: a refused widget focus is not worth more than the
         // script that follows it.
+        self.focus_intent.set(FocusSurface::Chrome);
         let _ = self.chrome.focus();
         self.emit("focus_url_bar", json!({}));
     }
@@ -3347,8 +3454,119 @@ impl AppState {
     /// Same best-effort rule: a refused widget focus is not worth more than
     /// the event that follows it.
     pub fn open_find_bar(&self) {
+        self.focus_intent.set(FocusSurface::Chrome);
         let _ = self.chrome.focus();
         self.emit("find_open", json!({}));
+    }
+
+    /// Hand the keyboard to the ACTIVE TAB'S PAGE. Used where every other
+    /// browser does it: pressing Enter in the address bar, and a launch that
+    /// was handed a link to read.
+    ///
+    /// NEVER WHILE A MODAL COVERS THE WINDOW. The panel is still on screen,
+    /// so someone typing into what looks like the vault's passphrase field
+    /// would be typing into the page behind it. The keyboard stays with the
+    /// chrome until the panel is closed.
+    pub fn focus_active_content(&self) {
+        if self.modal_covers_window() {
+            self.focus_chrome();
+            return;
+        }
+        self.focus_intent.set(FocusSurface::Content);
+        if let Some(tab) = self.tabs.get(self.active) {
+            platform::focus_content(&tab.webview);
+        }
+    }
+
+    /// Give the keyboard to the chrome webview as a widget. `element.focus()`
+    /// inside the chrome document places a caret without taking the keyboard
+    /// from a page (see `focus_url_bar`), so any path that wants a chrome field
+    /// to receive typing after a page had it goes through here first.
+    pub fn focus_chrome(&self) {
+        self.focus_intent.set(FocusSurface::Chrome);
+        let _ = self.chrome.focus();
+    }
+
+    /// Show tab `index` and give its page the keyboard, unless a modal covers
+    /// the window, in which case the chrome keeps it (see
+    /// focus_active_content). Showing and focusing are separate platform
+    /// calls so that this decision comes BEFORE any native focus reaches a
+    /// page: `show_tab` used to focus the page itself, and correcting that
+    /// afterwards still moved the keyboard into a page behind an open panel
+    /// (and closing the active tab never corrected it at all).
+    fn show_and_focus_tab(&self, index: usize) {
+        let tab = &self.tabs[index];
+        platform::show_tab(&tab.view, &tab.webview);
+        if self.modal_covers_window() {
+            self.focus_chrome();
+        } else {
+            self.focus_intent.set(FocusSurface::Content);
+            platform::focus_content(&tab.webview);
+        }
+    }
+
+    /// A modal panel (the vault, the library, ...) covers the window.
+    fn modal_covers_window(&self) -> bool {
+        matches!(
+            self.chrome_arrangement,
+            crate::platform::ChromeLayout::Overlay
+        )
+    }
+
+    /// Record where the user put the keyboard, as reported by the platform
+    /// (a click into the page or into the chrome). Our own focus calls set the
+    /// intent directly; this is how a CLICK is heard.
+    pub fn note_focus(&self, surface: FocusSurface) {
+        self.focus_intent.set(surface);
+    }
+
+    /// The window was just activated: put the keyboard back where it was.
+    ///
+    /// WHY THIS EXISTS. On Windows every webview is its own child HWND, built
+    /// with `build_as_child`, and wry installs its parent focus forwarding only
+    /// for NON-child webviews. So when the window is activated -- launch, a
+    /// taskbar click, Alt+Tab -- DefWindowProc gives the keyboard to the
+    /// top-level window itself, which holds no field at all, and nothing typed
+    /// went anywhere until the user clicked into the page or the bar.
+    ///
+    /// The chrome is refocused as a widget and then told to restore its own
+    /// caret (the address bar if nothing in it was focused). The page is
+    /// refocused as the active tab's webview. GTK already restores a window's
+    /// focus widget on activation, so this is only called on Windows.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn restore_focus(&self) {
+        match self.focus_intent.get() {
+            FocusSurface::Chrome => {
+                let _ = self.chrome.focus();
+                self.emit("focus_restore", json!({}));
+            }
+            // Not into a page a modal is still covering; see
+            // focus_active_content.
+            FocusSurface::Content if self.modal_covers_window() => {
+                self.focus_chrome();
+                self.emit("focus_restore", json!({}));
+            }
+            FocusSurface::Content => {
+                if let Some(tab) = self.tabs.get(self.active) {
+                    platform::focus_content(&tab.webview);
+                }
+            }
+        }
+    }
+
+    /// Where the keyboard goes at LAUNCH, asked for by the chrome once it has
+    /// loaded (before that there is no address bar to put it in).
+    ///
+    /// Opened on its own: the address bar, so someone who launched the browser
+    /// to go somewhere can just type -- the intent chrome.js already states at
+    /// its vault prompt, and never had a caller to make true. Handed a link by
+    /// another application: that page, which is what the person asked to read.
+    pub fn startup_focus(&self) {
+        if self.opened_with_url {
+            self.focus_active_content();
+        } else {
+            self.focus_url_bar();
+        }
     }
 
     /// A BLANK tab the user is now looking at has nothing to focus but the
@@ -3365,6 +3583,17 @@ impl AppState {
     fn focus_url_bar_for_blank_tab(&self, switch: bool, url: &str) {
         if switch && url == "about:blank" {
             self.focus_url_bar();
+        }
+    }
+
+    /// Switching TO a blank tab is the same situation as opening one: there
+    /// is nothing on the page to type into, so the cursor goes to the bar.
+    /// Called AFTER the switch's url_changed, which clears the bar for a
+    /// blank tab. Not called from `set_active`, because `new_tab` already
+    /// focuses the bar after its own switch and would do it twice.
+    fn focus_url_bar_if_active_is_blank(&self) {
+        if let Some(tab) = self.tabs.get(self.active) {
+            self.focus_url_bar_for_blank_tab(true, &tab.url);
         }
     }
 
@@ -5902,12 +6131,18 @@ impl AppState {
             &self.tabs[self.active].webview,
         );
         self.active = index;
-        platform::show_tab(&self.tabs[index].view, &self.tabs[index].webview);
+        // The page gets the keyboard, and a later window activation brings it
+        // back there -- unless a modal still covers the window (the strip
+        // stays clickable under one): see show_and_focus_tab.
+        self.show_and_focus_tab(index);
         // A freshly shown Windows tab may have stale bounds (created hidden,
         // or hidden during a resize); re-apply geometry for it and chrome.
         self.relayout();
-        let url = self.tabs[index].url.clone();
-        self.emit("url_changed", json!({ "url": url }));
+        let (url, tab_id) = (self.tabs[index].url.clone(), self.tabs[index].id);
+        // The tab id lets the address bar tell a switch (always shows the new
+        // tab's address) from the SAME tab redirecting under someone typing
+        // (keeps what they typed).
+        self.emit("url_changed", json!({ "url": url, "tab": tab_id }));
         // The status is PER TAB and `emit_tab_status`'s own doc has always
         // listed "tab switch" among the transitions that push it -- but no
         // switch path did. Everything rendered from tab_status (freeze chip,
@@ -6182,7 +6417,7 @@ impl AppState {
         self.tabs.push(tab);
         if was_empty {
             self.active = 0;
-            platform::show_tab(&self.tabs[0].view, &self.tabs[0].webview);
+            self.show_and_focus_tab(0);
             self.relayout();
         } else if switch {
             let index = self.tabs.len() - 1;
@@ -6292,6 +6527,7 @@ impl AppState {
     /// idempotent and can never reload a live tab.
     pub fn finish_session_wipe(&mut self) {
         for tab in &mut self.tabs {
+            platform::note_session_wipe_finished(&tab.view);
             tab.finish_initial_navigation();
         }
         let delayed_closes = self
@@ -6401,7 +6637,7 @@ impl AppState {
         // url_changed is emitted for the active tab only; the strip learns
         // about every URL change through tabs_changed.
         if index == self.active {
-            self.emit("url_changed", json!({ "url": url }));
+            self.emit("url_changed", json!({ "url": url, "tab": id }));
         }
         self.emit_tabs_changed();
         if is_active {
@@ -6471,7 +6707,7 @@ impl AppState {
         tab.insecure_pending = None;
         tab.insecure_pending_at = None;
         tab.allow_insecure_host(&host);
-        tab.webview.load_url(&url).ok();
+        tab.load_url(&url).ok();
         let status = self.active_tab_status();
         Ok(json!({ "allowed": host, "status": status }))
     }
