@@ -18,13 +18,12 @@
 //! nonce fails authentication instead of being quietly accepted. This is the
 //! same discipline `format.rs` applies to the store's own header.
 //!
-//! # Why this does not reuse `atomic_write`
+//! # Why the temporary file has a random name
 //!
-//! The store's helper names its temporary file after its target, which is
-//! safe there (one store, one writer, a path the user chose). Here the name
+//! A temporary file named after its target is predictable, and here the name
 //! would be derived from a caller-supplied id in a directory that exists for
-//! the lifetime of the profile, and two weaknesses follow from a predictable
-//! temp name:
+//! the lifetime of the profile. Two weaknesses follow from a predictable temp
+//! name:
 //!
 //! * a pre-existing symlink at that path is FOLLOWED by an ordinary create,
 //!   so a write lands wherever the link points, and
@@ -35,7 +34,8 @@
 //!
 //! Both disappear with a random temp name plus `create_new`, which refuses
 //! to open anything that already exists, symlink included. Found in review
-//! of the first draft of this module.
+//! of the first draft of this module. The store's own writer named its temp
+//! file after the Library until 2026-09-27 and now works the same way.
 
 use std::collections::BTreeSet;
 use std::fs;
@@ -110,8 +110,9 @@ fn derive_blob_key(store_key: &[u8; KEY_LEN]) -> Zeroizing<[u8; KEY_LEN]> {
 /// An UNPREDICTABLE temporary filename, which is half of why a write here
 /// cannot be diverted. The other half is `create_new`, which refuses to open
 /// anything already present. A name derived from the target (the shape the
-/// store's own helper uses) can be pre-created as a symlink by anyone who
-/// can write to the directory, and an ordinary create follows it.
+/// store's own writer used until 2026-09-27) can be pre-created as a symlink
+/// by anyone who can write to the directory, and an ordinary create follows
+/// it.
 fn temp_name() -> String {
     let suffix: [u8; 16] = crypto::random_bytes();
     let mut name = String::from(".tmp-");

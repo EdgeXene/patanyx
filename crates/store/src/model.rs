@@ -59,6 +59,30 @@ pub struct StoreData {
     /// ADDITIVE ONLY, same rule as the fields above.
     #[serde(default)]
     pub divergence_overrides: Vec<DivergenceOverride>,
+    /// The salt of this Library's version 1 file, recorded when the Library
+    /// moved into the vault (version 3), so a later passphrase change can
+    /// still recognize that file's leftover copies (`retire.rs`). Kept here,
+    /// inside the encrypted contents, and never in a header: with the old
+    /// passphrase it derives the Library's key. Absent from the file unless
+    /// set, and only a version 3 Library carries it, which no build older
+    /// than this one opens.
+    ///
+    /// ADDITIVE ONLY, same rule as the fields above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) v1_salt: Option<V1Salt>,
+}
+
+/// The recorded version 1 salt (`StoreData::v1_salt`), serialized as exactly
+/// its 16 bytes. Its own type so that Debug never prints it: with the old
+/// passphrase it derives the Library's key (final review, R-005).
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct V1Salt(pub(crate) [u8; 16]);
+
+impl std::fmt::Debug for V1Salt {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("V1Salt(<redacted>)")
+    }
 }
 
 impl Default for StoreData {
@@ -73,6 +97,7 @@ impl Default for StoreData {
             archive: Vec::new(),
             page_snapshots: Vec::new(),
             divergence_overrides: Vec::new(),
+            v1_salt: None,
         }
     }
 }

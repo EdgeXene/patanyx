@@ -267,6 +267,24 @@ else
 fi
 
 echo
+echo "=== gate 1d2: vault passphrase change and Library repair ==="
+# Passphrase change came back with the Library following the vault. The form
+# now reports three different outcomes (not changed, changed, changed with
+# cleanup owed), and its intro is a pinned claim about them; the repair prompt
+# is the only way back for a Library left under an older passphrase. Same
+# guard shape: a gate whose subject is renamed away must fail, not vanish.
+if [ -f scripts/vault-passphrase-ui-gate.js ]; then
+  if ! grep -q 'id="bk-pw-form"' "$CHROME/index.html" || ! grep -q 'id="library-repair-form"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/vault-passphrase-ui-gate.js exists but index.html" >&2
+    echo "  has no #bk-pw-form or #library-repair-form; this gate would silently vanish" >&2
+    exit 1
+  fi
+  node scripts/vault-passphrase-ui-gate.js
+else
+  echo "  (no vault passphrase UI gate in this tree)"
+fi
+
+echo
 echo "=== gate 1e: what the engine confirmed ==="
 # That section rendered its heading, its paragraph and zero rows for its whole
 # life, because it was fed the browser-wide `privacy_get` reply instead of the

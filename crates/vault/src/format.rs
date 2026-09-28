@@ -110,7 +110,7 @@ impl SlotKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Slot {
     pub kind: SlotKind,
     pub salt: [u8; SALT_LEN],
@@ -119,6 +119,13 @@ pub struct Slot {
 }
 
 impl Slot {
+    /// The slot's bytes exactly as a header stores them.
+    pub fn encoded(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SLOT_LEN);
+        self.write_into(&mut out);
+        out
+    }
+
     fn write_into(&self, out: &mut Vec<u8>) {
         out.push(self.kind.to_byte());
         out.extend_from_slice(&self.salt);
@@ -314,4 +321,84 @@ pub fn decode_header(bytes: &[u8]) -> Result<Header, VaultError> {
         nonce,
         slots,
     })
+}
+
+/// Where a slot's encrypted key begins: after its kind byte, salt and nonce.
+pub const SLOT_KEY_START: usize = 1 + SALT_LEN + NONCE_LEN; // 41
+
+/// The bytes of every slot position in a version 2 header (possibly cut short)
+/// that holds at least one byte of its encrypted key, each at most `SLOT_LEN`
+/// long. `None` when `bytes` do not begin a version 2 header.
+///
+/// Why a slot without its full tag still matters (review 2026-09-28, full-diff
+/// R-001): the wrap is a stream cipher, so anyone with the passphrase can
+/// decrypt the key bytes that ARE present without checking the tag. A copy cut
+/// short anywhere past the start of a slot's key can expose that key, or enough
+/// of it to guess the rest, so it cannot count as a harmless fragment.
+pub fn slot_prefixes_with_key_bytes(bytes: &[u8]) -> Option<Vec<&[u8]>> {
+    if !has_known_magic(bytes) || bytes.len() < PREFIX_LEN || bytes[7] != VERSION {
+        return None;
+    }
+    let slot_count = bytes[20] as usize;
+    if slot_count == 0 || slot_count > MAX_SLOTS {
+        return None;
+    }
+    let mut out = Vec::new();
+    for index in 0..slot_count {
+        let base = PREFIX_LEN + index * SLOT_LEN;
+        if bytes.len() <= base + SLOT_KEY_START {
+            break;
+        }
+        out.push(&bytes[base..bytes.len().min(base + SLOT_LEN)]);
+    }
+    Some(out)
+}
+
+/// The slots whose bytes are all present in `bytes`: a whole version 2 header,
+/// or the start of one that a crash cut short, which still carries every slot
+/// written before the cut. An empty list when not even one slot is complete.
+/// `None` when the bytes do not begin a version 2 header at all.
+///
+/// A passphrase rotation uses it to recognize a copy of the vault by the slots
+/// it shares with the vault (`backup::retire_backups`). Nothing is unwrapped
+/// here, so the KDF parameters are not needed and not checked.
+pub fn complete_slots(bytes: &[u8]) -> Option<Vec<Slot>> {
+    if !has_known_magic(bytes) {
+        return None;
+    }
+    if bytes.len() < PREFIX_LEN {
+        // Cut short inside the fixed prefix: no slot has begun.
+        return match bytes.get(7) {
+            Some(&version) if version != VERSION => None,
+            _ => Some(Vec::new()),
+        };
+    }
+    if bytes[7] != VERSION {
+        return None;
+    }
+    let slot_count = bytes[20] as usize;
+    if slot_count == 0 || slot_count > MAX_SLOTS {
+        return None;
+    }
+    let mut slots = Vec::new();
+    for index in 0..slot_count {
+        let base = PREFIX_LEN + index * SLOT_LEN;
+        let Some(slot) = bytes.get(base..base + SLOT_LEN) else {
+            break;
+        };
+        let kind = SlotKind::from_byte(slot[0]).ok()?;
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&slot[1..1 + SALT_LEN]);
+        let mut nonce = [0u8; NONCE_LEN];
+        nonce.copy_from_slice(&slot[17..17 + NONCE_LEN]);
+        let mut wrapped = [0u8; WRAPPED_LEN];
+        wrapped.copy_from_slice(&slot[41..41 + WRAPPED_LEN]);
+        slots.push(Slot {
+            kind,
+            salt,
+            nonce,
+            wrapped,
+        });
+    }
+    Some(slots)
 }

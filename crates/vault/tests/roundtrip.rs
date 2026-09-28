@@ -177,6 +177,18 @@ fn save_leaves_no_tmp_file_and_mode_0600() {
         !PathBuf::from(&tmp).exists(),
         "temporary file must not survive save"
     );
+    // The writer's own name since 2026-09-27: `.tmp-` and 32 hex characters,
+    // beside the vault. Checking only the old name above would pass for any
+    // leftover under the new one.
+    let leftovers: Vec<_> = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .filter(|name| name.to_string_lossy().starts_with(".tmp-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "temporary file must not survive save: {leftovers:?}"
+    );
 
     #[cfg(unix)]
     {
@@ -252,7 +264,10 @@ fn the_passphrase_still_works_after_a_recovery_key_exists() {
 fn a_different_recovery_key_is_refused() {
     let dir = test_dir("recovery-wrong");
     let path = dir.join("vault.rbv");
-    let (_vault, _recovery) = Vault::create_with_params(&path, PASS, M, T, P).unwrap();
+    let (vault, _recovery) = Vault::create_with_params(&path, PASS, M, T, P).unwrap();
+    // Unlock takes the vault's lock before reading it, so the creating handle
+    // must let go first or the answer is Locked, not a verdict on the key.
+    drop(vault);
     let impostor = patanyx_vault::RecoveryKey::generate();
     // Indistinguishable from tampering, exactly like a wrong passphrase.
     assert!(matches!(

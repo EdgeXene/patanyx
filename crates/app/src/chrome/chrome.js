@@ -192,16 +192,40 @@
   // vault unlock, which runs Argon2id at 64 MiB and t=3 twice; 30s is many
   // times that even on a slow machine.
   const RB_TIMEOUT_MS = 30000;
+  // A passphrase change or a Library repair runs several Argon2id
+  // derivations and confirmed writes, and its outcome must never be
+  // dropped: a reply arriving after a deadline is ignored, and a change that
+  // DID happen would then read as a failure while the new passphrase is
+  // already the one that works. So these two wait for their answer however
+  // long it takes, with the button held down meanwhile. The one other way a
+  // reply never comes is a frame the Rust side drops for size, so that is
+  // refused below, before anything is posted.
+  // (No `Infinity` deadline: setTimeout clamps an oversized delay and would
+  // fire at once.)
+  const RB_UNTIL_ANSWERED = null;
+  // Must equal MAX_FRAME_BYTES in ipc.rs, which drops a larger frame without
+  // answering (vault-passphrase-ui-gate.js checks the two stay equal). Only
+  // pasted text can reach it; refusing here turns a silent wait into an
+  // answer, and nothing is sent.
+  const RB_MAX_FRAME_BYTES = 1024 * 1024;
 
-  function rb(cmd, args) {
+  function rb(cmd, args, timeoutMs) {
     return new Promise((resolve, reject) => {
       const id = nextId++;
-      const timer = setTimeout(() => {
-        if (!pending.delete(id)) return;
-        reject(new Error("no_reply"));
-      }, RB_TIMEOUT_MS);
+      const frame = JSON.stringify({ id, cmd, args: args || {} });
+      if (new TextEncoder().encode(frame).length > RB_MAX_FRAME_BYTES) {
+        reject(new Error("request_too_large"));
+        return;
+      }
+      const timer =
+        timeoutMs === RB_UNTIL_ANSWERED
+          ? null
+          : setTimeout(() => {
+              if (!pending.delete(id)) return;
+              reject(new Error("no_reply"));
+            }, timeoutMs || RB_TIMEOUT_MS);
       pending.set(id, { resolve, reject, timer });
-      window.ipc.postMessage(JSON.stringify({ id, cmd, args: args || {} }));
+      window.ipc.postMessage(frame);
     });
   }
 
@@ -899,8 +923,10 @@
       adlist_not_listed: i18nText("chrome-js-error-adlist-not-listed", "That site is no longer on the list, so nothing needs allowing"),
       adlist_no_exception: i18nText("chrome-js-error-adlist-no-exception", "Opening anyway is not available on this platform"),
       blocked_stale: i18nText("chrome-js-error-blocked-stale", "That notice is out of date. Try the page again"),
-      passphrase_changed_backups_retained: i18nText("chrome-js-error-passphrase-changed-backups-retained", "Passphrase changed, but an older backup beside the vault could not be removed and still opens with the old passphrase. Delete it by hand"),
-      passphrase_change_unavailable: i18nText("chrome-js-error-passphrase-change-unavailable", "Changing the passphrase is not available in this version. Your recovery key and current passphrase keep working"),
+      passphrase_changed_backups_retained: i18nText("chrome-js-error-passphrase-changed-backups-retained", "Passphrase changed, but PATANYX could not confirm that every older backup or temporary copy of your vault is gone. They are in the same folder as your vault file, and some may be hidden files whose names start with .tmp-. Any that remain may still open with an earlier passphrase and may also open your Library. Delete them by hand."),
+      passphrase_changed_library_leftover_retained: i18nText("chrome-js-error-passphrase-changed-library-leftover-retained", "Passphrase changed, but PATANYX could not confirm that every leftover copy of your Library is gone. They are in the folder where PATANYX keeps your Library. Anyone with one of them and the earlier passphrase it opens with may be able to read your Library. Delete them by hand."),
+      passphrase_change_library_unavailable: i18nText("chrome-js-error-passphrase-change-library-unavailable", "Passphrase not changed, because your Library is not open here. Open the Library panel to see why."),
+      passphrase_change_not_confirmed: i18nText("chrome-js-error-passphrase-change-not-confirmed", "Passphrase not changed. PATANYX could not confirm that your Library is saved to disk, so it canceled the change. Your current passphrase still works. Try again."),
       duplicate_contact: i18nText("chrome-js-error-duplicate-contact", "You already have a contact with that number"),
       // Its own code rather than bad_args: the requirement is not guessable
       // from "Invalid input", and a well-formed http:// address is exactly the
@@ -946,8 +972,12 @@
       export_not_confirmed: i18nText("chrome-js-error-export-not-confirmed", "Type the confirmation sentence exactly to continue."),
       target_is_vault:
         i18nText("chrome-js-error-target-is-vault", "That path is your live vault. Choose a different destination."),
+      export_plaintext_may_remain:
+        i18nText("chrome-js-error-export-plaintext-may-remain", "The export stopped partway, and PATANYX could not erase the partial file it had started. That file may hold some of your passwords and notes in plain text. It was created under the name you chose. Check the file with that name, and delete it if it holds them."),
       store_bad_format:
         i18nText("chrome-js-error-store-bad-format", "The bookmarks file is unreadable or was written by something else."),
+      store_vault_mismatch:
+        i18nText("chrome-js-error-store-vault-mismatch", "Your Library does not open with this vault. It was made with a different vault, or it is damaged. PATANYX has left the file as it is."),
       no_page: i18nText("chrome-js-error-no-page", "This page has not finished loading yet."),
       no_page_bytes: i18nText("chrome-js-error-no-page-bytes", "This build cannot read the page's content."),
       no_snapshot: i18nText("chrome-js-error-no-snapshot", "No snapshot saved for this page yet."),
@@ -962,7 +992,18 @@
         i18nText("chrome-js-error-offline", "You are offline. Go online from the Chat panel to reach contacts."),
       relay_unavailable: i18nText("chrome-js-error-relay-unavailable", "Relay support is not compiled into this build."),
       store_needs_passphrase:
-        i18nText("chrome-js-error-store-needs-passphrase", "Bookmarks and downloads are encrypted with your passphrase, so they stay locked when you get in with a recovery key. Unlock with the passphrase to see them."),
+        i18nText("chrome-js-error-store-needs-passphrase", "Your Library still opens only with your passphrase, so it stays locked when you get in with a recovery key. To see it, lock your vault and unlock it with your passphrase. After your next passphrase change, your recovery key opens it too."),
+      import_library_in_use:
+        i18nText("chrome-js-error-import-library-in-use", "Nothing was imported. Your Library is in use by another PATANYX window, and the import would replace it. Close that window and try again."),
+      library_in_use:
+        i18nText("chrome-js-error-library-in-use", "Your Library is in use by another PATANYX window. To open it here, close that window, then lock your vault and unlock it with your passphrase."),
+      store_passphrase_mismatch:
+        i18nText("chrome-js-error-store-passphrase-mismatch", "Your Library did not open with your current passphrase. If you have changed your passphrase, the Library may still use an earlier one. Enter that passphrase in the Library panel."),
+      store_library_passphrase_wrong:
+        i18nText("chrome-js-error-store-library-passphrase-wrong", "That passphrase does not open your Library either. Nothing was changed."),
+      passphrase_unchanged: i18nText("chrome-js-error-passphrase-unchanged", "The current and new passphrases you entered are the same. Nothing was changed."),
+      request_too_large: i18nText("chrome-js-error-request-too-large", "That entry is too long. It was not sent."),
+      store_repair_not_needed: i18nText("chrome-js-error-store-repair-not-needed", "This repair does not apply to your Library right now."),
       // FOUR CODES THAT RENDERED AS "Unexpected error: <identifier>".
       //
       // The claim above ("Every code Rust can return must appear here") and the
@@ -6546,6 +6587,29 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     $("create-pass1").value = "";
     $("create-pass2").value = "";
     $("unlock-pass").value = "";
+    // EVERY PASSPHRASE FIELD IN THE BACKUP PANE AND THE LIBRARY REPAIR FORM.
+    // The change form clears itself only after a change goes through, and the
+    // export, import and repair forms keep their fields after a refusal so the
+    // person can correct them. That is right while they are looking at it and
+    // wrong the moment the vault locks: a typed passphrase would sit in the
+    // DOM of a locked browser through an idle auto-lock (found in plan
+    // review, 2026-09-26).
+    for (const id of [
+      "recovery-create-pass",
+      "bk-pw-current",
+      "bk-pw-new1",
+      "bk-pw-new2",
+      "bk-exp-pass1",
+      "bk-exp-pass2",
+      "bk-import-export-pass",
+      "bk-import-pass1",
+      "bk-import-pass2",
+      "library-repair-old",
+      "library-repair-current",
+    ]) {
+      const field = $(id);
+      if (field) field.value = "";
+    }
     // THE TUNNEL PASTE BOX HOLDS A WIREGUARD PRIVATE KEY, and it is cleared
     // on success only -- a REFUSED paste deliberately stays on screen so the
     // user can see what was wrong with it rather than re-copying. That is
@@ -6577,6 +6641,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     clearLibrarySnapshotData();
     $("library-content").hidden = true;
     $("library-locked").hidden = false;
+    $("library-repair-form").hidden = true;
+    // The lock is now the reason the Library is closed, whatever the last
+    // unlock recorded; do not leave a repair instruction on screen.
+    $("library-locked-note").textContent = i18nText("chrome-js-library-locked-note", "Unlock the vault for bookmarks, shelved tabs, and download records. PATANYX offers this when started on its own. Downloads finished before unlock are not recorded.");
     $("bmm-snapshots-caption").hidden = true;
     renderCreds();
     renderNotes();
@@ -6644,15 +6712,90 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       err.textContent = i18nText("chrome-js-backup-pw-required", "Both the current and the new passphrase are required.");
       return;
     }
+    // A "change" to the same passphrase changes nothing and would only move
+    // the Library to a format older builds cannot read; refused here and in
+    // Rust (compliance review, 2026-09-26).
+    if (next === current) {
+      err.textContent = friendly(new Error("passphrase_unchanged"));
+      return;
+    }
+    // The minimum create and import already enforce, and the placeholder
+    // promises. This form was the one place it was not checked.
+    if (next.length < 8) {
+      err.textContent = i18nText("chrome-js-backup-pw-short", "New passphrase must be at least 8 characters.");
+      return;
+    }
+    // A change runs several deliberately slow key derivations. The button
+    // stays down until the answer, so a second press cannot start a second
+    // change underneath the first.
+    const button = $("bk-pw-submit");
+    if (button) button.disabled = true;
     try {
-      await rb("vault_change_passphrase", { current, new: next });
+      const reply = await rb(
+        "vault_change_passphrase",
+        { current, new: next },
+        RB_UNTIL_ANSWERED,
+      );
+      // Committed. Cleanup may still be owed, but the NEW passphrase is the
+      // one that works now either way, so the fields clear and each warning
+      // says what is left (plan review, 2026-09-26). Each warning
+      // already opens by saying the passphrase changed.
       $("bk-pw-current").value = "";
       $("bk-pw-new1").value = "";
       $("bk-pw-new2").value = "";
-      ok.textContent =
-        i18nText("chrome-js-backup-pw-changed", "Passphrase changed. Your recovery key still works; the old passphrase does not.");
+      const warnings = (reply && Array.isArray(reply.warnings) ? reply.warnings : []).map((code) => {
+        const text = friendly(new Error(code));
+        return /[.!?]$/.test(text) ? text : `${text}.`;
+      });
+      ok.textContent = warnings.length
+        ? warnings.join(" ")
+        : i18nText("chrome-js-backup-pw-changed", "Passphrase changed for your vault and your Library. The old passphrase no longer opens them; a recovery key, if you have one, still works.");
     } catch (e) {
       err.textContent = friendly(e);
+    } finally {
+      if (button) button.disabled = false;
+    }
+  });
+
+  // A Library left under a different passphrase from the vault's: the
+  // person gives the one the Library still opens with, and the current one
+  // again, and the Library moves into the vault in one write
+  // (store_repair_passphrase), so it opens with the vault from then on.
+  // Shown by refreshLibrary only for that exact open failure.
+  $("library-repair-form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const err = $("library-repair-error");
+    err.textContent = "";
+    const libraryPassphrase = $("library-repair-old").value;
+    const current = $("library-repair-current").value;
+    if (!libraryPassphrase || !current) {
+      err.textContent = i18nText("chrome-js-library-repair-required", "Enter both passphrases.");
+      return;
+    }
+    const button = $("library-repair-submit");
+    if (button) button.disabled = true;
+    try {
+      await rb(
+        "store_repair_passphrase",
+        { library_passphrase: libraryPassphrase, current },
+        RB_UNTIL_ANSWERED,
+      );
+      $("library-repair-old").value = "";
+      $("library-repair-current").value = "";
+      toast(i18nText("chrome-js-library-repaired", "Library opened. It now uses your current passphrase."));
+      await refreshLibrary();
+    } catch (e) {
+      const code = e && e.message;
+      // Two fields, so a wrong passphrase must say WHICH one: the vault
+      // refused the current passphrase before the Library was touched.
+      err.textContent =
+        code === "auth_failed"
+          ? i18nText("chrome-js-library-repair-current-wrong", "That is not your current passphrase. Nothing was changed.")
+          : friendly(e);
+      // The Library is no longer in the state this form was shown for.
+      if (code === "store_repair_not_needed") await refreshLibrary();
+    } finally {
+      if (button) button.disabled = false;
     }
   });
 
@@ -8803,9 +8946,20 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       if (!st.open) {
         clearLibrarySnapshotData();
         // A recorded open error is more useful than the generic line.
-        $("library-locked-note").textContent = st.error
+        // While the vault is locked, the lock IS the reason, whatever the last
+        // unlock recorded: a stale "enter that passphrase" beside a hidden
+        // repair form would ask for something the panel cannot take.
+        $("library-locked-note").textContent = st.error && vaultUnlocked
           ? friendly(new Error(st.error))
           : i18nText("chrome-js-library-locked-note", "Unlock the vault for bookmarks, shelved tabs, and download records. PATANYX offers this when started on its own. Downloads finished before unlock are not recorded.");
+        // The one open failure the person can fix from here: the vault
+        // opened and the Library did not, which is what a passphrase change
+        // in 0.9.x left behind.
+        // Only while the vault is unlocked: the mismatch stays recorded after
+        // a lock, and the repair needs the vault open.
+        $("library-repair-form").hidden = !(
+          vaultUnlocked && st.error === "store_passphrase_mismatch"
+        );
         return;
       }
       await Promise.all([

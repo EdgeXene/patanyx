@@ -21,3 +21,9 @@ thiserror = "2"
 # chacha20poly1305's re-export, exactly as the vault does.
 sha2 = "0.10"
 hmac = "0.12"
+
+# O_NOFOLLOW and O_NONBLOCK for judging a leftover temporary file when a
+# passphrase change retires the version 1 file's copies (retire.rs). Already
+# in the tree through the vault, so this adds nothing new to the build.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -78,6 +78,21 @@ pub fn derive_from_recovery(
     Ok(key)
 }
 
+/// HKDF-SHA256(master) -> the key the Library's data key is wrapped under.
+///
+/// The Library opens with the vault, so there is one passphrase: the vault's,
+/// and never a second one to keep in step. The vault's master is random and outlives
+/// every passphrase change (a change rewraps it), so this key does too, and a
+/// passphrase change never has to touch the Library. Its own label, so it is
+/// never the master itself and never a key the vault uses for anything else.
+pub fn derive_library_key(master: &[u8; KEY_LEN]) -> Result<Zeroizing<[u8; KEY_LEN]>, VaultError> {
+    let hkdf = Hkdf::<Sha256>::new(None, master);
+    let mut key = Zeroizing::new([0u8; KEY_LEN]);
+    hkdf.expand(b"patanyx/library-key/v1", &mut key[..])
+        .map_err(|e| VaultError::Crypto(format!("hkdf expand failed: {e}")))?;
+    Ok(key)
+}
+
 pub fn encrypt(
     key: &[u8; KEY_LEN],
     nonce: &[u8; NONCE_LEN],

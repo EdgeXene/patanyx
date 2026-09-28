@@ -1187,11 +1187,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let (vault, recovery) =
                 Vault::create(&state.vault_path, passphrase).map_err(vault_code)?;
             state.vault = Some(vault);
-            // Bookmarks and downloads live in a separate file under the same
-            // passphrase. Nothing called this, so `state.store` was
+            // Bookmarks and downloads live in a separate file, which opens
+            // with the vault. Nothing called this, so `state.store` was
             // permanently None and every bookmark/download command failed
             // with `not_unlocked` while the vault was demonstrably open.
-            state.open_store(passphrase);
+            state.open_store(Some(passphrase));
             #[cfg(feature = "chat")]
             crate::chat_panel::on_vault_unlocked(state);
             // No tunnel_control::on_vault_unlocked here, deliberately: a
@@ -1212,7 +1212,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // the user has never seen; surface it or it helps nobody.
             let migrated = vault.take_migrated_recovery().map(|key| key.to_printable());
             state.vault = Some(vault);
-            state.open_store(passphrase);
+            state.open_store(Some(passphrase));
             #[cfg(feature = "chat")]
             crate::chat_panel::on_vault_unlocked(state);
             // NOT feature-gated, unlike chat: the tunnel crate is an
@@ -1248,9 +1248,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let vault =
                 Vault::unlock_with_recovery(&state.vault_path, &recovery).map_err(vault_code)?;
             state.vault = Some(vault);
-            // Bookmarks and downloads live in a separate file encrypted under
-            // the PASSPHRASE, which we do not have on this path.
-            state.mark_store_unavailable();
+            // The Library opens with the vault, so the recovery key reaches
+            // it too. Only a Library from before version 3 that has not
+            // moved into the vault yet needs the passphrase, which this path
+            // does not have: it stays shut (`store_needs_passphrase`).
+            state.open_store(None);
             #[cfg(feature = "chat")]
             crate::chat_panel::on_vault_unlocked(state);
             // Same as vault_unlock: ungated, and a start failure is
@@ -1990,6 +1992,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if src.is_empty() {
                 return Err("bad_args");
             }
+            // AN IMPORT REPLACES THE LIBRARY, so it takes the Library lock
+            // before anything is touched (final review, R-001): another
+            // PATANYX window holding the Library, even with its vault locked,
+            // would otherwise write the previous profile's Library back with
+            // its next save.
+            let newly_locked = state.hold_library_lock("import_library_in_use")?;
             // Import creates a NEW vault at the app's vault path, REPLACING
             // any vault already there. No refusal when a vault already exists. It used to return
             // `vault_exists`, which made the import form impossible to offer on
@@ -2026,18 +2034,23 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                     if import_started && code == "library_replace_refused" && marker.exists() {
                         state.detach_store_unreplaced();
                     }
+                    // A refused import that took the Library lock itself
+                    // leaves no Library for it to protect: give it back
+                    // (final review round 2, R-002).
+                    state.release_unused_library_lock(newly_locked);
                     return Err(code);
                 }
             };
-            // Rebuild the bookmark store under the NEW passphrase. A failure
-            // here loses bookmarks, never the vault: the credentials are
-            // already saved by this point, and refusing the whole import
-            // because a bookmark did not survive would be the wrong trade.
+            // Rebuild the bookmark store inside the NEW vault, which
+            // therefore goes in first. A failure here loses bookmarks, never
+            // the vault: the credentials are already saved by this point, and
+            // refusing the whole import because a bookmark did not survive
+            // would be the wrong trade.
+            state.vault = Some(vault);
             let library = finish_library_replacement(state, new_passphrase);
             let restored = restore_bookmarks(state, carried.as_deref());
             // Import mints a fresh recovery key — like creation, it is
             // returned exactly once so the UI can show it and then it is gone.
-            state.vault = Some(vault);
             // The replacement Library, whether or not bookmarks were carried:
             // restore_bookmarks only creates one on its bookmark path, so an
             // export without bookmarks used to leave the profile with a vault
@@ -2052,23 +2065,63 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 "library": library,
             }))
         }
-        // DISABLED FOR 1.0.0, deliberately, and the reason has to live here.
+        // The vault and the Library (Store) share one passphrase: the
+        // vault's, so a change never has to move two files. 1.0.0 refused this arm:
+        // rotating the vault alone stranded a Library whose key the
+        // passphrase derived (pentest F-001), and re-keying the Store would
+        // have broken every picture and provenance record, whose keys derive
+        // from its key. The Library now opens with a key the vault derives
+        // from its master (Store format version 3), which a passphrase change
+        // does not touch; a Library from before that moves into the vault
+        // here, at its owner's first change, keeping its key. The order and
+        // the crash reasoning live in `change_vault_and_library_passphrase`.
         //
-        // The vault and the Library (Store) are two files under two keys
-        // derived from the same passphrase, and the Store's key also derives
-        // the picture-blob key and the download-provenance MAC key. Rotating
-        // the vault alone stranded the Library on the next unlock and left
-        // its file under the old passphrase (pentest F-001); rotating the
-        // Store's key too would break every saved picture and every
-        // provenance record (design review, 2026-09-16). The right fix is
-        // a wrapped master key in the Store format, migrated on unlock, so a
-        // passphrase change re-wraps one key and touches no data. That is
-        // 1.0.1 work with its own review. Until then this arm refuses, and
-        // the chrome hides the form on `vault_status.passphrase_change`.
+        // A committed change answers Ok with `warnings`: cleanup still owed
+        // AFTER the new passphrase took effect (an old-passphrase vault
+        // backup that could not be removed; a leftover copy of the Library's
+        // version 1 file that could not be confirmed gone). Only a change
+        // that did NOT happen is an error, so the form can say which
+        // passphrase works now.
         "vault_change_passphrase" => {
-            let _ = (arg_str(args, "current")?, arg_str(args, "new")?);
-            unlocked(state)?;
-            Err("passphrase_change_unavailable")
+            let current = arg_str(args, "current")?;
+            let new = arg_str(args, "new")?;
+            let library_file_exists = Store::exists(&state.store_path);
+            let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+            let warnings = change_vault_and_library_passphrase(
+                vault,
+                state.store.as_mut(),
+                library_file_exists,
+                current,
+                new,
+            )?;
+            Ok(json!({ "warnings": warnings }))
+        }
+
+        // A Library left under a different passphrase from the vault's: a
+        // passphrase changed in 0.9.x (which moved only the vault), or
+        // a power loss that kept one file's change and not the other's. The
+        // person supplies the passphrase the Library opens with, and the
+        // CURRENT one again (the same re-authentication vault_recovery_create
+        // asks for), and the Library moves into the vault in one write, so it
+        // opens with the vault from then on. Offered only while the unlock
+        // recorded exactly this failure.
+        "store_repair_passphrase" => {
+            let library_passphrase = arg_str(args, "library_passphrase")?;
+            let current = arg_str(args, "current")?;
+            if state.vault.is_none() {
+                return Err("not_unlocked");
+            }
+            if state.store.is_some()
+                || state.store_error() != Some("store_passphrase_mismatch")
+                || state.library_replace_marker().exists()
+            {
+                return Err("store_repair_not_needed");
+            }
+            let vault = state.vault.as_ref().ok_or("not_unlocked")?;
+            let store =
+                repair_library_passphrase(vault, &state.store_path, library_passphrase, current)?;
+            state.attach_store(store);
+            Ok(json!({}))
         }
 
         // Mint a recovery key for a vault that never got one.
@@ -4109,6 +4162,68 @@ fn smoke_step(state: &mut AppState, cmd: &str, args: Value) -> Result<Value, Str
     handle(state, cmd, &args).map_err(|e| format!("{cmd}: {e}"))
 }
 
+/// Records a download and archives a page with a picture: the two things
+/// whose keys derive from the Library's key. Returns their ids.
+fn smoke_fill_library(store: &mut Store) -> Result<(String, String), String> {
+    let download = store
+        .record_download("https://smoke.example/file", "file.bin", 3, [5u8; 32])
+        .map_err(|e| format!("record_download: {e}"))?;
+    let picture = store
+        .add_archive(
+            "https://smoke.example/",
+            "smoke",
+            "full page",
+            "smoke words",
+            Some(b"smoke pixels"),
+        )
+        .map_err(|e| format!("add_archive: {e}"))?;
+    Ok((download, picture))
+}
+
+/// Whether what `smoke_fill_library` made still verifies and decrypts in the
+/// open Library.
+fn smoke_library_intact(
+    state: &AppState,
+    download_id: &str,
+    picture_id: &str,
+) -> Result<(), String> {
+    let store = state
+        .store
+        .as_ref()
+        .ok_or("smoke: the Library is not open")?;
+    if !store
+        .verify_download(download_id)
+        .map_err(|e| format!("verify_download: {e}"))?
+    {
+        return Err("a download record's MAC broke".into());
+    }
+    let pixels = store
+        .archive_picture(picture_id)
+        .map_err(|e| format!("archive_picture: {e}"))?;
+    if &pixels[..] != b"smoke pixels" {
+        return Err("an archived picture broke".into());
+    }
+    Ok(())
+}
+
+/// Replaces the Library with a version 1 one under `passphrase`, the kind
+/// every profile from before version 3 holds, filled like the first one.
+/// Returns what `smoke_fill_library` returns and the file's bytes.
+fn smoke_plant_v1_library(
+    state: &mut AppState,
+    passphrase: &str,
+) -> Result<(String, String, Vec<u8>), String> {
+    state.store = None;
+    std::fs::remove_file(&state.store_path).map_err(|e| format!("remove the Library: {e}"))?;
+    let mut v1 = Store::create_with_params(&state.store_path, passphrase, 8192, 1, 1)
+        .map_err(|e| format!("make a version 1 Library: {e}"))?;
+    let (download, picture) = smoke_fill_library(&mut v1)?;
+    drop(v1);
+    let bytes = std::fs::read(&state.store_path)
+        .map_err(|e| format!("read the version 1 Library: {e}"))?;
+    Ok((download, picture, bytes))
+}
+
 /// The complete Premium dispatcher surface in the public build. Arguments are
 /// deliberately the least-privileged honest calls available: the gate is the
 /// property under test, while a missing page, region, archive record, or chat
@@ -4191,7 +4306,11 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     if status["exists"] != json!(false) {
         return Err("vault unexpectedly exists in smoke dir".into());
     }
-    smoke_step(state, "vault_create", json!({ "passphrase": pass }))?;
+    let recovery_key = smoke_step(state, "vault_create", json!({ "passphrase": pass }))?
+        ["recovery_key"]
+        .as_str()
+        .ok_or("vault_create: reply carries no recovery key")?
+        .to_string();
     let id = smoke_step(
         state,
         "cred_add",
@@ -4265,6 +4384,181 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     let entry = smoke_step(state, "cred_get", json!({ "id": id }))?;
     if entry["password"] != json!("pw123456") {
         return Err("password mismatch after lock/unlock cycle".into());
+    }
+
+    // PASSPHRASE CHANGE, end to end through the real dispatch surface. A new
+    // Library is made inside the vault (version 3), so a change moves the
+    // vault alone and the Library opens with the changed passphrase; nothing
+    // inside it is re-keyed (a download MAC and an archived picture are read
+    // back to prove it); and the old passphrase opens neither.
+    let changed_pass = "smoke-passphrase-2";
+    let (download_id, picture_id) = {
+        let store = state
+            .store
+            .as_mut()
+            .ok_or("smoke: the Library is not open before the change")?;
+        if store.format_version() != 3 {
+            return Err("a new Library was not made inside the vault".into());
+        }
+        smoke_fill_library(store)?
+    };
+    let changed = smoke_step(
+        state,
+        "vault_change_passphrase",
+        json!({ "current": pass, "new": changed_pass }),
+    )?;
+    if changed["warnings"] != json!([]) {
+        return Err(format!(
+            "the passphrase change left cleanup behind: {changed}"
+        ));
+    }
+    smoke_step(state, "vault_lock", json!({}))?;
+    if smoke_step(state, "vault_unlock", json!({ "passphrase": pass })).is_ok() {
+        return Err("the old passphrase still opens the vault after a change".into());
+    }
+    smoke_step(state, "vault_unlock", json!({ "passphrase": changed_pass }))?;
+    if smoke_step(state, "store_status", json!({}))?["open"] != json!(true) {
+        return Err("the Library did not follow the vault to the new passphrase".into());
+    }
+    smoke_library_intact(state, &download_id, &picture_id)?;
+
+    // THE RECOVERY KEY OPENS THE LIBRARY TOO: it opens the vault, and the
+    // Library opens with the vault.
+    smoke_step(state, "vault_lock", json!({}))?;
+    smoke_step(
+        state,
+        "vault_unlock_recovery",
+        json!({ "recovery_key": recovery_key }),
+    )?;
+    if smoke_step(state, "store_status", json!({}))?["open"] != json!(true) {
+        return Err("the recovery key did not open the Library".into());
+    }
+    smoke_library_intact(state, &download_id, &picture_id)?;
+
+    // A LIBRARY FROM BEFORE VERSION 3 moves into the vault at its owner's
+    // first change, keeping its key, and the leftover copies its writer left
+    // stop opening with the old passphrase because they are gone. Stands in
+    // for an existing profile: a version 1 Library under the current
+    // passphrase, with a copy at each of the writer's leftover names.
+    smoke_step(state, "vault_lock", json!({}))?;
+    let (v1_download, v1_picture, v1_bytes) = smoke_plant_v1_library(state, changed_pass)?;
+    let library_dir = state
+        .store_path
+        .parent()
+        .ok_or("the Library path has no parent")?
+        .to_path_buf();
+    let mut legacy_name = state
+        .store_path
+        .file_name()
+        .ok_or("the Library path has no file name")?
+        .to_os_string();
+    legacy_name.push(".tmp");
+    let leftovers = [
+        library_dir.join(format!(".tmp-{}", "5a".repeat(16))),
+        library_dir.join(legacy_name),
+    ];
+    for leftover in &leftovers {
+        std::fs::write(leftover, &v1_bytes).map_err(|e| format!("plant a leftover: {e}"))?;
+    }
+    smoke_step(state, "vault_unlock", json!({ "passphrase": changed_pass }))?;
+    if state.store.as_ref().map(|store| store.format_version()) != Some(1) {
+        return Err("smoke: the planted Library did not open as version 1".into());
+    }
+    let moved_pass = "smoke-passphrase-3";
+    let moved = smoke_step(
+        state,
+        "vault_change_passphrase",
+        json!({ "current": changed_pass, "new": moved_pass }),
+    )?;
+    if moved["warnings"] != json!([]) {
+        return Err(format!("moving the Library left cleanup behind: {moved}"));
+    }
+    if leftovers.iter().any(|leftover| leftover.exists()) {
+        return Err("a leftover copy of the version 1 file survived the change".into());
+    }
+    smoke_step(state, "vault_lock", json!({}))?;
+    smoke_step(state, "vault_unlock", json!({ "passphrase": moved_pass }))?;
+    if state.store.as_ref().map(|store| store.format_version()) != Some(3) {
+        return Err("the changed Library did not move into the vault".into());
+    }
+    smoke_library_intact(state, &v1_download, &v1_picture)?;
+
+    // An unconfirmed Library flush stops a change before the vault moves,
+    // and a leftover that cannot be proven to be this Library's is kept and
+    // reported while the change stands. The failures are injected, so this
+    // part runs in debug builds, which smoke.sh uses.
+    #[cfg(debug_assertions)]
+    let moved_pass = {
+        state
+            .store
+            .as_ref()
+            .ok_or("smoke: the Library is not open")?
+            .fail_next_confirm_for_test();
+        match smoke_step(
+            state,
+            "vault_change_passphrase",
+            json!({ "current": moved_pass, "new": "smoke-passphrase-never" }),
+        ) {
+            Err(error) if error.ends_with(": passphrase_change_not_confirmed") => {}
+            other => {
+                return Err(format!(
+                    "an unconfirmed Library flush did not stop the change: {other:?}"
+                ))
+            }
+        }
+        smoke_step(state, "vault_lock", json!({}))?;
+        smoke_step(state, "vault_unlock", json!({ "passphrase": moved_pass }))?;
+        let fragment = library_dir.join(format!(".tmp-{}", "c3".repeat(16)));
+        // Seven salt bytes: too few to prove anything.
+        std::fs::write(&fragment, &v1_bytes[..27])
+            .map_err(|e| format!("plant a fragment: {e}"))?;
+        let reported_pass = "smoke-passphrase-4";
+        let reported = smoke_step(
+            state,
+            "vault_change_passphrase",
+            json!({ "current": moved_pass, "new": reported_pass }),
+        )?;
+        if reported["warnings"] != json!(["passphrase_changed_library_leftover_retained"]) {
+            return Err(format!("expected the leftover warning: {reported}"));
+        }
+        std::fs::remove_file(&fragment).map_err(|e| format!("remove the fragment: {e}"))?;
+        reported_pass
+    };
+
+    // REPAIR, end to end: a Library left under an earlier passphrase (what a
+    // 0.9.x change left behind: the vault moved, the Library did not). The
+    // repair arm moves it into the vault.
+    smoke_step(state, "vault_lock", json!({}))?;
+    state.store = None;
+    std::fs::remove_file(&state.store_path)
+        .map_err(|e| format!("remove the Library before the repair: {e}"))?;
+    Store::create_with_params(&state.store_path, pass, 8192, 1, 1)
+        .and_then(|mut stranded| stranded.add_bookmark(CARRIED_URL, "carried"))
+        .map_err(|e| format!("make a stranded Library: {e}"))?;
+    smoke_step(state, "vault_unlock", json!({ "passphrase": moved_pass }))?;
+    let stranded = smoke_step(state, "store_status", json!({}))?;
+    if stranded["error"] != json!("store_passphrase_mismatch") {
+        return Err(format!("a stranded Library was not recognised: {stranded}"));
+    }
+    smoke_step(
+        state,
+        "store_repair_passphrase",
+        json!({ "library_passphrase": pass, "current": moved_pass }),
+    )?;
+    if smoke_step(state, "store_status", json!({}))?["open"] != json!(true) {
+        return Err("the repaired Library did not open".into());
+    }
+    if state.store.as_ref().map(|store| store.format_version()) != Some(3) {
+        return Err("the repaired Library did not move into the vault".into());
+    }
+    let repaired_marks = smoke_step(state, "bookmark_list", json!({}))?;
+    if repaired_marks["items"]
+        .as_array()
+        .map(|a| a.len())
+        .unwrap_or(0)
+        != 1
+    {
+        return Err("the repaired Library lost its bookmark".into());
     }
 
     // MIGRATION, end to end through the real dispatch surface.
@@ -5982,12 +6276,117 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
         state.detach_store_unreplaced();
         return "not_replaced";
     }
-    state.open_store(passphrase);
+    state.open_store(Some(passphrase));
     if state.store.is_some() {
         "replaced"
     } else {
         "not_opened"
     }
+}
+
+/// Changes the vault's passphrase, which is the Library's too.
+///
+/// A version 3 Library opens with a key the vault derives from its master,
+/// and the master does not change when the passphrase does, so for such a
+/// Library this is the vault's change alone. A version 1 Library, whose key
+/// the passphrase derives, moves into the vault first, and THE ORDER IS THE
+/// SAFETY:
+///
+///   1. `move_into_vault`: one atomic write, the same key wrapped under the
+///      vault's Library key instead of derived from the passphrase.
+///   2. `retire_v1_leftovers`: the version 1 file's leftover copies, which
+///      the old passphrase would still open, go. A Library that moved at an
+///      earlier change retries here.
+///   3. `confirm_durable`: the Library's directory flush, strictly, so a
+///      power cut cannot bring the version 1 file back once the vault has
+///      moved (plan gate, R-612), where the platform can flush a directory at
+///      all (Windows cannot; see `sync_parent` in the store).
+///   4. The vault rotates, rollback-safe.
+///
+/// A failure before step 4 leaves both files opening with the current
+/// passphrase, whatever the Library's version by then (a version 3 Library
+/// opens through the vault's unchanged master), so nothing needs undoing.
+///
+/// A Library file that exists but is not open (left under another
+/// passphrase, being replaced by an import, open in another PATANYX window,
+/// or a version 1 Library this session came in without the passphrase for)
+/// is a refusal: rotating the vault alone would leave a version 1 Library
+/// under a passphrase the vault no longer takes, which is exactly what
+/// stranded Libraries in 0.9.x (pentest F-001). No Library file at all is
+/// fine; the next unlock creates one inside the vault.
+///
+/// Ok carries the cleanup still owed AFTER the change took effect, in the
+/// order it applies; both can occur together and neither may hide the other
+/// (plan review, 2026-09-26).
+fn change_vault_and_library_passphrase(
+    vault: &mut Vault,
+    store: Option<&mut Store>,
+    library_file_exists: bool,
+    current: &str,
+    new: &str,
+) -> Result<Vec<&'static str>, &'static str> {
+    if store.is_none() && library_file_exists {
+        return Err("passphrase_change_library_unavailable");
+    }
+    // A change to the same passphrase changes nothing, and would still move
+    // a version 1 Library into the vault, which 1.0.2 and older cannot read.
+    if new == current {
+        return Err("passphrase_unchanged");
+    }
+    // THE VAULT DECIDES WHICH PASSPHRASE IS CURRENT, before the Library is
+    // touched.
+    if !vault.verify_passphrase(current).map_err(vault_code)? {
+        return Err("auth_failed");
+    }
+    let mut leftovers_retained = false;
+    if let Some(store) = store {
+        let library_key = vault.library_key().map_err(vault_code)?;
+        store.move_into_vault(&library_key).map_err(store_code)?;
+        leftovers_retained = store.retire_v1_leftovers().is_err();
+        if store.confirm_durable().is_err() {
+            return Err("passphrase_change_not_confirmed");
+        }
+    }
+    let mut warnings = Vec::new();
+    match vault.change_passphrase(current, new) {
+        Ok(()) => {}
+        // The rotation IS committed; only an old-passphrase backup remains.
+        Err(VaultError::BackupsRetained(_)) => warnings.push("passphrase_changed_backups_retained"),
+        // Not committed: the vault rolled itself back, and the Library opens
+        // with the current passphrase whichever version it is now.
+        Err(error) => return Err(vault_code(error)),
+    }
+    if leftovers_retained {
+        warnings.push("passphrase_changed_library_leftover_retained");
+    }
+    Ok(warnings)
+}
+
+/// Moves a Library left under a different passphrase into the vault, so it
+/// opens with the vault from then on. `current` is confirmed against the
+/// vault first; the Library must then open with `library_passphrase`; then
+/// ONE atomic write moves it. Nothing is written unless all three hold, and a
+/// failed write leaves the file exactly as it was. Its flush is best effort
+/// and it retires no leftovers (plan gate, R-613): the vault moved long ago,
+/// a lost write only brings this prompt back, and the next passphrase change
+/// retires the version 1 file's leftovers with the salt the move records.
+fn repair_library_passphrase(
+    vault: &Vault,
+    store_path: &Path,
+    library_passphrase: &str,
+    current: &str,
+) -> Result<Store, &'static str> {
+    if !vault.verify_passphrase(current).map_err(vault_code)? {
+        return Err("auth_failed");
+    }
+    let mut store = match Store::unlock(store_path, library_passphrase) {
+        Ok(store) => store,
+        Err(StoreError::AuthFailed) => return Err("store_library_passphrase_wrong"),
+        Err(other) => return Err(store_code(other)),
+    };
+    let library_key = vault.library_key().map_err(vault_code)?;
+    store.move_into_vault(&library_key).map_err(store_code)?;
+    Ok(store)
 }
 
 /// Writes carried bookmarks into the ALREADY replaced Library. Returns the
@@ -6012,6 +6411,7 @@ fn export_code(error: ExportError) -> &'static str {
         ExportError::BadExport(_) => "bad_export",
         ExportError::PlaintextNotConfirmed => "export_not_confirmed",
         ExportError::TargetIsLiveVault => "target_is_vault",
+        ExportError::PlaintextMayRemain => "export_plaintext_may_remain",
         // Wrapped vault errors (import refusing to overwrite, i/o inside a
         // vault save after import) reuse the vault vocabulary unchanged.
         ExportError::Vault(inner) => vault_code(inner),
@@ -6146,10 +6546,10 @@ fn restore_after_tunnel_restart(state: &mut AppState) {
     };
 
     // THE STORE HAS TO BE OPEN BEFORE THE MARKER IS SPENT. This is called
-    // from the recovery-key unlock as well, and that path cannot read the
-    // store at all: bookmarks and downloads are encrypted under the
-    // PASSPHRASE, so vault_unlock_recovery calls mark_store_unavailable and
-    // every store_open after it returns "store_needs_passphrase".
+    // from the recovery-key unlock as well, and that path cannot read a
+    // Library from before version 3 that has not moved into the vault yet:
+    // it is encrypted under the PASSPHRASE, so after a recovery-key unlock
+    // every store_open returns "store_needs_passphrase".
     //
     // The marker used to be taken and PERSISTED CLEARED right here, before
     // anything was attempted, and the restore's error was discarded. So a
@@ -6243,20 +6643,6 @@ fn store_open(state: &mut AppState) -> Result<&mut Store, &'static str> {
     }
 }
 
-/// Store failures map onto the same small vocabulary. `AuthFailed` maps to
-/// `store_bad_format` rather than `auth_failed` on purpose: the store only
-/// ever sees the vault's passphrase, which has just succeeded at opening the
-/// vault, so an authentication failure here means the file is not readable
-/// as our store (corrupt or foreign), not that the user typed something
-/// wrong. `AlreadyExists` is unreachable through the UI (we check `exists`
-/// first) and maps to the generic storage failure.
-// CONFIRMED against crates/store/src/error.rs: exactly these six variants
-// (BadFormat, AuthFailed, AlreadyExists, NotFound, Io, Crypto) and no
-// `#[non_exhaustive]`, so this match is total and a new variant would fail to
-// compile here rather than fall through to a default. Was a Note
-// admitting the list had been inferred rather than read -- on a release
-// branch, where an inferred error map is exactly the kind of thing that ships
-// a wrong message to a user.
 /// The shared licence_get / licence_paste payload. A locked vault is NOT an
 /// error: nulls tell the panel to say nothing rather than guessing at a
 /// state — the same contract as tunnel_get's `has_config`. Every
@@ -6384,6 +6770,24 @@ fn licence_replace_needs_confirm(
     }
 }
 
+/// Store failures map onto the same small vocabulary. `AuthFailed` maps to
+/// `store_bad_format` rather than `auth_failed` on purpose: outside the
+/// unlock, it comes from a picture blob or a record that no longer
+/// authenticates, which is a file problem, not a mistyped passphrase. The ONE
+/// place `AuthFailed` means something else is opening the Library right after
+/// the vault accepted the same passphrase, and `AppState::open_store` gives
+/// that its own code (`store_passphrase_mismatch`) instead of calling this.
+/// `AlreadyExists` is unreachable through the UI (we check `exists` first) and
+/// maps to the generic storage failure, as do `NotDurable` and
+/// `LeftoversRetained`, which the passphrase change handles itself before
+/// anything reaches this map. A version 3 Library that does not open with
+/// this vault (`VaultMismatch`) has its own code, never the passphrase
+/// repair's: no passphrase can open it.
+// CONFIRMED against crates/store/src/error.rs: exactly these eleven variants
+// (BadFormat, AuthFailed, AlreadyExists, NotFound, Io, Crypto, Full,
+// NotDurable, NeedsPassphrase, VaultMismatch, LeftoversRetained) and no
+// `#[non_exhaustive]`, so this match is total and a new variant fails to
+// compile here rather than falling through to a default.
 pub(crate) fn store_code(error: StoreError) -> &'static str {
     match error {
         StoreError::NotFound(_) => "not_found",
@@ -6393,6 +6797,10 @@ pub(crate) fn store_code(error: StoreError) -> &'static str {
         StoreError::AuthFailed => "store_bad_format",
         StoreError::BadFormat(_) => "store_bad_format",
         StoreError::Full(_) => "archive_full",
+        StoreError::NotDurable(_) => "io",
+        StoreError::NeedsPassphrase => "store_needs_passphrase",
+        StoreError::VaultMismatch => "store_vault_mismatch",
+        StoreError::LeftoversRetained(_) => "io",
     }
 }
 
@@ -8061,5 +8469,412 @@ mod unwrap_redirect_tests {
             let url = format!("https://safelinks.protection.outlook.com/?url={value}");
             assert_eq!(unwrap_redirect(&url), url, "must not unwrap: {value}");
         }
+    }
+}
+
+/// The passphrase change and the Library repair, driven through the same
+/// functions the IPC arms call, on a real vault and a real Library in a
+/// throwaway directory (cheap Argon2id parameters).
+#[cfg(test)]
+mod passphrase_change_tests {
+    use super::{change_vault_and_library_passphrase, repair_library_passphrase};
+    use patanyx_store::{FailPoint, Store, StoreError};
+    use patanyx_vault::{RecoveryKey, Vault};
+    use std::path::{Path, PathBuf};
+
+    struct Profile {
+        _dir: tempfile::TempDir,
+        vault: PathBuf,
+        library: PathBuf,
+        recovery: RecoveryKey,
+    }
+
+    /// A vault and, beside it, a Library from before version 3 (its key
+    /// derived from the passphrase): what every existing profile holds.
+    fn profile(passphrase: &str) -> (Profile, Vault, Store) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vault_path = dir.path().join("vault.rbv");
+        let library_path = dir.path().join("store.rbs");
+        let (vault, recovery) =
+            Vault::create_with_params(&vault_path, passphrase, 8192, 1, 1).expect("vault");
+        let store =
+            Store::create_with_params(&library_path, passphrase, 8192, 1, 1).expect("library");
+        (
+            Profile {
+                _dir: dir,
+                vault: vault_path,
+                library: library_path,
+                recovery,
+            },
+            vault,
+            store,
+        )
+    }
+
+    /// A vault and a Library made inside it: what every new profile holds.
+    fn profile_in_vault(passphrase: &str) -> (Profile, Vault, Store) {
+        let (p, vault, store) = profile(passphrase);
+        drop(store);
+        std::fs::remove_file(&p.library).unwrap();
+        let store = Store::create_in_vault(&p.library, &vault.library_key().unwrap())
+            .expect("library");
+        (p, vault, store)
+    }
+
+    fn vault_opens(path: &Path, passphrase: &str) -> bool {
+        Vault::unlock(path, passphrase).is_ok()
+    }
+
+    /// Opens the Library the way an unlock with `passphrase` does.
+    fn library_through_vault(p: &Profile, passphrase: &str) -> Result<Store, StoreError> {
+        let vault = Vault::unlock(&p.vault, passphrase).expect("the vault opens");
+        Store::open(&p.library, Some(passphrase), &vault.library_key().unwrap())
+    }
+
+    #[test]
+    fn a_change_moves_a_version_1_library_into_the_vault_and_keeps_everything() {
+        let (p, mut vault, mut store) = profile("old pass");
+        let bookmark = store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        let picture = store
+            .add_archive("https://a.example/", "t", "full page", "x", Some(b"pixels"))
+            .unwrap();
+        let download = store
+            .record_download("https://dl.example/f", "f", 1, [1u8; 32])
+            .unwrap();
+        let warnings = change_vault_and_library_passphrase(
+            &mut vault,
+            Some(&mut store),
+            true,
+            "old pass",
+            "new pass",
+        )
+        .expect("the change");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(store.format_version(), 3);
+        drop(vault);
+        drop(store);
+        assert!(vault_opens(&p.vault, "new pass"));
+        assert!(!vault_opens(&p.vault, "old pass"));
+        let reopened = library_through_vault(&p, "new pass").expect("the Library follows");
+        assert!(reopened.get_bookmark(&bookmark).is_some());
+        assert_eq!(&reopened.archive_picture(&picture).unwrap()[..], b"pixels");
+        assert!(
+            reopened.verify_download(&download).unwrap(),
+            "a provenance MAC broke"
+        );
+        assert!(
+            Store::unlock(&p.library, "old pass").is_err(),
+            "the Library file still opens with the old passphrase"
+        );
+    }
+
+    #[test]
+    fn a_library_made_inside_the_vault_is_not_written_by_a_change() {
+        let (p, mut vault, mut store) = profile_in_vault("old");
+        store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        let library_before = std::fs::read(&p.library).unwrap();
+        let warnings =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+                .expect("the change");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(std::fs::read(&p.library).unwrap(), library_before);
+        drop(vault);
+        drop(store);
+        assert_eq!(library_through_vault(&p, "new").unwrap().bookmarks().len(), 1);
+    }
+
+    #[test]
+    fn the_recovery_key_opens_the_library_before_and_after_a_change() {
+        let (p, vault, mut store) = profile("old");
+        store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        // Before the move the Library opens only with the passphrase. (One
+        // live vault at a time: each holds the vault's lock.)
+        drop(vault);
+        let by_recovery = Vault::unlock_with_recovery(&p.vault, &p.recovery).unwrap();
+        assert!(matches!(
+            Store::open(&p.library, None, &by_recovery.library_key().unwrap()),
+            Err(StoreError::NeedsPassphrase)
+        ));
+        drop(by_recovery);
+        let mut vault = Vault::unlock(&p.vault, "old").unwrap();
+        change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+            .expect("the change");
+        drop(vault);
+        drop(store);
+        let by_recovery = Vault::unlock_with_recovery(&p.vault, &p.recovery).unwrap();
+        let library = Store::open(&p.library, None, &by_recovery.library_key().unwrap())
+            .expect("the recovery key reaches the Library");
+        assert_eq!(library.bookmarks().len(), 1);
+    }
+
+    #[test]
+    fn a_wrong_current_passphrase_changes_neither_file() {
+        let (p, mut vault, mut store) = profile("right");
+        let vault_before = std::fs::read(&p.vault).unwrap();
+        let library_before = std::fs::read(&p.library).unwrap();
+        let outcome =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "wrong", "new");
+        assert_eq!(outcome, Err("auth_failed"));
+        assert_eq!(std::fs::read(&p.vault).unwrap(), vault_before);
+        assert_eq!(std::fs::read(&p.library).unwrap(), library_before);
+        assert_eq!(store.format_version(), 1);
+    }
+
+    #[test]
+    fn a_library_that_exists_but_is_not_open_is_refused_and_the_vault_is_untouched() {
+        // Pentest F-001 was exactly this: the vault rotated alone.
+        let (p, mut vault, store) = profile("old");
+        drop(store);
+        let vault_before = std::fs::read(&p.vault).unwrap();
+        let outcome = change_vault_and_library_passphrase(&mut vault, None, true, "old", "new");
+        assert_eq!(outcome, Err("passphrase_change_library_unavailable"));
+        assert_eq!(std::fs::read(&p.vault).unwrap(), vault_before);
+    }
+
+    #[test]
+    fn with_no_library_file_the_vault_changes_alone() {
+        let (p, mut vault, store) = profile("old");
+        drop(store);
+        std::fs::remove_file(&p.library).unwrap();
+        let warnings =
+            change_vault_and_library_passphrase(&mut vault, None, false, "old", "new").unwrap();
+        assert!(warnings.is_empty());
+        drop(vault);
+        assert!(vault_opens(&p.vault, "new"));
+    }
+
+    #[test]
+    fn a_failed_library_move_stops_the_change_and_writes_no_vault() {
+        let (p, mut vault, mut store) = profile("old");
+        let vault_before = std::fs::read(&p.vault).unwrap();
+        store.fail_next_write_for_test(FailPoint::BeforeRename);
+        let outcome =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new");
+        assert_eq!(outcome, Err("io"));
+        assert_eq!(std::fs::read(&p.vault).unwrap(), vault_before);
+        assert_eq!(store.format_version(), 1);
+        drop(vault);
+        drop(store);
+        assert!(Store::unlock(&p.library, "old").is_ok());
+    }
+
+    #[test]
+    fn a_failed_vault_step_leaves_both_opening_with_the_current_passphrase() {
+        let (p, mut vault, mut store) = profile("old");
+        vault.fail_next_save_for_test();
+        let outcome =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new");
+        assert!(outcome.is_err(), "the injected vault failure must surface");
+        // The move stands, and needs no undoing: the Library now opens
+        // through the vault, whose passphrase did not change.
+        assert_eq!(store.format_version(), 3);
+        drop(vault);
+        drop(store);
+        assert!(vault_opens(&p.vault, "old"));
+        assert!(!vault_opens(&p.vault, "new"));
+        assert!(library_through_vault(&p, "old").is_ok());
+    }
+
+    #[test]
+    fn an_unconfirmed_library_flush_stops_before_the_vault_moves() {
+        let (p, mut vault, mut store) = profile("old");
+        store.fail_next_confirm_for_test();
+        let outcome =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new");
+        assert_eq!(outcome, Err("passphrase_change_not_confirmed"));
+        drop(vault);
+        assert!(
+            vault_opens(&p.vault, "old"),
+            "the vault moved after an unconfirmed Library flush"
+        );
+        assert!(!vault_opens(&p.vault, "new"));
+        // Moved, but opening with the vault's unchanged passphrase; a retry
+        // confirms and goes through (plan gate, R-612).
+        assert_eq!(store.format_version(), 3);
+        let mut vault = Vault::unlock(&p.vault, "old").unwrap();
+        change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+            .expect("the retry");
+        drop(vault);
+        drop(store);
+        assert!(library_through_vault(&p, "new").is_ok());
+    }
+
+    #[test]
+    fn a_change_removes_the_leftover_copies_of_the_version_1_file() {
+        let (p, mut vault, mut store) = profile("old");
+        let v1 = std::fs::read(&p.library).unwrap();
+        let dir = p.library.parent().unwrap();
+        let temp = dir.join(format!(".tmp-{}", "5a".repeat(16)));
+        let legacy = dir.join("store.rbs.tmp");
+        std::fs::write(&temp, &v1).unwrap();
+        std::fs::write(&legacy, &v1).unwrap();
+        let warnings =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+                .expect("the change");
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert!(!temp.exists() && !legacy.exists(), "a leftover survived");
+    }
+
+    #[test]
+    fn both_cleanup_warnings_surface_together_and_the_change_stands() {
+        // Both at once (plan review, 2026-09-26): an old-passphrase vault
+        // backup that cannot be removed AND a leftover shaped like a Library
+        // that cannot be proven to be this one.
+        let (p, mut vault, mut store) = profile("old");
+        vault.save().unwrap(); // leaves a backup under the old passphrase
+        let stuck = p.vault.with_file_name("vault.rbv.bak-1");
+        std::fs::create_dir(&stuck).unwrap(); // a directory remove_file refuses
+        let v1 = std::fs::read(&p.library).unwrap();
+        let fragment = p
+            .library
+            .with_file_name(format!(".tmp-{}", "c3".repeat(16)));
+        std::fs::write(&fragment, &v1[..27]).unwrap(); // 7 salt bytes prove nothing
+        let warnings =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+                .expect("the change is committed");
+        assert_eq!(
+            warnings,
+            vec![
+                "passphrase_changed_backups_retained",
+                "passphrase_changed_library_leftover_retained"
+            ]
+        );
+        drop(vault);
+        drop(store);
+        assert!(vault_opens(&p.vault, "new"));
+        assert!(library_through_vault(&p, "new").is_ok());
+        let _ = std::fs::remove_dir(&stuck);
+    }
+
+    #[test]
+    fn a_change_to_the_same_passphrase_is_refused_before_anything_is_written() {
+        let (p, mut vault, mut store) = profile("same-pass");
+        let vault_before = std::fs::read(&p.vault).unwrap();
+        let library_before = std::fs::read(&p.library).unwrap();
+        let outcome = change_vault_and_library_passphrase(
+            &mut vault,
+            Some(&mut store),
+            true,
+            "same-pass",
+            "same-pass",
+        );
+        assert_eq!(outcome, Err("passphrase_unchanged"));
+        assert_eq!(std::fs::read(&p.vault).unwrap(), vault_before);
+        assert_eq!(std::fs::read(&p.library).unwrap(), library_before);
+        assert_eq!(
+            store.format_version(),
+            1,
+            "a no-op change moved the Library into the vault"
+        );
+    }
+
+    /// The limitation the change form states: the vault's master never
+    /// changes, so a copy of the vault from before a change, with the old
+    /// passphrase, still reaches the Library.
+    #[test]
+    fn an_old_copy_of_the_vault_with_the_old_passphrase_still_reaches_the_library() {
+        let (p, mut vault, mut store) = profile("old");
+        store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        let copy = p.vault.with_file_name("vault-copy.rbv");
+        std::fs::copy(&p.vault, &copy).unwrap();
+        change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old", "new")
+            .expect("the change");
+        drop(vault);
+        drop(store);
+        let old_copy = Vault::unlock(&copy, "old").expect("the old copy still opens");
+        let library = Store::open(&p.library, None, &old_copy.library_key().unwrap())
+            .expect("the old copy's key opens the Library");
+        assert_eq!(library.bookmarks().len(), 1);
+    }
+
+    #[test]
+    fn repair_moves_a_stranded_library_into_the_vault() {
+        // A 0.9.x profile: the vault moved to "current", the Library
+        // stayed under "previous".
+        let (p, mut vault, store) = profile("previous");
+        let bookmark = {
+            let mut store = store;
+            store.add_bookmark("https://kept.example/", "Kept").unwrap()
+        };
+        vault.change_passphrase("previous", "current").unwrap();
+        assert!(matches!(
+            Store::open(&p.library, Some("current"), &vault.library_key().unwrap()),
+            Err(StoreError::AuthFailed)
+        ));
+        let repaired = repair_library_passphrase(&vault, &p.library, "previous", "current")
+            .expect("the repair");
+        assert_eq!(repaired.format_version(), 3);
+        assert!(repaired.get_bookmark(&bookmark).is_some());
+        drop(repaired);
+        drop(vault);
+        assert!(library_through_vault(&p, "current").is_ok());
+        assert!(Store::unlock(&p.library, "previous").is_err());
+    }
+
+    /// An import deletes the Library, so it must hold the Library lock before
+    /// it starts (final review, R-001). The arm needs a whole AppState, so the
+    /// order is checked in the source.
+    #[test]
+    fn an_import_takes_the_library_lock_before_it_replaces_anything() {
+        let source = include_str!("ipc.rs");
+        let arm = source
+            .find("\"vault_import\" => {")
+            .expect("the import arm was renamed");
+        let lock = source[arm..]
+            .find("state.hold_library_lock(\"import_library_in_use\")?;")
+            .expect("the import no longer takes the Library lock");
+        let replace = source[arm..]
+            .find("replace_library(&marker")
+            .expect("the import no longer replaces the Library");
+        assert!(lock < replace, "the import takes the Library lock too late");
+        // ...and a refused import gives back a lock it took itself (final
+        // review round 2, R-002): the release sits in the failure branch.
+        let failed = replace
+            + source[arm + replace..]
+                .find("Err(code) => {")
+                .expect("the import's failure branch moved");
+        let release = source[arm + failed..]
+            .find("state.release_unused_library_lock(newly_locked);")
+            .expect("a refused import keeps the Library lock it took");
+        let refused = source[arm + failed..]
+            .find("return Err(code);")
+            .expect("the import's refusal moved");
+        assert!(release < refused, "the lock is given back after the refusal returns");
+    }
+
+    /// The repair prompt is offered only for `store_passphrase_mismatch`, so a
+    /// Library no passphrase can open must never map to it, and a version 1
+    /// Library reached without the passphrase says so.
+    #[test]
+    fn a_library_no_passphrase_can_open_never_asks_for_one() {
+        assert_eq!(
+            super::store_code(StoreError::VaultMismatch),
+            "store_vault_mismatch"
+        );
+        assert_eq!(
+            super::store_code(StoreError::NeedsPassphrase),
+            "store_needs_passphrase"
+        );
+    }
+
+    #[test]
+    fn repair_refuses_without_the_current_passphrase_and_writes_nothing() {
+        let (p, mut vault, store) = profile("previous");
+        drop(store);
+        vault.change_passphrase("previous", "current").unwrap();
+        let before = std::fs::read(&p.library).unwrap();
+        assert_eq!(
+            repair_library_passphrase(&vault, &p.library, "previous", "a guess").err(),
+            Some("auth_failed")
+        );
+        assert_eq!(
+            repair_library_passphrase(&vault, &p.library, "not it", "current").err(),
+            Some("store_library_passphrase_wrong")
+        );
+        assert_eq!(
+            std::fs::read(&p.library).unwrap(),
+            before,
+            "a refused repair wrote the Library"
+        );
     }
 }

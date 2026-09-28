@@ -12,10 +12,12 @@ fn main() {
     let path = a.next().expect("usage: seed-demo <store-path> <passphrase>");
     let pass = a.next().expect("passphrase required");
     let path = std::path::PathBuf::from(path);
+    // A version 1 Library, which the browser opens with the vault's
+    // passphrase and moves into the vault at the first passphrase change.
     let mut store = if Store::exists(&path) {
         Store::unlock(&path, &pass).expect("unlock")
     } else {
-        Store::create(&path, &pass).expect("create")
+        Store::create_with_params(&path, &pass, 65_536, 3, 1).expect("create")
     };
 
     let sets = [

@@ -31,6 +31,8 @@ mod backup;
 pub mod lock;
 mod recovery;
 mod model;
+#[cfg(test)]
+mod writer_tests;
 
 pub use error::VaultError;
 pub use recovery::{RecoveryKey, RECOVERY_LEN};
@@ -81,6 +83,11 @@ pub struct Vault {
     /// neither the field nor the method.
     #[cfg(any(debug_assertions, test))]
     fail_next_save: bool,
+    /// TEST-ONLY fault INSIDE the writer, where the temporary file already
+    /// exists, so its cleanup is exercised too. `fail_next_save` above is
+    /// unchanged: it still fails a save before anything touches the disk.
+    #[cfg(test)]
+    fail_next_write: Fault,
     /// Encrypts the contents. Random, never derived from a passphrase: that
     /// indirection is what allows more than one unlock method.
     master: Zeroizing<[u8; crypto::KEY_LEN]>,
@@ -228,6 +235,8 @@ impl Vault {
             last_backup_error: None,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
+            #[cfg(test)]
+            fail_next_write: Fault::None,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -294,16 +303,56 @@ impl Vault {
     /// Unlock with the passphrase. Version 1 vaults are migrated to version 2
     /// transparently, which is also when they gain a recovery key.
     pub fn unlock(path: &Path, passphrase: &str) -> Result<Vault, VaultError> {
+        let guard = Self::lock_before_reading(path)?;
         let bytes = fs::read(path)?;
         if format::is_v1(&bytes) {
-            return Self::unlock_v1_and_migrate(path, &bytes, passphrase);
+            return Self::unlock_v1_and_migrate(path, &bytes, passphrase, guard);
         }
-        Self::unlock_slots(path, &bytes, format::SlotKind::Passphrase, passphrase.as_bytes())
+        Self::unlock_slots(
+            path,
+            &bytes,
+            format::SlotKind::Passphrase,
+            passphrase.as_bytes(),
+            guard,
+        )
+    }
+
+    /// Takes the vault's lock BEFORE its bytes are read (review 2026-09-28,
+    /// full-diff R-002). Reading first let a second window hold the old
+    /// slots and payload while another window changed the passphrase, then
+    /// take the released lock and save the retired passphrase back. With the
+    /// lock first, what is read is what nobody else can change until this
+    /// vault is dropped. A missing file is reported as missing, before any
+    /// sidecar is created.
+    ///
+    /// A lock this process has only just let go of can stay held for a
+    /// moment: while any thread spawns a child process, the child holds a copy
+    /// of every open file, the lock's included, until its program starts and
+    /// closes them. Before the lock moved ahead of the read, the passphrase
+    /// check's delay hid that moment; now a lock then an immediate unlock could
+    /// report "already open in another window" for nothing. So a busy lock is
+    /// retried for up to about 200 ms before Locked is returned; a vault that
+    /// really is open elsewhere still reports Locked, a moment later.
+    fn lock_before_reading(path: &Path) -> Result<VaultLock, VaultError> {
+        const ATTEMPTS: u32 = 10;
+        const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+        fs::metadata(path)?;
+        let mut attempt = 1;
+        loop {
+            match lock::acquire(path) {
+                Err(LockError::Busy) if attempt < ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(PAUSE);
+                }
+                outcome => return outcome.map_err(VaultError::from),
+            }
+        }
     }
 
     /// Unlock with the recovery key, for the case this whole mechanism exists
     /// for: the passphrase is gone.
     pub fn unlock_with_recovery(path: &Path, recovery: &RecoveryKey) -> Result<Vault, VaultError> {
+        let guard = Self::lock_before_reading(path)?;
         let bytes = fs::read(path)?;
         if format::is_v1(&bytes) {
             // v1 predates slots entirely, so there is nothing to try.
@@ -314,6 +363,7 @@ impl Vault {
             &bytes,
             format::SlotKind::Recovery,
             recovery.as_bytes(),
+            guard,
         )
     }
 
@@ -322,6 +372,7 @@ impl Vault {
         bytes: &[u8],
         kind: format::SlotKind,
         secret: &[u8],
+        guard: VaultLock,
     ) -> Result<Vault, VaultError> {
         let header = format::decode_header(bytes)?;
         let header_len = header.len();
@@ -364,11 +415,12 @@ impl Vault {
             &bytes[header_len..],
         )?;
         let data = Self::parse_payload(&plaintext)?;
-        let guard = lock::acquire(path).map_err(VaultError::from)?;
         Ok(Vault {
             last_backup_error: None,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
+            #[cfg(test)]
+            fail_next_write: Fault::None,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -390,6 +442,7 @@ impl Vault {
         path: &Path,
         bytes: &[u8],
         passphrase: &str,
+        guard: VaultLock,
     ) -> Result<Vault, VaultError> {
         let header = format::decode_v1_header(bytes)?;
         if bytes.len() < format::V1_HEADER_LEN + 16 {
@@ -407,13 +460,15 @@ impl Vault {
         let data = Self::parse_payload(&plaintext)?;
 
         // v1 derived the content key from the passphrase directly; v2 needs a
-        // master key, so mint one and re-wrap.
-        let guard = lock::acquire(path).map_err(VaultError::from)?;
+        // master key, so mint one and re-wrap. The lock was taken before
+        // the file was read (`lock_before_reading`).
         let master = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
         let mut vault = Vault {
             last_backup_error: None,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
+            #[cfg(test)]
+            fail_next_write: Fault::None,
             _lock: guard,
             path: path.to_path_buf(),
             master,
@@ -505,6 +560,8 @@ impl Vault {
             last_backup_error: None,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
+            #[cfg(test)]
+            fail_next_write: Fault::None,
             _lock: guard,
             path,
             master,
@@ -554,6 +611,13 @@ impl Vault {
         &self.master
     }
 
+    /// The key the Library opens with (`crypto::derive_library_key`): the
+    /// same for every unlock method and across every passphrase change, and
+    /// different for every vault.
+    pub fn library_key(&self) -> Result<Zeroizing<[u8; crypto::KEY_LEN]>, VaultError> {
+        crypto::derive_library_key(&self.master)
+    }
+
     /// True when this vault can be opened with a recovery key.
     pub fn has_recovery(&self) -> bool {
         self.slots
@@ -578,6 +642,13 @@ impl Vault {
     #[cfg(any(debug_assertions, test))]
     pub fn fail_next_save_for_test(&mut self) {
         self.fail_next_save = true;
+    }
+
+    /// Arms a fault INSIDE the writer for the next save (tests only). See
+    /// `fail_next_write`.
+    #[cfg(test)]
+    fn fail_next_write_for_test(&mut self, fault: Fault) {
+        self.fail_next_write = fault;
     }
 
     /// `backup == false` only for a passphrase rotation, which must not leave
@@ -631,7 +702,13 @@ impl Vault {
         let mut out = Vec::with_capacity(header.len() + ciphertext.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&ciphertext);
-        atomic_write(&self.path, &out)
+        // A test fault fires INSIDE the writer, after the temporary file
+        // exists, so its cleanup is exercised as well.
+        #[cfg(test)]
+        let fault = std::mem::replace(&mut self.fail_next_write, Fault::None);
+        #[cfg(not(test))]
+        let fault = Fault::None;
+        atomic_write_with(&self.path, &out, fault)
     }
 
     // ---- credentials ----
@@ -1218,53 +1295,112 @@ fn random_id() -> String {
     id
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
+/// A temporary file's name: `.tmp-` and 32 lowercase hex characters from the
+/// OS RNG, in the target's directory. UNPREDICTABLE, so nobody can pre-create
+/// it: the name every build up to 1.0.2 used, `<path>.tmp`, could be planted
+/// as a symlink by anyone able to write to the directory, and an ordinary
+/// create follows one (the vault, a backup or an export was then written
+/// wherever the link pointed). It is also independent of the target's own
+/// name, so a long or non-UTF-8 file name gains nothing here. The Library's
+/// writer and its picture store use the same shape.
+fn temp_path_in(dir: &Path) -> PathBuf {
+    dir.join(format!(".tmp-{}", random_id()))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let tmp = tmp_path(path);
+/// Whether `name` is exactly what `temp_path_in` makes: `.tmp-` and 32
+/// lowercase hex characters. A passphrase rotation uses it to find this
+/// writer's leftovers (`backup::retire_backups`).
+fn is_temp_name(name: &str) -> bool {
+    name.strip_prefix(".tmp-").is_some_and(|hex| {
+        hex.len() == 32
+            && hex
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Opens a NEW file, refusing anything already at `temp`: a file, a directory,
+/// or a symlink, which `create_new` (O_EXCL) never follows. Mode 0600 is part
+/// of the create itself, so no byte ever sits in a looser file.
+pub(crate) fn open_new_temp(temp: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            // Mode 0600 must be in effect *before* any plaintext-derived
-            // bytes reach disk.
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        #[cfg(unix)]
-        {
-            // In case a stale tmp file with a looser mode already existed.
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-        // Note (Windows hardening): there is no chmod on Windows; the
-        // tmp file inherits the directory's ACL. Under %APPDATA% (a per-user
-        // directory) that ACL already grants access only to the owning user
-        // and SYSTEM, so the "never world-readable" invariant holds through
-        // inheritance — but it now depends on where the file lives. A
-        // Windows-appropriate hardening would apply an explicit owner-only
-        // DACL to the tmp file (e.g. SetNamedSecurityInfoW) before any
-        // plaintext-derived bytes are written; that requires a WinAPI
-        // dependency and unsafe code, so it is deliberately left out rather
-        // than invented here.
-        file.write_all(bytes)?;
-        // Durability, not just ordering: the bytes must be on the medium
-        // before the rename publishes them under the real name, or a crash
-        // can leave a correctly-named file full of nothing.
-        file.sync_all()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    fs::rename(&tmp, path)?;
+    // Note (Windows hardening): there is no chmod on Windows; the
+    // tmp file inherits the directory's ACL. Under %APPDATA% (a per-user
+    // directory) that ACL already grants access only to the owning user
+    // and SYSTEM, so the "never world-readable" invariant holds through
+    // inheritance — but it now depends on where the file lives. A
+    // Windows-appropriate hardening would apply an explicit owner-only
+    // DACL to the tmp file (e.g. SetNamedSecurityInfoW) before any
+    // plaintext-derived bytes are written; that requires a WinAPI
+    // dependency and unsafe code, so it is deliberately left out rather
+    // than invented here.
+    options.open(temp)
+}
+
+/// A fault to inject inside `atomic_write_with`. Only tests ever pass anything
+/// but `None`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum Fault {
+    None,
+    /// Half the bytes are written, then the write fails, the way a full disk
+    /// would.
+    Write,
+    /// The temporary file's flush fails after every byte was written.
+    Sync,
+    /// Fails just before the rename, with the temporary file written and
+    /// flushed: the previous file is still the one on disk.
+    Rename,
+    /// Removing the temporary file after a failure fails too.
+    Cleanup,
+}
+
+/// The one writer for everything this crate puts on disk: the vault itself,
+/// its rotating backups, and both exports.
+fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
+    atomic_write_with(path, bytes, Fault::None)
+}
+
+/// Writes `bytes` to a new, unpredictably named temporary file beside `path`,
+/// flushes it, and renames it over `path`. Every error from here means the
+/// rename did not happen and the previous file is still the one on disk. The
+/// temporary file is removed on the way out, BEST EFFORT: if even that removal
+/// fails, the file stays exactly as crash debris would (below), and the caller
+/// still gets the error that mattered, never the cleanup's.
+///
+/// A temporary file a CRASH leaves behind (between its creation and the
+/// rename) stays where it is, 0600 and never read, with one exception: a
+/// passphrase rotation removes the ones beside the vault that are copies of
+/// it, because they would still open with a passphrase it retired (pentest
+/// F-002; `backup::retire_backups`). Nothing is swept at unlock or at save.
+fn atomic_write_with(path: &Path, bytes: &[u8], fault: Fault) -> Result<(), VaultError> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            fs::create_dir_all(parent)?;
+            parent
+        }
+        _ => Path::new("."),
+    };
+    let temp = temp_path_in(dir);
+    let mut file = open_new_temp(&temp)?;
+    let written = write_temp(&mut file, bytes, fault);
+    drop(file);
+    let renamed = written.and_then(|()| {
+        if fault == Fault::Rename {
+            return Err(std::io::Error::other("injected failure before the rename"));
+        }
+        fs::rename(&temp, path)
+    });
+    if let Err(error) = renamed {
+        let _ = remove_temp(&temp, fault);
+        return Err(VaultError::Io(error));
+    }
     // An atomic rename is not automatically a DURABLE rename. The rename is
     // atomic with respect to other processes immediately, but the directory
     // entry itself lives in the parent's metadata, and until that is flushed
@@ -1303,6 +1439,38 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), VaultError> {
         }
     }
     Ok(())
+}
+
+/// Writes and flushes the temporary file. `Fault::Write` stops after half the
+/// bytes, the way a full disk would; `Fault::Sync` fails the flush after every
+/// byte is written.
+fn write_temp(file: &mut fs::File, bytes: &[u8], fault: Fault) -> std::io::Result<()> {
+    if fault == Fault::Write {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(std::io::Error::other(
+            "injected failure part-way through the write",
+        ));
+    }
+    file.write_all(bytes)?;
+    if fault == Fault::Sync {
+        return Err(std::io::Error::other(
+            "injected failure at the temporary file's flush",
+        ));
+    }
+    // Durability, not just ordering: the bytes must be on the medium
+    // before the rename publishes them under the real name, or a crash
+    // can leave a correctly-named file full of nothing.
+    file.sync_all()
+}
+
+/// Removes a temporary file after a failure. `Fault::Cleanup` makes it fail.
+fn remove_temp(temp: &Path, fault: Fault) -> std::io::Result<()> {
+    if fault == Fault::Cleanup {
+        return Err(std::io::Error::other(
+            "injected failure removing the temporary file",
+        ));
+    }
+    fs::remove_file(temp)
 }
 
 #[cfg(test)]

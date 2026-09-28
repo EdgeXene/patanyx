@@ -10,17 +10,21 @@
 //!
 //! - **Passwords** (vault): locked aggressively; the key is dropped at
 //!   auto-lock.
-//! - **Bookmarks and provenance** (this store): encrypted at rest with a
-//!   key derived from the same passphrase, but that key is held for the
-//!   whole session. There is intentionally NO lock/timeout API on `Store` —
-//!   the session owner keeps it resident so a download already in flight can
-//!   still record provenance. The app's `store_open` is the user-facing gate:
-//!   it refuses bookmark, snapshot, shelf, archive and download reads while
-//!   the vault is locked.
+//! - **Bookmarks and provenance** (this store): encrypted at rest with its
+//!   own key, which the vault unlocks (version 3) or, in a Library from
+//!   before that, the same passphrase derives (version 1); that key is held
+//!   for the whole session. There is intentionally NO lock/timeout API on
+//!   `Store` — the session owner keeps it resident so a download already in
+//!   flight can still record provenance. The app's `store_open` is the
+//!   user-facing gate: it refuses bookmark, snapshot, shelf, archive and
+//!   download reads while the vault is locked.
 //!
-//! The two stores still cannot share a key: the passphrase is pre-hashed
-//! with a store-specific domain label before Argon2id (see `crypto.rs`), so
-//! the keys are unrelated even for the same passphrase, and the files have
+//! The two stores still never share a key. A version 3 Library's key is
+//! random, and reaches the file wrapped under a key the vault derives from
+//! its master for this purpose alone (`Vault::library_key`). A version 1
+//! Library's key is derived from the passphrase, pre-hashed with a
+//! store-specific domain label before Argon2id (see `crypto.rs`), so it is
+//! unrelated to the vault's even for the same passphrase. The files have
 //! distinct magic values so they can never be confused with each other.
 //!
 //! # What download provenance proves — and what it does not
@@ -58,13 +62,24 @@
 //! KDF parameters, or salt fails authentication exactly like a wrong
 //! passphrase does. Same shape as the vault, same atomic-write and 0600
 //! rules.
+//!
+//! Version 3, where every new Library starts and every existing one moves at
+//! its owner's first passphrase change, opens with the vault instead of the
+//! passphrase; its layout is in `format.rs`.
 
 mod blob;
 mod crypto;
 mod error;
 mod format;
+#[cfg(test)]
+mod library_key_tests;
 mod model;
 pub mod provenance;
+mod retire;
+#[cfg(test)]
+mod retire_tests;
+#[cfg(test)]
+mod writer_tests;
 
 pub use error::StoreError;
 pub use model::{
@@ -88,11 +103,61 @@ use crate::crypto::KdfParams;
 /// does — that is the session-lifetime guarantee documented above.
 pub struct Store {
     path: PathBuf,
+    /// The Library's data key. A version 1 file derives it from the
+    /// passphrase; a version 3 file carries it wrapped under the vault's
+    /// Library key. It never changes, not even when the Library moves from
+    /// version 1 to 3, which is what keeps every picture blob and every
+    /// provenance MAC valid.
     key: Zeroizing<[u8; crypto::KEY_LEN]>,
     provenance_key: Zeroizing<[u8; crypto::KEY_LEN]>,
-    params: KdfParams,
-    salt: [u8; crypto::SALT_LEN],
+    envelope: Envelope,
     data: StoreData,
+    #[cfg(any(debug_assertions, test))]
+    /// Low byte: where the armed failure strikes (0 = none). High byte: how
+    /// many writes to let through first.
+    fail_next_write: std::sync::atomic::AtomicU16,
+    #[cfg(any(debug_assertions, test))]
+    fail_next_confirm: std::sync::atomic::AtomicBool,
+}
+
+/// How the data key reaches the file: derived from the passphrase
+/// (version 1) or wrapped under the vault's Library key (version 3). Never
+/// printed: see the hand-written Debug below.
+#[derive(Clone)]
+enum Envelope {
+    V1 {
+        params: KdfParams,
+        salt: [u8; crypto::SALT_LEN],
+    },
+    V3 {
+        wrap_nonce: [u8; crypto::NONCE_LEN],
+        wrapped: [u8; format::WRAPPED_LEN],
+    },
+}
+
+/// Whether a failed directory flush is reported. Ordinary saves never report
+/// it (a lost flush loses one save, and the caller must not treat live data
+/// as absent); `confirm_durable`, before a passphrase change moves the vault,
+/// must.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirSync {
+    BestEffort,
+    Strict,
+}
+
+/// Where the next write fails, for fault-injection tests (debug builds only,
+/// mirroring the vault's `fail_next_save_for_test`).
+#[cfg(any(debug_assertions, test))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailPoint {
+    /// Part-way through writing the temporary file: half the bytes are on
+    /// disk, then the write fails, the way a full disk would.
+    DuringWrite,
+    /// At the temporary file's own flush, after every byte was written.
+    DuringSync,
+    /// Before the rename, with the temporary file written and flushed: the
+    /// old file is still the one on disk.
+    BeforeRename,
 }
 
 impl std::fmt::Debug for Store {
@@ -173,20 +238,28 @@ impl Store {
         path.is_file()
     }
 
-    /// Create a new store with default Argon2id parameters (m=64 MiB, t=3,
-    /// p=1). Fails with `StoreError::AlreadyExists` if `path` exists — this
-    /// function never clobbers.
-    pub fn create(path: &Path, passphrase: &str) -> Result<Store, StoreError> {
-        let KdfParams {
-            m_cost,
-            t_cost,
-            p_cost,
-        } = KdfParams::default();
-        Self::create_with_params(path, passphrase, m_cost, t_cost, p_cost)
+    /// Creates a new Library that opens with the vault (version 3): a random
+    /// data key, wrapped under `library_key` (`Vault::library_key`). Every
+    /// new Library starts here. Fails with `StoreError::AlreadyExists` if
+    /// `path` exists — this function never clobbers.
+    pub fn create_in_vault(
+        path: &Path,
+        library_key: &[u8; crypto::KEY_LEN],
+    ) -> Result<Store, StoreError> {
+        if path.exists() {
+            return Err(StoreError::AlreadyExists(path.to_path_buf()));
+        }
+        let key = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
+        let envelope = wrap_for_vault(&key, library_key)?;
+        let store = Store::assembled(path, key, envelope, StoreData::default());
+        store.save()?;
+        Ok(store)
     }
 
-    /// Same as `create` but with explicit KDF parameters; intended for
-    /// tests (e.g. m=8192, t=1, p=1) and future parameter upgrades.
+    /// Creates a version 1 Library, whose key is derived from `passphrase`,
+    /// with explicit KDF parameters. The app no longer makes these (see
+    /// `create_in_vault`); tests do, to stand in for a Library from before
+    /// version 3 (e.g. m=8192, t=1, p=1).
     pub fn create_with_params(
         path: &Path,
         passphrase: &str,
@@ -204,22 +277,50 @@ impl Store {
         };
         let salt: [u8; crypto::SALT_LEN] = crypto::random_bytes();
         let key = crypto::derive_key(passphrase.as_bytes(), &salt, &params)?;
-        let provenance_key = provenance::mac_key(&key);
-        let store = Store {
-            path: path.to_path_buf(),
+        let store = Store::assembled(
+            path,
             key,
-            provenance_key,
-            params,
-            salt,
-            data: StoreData::default(),
-        };
+            Envelope::V1 { params, salt },
+            StoreData::default(),
+        );
         store.save()?;
         Ok(store)
     }
 
+    /// Opens the Library at `path` with what its version needs: version 3
+    /// with `library_key`, version 1 with `passphrase`, and a version 1 file
+    /// with no passphrase is `NeedsPassphrase` (a recovery-key unlock). The
+    /// version byte is read before anything else, and any other version is
+    /// refused before a key derivation and never written.
+    pub fn open(
+        path: &Path,
+        passphrase: Option<&str>,
+        library_key: &[u8; crypto::KEY_LEN],
+    ) -> Result<Store, StoreError> {
+        let bytes = fs::read(path)?;
+        match format::version_of(&bytes)? {
+            format::VERSION => match passphrase {
+                Some(passphrase) => Self::unlock_v1(path, &bytes, passphrase),
+                None => Err(StoreError::NeedsPassphrase),
+            },
+            format::VERSION_V3 => Self::open_v3(path, &bytes, library_key),
+            other => Err(unsupported_version(other)),
+        }
+    }
+
+    /// Opens a version 1 Library with its passphrase: the repair of a Library
+    /// left under an earlier passphrase, and tests. A version 3 Library opens
+    /// only with the vault (`open`).
     pub fn unlock(path: &Path, passphrase: &str) -> Result<Store, StoreError> {
         let bytes = fs::read(path)?;
-        let header = format::decode_header(&bytes)?;
+        match format::version_of(&bytes)? {
+            format::VERSION => Self::unlock_v1(path, &bytes, passphrase),
+            other => Err(unsupported_version(other)),
+        }
+    }
+
+    fn unlock_v1(path: &Path, bytes: &[u8], passphrase: &str) -> Result<Store, StoreError> {
+        let header = format::decode_header(bytes)?;
         if bytes.len() < format::HEADER_LEN + 16 {
             return Err(StoreError::BadFormat(
                 "file ends after header: no ciphertext/tag".into(),
@@ -230,7 +331,72 @@ impl Store {
         // and nonce to the ciphertext.
         let aad = &bytes[..format::HEADER_LEN];
         let plaintext = crypto::decrypt(&key, &header.nonce, aad, &bytes[format::HEADER_LEN..])?;
-        let data: StoreData = serde_json::from_slice(&plaintext).map_err(|e| {
+        Self::decoded(
+            path,
+            key,
+            Envelope::V1 {
+                params: header.params,
+                salt: header.salt,
+            },
+            &plaintext,
+        )
+    }
+
+    fn open_v3(
+        path: &Path,
+        bytes: &[u8],
+        library_key: &[u8; crypto::KEY_LEN],
+    ) -> Result<Store, StoreError> {
+        let header = format::decode_header_v3(bytes)?;
+        if bytes.len() < format::HEADER_LEN_V3 + 16 {
+            return Err(StoreError::BadFormat(
+                "file ends after header: no ciphertext/tag".into(),
+            ));
+        }
+        // Another vault's Library and a damaged one read the same, whichever
+        // of the two decryptions refuses.
+        let mismatch = |error| match error {
+            StoreError::AuthFailed => StoreError::VaultMismatch,
+            other => other,
+        };
+        let unwrapped = crypto::decrypt(
+            library_key,
+            &header.wrap_nonce,
+            &bytes[..format::WRAP_AAD_LEN],
+            &header.wrapped,
+        )
+        .map_err(mismatch)?;
+        if unwrapped.len() != crypto::KEY_LEN {
+            return Err(StoreError::VaultMismatch);
+        }
+        let mut key = Zeroizing::new([0u8; crypto::KEY_LEN]);
+        key.copy_from_slice(&unwrapped);
+        // AAD = the whole 104-byte header: the wrapped key and both nonces.
+        let plaintext = crypto::decrypt(
+            &key,
+            &header.nonce,
+            &bytes[..format::HEADER_LEN_V3],
+            &bytes[format::HEADER_LEN_V3..],
+        )
+        .map_err(mismatch)?;
+        Self::decoded(
+            path,
+            key,
+            Envelope::V3 {
+                wrap_nonce: header.wrap_nonce,
+                wrapped: header.wrapped,
+            },
+            &plaintext,
+        )
+    }
+
+    fn decoded(
+        path: &Path,
+        key: Zeroizing<[u8; crypto::KEY_LEN]>,
+        envelope: Envelope,
+        plaintext: &[u8],
+    ) -> Result<Store, StoreError> {
+        let data: StoreData = serde_json::from_slice(plaintext).map_err(|e| {
             StoreError::BadFormat(format!("decrypted payload is not valid json: {e}"))
         })?;
         if data.schema != model::SCHEMA_VERSION {
@@ -239,24 +405,52 @@ impl Store {
                 data.schema
             )));
         }
+        Ok(Store::assembled(path, key, envelope, data))
+    }
+
+    fn assembled(
+        path: &Path,
+        key: Zeroizing<[u8; crypto::KEY_LEN]>,
+        envelope: Envelope,
+        data: StoreData,
+    ) -> Store {
         let provenance_key = provenance::mac_key(&key);
-        Ok(Store {
+        Store {
             path: path.to_path_buf(),
             key,
             provenance_key,
-            params: header.params,
-            salt: header.salt,
+            envelope,
             data,
-        })
+            #[cfg(any(debug_assertions, test))]
+            fail_next_write: std::sync::atomic::AtomicU16::new(0),
+            #[cfg(any(debug_assertions, test))]
+            fail_next_confirm: std::sync::atomic::AtomicBool::new(false),
+        }
     }
 
-    /// Persist with a fresh nonce, written atomically (tmp file + fsync +
-    /// rename) with mode 0600 on unix — same discipline as the vault.
+    /// Persist with a fresh nonce, written atomically (a new, unpredictably
+    /// named temporary file + fsync + rename) with mode 0600 on unix. The
+    /// file keeps its current format: a version 1 Library stays version 1
+    /// until its owner changes the passphrase.
     pub fn save(&self) -> Result<(), StoreError> {
+        self.write_envelope(&self.envelope)
+    }
+
+    /// Serialises the data under `envelope` and replaces the file. Any error
+    /// means the rename did not happen and the previous file is still the one
+    /// on disk. The directory flush after the rename is best effort, as it
+    /// always was; `confirm_durable` is the strict one.
+    fn write_envelope(&self, envelope: &Envelope) -> Result<(), StoreError> {
         // A fresh nonce on every save: reusing an XChaCha20-Poly1305 nonce
         // with the same key would break AEAD security.
         let nonce: [u8; crypto::NONCE_LEN] = crypto::random_bytes();
-        let header = format::encode_header(&self.params, &self.salt, &nonce);
+        let header: Vec<u8> = match envelope {
+            Envelope::V1 { params, salt } => format::encode_header(params, salt, &nonce).to_vec(),
+            Envelope::V3 {
+                wrap_nonce,
+                wrapped,
+            } => format::encode_header_v3(wrap_nonce, wrapped, &nonce).to_vec(),
+        };
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&self.data)
                 .map_err(|e| StoreError::Crypto(format!("json encode: {e}")))?,
@@ -265,7 +459,155 @@ impl Store {
         let mut out = Vec::with_capacity(header.len() + ciphertext.len());
         out.extend_from_slice(&header);
         out.extend_from_slice(&ciphertext);
-        atomic_write(&self.path, &out)
+
+        // Test faults fire INSIDE the writer, where the temporary file
+        // exists, so its cleanup is exercised too (plan review, 2026-09-27).
+        #[cfg(any(debug_assertions, test))]
+        let fault = match self.take_injected_failure() {
+            FAIL_DURING_WRITE => Fault::Write,
+            FAIL_DURING_SYNC => Fault::Sync,
+            FAIL_BEFORE_RENAME => Fault::Rename,
+            _ => Fault::None,
+        };
+        #[cfg(not(any(debug_assertions, test)))]
+        let fault = Fault::None;
+
+        atomic_replace(&self.path, &out, fault)?;
+        sync_parent(&self.path, DirSync::BestEffort)
+    }
+
+    // ---- one passphrase: the Library opens with the vault ----
+    //
+    // The Vault and the Library share one passphrase, and a change made in
+    // the vault carries over to the Library, so there is never a second
+    // passphrase to remember or a second file to move in step. A version 3
+    // Library opens with a key the vault derives from its master, and the
+    // master never changes when the passphrase does, so a change moves only
+    // the vault. The recovery key opens the Library too.
+    //
+    // A version 1 Library moves at its owner's first passphrase change, in
+    // the app's order: `move_into_vault` (one atomic write, the same data key
+    // wrapped instead of derived), `retire_v1_leftovers`, `confirm_durable`,
+    // and only then the vault. A failure before the vault moves leaves both
+    // opening with the current passphrase, whatever the Library's version by
+    // then: a version 3 Library opens through the vault's unchanged master.
+
+    /// 1 for a Library from before version 3 that has not moved yet, 3 for
+    /// every other.
+    pub fn format_version(&self) -> u8 {
+        match self.envelope {
+            Envelope::V1 { .. } => format::VERSION,
+            Envelope::V3 { .. } => format::VERSION_V3,
+        }
+    }
+
+    /// Moves a version 1 Library into the vault: ONE atomic write of a
+    /// version 3 file carrying the same data key, wrapped under
+    /// `library_key`, so no picture and no download record is re-keyed. The
+    /// version 1 salt is recorded inside the encrypted contents, never in a
+    /// header, so later changes still recognize that file's leftover copies.
+    /// A version 3 Library is left as it is.
+    ///
+    /// A failure leaves file and memory as they were. The directory flush is
+    /// best effort here; the change confirms it with `confirm_durable` before
+    /// the vault moves.
+    pub fn move_into_vault(
+        &mut self,
+        library_key: &[u8; crypto::KEY_LEN],
+    ) -> Result<(), StoreError> {
+        let Envelope::V1 { salt, .. } = self.envelope else {
+            return Ok(());
+        };
+        let next = wrap_for_vault(&self.key, library_key)?;
+        let recorded = self.data.v1_salt.replace(model::V1Salt(salt));
+        match self.write_envelope(&next) {
+            Ok(()) => {
+                self.envelope = next;
+                Ok(())
+            }
+            Err(error) => {
+                self.data.v1_salt = recorded;
+                Err(error)
+            }
+        }
+    }
+
+    /// Removes the leftover copies of this Library's version 1 file, which
+    /// would still open with the passphrase they were written under (see
+    /// `retire.rs`). Only a version 3 Library that recorded its version 1
+    /// salt has any; for every other Library this does nothing.
+    /// `LeftoversRetained` when one could not be confirmed gone.
+    pub fn retire_v1_leftovers(&self) -> Result<(), StoreError> {
+        let (Envelope::V3 { .. }, Some(salt)) = (&self.envelope, self.data.v1_salt) else {
+            return Ok(());
+        };
+        retire::retire_leftovers(&self.path, &salt.0, || retire::flush_dir(&self.path))
+    }
+
+    /// Confirms the Library's directory entry is on disk, strictly: what a
+    /// passphrase change needs before the vault moves, since losing the
+    /// Library's move to a power cut after that would leave a version 1
+    /// Library under a passphrase the vault no longer takes. `NotDurable` on
+    /// a real failure; a platform or filesystem that cannot flush a directory
+    /// at all is not one (see `sync_parent`).
+    pub fn confirm_durable(&self) -> Result<(), StoreError> {
+        #[cfg(any(debug_assertions, test))]
+        if self
+            .fail_next_confirm
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(StoreError::NotDurable(std::io::Error::other(
+                "injected failure at the directory flush",
+            )));
+        }
+        sync_parent(&self.path, DirSync::Strict)
+    }
+
+    /// Makes the next `confirm_durable` fail (debug builds only).
+    #[cfg(any(debug_assertions, test))]
+    pub fn fail_next_confirm_for_test(&self) {
+        self.fail_next_confirm
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// Makes the next write fail at `point` (debug builds only).
+    #[cfg(any(debug_assertions, test))]
+    pub fn fail_next_write_for_test(&self, point: FailPoint) {
+        self.fail_write_for_test(point, 0);
+    }
+
+    /// Lets `after_writes` writes through, then fails the next one at `point`
+    /// (debug builds only). For failing a later write of a sequence that
+    /// writes more than once.
+    #[cfg(any(debug_assertions, test))]
+    pub fn fail_write_for_test(&self, point: FailPoint, after_writes: u8) {
+        let code = match point {
+            FailPoint::DuringWrite => FAIL_DURING_WRITE,
+            FailPoint::DuringSync => FAIL_DURING_SYNC,
+            FailPoint::BeforeRename => FAIL_BEFORE_RENAME,
+        };
+        self.fail_next_write.store(
+            (u16::from(after_writes) << 8) | u16::from(code),
+            std::sync::atomic::Ordering::SeqCst,
+        );
+    }
+
+    #[cfg(any(debug_assertions, test))]
+    fn take_injected_failure(&self) -> u8 {
+        use std::sync::atomic::Ordering::SeqCst;
+        let armed = self.fail_next_write.load(SeqCst);
+        if armed == 0 {
+            return 0;
+        }
+        let skip = armed >> 8;
+        let point = (armed & 0xff) as u8;
+        if skip > 0 {
+            self.fail_next_write
+                .store(((skip - 1) << 8) | u16::from(point), SeqCst);
+            return 0;
+        }
+        self.fail_next_write.store(0, SeqCst);
+        point
     }
 
     // ---- shelves ----
@@ -1268,50 +1610,185 @@ fn random_id() -> String {
     id
 }
 
-fn tmp_path(path: &Path) -> PathBuf {
-    let mut tmp = path.as_os_str().to_os_string();
-    tmp.push(".tmp");
-    PathBuf::from(tmp)
+/// A temporary file's name: `.tmp-` and 32 lowercase hex characters from the
+/// OS RNG, in the Library's directory. UNPREDICTABLE, so nobody can pre-create
+/// it: the name every build up to 1.0.2 used, `<path>.tmp`, could be planted
+/// as a symlink by anyone able to write to the directory, and an ordinary
+/// create follows one. It is also independent of the Library's own name, so a
+/// long or non-UTF-8 file name gains nothing here (plan review, 2026-09-27: a
+/// name built from the target added 38 bytes and pushed long names past the
+/// platform limit). The same shape `blob.rs` uses for pictures.
+fn temp_path_in(dir: &Path) -> PathBuf {
+    dir.join(format!(".tmp-{}", random_id()))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent)?;
-        }
-    }
-    let tmp = tmp_path(path);
+/// Opens a NEW file, refusing anything already at `temp`: a file, a directory,
+/// or a symlink, which `create_new` (O_EXCL) never follows. Mode 0600 is part
+/// of the create itself, so no byte ever sits in a looser file.
+fn open_new_temp(temp: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
     {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            // Mode 0600 must be in effect *before* any plaintext-derived
-            // bytes reach disk.
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp)?;
-        #[cfg(unix)]
-        {
-            // In case a stale tmp file with a looser mode already existed.
-            use std::os::unix::fs::PermissionsExt;
-            file.set_permissions(fs::Permissions::from_mode(0o600))?;
-        }
-        file.write_all(bytes)?;
-        file.sync_all()?;
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
     }
-    fs::rename(&tmp, path)?;
-    // Best-effort directory fsync so the rename itself is durable. (On
-    // Windows opening a directory as a File fails; the error is swallowed
-    // by design.)
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
+    options.open(temp)
+}
+
+/// A fault to inject inside `atomic_replace`. Only tests and debug builds ever
+/// pass anything but `None`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(any(debug_assertions, test)), allow(dead_code))]
+enum Fault {
+    None,
+    Write,
+    Sync,
+    Rename,
+    /// Removing the temporary file after a failure fails too.
+    Cleanup,
+}
+
+/// Writes `bytes` to a new, unpredictably named temporary file beside `path`,
+/// flushes it, and renames it over `path`. Every error from here means the
+/// rename did not happen and the previous file is still the one on disk. The
+/// temporary file is removed on the way out, BEST EFFORT: if even that removal
+/// fails, the file stays exactly as crash debris would (below), and the caller
+/// still gets the error that mattered, never the cleanup's (final review,
+/// 2026-09-27). The directory flush that makes the rename itself durable is
+/// `sync_parent`, kept separate so a caller can tell the two sides of the
+/// rename apart.
+///
+/// A temporary file a CRASH leaves behind (between its creation and the
+/// rename) stays where it is: it holds only ciphertext under the Library's
+/// key, mode 0600, and nothing ever reads it. Removing such files at unlock
+/// was considered and dropped (plan review, 2026-09-27): deleting stored
+/// ciphertext would be a retention change of its own. The one exception is a
+/// passphrase change, which removes the leftover copies of a version 1 file,
+/// since those would still open with the old passphrase (`retire.rs`).
+fn atomic_replace(path: &Path, bytes: &[u8], fault: Fault) -> Result<(), StoreError> {
+    let dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => {
+            fs::create_dir_all(parent)?;
+            parent
         }
+        _ => Path::new("."),
+    };
+    let temp = temp_path_in(dir);
+    let mut file = open_new_temp(&temp)?;
+    let written = write_temp(&mut file, bytes, fault);
+    drop(file);
+    let renamed = written.and_then(|()| {
+        if fault == Fault::Rename {
+            return Err(std::io::Error::other("injected failure before the rename"));
+        }
+        fs::rename(&temp, path)
+    });
+    if let Err(error) = renamed {
+        let _ = remove_temp(&temp, fault);
+        return Err(StoreError::Io(error));
     }
     Ok(())
 }
+
+/// Removes a temporary file after a failure. `Fault::Cleanup` makes it fail.
+fn remove_temp(temp: &Path, fault: Fault) -> std::io::Result<()> {
+    if fault == Fault::Cleanup {
+        return Err(std::io::Error::other(
+            "injected failure removing the temporary file",
+        ));
+    }
+    fs::remove_file(temp)
+}
+
+/// Writes and flushes the temporary file. `Fault::Write` stops after half the
+/// bytes, the way a full disk would; `Fault::Sync` fails the flush after every
+/// byte is written.
+fn write_temp(file: &mut fs::File, bytes: &[u8], fault: Fault) -> std::io::Result<()> {
+    if fault == Fault::Write {
+        file.write_all(&bytes[..bytes.len() / 2])?;
+        return Err(std::io::Error::other(
+            "injected failure part-way through the write",
+        ));
+    }
+    file.write_all(bytes)?;
+    if fault == Fault::Sync {
+        return Err(std::io::Error::other(
+            "injected failure at the temporary file's flush",
+        ));
+    }
+    file.sync_all()
+}
+
+/// Flushes the directory entry the rename just changed, so a power loss
+/// cannot bring the previous file back.
+///
+/// Best effort for ordinary saves, as it always was: the rename has already
+/// happened, and reporting an error would invite the caller to treat live
+/// data as absent. `Strict` reports a real flush failure as `NotDurable`, for
+/// `Store::confirm_durable`, before a passphrase change moves the vault. Even
+/// then, a platform or filesystem that cannot flush a directory at all
+/// (Windows, where a directory cannot be opened as a file; a filesystem that
+/// answers "unsupported") is not an error: the change must stay possible
+/// there, and the Library's repair prompt covers the rare power-loss revert.
+fn sync_parent(path: &Path, sync: DirSync) -> Result<(), StoreError> {
+    #[cfg(unix)]
+    {
+        let parent = match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent,
+            _ => Path::new("."),
+        };
+        let flushed = fs::File::open(parent).and_then(|dir| dir.sync_all());
+        if let Err(error) = flushed {
+            let unsupported = matches!(
+                error.kind(),
+                std::io::ErrorKind::Unsupported | std::io::ErrorKind::InvalidInput
+            );
+            if sync == DirSync::Strict && !unsupported {
+                return Err(StoreError::NotDurable(error));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, sync);
+    }
+    Ok(())
+}
+
+/// Wraps the data key under the vault's Library key with a fresh wrap nonce,
+/// bound to the first 32 bytes of the version 3 header that will carry it.
+fn wrap_for_vault(
+    key: &[u8; crypto::KEY_LEN],
+    library_key: &[u8; crypto::KEY_LEN],
+) -> Result<Envelope, StoreError> {
+    let wrap_nonce: [u8; crypto::NONCE_LEN] = crypto::random_bytes();
+    let sealed = crypto::encrypt(
+        library_key,
+        &wrap_nonce,
+        &format::wrap_aad_v3(&wrap_nonce),
+        &key[..],
+    )?;
+    let wrapped: [u8; format::WRAPPED_LEN] = sealed
+        .as_slice()
+        .try_into()
+        .map_err(|_| StoreError::Crypto("unexpected wrapped key length".into()))?;
+    Ok(Envelope::V3 {
+        wrap_nonce,
+        wrapped,
+    })
+}
+
+fn unsupported_version(version: u8) -> StoreError {
+    StoreError::BadFormat(format!("unsupported version {version:#04x}"))
+}
+
+#[cfg(any(debug_assertions, test))]
+const FAIL_BEFORE_RENAME: u8 = 1;
+#[cfg(any(debug_assertions, test))]
+const FAIL_DURING_WRITE: u8 = 3;
+#[cfg(any(debug_assertions, test))]
+const FAIL_DURING_SYNC: u8 = 4;
 
 #[cfg(test)]
 mod tests {

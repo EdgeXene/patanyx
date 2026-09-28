@@ -1311,6 +1311,29 @@
            Kept from the old Library panel, whose job this panel took over. -->
       <div id="library-locked" hidden>
         <p id="library-locked-note"></p>
+        <!-- Shown only when the unlock recorded store_passphrase_mismatch: the
+             vault opened and the Library did not, which is what a passphrase
+             changed in 0.9.x left behind (only the vault moved). The
+             Library moves into the vault in one write, so it opens with the
+             vault from then on. -->
+        <form id="library-repair-form" class="entry-form" hidden>
+          <input
+            id="library-repair-old"
+            type="password"
+            placeholder="Passphrase your Library still uses"
+            autocomplete="off"
+           data-msg-placeholder="chrome.library.repair.old.placeholder"/>
+          <input
+            id="library-repair-current"
+            type="password"
+            placeholder="Your current passphrase"
+            autocomplete="current-password"
+           data-msg-placeholder="chrome.library.repair.current.placeholder"/>
+          <div class="form-buttons">
+            <button id="library-repair-submit" type="submit" data-msg="chrome.library.repair.button">Open Library</button>
+          </div>
+          <p class="error" id="library-repair-error"></p>
+        </form>
       </div>
 
       <div id="library-content" hidden>
@@ -3087,20 +3110,19 @@
           </form>
 
           <h2 data-msg="chrome.pane.backup.h2.n4">Change passphrase</h2>
-          <!-- 1.0.0 ships WITHOUT passphrase rotation, on purpose: the vault
-               and the Library are two files keyed from the same passphrase,
-               and rotating one without the other strands or exposes the
-               Library (pentest F-001/F-002/F-004, 2026-09-16). The form stays
-               in the markup, hidden, so the submit handler and its gate
-               survive; the arm refuses anyway. Returns with the wrapped
-               Library key in 1.0.1. -->
-          <p class="panel-foot" id="bk-pw-unavailable" data-msg="chrome.bk.pw.unavailable.p">Changing the passphrase is not available in this version. Your current passphrase and your recovery key keep working. It returns in a later update.</p>
-          <!-- The form's own description, hidden with the form: read under
-               the unavailability note it sounded like a remaining step. -->
-          <p class="panel-intro" data-msg="chrome.pane.backup.p.n4" hidden>
-            Your contents and recovery key do not change. If this fails, your old passphrase still works.
+          <!-- The vault and the Library share one passphrase (1.0.0 and 1.0.1
+               hid this form: rotating the vault alone stranded the Library,
+               pentest F-001). The Library opens with the vault, so a change
+               moves only the vault; a Library from before that moves into the
+               vault at its owner's first change, keeping its key, so nothing
+               inside either file is re-encrypted. See
+               change_vault_and_library_passphrase in ipc.rs. The intro is a
+               pinned claim (claims.list): it must stay true for every outcome
+               the form can report. -->
+          <p class="panel-intro" data-msg="chrome.pane.backup.p.n4">
+            Your vault and your Library share this passphrase, so it changes for both. Nothing you keep in either one changes, and your recovery key is not affected. If the change does not go through, your current passphrase keeps working. Someone with an earlier copy of your vault, and the old passphrase it still opens with, may be able to read newer copies of your vault and your Library. Someone with a copy of your Library made while it opened only with your passphrase, and that passphrase, may be able to read newer copies of your Library.
           </p>
-          <form id="bk-pw-form" class="entry-form" hidden>
+          <form id="bk-pw-form" class="entry-form">
             <input
               id="bk-pw-current"
               type="password"
@@ -3120,7 +3142,7 @@
               autocomplete="new-password"
              data-msg-placeholder="chrome.bk.pw.new2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" data-msg="chrome.bk.pw.form.button">Change passphrase</button>
+              <button id="bk-pw-submit" type="submit" data-msg="chrome.bk.pw.form.button">Change passphrase</button>
             </div>
             <p class="error" id="bk-pw-error"></p>
             <p class="ok" id="bk-pw-ok"></p>

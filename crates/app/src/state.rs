@@ -1970,17 +1970,25 @@ pub struct AppState {
     pub vault: Option<Vault>,
     pub vault_path: PathBuf,
     /// Bookmark/provenance store. Session-lifetime BY DESIGN: it opens
-    /// alongside the vault (same passphrase, separate file, separate key via
-    /// domain separation) and is NOT dropped when the vault locks. See the
-    /// Notes in `lock_vault`/`check_autolock` — the brief asked for
-    /// lock-step behavior and this deliberately deviates, for the reasons
-    /// the store crate's own docs give.
+    /// alongside the vault (with the vault's Library key, or the passphrase
+    /// for a Library from before that; a separate file under a separate key)
+    /// and is NOT dropped when the vault locks. See the Notes in
+    /// `lock_vault`/`check_autolock` — the brief asked for lock-step behavior
+    /// and this deliberately deviates, for the reasons the store crate's own
+    /// docs give.
     pub store: Option<Store>,
     pub store_path: PathBuf,
     /// Why the store failed to open alongside the vault, if it did. Surfaced
     /// through `store_status` so the UI can say what happened instead of
     /// showing a silently empty panel.
     store_error: Option<&'static str>,
+    /// The Library lock: one PATANYX process writes the Library at a time
+    /// (plan gate, R-611). Taken at the first `open_store` and held for the
+    /// rest of the process, so a Store left resident after the vault locks
+    /// stays the only writer. A second window that opens the vault meanwhile
+    /// finds it busy and leaves its Library shut (`library_in_use`) rather
+    /// than save a stale copy over this one's.
+    store_lock: Option<patanyx_vault::lock::VaultLock>,
     pub last_activity: Instant,
     /// Idle timeout in seconds, 0 meaning never. Cached from prefs rather than
     /// re-read from disk: this is consulted on every pass of the event loop.
@@ -2470,6 +2478,7 @@ impl AppState {
             store: None,
             store_path: Store::default_path(),
             store_error: None,
+            store_lock: None,
             last_activity: Instant::now(),
             autolock_secs: crate::prefs::load().vault_autolock_secs,
             lock_warning_sent: false,
@@ -5951,7 +5960,18 @@ impl AppState {
         std::path::PathBuf::from(p)
     }
 
-    pub fn open_store(&mut self, passphrase: &str) {
+    /// Opens the Library with the unlocked vault, creating it inside the
+    /// vault on first use (existing vaults from before the store was wired
+    /// get one silently, at the moment of unlock — no second prompt). A
+    /// version 3 Library opens with the vault's Library key, which a
+    /// recovery-key unlock reaches too. A version 1 Library, from before
+    /// that and not moved yet, opens with `passphrase`; a recovery-key unlock
+    /// passes none, and such a Library then stays shut
+    /// (`store_needs_passphrase`) until an unlock with the passphrase.
+    ///
+    /// Failure is recorded rather than propagated: a damaged bookmark file
+    /// must not make the vault unusable, and the next unlock retries.
+    pub fn open_store(&mut self, passphrase: Option<&str>) {
         let marker = self.library_replace_marker();
         if marker.exists() {
             if Store::exists(&self.store_path) {
@@ -5960,10 +5980,24 @@ impl AppState {
             }
             let _ = std::fs::remove_file(&marker);
         }
+        let library_key = match self.vault.as_ref().map(Vault::library_key) {
+            Some(Ok(key)) => key,
+            Some(Err(_)) => {
+                self.store = None;
+                self.store_error = Some("io");
+                return;
+            }
+            None => return,
+        };
+        if let Err(code) = self.hold_library_lock("library_in_use") {
+            self.store = None;
+            self.store_error = Some(code);
+            return;
+        }
         let opened = if Store::exists(&self.store_path) {
-            Store::unlock(&self.store_path, passphrase)
+            Store::open(&self.store_path, passphrase, &library_key)
         } else {
-            Store::create(&self.store_path, passphrase)
+            Store::create_in_vault(&self.store_path, &library_key)
         };
         match opened {
             Ok(store) => {
@@ -5972,9 +6006,47 @@ impl AppState {
             }
             Err(err) => {
                 self.store = None;
-                self.store_error = Some(crate::ipc::store_code(err));
+                // Here, and only here, `AuthFailed` means the vault accepted
+                // this passphrase and a version 1 Library did not: a Library
+                // left under another passphrase (0.9.x changed only the
+                // vault, or a power loss kept one file's change and not the
+                // other's). Its own code, so the chrome can offer the repair
+                // step instead of calling the file unreadable. A tampered file
+                // reads the same way; the repair then fails honestly. A
+                // version 3 Library never gets here: no passphrase can help
+                // it, and it reads `store_vault_mismatch`.
+                self.store_error = Some(match err {
+                    patanyx_store::StoreError::AuthFailed => "store_passphrase_mismatch",
+                    other => crate::ipc::store_code(other),
+                });
             }
         }
+        self.after_store_opened();
+    }
+
+    /// Takes the Library lock for this process unless it already holds it
+    /// (`take_library_lock`); `busy` is the refusal when another PATANYX
+    /// process holds it. True when this call is what took it.
+    pub fn hold_library_lock(&mut self, busy: &'static str) -> Result<bool, &'static str> {
+        take_library_lock(&mut self.store_lock, &self.store_path, busy)
+    }
+
+    /// Gives back a Library lock that an operation took and then failed
+    /// before any Library was open (`release_unused_library_lock`).
+    pub fn release_unused_library_lock(&mut self, newly_taken: bool) {
+        let library_open = self.store.is_some();
+        release_unused_library_lock(&mut self.store_lock, newly_taken, library_open);
+    }
+
+    /// Attaches a Library opened outside `open_store` (the repair step) and
+    /// runs the same follow-up an unlock runs.
+    pub fn attach_store(&mut self, store: Store) {
+        self.store = Some(store);
+        self.store_error = None;
+        self.after_store_opened();
+    }
+
+    fn after_store_opened(&mut self) {
         // Per-site divergence choices live in the store, and the script that
         // needs them is built by platform code with no AppState in reach, so
         // the table is snapshotted into a process-level cache here.
@@ -6032,19 +6104,6 @@ impl AppState {
             // read it and produced verdicts.
             "digests_ready": crate::platform::page_bytes_supported(),
         })
-    }
-
-    /// Marks the bookmarks/downloads store as unavailable for this session.
-    ///
-    /// Used after a recovery-key unlock: the store is encrypted under the
-    /// vault PASSPHRASE, and a recovery unlock legitimately does not have it.
-    /// The library is therefore genuinely unreadable until the user unlocks
-    /// with their passphrase again — which is a true statement about the
-    /// encryption, not a bug, and the UI says exactly that instead of showing
-    /// an empty list that reads as "you have no bookmarks".
-    pub fn mark_store_unavailable(&mut self) {
-        self.store = None;
-        self.store_error = Some("store_needs_passphrase");
     }
 
     pub fn store_error(&self) -> Option<&'static str> {
@@ -8544,4 +8603,96 @@ mod translation_session_tests {
         );
     }
 
+}
+
+/// Takes the Library lock into `held` unless this process already holds it
+/// (flock refuses a second handle even in the same process, so it is taken
+/// once and kept). `busy` when another PATANYX process holds it. True when
+/// this call is what took it.
+pub(crate) fn take_library_lock(
+    held: &mut Option<patanyx_vault::lock::VaultLock>,
+    library: &std::path::Path,
+    busy: &'static str,
+) -> Result<bool, &'static str> {
+    if held.is_some() {
+        return Ok(false);
+    }
+    match patanyx_vault::lock::acquire(library) {
+        Ok(lock) => {
+            *held = Some(lock);
+            Ok(true)
+        }
+        Err(patanyx_vault::lock::LockError::Busy) => Err(busy),
+        Err(patanyx_vault::lock::LockError::Io(_)) => Err("io"),
+    }
+}
+
+/// Gives back a lock `take_library_lock` just took for an operation that then
+/// failed, when no Library is open in this process: nothing is left for it to
+/// protect, and keeping it would shut every other window's Library until
+/// this one exits (final review round 2, R-002). A lock this process held
+/// before, or one guarding an open Library, stays.
+pub(crate) fn release_unused_library_lock(
+    held: &mut Option<patanyx_vault::lock::VaultLock>,
+    newly_taken: bool,
+    library_open: bool,
+) {
+    if newly_taken && !library_open {
+        *held = None;
+    }
+}
+
+#[cfg(test)]
+mod library_lock_tests {
+    use super::take_library_lock;
+
+    /// One writer per Library (plan gate, R-611): while another holder has
+    /// it, the Library stays shut here; once this process holds it, every
+    /// later unlock reuses it instead of refusing itself.
+    #[test]
+    fn a_library_held_elsewhere_is_in_use_and_ours_is_kept_across_unlocks() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let library = dir.path().join("store.rbs");
+        let other_window = patanyx_vault::lock::acquire(&library).expect("the other holder");
+        let mut held = None;
+        assert_eq!(
+            take_library_lock(&mut held, &library, "library_in_use"),
+            Err("library_in_use")
+        );
+        assert!(held.is_none());
+        drop(other_window);
+        assert_eq!(take_library_lock(&mut held, &library, "library_in_use"), Ok(true));
+        assert!(held.is_some());
+        assert_eq!(take_library_lock(&mut held, &library, "library_in_use"), Ok(false));
+        assert!(
+            patanyx_vault::lock::acquire(&library).is_err(),
+            "the lock was not kept"
+        );
+    }
+
+    /// A failed operation that took the lock itself gives it back when no
+    /// Library is open, so another window can open its Library (final review
+    /// round 2, R-002); any other lock stays.
+    #[test]
+    fn a_lock_a_failed_operation_took_is_given_back() {
+        use super::release_unused_library_lock;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let library = dir.path().join("store.rbs");
+        let mut held = None;
+        let newly = take_library_lock(&mut held, &library, "busy").unwrap();
+        assert!(newly);
+        release_unused_library_lock(&mut held, newly, false);
+        assert!(held.is_none());
+        let other_window = patanyx_vault::lock::acquire(&library)
+            .expect("another window can take the lock after the failure");
+        drop(other_window);
+
+        let newly = take_library_lock(&mut held, &library, "busy").unwrap();
+        release_unused_library_lock(&mut held, newly, true);
+        assert!(held.is_some(), "a lock guarding an open Library was given back");
+        let again = take_library_lock(&mut held, &library, "busy").unwrap();
+        assert!(!again);
+        release_unused_library_lock(&mut held, again, false);
+        assert!(held.is_some(), "a lock held before the operation was given back");
+    }
 }
