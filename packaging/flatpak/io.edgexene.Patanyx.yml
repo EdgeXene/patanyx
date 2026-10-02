@@ -83,7 +83,7 @@ modules:
       # whatever the network served that day.
       #
       # Two things used to need the network. The toolchain is now a
-      # checksummed archive source below, pinned to the same 1.98.0 that
+      # checksummed archive source below, pinned to the same 1.98.1 that
       # rust-toolchain.toml pins so published build hashes keep verifying.
       # NOTHING INSIDE THIS SANDBOX READS rust-toolchain.toml. There is no
       # rustup here and cargo is invoked by absolute path, so the pin is inert
@@ -100,7 +100,7 @@ modules:
         CARGO_NET_OFFLINE: "true"
     build-commands:
       # The pinned toolchain, NOT org.freedesktop.Sdk.Extension.rust-stable:
-      # that would silently drift off 1.98.0 and break every published
+      # that would silently drift off 1.98.1 and break every published
       # reproducible-build hash with nothing in the repo to explain why.
       - ./rust-toolchain/install.sh --prefix=/run/build/patanyx/rust
         --components=rustc,cargo,rust-std-x86_64-unknown-linux-gnu
@@ -164,7 +164,7 @@ modules:
       # rust-toolchain.toml in the same commit, and it CHANGES EVERY
       # PUBLISHED HASH.
       - type: archive
-        url: https://static.rust-lang.org/dist/rust-1.98.0-x86_64-unknown-linux-gnu.tar.gz
-        sha256: aa30409afa67bd1ada244cefd82c7980e6a65bc113bb978e934b2413c75e3900
+        url: https://static.rust-lang.org/dist/rust-1.98.1-x86_64-unknown-linux-gnu.tar.gz
+        sha256: 24ba1338a2d35c5a3247936546429e163fa674d726102af18bdf624582c57aea
         dest: rust-toolchain
         strip-components: 1

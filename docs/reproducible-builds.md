@@ -63,7 +63,8 @@ triple. Remapping the sysroot removes all three facts at once.
 
 > **Historical note.** This finding refers to the 0.9.65 / pre-release
 > artifact, which was built with Rust 1.96.0. The stable release toolchain was
-> subsequently moved to Rust 1.98.0. The path above is quoted as it was
+> subsequently moved to Rust 1.98.0, which the 1.0.0 to 1.0.3 tags pin, and
+> later to 1.98.1. The path above is quoted as it was
 > recovered from that binary and is deliberately not updated: it is evidence of
 > what a shipped artifact contained, not a statement of current configuration.
 > The same applies to the published 0.9.65 source snapshot, which keeps its
