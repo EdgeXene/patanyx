@@ -617,6 +617,8 @@ fn gdk_key(value: gtk::gdk::keys::Key) -> Option<Key> {
         k::F5 => Key::F5,
         // F6, the third spelling of "focus the address bar".
         k::F6 => Key::F6,
+        k::F9 => Key::F9,
+        k::s | k::S => Key::S,
         k::F3 => Key::F3,
         k::F12 => Key::F12,
         k::Left => Key::Left,
@@ -835,6 +837,7 @@ pub fn build_content(
     connect_context_menu(&webview, proxy);
     connect_hover_readout(&webview, hosts);
     connect_shortcuts(&webview, proxy);
+    connect_pane_focus(&webview, proxy, id);
 
     // The host-to-page direction. Registered alongside the page-to-host
     // channel above so a tab either has both halves of the conversation or
@@ -846,6 +849,7 @@ pub fn build_content(
     TRANSLATE_CHANNEL_READY.with(|c| c.set(translate_channel && translate_reply));
 
     let state = Rc::new(RefCell::new(TabState::new(policy)));
+    FREEZE_STATUS_WAKE.with(|w| *w.borrow_mut() = Some(proxy.clone()));
     state.borrow_mut().fingerprint_probe_reporting =
         if connect_fingerprint_probe_messages(&webview, proxy, id) {
             SettingState::Applied
@@ -1165,6 +1169,20 @@ pub fn itp_confirmed() -> bool {
 
 thread_local! {
     static ITP_CONFIRMED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// How a GTK callback with no IPC of its own (the auto-freeze timer, a
+    /// freeze compile finishing) asks the event loop to re-send the toolbar
+    /// status. Set by every content build; the proxy is the same each time.
+    static FREEZE_STATUS_WAKE: RefCell<Option<EventLoopProxy<UserEvent>>> =
+        const { RefCell::new(None) };
+}
+
+/// Tell the event loop a tab's freeze changed so the toolbar is refreshed.
+fn wake_freeze_status() {
+    FREEZE_STATUS_WAKE.with(|w| {
+        if let Some(proxy) = w.borrow().as_ref() {
+            let _ = proxy.send_event(UserEvent::FreezeStatusChanged);
+        }
+    });
 }
 
 /// Replaces WebKit's "blocked by a content blocker" page with ours, and tells
@@ -1212,7 +1230,9 @@ fn connect_adlist_hold(
         let (frozen, overridden) = {
             let st = state.borrow();
             (
-                st.freeze.phase() == privacy::FreezePhase::Frozen,
+                // A document refused before the auto freeze was lifted at the
+                // start of this load is still the freeze's refusal.
+                st.freeze.phase() == privacy::FreezePhase::Frozen || st.freeze_lifted_this_load,
                 st.adlist_override_host().as_deref() == Some(host.as_str()),
             )
         };
@@ -1306,33 +1326,128 @@ fn connect_load_events(
                 // The document's own URL, for the local-network boundary:
                 // it keys on whether THIS PAGE was loaded over plain HTTP.
                 let url = web_view.uri().map(|u| u.to_string());
+                // An AUTO freeze yields to a new top-level page, as it does
+                // on WebView2 (load-changed is main-frame only, so an iframe
+                // cannot do this). The compiled filter is not removed by the
+                // state change, so it is lifted here. It may already have
+                // refused THIS document (a link clicked in a page frozen after
+                // load): that one click shows the engine's refusal, and the
+                // next one loads. Not retried: a retry by address would turn a
+                // refused form POST into a GET. Addresses the browser itself
+                // opens (typed, back, forward, reload) yield BEFORE the request
+                // instead; see `yield_auto_freeze`.
+                // Lifted only if a freeze filter is really in the engine: a
+                // freeze whose compile failed blocks nothing, and a refusal on
+                // such a tab is the ad list's, not the freeze's.
+                let (was_auto, lifted) = {
+                    let st = state.borrow();
+                    let auto = st.freeze.is_auto_frozen();
+                    (auto, auto && st.freeze_filters.has_installed())
+                };
                 state.borrow_mut().on_load_started(url.as_deref());
+                // Attribution for connect_adlist_hold: a refusal of THIS
+                // document came from the freeze if the freeze was lifted here.
+                state.borrow_mut().freeze_lifted_this_load = lifted;
+                if lifted {
+                    lift_freeze_filter(web_view, &state);
+                }
+                // The toolbar hears of a load only at COMMIT (wry reports
+                // Started there), and a slow response can sit between this
+                // point and that one with requests allowed. Only on the
+                // auto-to-live edge, so a page navigating in a loop cannot
+                // turn this into a status per navigation.
+                if was_auto {
+                    wake_freeze_status();
+                }
             }
             LoadEvent::Finished => {
+                state.borrow_mut().freeze_lifted_this_load = false;
                 state.borrow_mut().on_load_finished(Instant::now());
-                // Weak ref: the timer may outlive the tab (closing a tab
-                // drops the WebView); upgrading a dead weak ref is a no-op
-                // instead of a use-after-free.
-                let weak = web_view.downgrade();
-                let state = state.clone();
-                // Note: glib::timeout_add_local_once is assumed present
-                // in the pinned glib 0.18.x. If it is not, use
-                // glib::timeout_add_local returning ControlFlow::Break.
-                gtk::glib::timeout_add_local_once(privacy::FREEZE_GRACE, move || {
-                    let Some(web_view) = weak.upgrade() else {
-                        return;
-                    };
-                    let mut st = state.borrow_mut();
-                    if st.freeze.should_auto_freeze(Instant::now()) {
-                        st.freeze.freeze();
-                        drop(st);
-                        install_freeze_filter(&web_view, &state);
-                    }
-                });
+                schedule_auto_freeze(web_view, &state);
             }
             _ => {}
         }
     });
+}
+
+/// Arms the freeze-after-load timer: once the grace period has passed with no
+/// new load and no live channel, the tab is frozen AUTOMATICALLY (the kind
+/// that yields to the next page). Used when a load finishes, and after an
+/// automatic freeze yielded to a navigation that may never produce a load
+/// (an in-page address change, a navigation the policy refused) -- without
+/// that, the page would stay unfrozen indefinitely.
+fn schedule_auto_freeze(web_view: &webkit2gtk::WebView, state: &Rc<RefCell<TabState>>) {
+    // Weak ref: the timer may outlive the tab (closing a tab drops the
+    // WebView); upgrading a dead weak ref is a no-op instead of a
+    // use-after-free.
+    let weak = web_view.downgrade();
+    let state = state.clone();
+    gtk::glib::timeout_add_local_once(privacy::FREEZE_GRACE, move || {
+        let Some(web_view) = weak.upgrade() else {
+            return;
+        };
+        let mut st = state.borrow_mut();
+        if st.freeze.should_auto_freeze(Instant::now()) {
+            // AUTO, not `freeze()`. `freeze()` is the user's manual freeze,
+            // which survives navigation on purpose; recording the heuristic
+            // as manual left every Strict Tab refusing the next address typed
+            // into it ("blocked by a content blocker"), while WebView2 records
+            // the same transition as auto. Pinned by a test in privacy.rs.
+            st.freeze.freeze_auto_now();
+            drop(st);
+            install_freeze_filter(&web_view, &state);
+            wake_freeze_status();
+        }
+    });
+}
+
+/// Remove THIS tab's freeze filter, by its id, and nothing else. The ad and
+/// tracker filters stay installed throughout (a freeze no longer removes
+/// them), so lifting a freeze never opens a moment with no ad blocking while
+/// they are reloaded. Shared by the auto-freeze lift and by `unfreeze`.
+fn lift_freeze_filter(native: &webkit2gtk::WebView, state: &Rc<RefCell<TabState>>) {
+    let ids = {
+        let mut st = state.borrow_mut();
+        st.freeze_json = None;
+        st.freeze_filters.lift()
+    };
+    let Some(ucm) = user_content_manager(native) else {
+        return;
+    };
+    for id in ids {
+        remove_filter_by_id(&ucm, &id);
+    }
+}
+
+fn remove_filter_by_id(ucm: &webkit2gtk::UserContentManager, id: &str) {
+    use webkit2gtk::glib::translate::ToGlibPtr;
+    let Ok(c_id) = std::ffi::CString::new(id) else {
+        return;
+    };
+    let raw: *mut webkit2gtk_sys::WebKitUserContentManager = ucm.to_glib_none().0;
+    // SAFETY: `raw` is valid while `ucm` is held, `c_id` outlives the call,
+    // and the call is synchronous.
+    unsafe { webkit2gtk_sys::webkit_user_content_manager_remove_filter_by_id(raw, c_id.as_ptr()) };
+}
+
+/// A navigation the BROWSER is about to start (typed address, back, forward,
+/// reload, a restored shelf): an AUTO freeze yields before the request leaves,
+/// so the page loads on the first try. A manual freeze is left alone; lifting
+/// it stays one deliberate click (unfreeze, or allow the host).
+pub fn yield_auto_freeze(webview: &WebView, view: &TabView) {
+    use wry::WebViewExtUnix;
+    if !view.state.borrow().freeze.is_auto_frozen() {
+        return;
+    }
+    view.state.borrow_mut().freeze.unfreeze(Instant::now());
+    let native = webview.webview();
+    lift_freeze_filter(&native, &view.state);
+    // If this navigation never becomes a load (an in-page address change, a
+    // refusal by the navigation policy), the page must freeze again.
+    schedule_auto_freeze(&native, &view.state);
+    // Nor would such a navigation send a status: the toolbar would keep
+    // saying Frozen while requests flow until the timer fires.
+    wake_freeze_status();
 }
 
 /// Feeds the per-tab ledger. Requests the content blocker stops never
@@ -1399,20 +1514,19 @@ fn install_freeze_filter(native: &webkit2gtk::WebView, state: &Rc<RefCell<TabSta
     };
     let exceptions = state.borrow().freeze.overrides();
     let json = privacy::freeze_filter_json(&exceptions);
-    // A freeze must not be defeated by a stale ad-block filter sitting
-    // alongside it: WebKit ORs its filters, and the ad filter's rules are
-    // narrower, so leaving it would be harmless — but leaving a PREVIOUS
-    // freeze filter with wider exceptions would not. Clear first.
-    remove_all_filters(&ucm);
-    compile_and_add_filter(&ucm, &json, Some(state.clone()));
-}
-
-/// Reinstalls a tab's freeze filter after filters were cleared for another
-/// reason.
-fn install_freeze_filter_for(ucm: &webkit2gtk::UserContentManager, view: &TabView) {
-    let exceptions = view.state.borrow().freeze.overrides();
-    let json = privacy::freeze_filter_json(&exceptions);
-    compile_and_add_filter(ucm, &json, Some(view.state.clone()));
+    let id = privacy::filter_id_for(&json);
+    // WebKit ORs its filters, and the ad filter's rules are narrower, so
+    // leaving it beside the freeze is harmless -- and keeping it means a
+    // later thaw never has a moment without ad blocking. A PREVIOUS freeze
+    // filter (fewer exceptions, when one host is being allowed) stays in
+    // place until this one is installed: removing it first left a frozen tab
+    // with no freeze while the replacement compiled. FreezeFilterBook swaps
+    // them in on_filter_saved.
+    let generation = state
+        .borrow_mut()
+        .freeze_filters
+        .request_with_hosts(id, exceptions);
+    compile_and_add_filter(&ucm, &json, Some((state.clone(), generation)));
 }
 
 /// Whether freezing actually blocks requests on this platform.
@@ -1472,6 +1586,10 @@ struct FilterSaveData {
     /// GTK main loop, the same thread that created the tab. Holding it also
     /// keeps the state alive if the tab is closed mid-compile.
     freeze_state: Option<Rc<RefCell<TabState>>>,
+    /// The filter's id and the request generation, so a freeze compile can
+    /// tell whether it is still the one the tab wants when it finishes.
+    id: String,
+    generation: u64,
 }
 
 /// Compiles `json` into a content filter and adds it to `ucm`.
@@ -1666,6 +1784,8 @@ unsafe extern "C" fn on_bundled_filter_loaded(
         ucm: data.ucm,
         store: data.store,
         freeze_state: None,
+        id: data.which.id().to_string(),
+        generation: 0,
     }));
     webkit2gtk_sys::webkit_user_content_filter_store_save(
         data.store,
@@ -1681,8 +1801,12 @@ unsafe extern "C" fn on_bundled_filter_loaded(
 fn compile_and_add_filter(
     ucm: &webkit2gtk::UserContentManager,
     json: &str,
-    freeze_state: Option<Rc<RefCell<TabState>>>,
+    freeze: Option<(Rc<RefCell<TabState>>, u64)>,
 ) {
+    let (freeze_state, generation) = match freeze {
+        Some((state, generation)) => (Some(state), generation),
+        None => (None, 0),
+    };
     // Every early return below routes through here, so adding a new failure
     // path cannot silently skip the reporting.
     macro_rules! give_up {
@@ -1694,8 +1818,7 @@ fn compile_and_add_filter(
             // two callers here.
             match &freeze_state {
                 Some(state) => {
-                    state.borrow_mut().freeze.note_enforcement_failed();
-                    diag(&format!("freeze filter not installed: {}", $why));
+                    report_freeze_failure(state, &privacy::filter_id_for(json), generation, &$why)
                 }
                 None => diag(&format!("ad/tracker filter not installed: {}", $why)),
             }
@@ -1753,6 +1876,8 @@ fn compile_and_add_filter(
         ucm: raw_ucm,
         store,
         freeze_state,
+        id: privacy::filter_id_for(json),
+        generation,
     }));
 
     // SAFETY: every pointer is non-NULL and valid; `store` and `ucm` are kept
@@ -1815,19 +1940,53 @@ unsafe extern "C" fn on_filter_saved(
         };
         glib_sys::g_error_free(error);
         match &data.freeze_state {
-            Some(state) => {
-                state.borrow_mut().freeze.note_enforcement_failed();
-                diag(&format!("freeze filter not installed: {why}"));
-            }
+            // A failure for a superseded freeze request says nothing about
+            // the freeze the tab wants now.
+            Some(state) => report_freeze_failure(state, &data.id, data.generation, &why),
             None => diag(&format!("ad/tracker filter not installed: {why}")),
         }
     } else if !filter.is_null() {
+        // A FREEZE compile that finished after the tab thawed, or after a
+        // newer freeze was asked for, installs nothing: otherwise the engine
+        // would block everything while the toolbar said the tab was live
+        // (review finding, reproduced by reading the order of events).
+        let superseded = match &data.freeze_state {
+            None => Some(Vec::new()),
+            Some(state) => {
+                let mut st = state.borrow_mut();
+                let frozen = st.freeze.phase() == privacy::FreezePhase::Frozen;
+                match st
+                    .freeze_filters
+                    .on_compiled(&data.id, data.generation, frozen)
+                {
+                    privacy::CompiledFreeze::Install { remove } => Some(remove),
+                    privacy::CompiledFreeze::Discard => None,
+                }
+            }
+        };
+        let Some(superseded) = superseded else {
+            webkit2gtk_sys::webkit_user_content_filter_unref(filter);
+            gobject_sys::g_object_unref(data.ucm as *mut gobject_sys::GObject);
+            gobject_sys::g_object_unref(data.store as *mut gobject_sys::GObject);
+            return;
+        };
         webkit2gtk_sys::webkit_user_content_manager_add_filter(data.ucm, filter);
         // `add_filter` takes its own ref; release the one `save_finish` gave us.
         webkit2gtk_sys::webkit_user_content_filter_unref(filter);
-        // The one path entitled to claim the freeze is real.
+        // The freeze this one replaces comes off only now that it is in.
+        for old in superseded {
+            if let Ok(c_old) = std::ffi::CString::new(old) {
+                webkit2gtk_sys::webkit_user_content_manager_remove_filter_by_id(
+                    data.ucm,
+                    c_old.as_ptr(),
+                );
+            }
+        }
+        // The one path entitled to claim the freeze is real. The toolbar
+        // showed "Freezing..." until now; nothing else tells it.
         if let Some(state) = &data.freeze_state {
             state.borrow_mut().freeze.note_enforced();
+            wake_freeze_status();
         }
     } else if let Some(state) = &data.freeze_state {
         // Neither an error nor a filter. Not documented as reachable, but the
@@ -1835,10 +1994,51 @@ unsafe extern "C" fn on_filter_saved(
         // reading of "no filter" is that nothing is blocking. Anything other
         // than a confirmed install is a failure.
         state.borrow_mut().freeze.note_enforcement_failed();
+        wake_freeze_status();
     }
 
     gobject_sys::g_object_unref(data.ucm as *mut gobject_sys::GObject);
     gobject_sys::g_object_unref(data.store as *mut gobject_sys::GObject);
+}
+
+/// A freeze compile failed. Nothing changes if it was a superseded request.
+/// If an earlier freeze filter is still installed (a replacement for "allow
+/// this host" failed), that one keeps enforcing and the tab is still frozen,
+/// so enforcement is NOT reported as failed; only the log says the
+/// replacement did not take. Otherwise nothing is blocking, and the toolbar
+/// is told.
+fn report_freeze_failure(state: &Rc<RefCell<TabState>>, id: &str, generation: u64, why: &str) {
+    let (current, still_enforced) = {
+        let st = state.borrow();
+        (
+            st.freeze_filters.failure_is_current(id, generation),
+            st.freeze_filters.has_installed(),
+        )
+    };
+    if !current {
+        return;
+    }
+    if still_enforced {
+        // The previous filter still blocks, so the tab stays frozen; but the
+        // exception this replacement carried did not take. The exceptions go
+        // back to what the installed filter lets through, and the toolbar is
+        // told, so the panel stops showing that host as allowed (final
+        // review, R-003).
+        {
+            let mut st = state.borrow_mut();
+            if let Some(hosts) = st.freeze_filters.installed_hosts() {
+                st.freeze.set_overrides(hosts);
+            }
+        }
+        diag(&format!(
+            "freeze filter replacement not installed; the previous freeze stays: {why}"
+        ));
+        wake_freeze_status();
+        return;
+    }
+    state.borrow_mut().freeze.note_enforcement_failed();
+    diag(&format!("freeze filter not installed: {why}"));
+    wake_freeze_status();
 }
 
 /// Asks the ENGINE whether the shipped ad and tracker rules actually compile,
@@ -1987,14 +2187,6 @@ unsafe extern "C" fn on_verify_saved(
         Ok(())
     };
     *data.outcome.borrow_mut() = Some(verdict);
-}
-
-/// Drops every compiled filter from a manager. Style sheets are unaffected.
-fn remove_all_filters(ucm: &webkit2gtk::UserContentManager) {
-    use webkit2gtk::glib::translate::ToGlibPtr;
-    let raw: *mut webkit2gtk_sys::WebKitUserContentManager = ucm.to_glib_none().0;
-    // SAFETY: `raw` is valid while `ucm` is held, and this call is synchronous.
-    unsafe { webkit2gtk_sys::webkit_user_content_manager_remove_all_filters(raw) };
 }
 
 /// Note: WebViewExt::user_content_manager() is assumed to return
@@ -2632,20 +2824,13 @@ fn set_ad_blocking(native: &webkit2gtk::WebView, view: &TabView, enable: bool) {
     if enable {
         install_bundled_filters(&ucm);
     } else {
-        remove_all_filters(&ucm);
-        // Cosmetic hiding is re-applied by set_cosmetic above; removing every
-        // filter also drops any freeze filter, so a frozen tab whose ad
-        // blocking is switched off must re-install it.
-        if freeze_active(view) {
-            install_freeze_filter_for(&ucm, view);
-        }
+        // Only the ad and tracker filters, by id. Removing EVERY filter here
+        // also took a frozen tab's freeze filter, and the tab could send
+        // requests while the replacement compiled with the toolbar still
+        // saying Frozen. A freeze is simply left where it is.
+        remove_filter_by_id(&ucm, BundledFilter::Ads.id());
+        remove_filter_by_id(&ucm, BundledFilter::Tracking.id());
     }
-}
-
-/// Whether this tab is currently frozen, so filter teardown can re-install the
-/// freeze filter it necessarily also removed.
-fn freeze_active(view: &TabView) -> bool {
-    view.state.borrow().freeze.phase() == FreezePhase::Frozen
 }
 
 /// Cosmetic filtering as a user STYLESHEET, not injected script. This is
@@ -2743,20 +2928,8 @@ pub fn freeze(webview: &WebView, view: &TabView) {
 /// necessarily went with the freeze filter and has to be reinstated.
 pub fn unfreeze(webview: &WebView, view: &TabView) {
     use wry::WebViewExtUnix;
-    let block_ads = {
-        let mut st = view.state.borrow_mut();
-        st.freeze.unfreeze(Instant::now());
-        st.freeze_json = None;
-        st.policy.block_ads
-    };
-    let native = webview.webview();
-    let Some(ucm) = user_content_manager(&native) else {
-        return;
-    };
-    remove_all_filters(&ucm);
-    if block_ads {
-        install_bundled_filters(&ucm);
-    }
+    view.state.borrow_mut().freeze.unfreeze(Instant::now());
+    lift_freeze_filter(&webview.webview(), &view.state);
 }
 
 /// Per-site override: `host` keeps working even while the tab is frozen.
@@ -3022,6 +3195,11 @@ pub fn profile_mode(view: &TabView) -> ProfileMode {
 
 pub fn freeze_phase(view: &TabView) -> FreezePhase {
     view.state.borrow().freeze.phase()
+}
+
+/// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
+pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
+    view.state.borrow().freeze.overrides()
 }
 
 /// Whether the block behind a freeze is actually in place.
@@ -3750,6 +3928,46 @@ pub fn hide_tab(view: &TabView, _webview: &WebView) {
     view.container.hide();
 }
 
+/// Side by Side: two tabs' pages next to each other, or back to one tab at
+/// a time. The content box holds every tab's container and shows only the
+/// visible ones, so turning it horizontal with equal shares is the whole
+/// arrangement; the pair is moved to the front in left-right order.
+/// It never focuses either page (the keyboard stays where it is; see
+/// AppState::show_and_focus_tab).
+pub fn set_side_by_side(
+    hosts: &Hosts,
+    pair: Option<((&TabView, &WebView), (&TabView, &WebView))>,
+) {
+    use gtk::prelude::*;
+    let content = &hosts.content_box;
+    match pair {
+        Some(((left, _), (right, _))) => {
+            content.set_orientation(gtk::Orientation::Horizontal);
+            content.set_homogeneous(true);
+            content.set_spacing(crate::platform::SIDE_BY_SIDE_GAP_PX);
+            content.reorder_child(&left.container, 0);
+            content.reorder_child(&right.container, 1);
+            left.container.show_all();
+            right.container.show_all();
+        }
+        None => {
+            content.set_orientation(gtk::Orientation::Vertical);
+            content.set_homogeneous(false);
+            content.set_spacing(0);
+        }
+    }
+}
+
+/// Side by Side: which tab's page took the keyboard (see windows.rs).
+fn connect_pane_focus(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: u64) {
+    use wry::WebViewExtUnix;
+    let proxy = proxy.clone();
+    webview.webview().connect_focus_in_event(move |_widget, _event| {
+        let _ = proxy.send_event(UserEvent::PaneFocused(id));
+        gtk::glib::Propagation::Proceed
+    });
+}
+
 pub fn remove_tab(view: &TabView, webview: &WebView) {
     // The find handlers hold the webview's identity key; unwire them while
     // the webview is still alive so a future tab reusing the address starts
@@ -3837,6 +4055,9 @@ pub fn layout(
     hosts: &Hosts,
     _chrome: &WebView,
     _active: Option<&WebView>,
+    // Side by Side is arranged by `set_side_by_side` (the content box turns
+    // horizontal); GTK then sizes both pages itself.
+    _pair: Option<(&WebView, &WebView)>,
     _chrome_height: i32,
     // Taken for one signature across both backends, and unused here: this
     // backend already holds the stated strip in `hosts.strip_top`, written by
@@ -3932,6 +4153,26 @@ pub fn split_supported() -> bool {
 /// did, not what the code hopes. If the downcast in `build_chrome` ever finds
 /// no WebKitGTK view to clear, this stays false and the stylesheet keeps its
 /// opaque cover, which would then be the truthful answer.
+/// Whether WebKitGTK is drawing WITHOUT accelerated compositing, through the
+/// switch the engine documents for that (`WEBKIT_DISABLE_COMPOSITING_MODE`,
+/// any value but "0"). Users set it to work around GPU driver faults, and
+/// it is common advice for NVIDIA machines and virtual machines.
+///
+/// It matters to the chrome because in that mode the engine paints a
+/// translucent area over its own previous pixels without clearing them: a
+/// panel that got shorter left its old contents showing, faded, through the
+/// 62% backdrop below it (measured 2026-10-07, Vault create -> recovery key).
+/// The page is not visible through the backdrop in that mode anyway, so the
+/// chrome draws the backdrop solid there, which overwrites instead of
+/// blending. See `solid_backdrop` in ipc.rs `chrome_caps`.
+pub fn compositing_disabled() -> bool {
+    compositing_disabled_by(std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").ok().as_deref())
+}
+
+pub(crate) fn compositing_disabled_by(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
+
 pub fn translucent_overlay_supported() -> bool {
     CHROME_TRANSPARENT.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -4040,6 +4281,9 @@ mod key_table_tests {
             (k::F5, Key::F5),
             (k::F3, Key::F3),
             (k::F6, Key::F6),
+            (k::F9, Key::F9),
+            (k::s, Key::S),
+            (k::S, Key::S),
             (k::d, Key::D),
             (k::D, Key::D),
             (k::F12, Key::F12),
@@ -4296,5 +4540,19 @@ mod translate_outbox_tests {
         // They are registered separately and carry opposite directions; one
         // name for both would silently merge them.
         assert_ne!(TRANSLATE_CHANNEL, TRANSLATE_ASK_CHANNEL);
+    }
+}
+
+#[cfg(test)]
+mod compositing_switch_tests {
+    use super::compositing_disabled_by;
+
+    #[test]
+    fn the_documented_switch_turns_the_solid_backdrop_on() {
+        assert!(compositing_disabled_by(Some("1")));
+        assert!(compositing_disabled_by(Some("true")));
+        assert!(!compositing_disabled_by(Some("0")), "0 means compositing stays on");
+        assert!(!compositing_disabled_by(Some("")));
+        assert!(!compositing_disabled_by(None));
     }
 }

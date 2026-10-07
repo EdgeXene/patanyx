@@ -144,6 +144,7 @@ fn counts_as_presence(cmd: &str) -> bool {
             | "vault_status"
             | "chat_status"
             | "onboarding_seen_get"
+            | "tutorial_seen_get"
             // Passive tunnel reads: the panel refresh and any status poll.
             // The mutating arms (tunnel_import / tunnel_set_mode /
             // tunnel_remove) count as presence by this list's default, and
@@ -961,8 +962,80 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // order. Ephemeral and quarantine tabs deliberately take the
             // same path: moving a chip has no navigation or policy effect.
             let ids = state.reorder_tabs(&ids)?;
-            let items = state.tab_list()["items"].clone();
-            Ok(json!({ "ids": ids, "items": items }))
+            let list = state.tab_list();
+            Ok(json!({ "ids": ids, "items": list["items"], "groups": list["groups"] }))
+        }
+        // Tab Groups (tab_groups.rs). Free, live only: membership, names and
+        // colors last until PATANYX closes unless a group is saved to a shelf.
+        "group_create" => {
+            let tabs = arg_u64_list(args, "tabs")?;
+            let name = args.get("name").and_then(Value::as_str).unwrap_or("");
+            if name.len() > 400 {
+                return Err("bad_args");
+            }
+            let color = match args.get("color").and_then(Value::as_str) {
+                None => None,
+                Some(word) => Some(crate::tab_groups::color(word).ok_or("bad_args")?),
+            };
+            let mut order = tab_order(state);
+            let id = state.groups.create(&tabs, name, color, &mut order)?;
+            commit_group_order(state, order, json!({ "group": id }))
+        }
+        "group_add" => {
+            let group = arg_u64(args, "group")?;
+            let tab = arg_u64(args, "tab")?;
+            let mut order = tab_order(state);
+            state.groups.add(group, tab, &mut order)?;
+            commit_group_order(state, order, json!({}))
+        }
+        "group_remove" => {
+            let tab = arg_u64(args, "tab")?;
+            let mut order = tab_order(state);
+            state.groups.remove(tab, &mut order)?;
+            commit_group_order(state, order, json!({}))
+        }
+        "group_rename" => {
+            let group = arg_u64(args, "group")?;
+            let name = arg_str_capped(args, "name", 400)?;
+            state.groups.rename(group, name)?;
+            state.emit_tabs_changed();
+            Ok(json!({}))
+        }
+        "group_color" => {
+            let group = arg_u64(args, "group")?;
+            let color = crate::tab_groups::color(arg_str_capped(args, "color", 16)?).ok_or("bad_args")?;
+            state.groups.set_color(group, color)?;
+            state.emit_tabs_changed();
+            Ok(json!({}))
+        }
+        "group_collapse" => {
+            let group = arg_u64(args, "group")?;
+            let collapsed = args.get("collapsed").and_then(Value::as_bool).ok_or("bad_args")?;
+            state.groups.set_collapsed(group, collapsed)?;
+            state.emit_tabs_changed();
+            Ok(json!({}))
+        }
+        "group_ungroup" => {
+            let group = arg_u64(args, "group")?;
+            state.groups.ungroup(group)?;
+            state.emit_tabs_changed();
+            Ok(json!({}))
+        }
+        // Closes every tab in the group. Best effort per tab, like the shelf
+        // close loop: never-tabless is close_tab's own rule.
+        "group_close" => {
+            let group = arg_u64(args, "group")?;
+            if state.groups.get(group).is_none() {
+                return Err("not_found");
+            }
+            let members = state.groups.members(group, &tab_order(state));
+            let mut closed = 0usize;
+            for id in members {
+                if state.close_tab(id).is_ok() {
+                    closed += 1;
+                }
+            }
+            Ok(json!({ "closed": closed }))
         }
         "tab_list" => Ok(state.tab_list()),
         // The switcher reads the SAME list through its own gated arm
@@ -1009,7 +1082,20 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // call; ids that name no live tab simply match nothing, the
             // same tolerance the close loop below shows for tabs that
             // have gone away.
+            // Optional `group`: save a Tab Group. Its members are the tabs,
+            // and its name and color are kept with the shelf so restoring
+            // brings the group back. Takes precedence over `ids`.
+            let group_look = match args.get("group") {
+                None => None,
+                Some(raw) => {
+                    let gid = raw.as_u64().ok_or("bad_args")?;
+                    let g = state.groups.get(gid).ok_or("not_found")?.clone();
+                    let members = state.groups.members(gid, &tab_order(state));
+                    Some((g, members))
+                }
+            };
             let only: Option<Vec<u64>> = match args.get("ids") {
+                _ if group_look.is_some() => group_look.as_ref().map(|(_, m)| m.clone()),
                 None => None,
                 Some(raw) => {
                     let list = raw.as_array().ok_or("bad_args")?;
@@ -1057,11 +1143,21 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 )
             };
             let (name, tabs, close_ids, left_out) = plan;
+            let (name, shelf_group) = match &group_look {
+                Some((g, _)) => (
+                    if g.name.is_empty() { name } else { g.name.clone() },
+                    Some(patanyx_store::ShelfGroup {
+                        name: g.name.clone(),
+                        color: g.color.to_string(),
+                    }),
+                ),
+                None => (name, None),
+            };
             // WRITE FIRST, close only after the write succeeded. On failure
             // the store has already rolled the shelf back and the window is
             // exactly as it was.
             let stored = store_open(state)?
-                .add_shelf(name, tabs)
+                .add_shelf_grouped(name, tabs, shelf_group)
                 .map_err(store_code)?;
             // Never-tabless is inherited from close_tab: it builds the
             // replacement BEFORE removing the last tab and refuses cleanly
@@ -1092,6 +1188,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                         "id": shelf.id,
                         "name": shelf.name,
                         "note": shelf.note,
+                        "group": shelf.group.as_ref().map(|g| json!({ "name": g.name, "color": g.color })),
                         "count": shelf.tabs.len(),
                         // The titles and addresses inside, so a shelf can be
                         // looked into without being restored. Reading a
@@ -1113,8 +1210,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // entry; the reply says how many opened.
         "shelf_restore" => {
             let id = arg_str(args, "id")?;
-            let (opened, total) = restore_shelf_tabs(state, id)?;
-            Ok(json!({ "opened": opened, "total": total }))
+            let (opened, total, ungrouped) = restore_shelf_tabs(state, id)?;
+            // `ungrouped`: the shelf was saved from a Tab Group but its tabs
+            // came back without one (the group limit was reached). Said, not
+            // hidden: the About row promises the group comes back.
+            Ok(json!({ "opened": opened, "total": total, "ungrouped": ungrouped }))
         }
         // The chrome asks nothing before sending this (a shelf is small and
         // recreatable, and confirm dialogs train click-through), but it
@@ -1840,6 +1940,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // stylesheet needs to know which world it is in; it cannot
             // measure this.
             "page_covers_chrome": !crate::platform::translucent_overlay_supported(),
+            // Draw the modal backdrop SOLID even where it could be
+            // translucent: WebKitGTK without compositing blends a translucent
+            // repaint over stale pixels, so a panel that shrinks leaves its
+            // old contents showing below it. See platform::compositing_disabled.
+            "solid_backdrop": crate::platform::compositing_disabled(),
             // Whether the toolbar can be moved to either edge. True on both
             // backends: the page's rectangle is computed by one shared
             // function and both can inset it. Asked before the choice is
@@ -3893,6 +3998,21 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::prefs::mark_onboarding_seen();
             Ok(json!({}))
         }
+        // The feature-videos banner: asked once at chrome boot (passive, see
+        // counts_as_presence), and answered by Watch or Not now.
+        "tutorial_seen_get" => Ok(json!({ "seen": crate::prefs::tutorial_seen() })),
+        // One feature video by name, base64 (tutorial.rs). Names outside the
+        // three are refused.
+        "tutorial_video" => {
+            let name = arg_str(args, "name")?;
+            crate::tutorial::video_base64(name)
+                .map(|data| json!({ "data": data }))
+                .ok_or("bad_args")
+        }
+        "tutorial_seen_set" => {
+            crate::prefs::mark_tutorial_seen();
+            Ok(json!({}))
+        }
 
         // How many malicious hosts are in force, so "am I protected" has a
         // number behind it rather than a claim.
@@ -4004,6 +4124,27 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             state.translate_active_tab(pair)
         }
         "translate_status" => state.translation_status(),
+        // Reader View: plain-text article from the bytes the engine already
+        // received. No script in the page, no network request.
+        "reader_open" => {
+            let request = args.get("request").and_then(Value::as_u64).ok_or("bad_args")?;
+            crate::reader_view::ipc_open(state, request)
+        }
+        "reader_close" => crate::reader_view::ipc_close(state),
+        // Side by Side: the active tab on the left, `with` on the right.
+        "side_by_side_open" => {
+            let with = args.get("with").and_then(Value::as_u64).ok_or("bad_args")?;
+            state.side_by_side_open(with)?;
+            Ok(state.tab_list())
+        }
+        "side_by_side_close" => {
+            state.side_by_side_close()?;
+            Ok(state.tab_list())
+        }
+        "side_by_side_toggle" => {
+            state.side_by_side_toggle()?;
+            Ok(state.tab_list())
+        }
         "translate_cancel" => state.translation_cancel(),
         "translate_restore" => state.restore_active_tab(),
 
@@ -6046,6 +6187,31 @@ fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, &'static str> {
 /// Deliberately not applied to passphrases: they are bounded by the frame cap,
 /// a KDF is meant to be expensive, and a length limit on a secret is a
 /// property users can discover and attackers can exploit.
+fn arg_u64(args: &Value, key: &str) -> Result<u64, &'static str> {
+    args.get(key).and_then(Value::as_u64).ok_or("bad_args")
+}
+
+fn arg_u64_list(args: &Value, key: &str) -> Result<Vec<u64>, &'static str> {
+    let list = args.get(key).and_then(Value::as_array).ok_or("bad_args")?;
+    if list.is_empty() || list.len() > crate::state::MAX_TABS {
+        return Err("bad_args");
+    }
+    list.iter().map(|v| v.as_u64().ok_or("bad_args")).collect()
+}
+
+fn tab_order(state: &AppState) -> Vec<u64> {
+    state.tabs.iter().map(|t| t.id).collect()
+}
+
+/// Apply an order a group command produced and answer with the strip.
+fn commit_group_order(state: &mut AppState, order: Vec<u64>, mut reply: Value) -> Result<Value, &'static str> {
+    state.reorder_tabs(&order)?;
+    let list = state.tab_list();
+    reply["items"] = list["items"].clone();
+    reply["groups"] = list["groups"].clone();
+    Ok(reply)
+}
+
 fn arg_str_capped<'a>(args: &'a Value, key: &str, max: usize) -> Result<&'a str, &'static str> {
     let value = arg_str(args, key)?;
     if value.len() > max {
@@ -6599,20 +6765,19 @@ fn restore_after_tunnel_restart(state: &mut AppState) {
 /// foreground and the rest behind it, and a refused build stops the loop
 /// rather than hammering on. NEITHER caller deletes the shelf here --
 /// restoring never destroys.
-fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize), &'static str> {
+fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize, bool), &'static str> {
     // Cloned out of the store first: the open calls below borrow state
     // mutably, and a shelf is small.
-    let entries = {
-        store_open(state)?
+    let (entries, group) = {
+        let shelf = store_open(state)?
             .shelves()
             .iter()
             .find(|shelf| shelf.id == id)
-            .ok_or("not_found")?
-            .tabs
-            .clone()
+            .ok_or("not_found")?;
+        (shelf.tabs.clone(), shelf.group.clone())
     };
     let total = entries.len();
-    let mut opened = 0usize;
+    let mut opened_ids = Vec::new();
     for entry in &entries {
         if state.tabs.len() >= crate::state::MAX_TABS {
             break;
@@ -6620,12 +6785,28 @@ fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize), 
         if !crate::state::is_allowed_content_url(&entry.url) {
             continue;
         }
-        match state.new_tab(&entry.url, opened == 0) {
-            Ok(_) => opened += 1,
+        match state.new_tab(&entry.url, opened_ids.is_empty()) {
+            Ok(tab) => opened_ids.push(tab),
             Err(_) => break,
         }
     }
-    Ok((opened, total))
+    // A shelf saved from a Tab Group comes back as that group. A color this
+    // build does not know (a newer palette) falls back to the next free one
+    // rather than refusing the restore. Best effort: the tabs are open
+    // either way, and a full set of groups only means these stay ungrouped.
+    let mut ungrouped = false;
+    if let Some(g) = group {
+        if !opened_ids.is_empty() {
+            let color = crate::tab_groups::color(&g.color);
+            let mut order = tab_order(state);
+            if state.groups.create(&opened_ids, &g.name, color, &mut order).is_ok() {
+                let _ = state.reorder_tabs(&order);
+            } else {
+                ungrouped = true;
+            }
+        }
+    }
+    Ok((opened_ids.len(), total, ungrouped))
 }
 
 fn store_open(state: &mut AppState) -> Result<&mut Store, &'static str> {
@@ -7940,6 +8121,8 @@ mod tests {
             // whole point of the note above: a new module's codes are
             // invisible to a fixed list until somebody extends it.
             include_str!("download_compare.rs"),
+            include_str!("reader_view.rs"),
+            include_str!("tab_groups.rs"),
         ];
         let mut missing: Vec<&str> = Vec::new();
         let mut checked: Vec<&str> = Vec::new();

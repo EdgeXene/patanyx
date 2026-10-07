@@ -108,13 +108,17 @@ mod platform;
 mod prefs;
 mod premium_purchase;
 mod psl;
+mod reader_view;
 mod resolver_probe;
 /// The browser's only self-initiated network activity, and its timing.
 mod schedule;
 mod shelf;
 mod shortcuts;
+mod side_by_side;
 mod sponsorship;
 mod state;
+mod tutorial;
+mod tab_groups;
 /// Cross-tab text search over each tab's visible text: pure matching,
 /// snippet shaping and refusal wording, identical on every platform.
 mod tab_search;
@@ -148,6 +152,12 @@ enum UserEvent {
     /// plainly which data were NOT cleared instead of turning an unavailable
     /// privacy primitive into a browser that never loads.
     SessionWipeFinished,
+    /// A tab's freeze changed without a navigation or an IPC call (Linux: the
+    /// GTK auto-freeze timer froze it, or its freeze filter failed to
+    /// install). Re-sends the toolbar status; without it the freeze chip read
+    /// "Live" on a frozen tab until something else happened to push one.
+    #[cfg_attr(windows, allow(dead_code))]
+    FreezeStatusChanged,
     /// The engine answered tab N's WebSocket guard registration (Windows):
     /// its first page may be released.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -187,6 +197,9 @@ enum UserEvent {
     // Sent only by the WebView2 backend; GTK restores focus by itself.
     #[cfg_attr(not(windows), allow(dead_code))]
     SurfaceFocused(state::FocusSurface),
+    /// Side by Side: this tab's page took the keyboard.
+    #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+    PaneFocused(u64),
     /// A key was pressed inside a PAGE. Carries nothing -- not the key, not a
     /// timestamp -- because the only thing it is used for is "a human is
     /// here", and a keystroke stream crossing this boundary would be a
@@ -312,6 +325,8 @@ enum UserEvent {
     /// Page bytes arriving from the engine's main-resource read, which is
     /// asynchronous. See page_integrity.rs.
     Integrity(page_integrity::IntegrityEvent),
+    /// A Reader View extraction finished on its worker thread.
+    Reader(reader_view::ReaderEvent),
     /// A navigation was refused because its host is on the malicious-host
     /// list. Carries the HOST and the matched rule, never the full URL: the
     /// path can hold a session token, and this event is rendered in the
@@ -390,8 +405,14 @@ enum UserEvent {
     Chat(patanyx_chat::TransportEvent),
 }
 
-/// Mirrors the CSP <meta> in chrome/index.html — keep the two in sync.
-const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'";
+/// Mirrors the CSP <meta> in chrome/index.html — keep the two in sync
+/// (`the_chrome_policy_header_and_meta_tag_agree` checks it).
+///
+/// `media-src blob:` is for the feature videos (1.0.5): compiled in, handed
+/// to the chrome over IPC and played from a blob URL the chrome's own script
+/// made (tutorial.rs says why not a chrome-origin URL). Nothing else in the
+/// chrome plays media, and `connect-src` stays `'none'`.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src blob:; connect-src 'none'; form-action 'none'; base-uri 'none'";
 
 const INDEX_HTML: &str = include_str!("chrome/index.html");
 const CHROME_CSS: &str = include_str!("chrome/chrome.css");
@@ -1464,6 +1485,7 @@ fn main() {
                 app.restore_focus();
             }
             Event::UserEvent(UserEvent::SurfaceFocused(surface)) => app.note_focus(surface),
+            Event::UserEvent(UserEvent::PaneFocused(id)) => app.on_pane_focused(id),
             // A key was pressed inside a page. The ONLY effect is to say a
             // human is here; see UserEvent::UserPresence.
             Event::UserEvent(UserEvent::UserPresence) => app.touch(),
@@ -1520,6 +1542,7 @@ fn main() {
             Event::UserEvent(UserEvent::SessionWipeFinished) => {
                 app.finish_session_wipe()
             }
+            Event::UserEvent(UserEvent::FreezeStatusChanged) => app.emit_tab_status(),
             Event::UserEvent(UserEvent::LocalNetworkGuardSettled(id)) => {
                 app.on_local_network_guard_settled(id)
             }
@@ -1626,6 +1649,9 @@ fn main() {
             // over IPC and then never answered.
             Event::UserEvent(UserEvent::Integrity(event)) => {
                 page_integrity::handle_event(&mut app, event);
+            }
+            Event::UserEvent(UserEvent::Reader(event)) => {
+                reader_view::handle_event(&mut app, event);
             }
             Event::UserEvent(UserEvent::Ocr(event)) => {
                 ocr_support::handle_event(&mut app, event);
@@ -1788,6 +1814,12 @@ fn main() {
                     }
                     Shortcut::LockVault => app.lock_vault(),
                     Shortcut::OpenCommandPalette => app.open_command_palette(),
+                    Shortcut::ToggleReaderView => app.emit("toggle_reader_view", serde_json::json!({})),
+                    Shortcut::ToggleSideBySide => {
+                        if let Err(code) = app.side_by_side_toggle() {
+                            app.emit("side_by_side_error", serde_json::json!({ "code": code }));
+                        }
+                    }
                     Shortcut::Print => app.print_active_tab(),
                     Shortcut::OpenDeveloperTools => {
                         // The accelerator has nowhere to report "no active tab";
@@ -2081,6 +2113,25 @@ mod translator_origin_tests {
             let res = serve_translator(&req);
             assert!(res.status() == 200 || res.status() == 404, "{path}");
         }
+    }
+
+    /// The chrome's policy is sent twice, as a header and as the page's meta
+    /// tag, and the stricter of the two wins in the engine: a directive added
+    /// to one copy only does nothing, silently (the plan review of the
+    /// feature videos, 2026-10-07).
+    #[test]
+    fn the_chrome_policy_header_and_meta_tag_agree() {
+        let at = INDEX_HTML.find("http-equiv=\"Content-Security-Policy\"").expect("meta CSP");
+        let rest = &INDEX_HTML[at..];
+        let start = rest.find("content=\"").expect("content") + "content=\"".len();
+        let meta = &rest[start..start + rest[start..].find('"').expect("end quote")];
+        let norm = |p: &str| {
+            let mut d: Vec<String> = p.split(';').map(|x| x.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|x| !x.is_empty()).collect();
+            d.sort();
+            d
+        };
+        assert_eq!(norm(meta), norm(CSP), "index.html meta CSP and main.rs CSP differ");
+        assert!(CSP.contains("media-src blob:"));
     }
 
     /// Every response carries the policy, including the 404 -- the same rule

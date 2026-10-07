@@ -930,6 +930,23 @@ pub fn page_rect(
     )
 }
 
+/// The gap between the two pages of Side by Side, in logical pixels.
+pub const SIDE_BY_SIDE_GAP_PX: i32 = 6;
+
+/// Side by Side: the page rectangle from `page_rect` split into a left and a
+/// right page with `gap` between them, each half as wide as the space allows.
+/// Pure, so the geometry both backends rely on is tested here.
+pub fn split_page_rect(
+    rect: (f64, f64, f64, f64),
+    gap: i32,
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let (x, y, w, h) = rect;
+    let gap = f64::from(gap.max(0)).min(w.max(0.0));
+    let half = ((w - gap) / 2.0).max(0.0).floor();
+    let right_w = (w - gap - half).max(0.0);
+    ((x, y, half, h), (x + half + gap, y, right_w, h))
+}
+
 /// Whether the chrome must be given the WHOLE window rather than a strip.
 ///
 /// The chrome is one webview and the layout it paints is not a rectangle:
@@ -1970,6 +1987,33 @@ mod chrome_inset_tests {
 /// they cover the degenerate cases rather than just the happy one -- a
 /// window smaller than its own chrome is what a user does with the mouse in
 /// half a second.
+#[cfg(test)]
+mod split_page_rect_tests {
+    use super::split_page_rect;
+
+    #[test]
+    fn two_pages_fill_the_width_with_the_gap_between() {
+        let (l, r) = split_page_rect((10.0, 100.0, 1006.0, 600.0), 6);
+        assert_eq!(l, (10.0, 100.0, 500.0, 600.0));
+        assert_eq!(r, (516.0, 100.0, 500.0, 600.0));
+        assert_eq!(l.2 + 6.0 + r.2, 1006.0);
+    }
+
+    #[test]
+    fn odd_widths_never_overlap_or_leave_a_seam() {
+        let (l, r) = split_page_rect((0.0, 0.0, 1001.0, 10.0), 6);
+        assert_eq!(l.0 + l.2 + 6.0, r.0);
+        assert_eq!(r.0 + r.2, 1001.0);
+    }
+
+    #[test]
+    fn a_window_too_narrow_gives_empty_pages_not_negative_ones() {
+        let (l, r) = split_page_rect((0.0, 0.0, 4.0, 10.0), 6);
+        assert!(l.2 >= 0.0 && r.2 >= 0.0);
+        assert!(r.0 >= l.0);
+    }
+}
+
 #[cfg(test)]
 mod page_rect_tests {
     use super::{

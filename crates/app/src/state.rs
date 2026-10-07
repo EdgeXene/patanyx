@@ -416,6 +416,23 @@ pub struct TranslationSession {
     /// run. `translation_patched` reports it; a per-batch count would reset to
     /// a small number at the end of a long page and read as a failure.
     pub patched_total: usize,
+    /// Letters in the source language's own script sent so far this run.
+    /// Once a page has given MIN_SOURCE_LETTERS_SENT of them it is in the
+    /// language the user chose, and a later batch that is all foreign (a
+    /// webmail's English buttons under a Greek email) is skipped rather than
+    /// ending the run. Digits, punctuation and shared Han count for nothing.
+    pub source_letters_sent: usize,
+    /// Source-script letters in the batch now with the engine, credited to
+    /// source_letters_sent only when its translation comes back: text merely
+    /// queued proves nothing (a page could otherwise answer two extractions
+    /// before the engine saw either).
+    pub pending_source_letters: usize,
+    /// Whether this run has gone on past a batch 1.0.4 would have refused
+    /// (all foreign under a mismatched tally, skipped on the page's earned
+    /// trust). From then on, long nodes must carry letters in the source's
+    /// own script: filler later diluting the tally back to Unknown does not
+    /// relax that.
+    pub continued_past_refusal: bool,
     /// THE PAGE THIS CONSENT WAS GIVEN FOR.
     ///
     /// Consent attaches to the page the user was reading when they clicked,
@@ -463,7 +480,45 @@ pub fn extract_is_acceptable(
         // is the line that makes that pointless.
         return false;
     };
-    session_is_current(page, tab_url) && page == href
+    // The exact page first, as in every release and with no length limit
+    // (on Windows `href` is the engine's full Source, however long); only an
+    // address changed in place goes through the bounded origin comparison.
+    session_is_current(page, tab_url) && (page == href || same_origin(page, href))
+}
+
+/// Whether two URLs share an origin (scheme, host, port).
+///
+/// The page's own `href` is compared by ORIGIN, not exactly. The tab's URL
+/// follows full page loads only, so a site that changes its address in
+/// place (the History API: Proton Mail opening an email from the inbox)
+/// reports an `href` that differs from the URL Translate was pressed on.
+/// Every batch was then dropped and the run timed out; a reload made the
+/// two equal again (reported on the 1.0.5 candidate, 2026-10-07). This
+/// grants nothing a page could not already claim: `href` is the page's own
+/// word, and what binds consent is the tab having not navigated since
+/// (session_is_current) and the run's token. An in-place address change
+/// cannot leave the origin, so a different origin is still refused.
+///
+/// http(s) only, compared field by field, and length-capped. `href` is the
+/// page's own word and arrives unvalidated: Url::origin on a "blob:" URL
+/// parses its inner URL recursively with no depth bound, so a page posting
+/// "blob:blob:...https://x/" could stall the browser (review of this
+/// change, R-001). The extractor sends at most 2048 characters.
+fn same_origin(a: &str, b: &str) -> bool {
+    const MAX_HREF: usize = 4096;
+    if a.len() > MAX_HREF || b.len() > MAX_HREF {
+        return false;
+    }
+    let (Ok(a), Ok(b)) = (url::Url::parse(a), url::Url::parse(b)) else {
+        return false;
+    };
+    let web = |u: &url::Url| matches!(u.scheme(), "http" | "https");
+    web(&a)
+        && web(&b)
+        && a.scheme() == b.scheme()
+        && a.host().is_some()
+        && a.host() == b.host()
+        && a.port_or_known_default() == b.port_or_known_default()
 }
 
 /// Whether an extraction belongs to the session run that is currently live.
@@ -543,6 +598,7 @@ fn translation_failure_key(reported: &str) -> &'static str {
         "translate-engine-aborted" => "translate-engine-aborted",
         "translate-pack-failed" => "translate-pack-failed",
         "translate-timeout" => "translate-timeout",
+        "translate-no-text" => "translate-no-text",
         "translate-no-pack" => "translate-no-pack",
         "translate-patch-failed" => "translate-patch-failed",
         // Pack delivery. Three outcomes a user can act on differently: the
@@ -629,8 +685,133 @@ fn patch_index(i: usize, map: &[usize], offset: usize) -> Option<u64> {
     u64::try_from(in_batch.checked_add(offset)?).ok()
 }
 
+/// Whether a run still accepts page text: only while it is asking for it.
+fn run_takes_batches(phase: &TranslationPhase) -> bool {
+    matches!(phase, TranslationPhase::Preparing | TranslationPhase::Translating)
+}
+
+/// Whether a batch that sends nothing counts as progress against the stall
+/// deadline. Before the run has gone past a batch 1.0.4 refused, it does, as
+/// in 1.0.4. After it, only a translated batch does: a page answering with
+/// batches that hold nothing to send would otherwise keep the run (and every
+/// tab queued behind it) alive forever (eighth pass, R-002), where 1.0.4 had
+/// already refused. A real page's skipped batches take milliseconds each.
+/// That covers an empty batch claiming more, too: the run ends by the
+/// deadline as a failure, never as Done (eleventh pass, R-001).
+fn skipped_batch_is_progress(continued_past_refusal: bool) -> bool {
+    !continued_past_refusal
+}
+
 fn script_refuses(counts: &crate::detect::ScriptCounts) -> bool {
     crate::detect::verify(counts) == crate::detect::Verdict::ScriptMismatch
+}
+
+/// What the handler does with one extracted batch. Pure, so the replay
+/// tests drive exactly the decision the handler ships.
+#[derive(Debug, Default)]
+struct BatchPlan {
+    /// The strings to send, and where each sat in the batch.
+    sent: Vec<String>,
+    map: Vec<usize>,
+    /// Their letters in the source's own script, credited once translated.
+    letters: usize,
+    /// This is a batch where 1.0.4 would have refused the page, and the run
+    /// goes on past it: source-only text from here.
+    latch: bool,
+    /// The run ends here as a script mismatch.
+    refuse: bool,
+}
+
+/// Plans one batch, judged against the page tally with this batch folded in.
+///
+/// 1.0.4 refused a page at the first batch where the tally was a mismatch
+/// and its per-node rule passed nothing. That point is found here by
+/// applying 1.0.4's own rule. A page that has not yet had
+/// MIN_SOURCE_LETTERS_SENT letters in the source's own script translated is
+/// refused there, as before: a page in the wrong language sends nothing and
+/// fetches no pack. A page that has (a Greek email, then the webmail's
+/// English buttons) goes on, but from that batch on only text wholly in the
+/// source's writing system is sent: 1.0.4 sent nothing past it, so nothing
+/// carrying a foreign letter may be new (sixth review R-001, R-002).
+fn plan_batch(
+    counts: &crate::detect::ScriptCounts,
+    batch: &[String],
+    source_letters_sent: usize,
+    continued_past_refusal: bool,
+) -> BatchPlan {
+    let refusal_point = !continued_past_refusal
+        && script_refuses(counts)
+        && filter_batch(counts, batch, crate::detect::NodeRules::RELEASE_1_0_4)
+            .0
+            .is_empty();
+    if refusal_point && source_letters_sent < MIN_SOURCE_LETTERS_SENT {
+        return BatchPlan {
+            refuse: true,
+            ..BatchPlan::default()
+        };
+    }
+    let rules = node_rules(source_letters_sent, continued_past_refusal || refusal_point);
+    let (sent, map) = filter_batch(counts, batch, rules);
+    let letters = source_letters_in(counts, &sent);
+    BatchPlan {
+        sent,
+        map,
+        letters,
+        latch: refusal_point,
+        refuse: false,
+    }
+}
+
+/// Source-script letters a page must have sent before a later all-foreign
+/// batch is skipped instead of refused. Enough to be a heading or a line of
+/// the chosen language, not a stray word.
+const MIN_SOURCE_LETTERS_SENT: usize = 20;
+
+/// Letters in the source's own script among the strings a batch would send.
+/// A batch with none (only numbers, shared Han, short foreign acronyms) is
+/// not sent at all: it gives the model nothing to translate and is no
+/// evidence the page is in the chosen language.
+fn source_letters_in(counts: &crate::detect::ScriptCounts, sent: &[String]) -> usize {
+    sent.iter().map(|t| counts.source_letters(t)).sum()
+}
+
+/// The per-node rules for a batch, from what the run has learned: short
+/// source-script nodes are trusted under a foreign tally only once the page
+/// has had MIN_SOURCE_LETTERS_SENT letters in the source's own script
+/// translated, and from a batch 1.0.4 would have refused onward only text
+/// wholly in the source's writing system is sent.
+fn node_rules(source_letters_sent: usize, past_refusal: bool) -> crate::detect::NodeRules {
+    crate::detect::NodeRules {
+        trust_source_short: source_letters_sent >= MIN_SOURCE_LETTERS_SENT,
+        source_only: past_refusal,
+    }
+}
+
+/// Whether the engine may fetch and load a language pack now: only once the
+/// page has given it something to translate. A page in the wrong language
+/// sends nothing and must fetch nothing either (release review of the
+/// mixed-page change, R-001).
+fn pack_may_load(batch_is_empty: bool, source_letters_sent: usize) -> bool {
+    !batch_is_empty || source_letters_sent > 0
+}
+
+/// The strings of one batch that may be sent to the source model, and where
+/// each sat in the batch. Judged against the tally AFTER this batch was
+/// folded in, so the per-node check sees the whole page seen so far.
+fn filter_batch(
+    counts: &crate::detect::ScriptCounts,
+    batch: &[String],
+    rules: crate::detect::NodeRules,
+) -> (Vec<String>, Vec<usize>) {
+    let mut sent = Vec::new();
+    let mut map = Vec::new();
+    for (i, text) in batch.iter().enumerate() {
+        if counts.text_is_expected_with(text, rules) {
+            sent.push(text.clone());
+            map.push(i);
+        }
+    }
+    (sent, map)
 }
 
 /// How often an in-flight translation is polled.
@@ -1023,6 +1204,10 @@ impl Tab {
     /// bypasses this still works for public addresses and fails closed for
     /// local ones, which is the direction a missed call site should fail in.
     pub(crate) fn load_url(&self, url: &str) -> Result<(), wry::Error> {
+        // The browser's own navigation: an AUTO freeze (Strict Tab's
+        // freeze-after-load) yields before the request, as it would to a
+        // link. A manual freeze is not touched.
+        platform::yield_auto_freeze(&self.webview, &self.view);
         platform::note_app_navigation(&self.view, url);
         let loaded = self.webview.load_url(url);
         if loaded.is_err() {
@@ -1099,6 +1284,7 @@ impl Tab {
         // Marked as the browser's own navigation: the engine reports a reload
         // the same way whoever asked for it, and the button is the user
         // asking (TabState::on_top_level_navigation_starting).
+        platform::yield_auto_freeze(&self.webview, &self.view);
         platform::note_app_navigation(&self.view, &self.url);
         let reloaded = self.webview.reload();
         if reloaded.is_err() {
@@ -2149,6 +2335,14 @@ pub struct AppState {
     pub smoke_vault_done: bool,
     /// In-flight page-byte reads and corroboration requests. Memory only.
     pub integrity: crate::page_integrity::IntegrityState,
+    /// Reader View's one current request, memory only (reader_view.rs).
+    pub reader: crate::reader_view::ReaderState,
+    /// Tab Groups, live only (tab_groups.rs). Never written anywhere.
+    pub groups: crate::tab_groups::TabGroups,
+    /// Side by Side: the (left, right) tab ids shown together, or None.
+    /// `active` is always the pane with the keyboard, so every command that
+    /// acts on the active tab acts on the focused pane.
+    pub pair: Option<(u64, u64)>,
     /// Outstanding download comparisons we asked for. Memory only, like the
     /// page-corroboration map beside it.
     #[cfg(feature = "chat")]
@@ -2522,6 +2716,9 @@ impl AppState {
             smoke_deadline_ticks: 0,
             smoke_vault_done: false,
             integrity: crate::page_integrity::IntegrityState::default(),
+            reader: crate::reader_view::ReaderState::default(),
+            groups: crate::tab_groups::TabGroups::default(),
+            pair: None,
             #[cfg(feature = "chat")]
             download_compare: crate::download_compare::DownloadCompareState::default(),
             pending_save: None,
@@ -2974,10 +3171,15 @@ impl AppState {
             platform::reapply_window_accent(&self.hosts, &self.chrome_palette);
         }
         let active = self.tabs.get(self.active).map(|tab| &tab.webview);
+        let pair = self.pair.and_then(|(l, r)| {
+            let find = |id: u64| self.tabs.iter().find(|t| t.id == id).map(|t| &t.webview);
+            Some((find(l)?, find(r)?))
+        });
         platform::layout(
             &self.hosts,
             &self.chrome,
             active,
+            pair,
             self.chrome_height,
             // What the chrome measures with no panel open. The Windows
             // Overlay branch lays the page out against THIS rather than
@@ -3002,6 +3204,13 @@ impl AppState {
     pub fn set_chrome_arrangement(&mut self, next: platform::ChromeLayout) {
         if self.chrome_arrangement == next {
             return;
+        }
+        // The docked chat pane and Side by Side do not share the window:
+        // docking the pane ends the pair, keeping the focused page.
+        if matches!(next, platform::ChromeLayout::Split { .. }) && self.pair.is_some() {
+            let keep = self.tabs[self.active].id;
+            self.end_side_by_side_hiding_all_but(keep);
+            self.emit_tabs_changed();
         }
         let leaving_cover = !matches!(self.chrome_arrangement, platform::ChromeLayout::Strip)
             && matches!(next, platform::ChromeLayout::Strip);
@@ -3237,6 +3446,17 @@ impl AppState {
             .position(|tab| tab.id == id)
             .ok_or("not_found")?;
         crate::page_integrity::on_tab_closed(self, id);
+        crate::reader_view::on_tab_closed(self, id);
+        // Closing either pane ends Side by Side; the other pane stays open
+        // and is shown if it is the tab that becomes active.
+        let pair_ended = crate::side_by_side::close_ends_pair(self.pair, id);
+        if pair_ended {
+            let keep = self.tabs[self.active].id;
+            self.end_side_by_side_hiding_all_but(keep);
+        }
+        // Group membership is forgotten only where the close has actually
+        // happened, below: a refused close (the last tab's replacement
+        // failing to build) must leave the tab in its group.
 
         // Keep the WebView that owns the asynchronous engine clear alive.
         // Closing it can suppress the completion callback, leaving the
@@ -3247,6 +3467,15 @@ impl AppState {
             && platform::holds_session_wipe(&self.tabs[index].view, true)
         {
             self.tabs[index].close_after_session_wipe = true;
+            // Membership stays until the close really happens, in
+            // finish_session_wipe; that close can still be refused (review
+            // round 2, R-005), and a tab that lives on keeps its group.
+            if pair_ended {
+                // The pair is gone even though this close is deferred: the
+                // surviving page takes the full width and the strip says so.
+                self.relayout();
+                self.emit_tabs_changed();
+            }
             return Ok(());
         }
         let was_active = index == self.active;
@@ -3287,6 +3516,7 @@ impl AppState {
             .map_err(|_| "tab_failed")?;
             self.next_tab_id += 1;
             drop(self.tabs.remove(index)); // detaches (unix) / destroys (windows)
+            self.groups.forget_tab(id);
             self.tabs.push(fresh);
             self.active = 0;
             self.show_and_focus_tab(0);
@@ -3301,6 +3531,7 @@ impl AppState {
 
         let tab = self.tabs.remove(index);
         drop(tab); // Tab::drop detaches the view (unix) / destroys the WebView2 (windows)
+        self.groups.forget_tab(id);
 
         // At least one tab remains -- the single-tab case returned above -- so
         // every index below is in range.
@@ -3312,6 +3543,10 @@ impl AppState {
         }
         if was_active {
             self.show_and_focus_tab(self.active);
+            self.relayout();
+        } else if pair_ended {
+            // The closed tab was the other pane: the active page was laid out
+            // at half width and must take the full page area again.
             self.relayout();
         }
         self.emit_tabs_changed();
@@ -3370,6 +3605,11 @@ impl AppState {
         if ids.len() != self.tabs.len() || requested.len() != ids.len() || requested != current {
             return Err("bad_args");
         }
+        // A group's tabs stay together whatever order was proposed; the
+        // strip keeps the normalized order returned below.
+        let mut normalized = ids.to_vec();
+        self.groups.normalize(&mut normalized);
+        let ids = normalized.as_slice();
 
         // Validation above proves every lookup in this loop succeeds exactly
         // once. MAX_TABS is 32, so the simple removal pass is clearer than an
@@ -3760,6 +4000,7 @@ impl AppState {
             return json!({
                 "freeze_phase": "loaded",
                 "freeze_enforcement": "inactive",
+                "allowed_hosts": [],
                 "profile": "persistent",
                 "origin": Value::Null,
                 "tls": "unknown",
@@ -3798,6 +4039,11 @@ impl AppState {
             // filter compiles asynchronously and can fail — so the UI must
             // read this before claiming the tab is making no requests.
             "freeze_enforcement": platform::freeze_enforcement(&tab.view).as_str(),
+            // The hosts the freeze really lets through. The panel's ledger
+            // follows this rather than what it asked for: on WebKitGTK an
+            // exception that fails to install is rolled back (final review,
+            // R-003).
+            "allowed_hosts": platform::freeze_allowed_hosts(&tab.view),
             "profile": platform::profile_mode(&tab.view),
             // The host of the page actually loaded, not the address-bar text
             // (which may be mid-edit or a search string that never
@@ -4165,6 +4411,12 @@ impl AppState {
         ) {
             return;
         }
+        // A run that finished or failed takes no more text: the host asks for
+        // a batch only while Preparing or Translating, and a late reply after
+        // a timeout would otherwise revive the run (ninth pass, R-001).
+        if !tab.translation.as_ref().is_some_and(|s| run_takes_batches(&s.phase)) {
+            return;
+        }
         let batch: Vec<&str> = match value.get("batch").and_then(Value::as_array) {
             Some(items) => items.iter().filter_map(Value::as_str).collect(),
             None => return,
@@ -4197,6 +4449,20 @@ impl AppState {
         if offset_u64 != expected_offset {
             return;
         }
+        // ONE BATCH WITH THE ENGINE AT A TIME. The host asks for the next
+        // batch only after the last one's patch is delivered, and the result
+        // handler maps and credits the engine's answer through the batch held
+        // here. A page that posts its next batch early would replace the one
+        // in flight, so the older result was credited with the newer batch's
+        // letters (sixth review R-003) and patched through its node map.
+        // Dropped, like an out-of-order offset.
+        if self.tabs[index]
+            .translation
+            .as_ref()
+            .is_some_and(|s| !s.batch.is_empty())
+        {
+            return;
+        }
         let offset = offset_u64 as usize; // safe: equals translation_extracted
         self.tabs[index].translation_extracted = offset.saturating_add(batch.len());
 
@@ -4215,16 +4481,11 @@ impl AppState {
         // disambiguate -- proceeds on the user's explicit source choice, which
         // the dropdown exists to resolve. A clear incompatible script, or a
         // substantial incompatible SHARE across several scripts, is refused.
-        // The check runs before any pack is fetched on the first batch, so the
-        // common case costs no download and leaves the page untouched; a
-        // refusal on a later batch stops further translation (earlier batches
-        // stay as translated -- readable, never corrupted).
+        // A wrong-language page sends nothing, so no pack is fetched and the
+        // page is untouched; it is refused at the batch where 1.0.4 refused
+        // it (plan_batch).
         // Fold this batch into the session's running tally, then judge the
-        // WHOLE page seen so far. A clear mismatch refuses the session; the
-        // first batch catches the common case before any pack is fetched, and a
-        // later batch that tips the cumulative tally into mismatch stops
-        // further translation (earlier batches stay as translated -- readable,
-        // never corrupted).
+        // WHOLE page seen so far.
         if let Some(session) = self.tabs[index].translation.as_mut() {
             session.script_counts.add_batch(&batch);
             // The document's translatable-node count, as the page counted it.
@@ -4249,47 +4510,58 @@ impl AppState {
         // check, so the filtered batch comes out empty and the refusal below
         // still fires. What changed is that "some of this page is foreign" and
         // "this page is the wrong language" are no longer the same answer.
-        let (sent, map): (Vec<String>, Vec<usize>) = {
+        // As in every release, a page judged the wrong language is refused
+        // where 1.0.4 refused it, before any pack is fetched, UNLESS it has
+        // already given the model real text in the chosen language: a Greek
+        // email's batches, then the webmail's English buttons, is a Greek
+        // page with foreign chrome, and ending the run there told the reader
+        // a Greek page was not Greek. Past that point the run is strict (see
+        // plan_batch).
+        let plan = {
             let Some(session) = self.tabs[index].translation.as_ref() else {
                 return;
             };
-            let mut sent = Vec::new();
-            let mut map = Vec::new();
-            for (i, text) in batch.iter().enumerate() {
-                if session.script_counts.text_is_expected(text) {
-                    sent.push(text.clone());
-                    map.push(i);
-                }
-            }
-            (sent, map)
+            plan_batch(
+                &session.script_counts,
+                &batch,
+                session.source_letters_sent,
+                session.continued_past_refusal,
+            )
         };
-        // Nothing on this page belongs to the source the user chose. THAT is a
-        // script mismatch; a page merely containing some foreign text is not.
-        if sent.is_empty() {
-            let refuses = self.tabs[index]
-                .translation
-                .as_ref()
-                .map(|ssn| script_refuses(&ssn.script_counts))
-                .unwrap_or(false);
-            if refuses {
-                self.fail_translation(index, "translate-script-mismatch");
-                return;
+        if plan.refuse {
+            self.fail_translation(index, "translate-script-mismatch");
+            return;
+        }
+        if plan.latch {
+            if let Some(session) = self.tabs[index].translation.as_mut() {
+                session.continued_past_refusal = true;
             }
-            // Too little text to judge and nothing to send: ask for the next
-            // batch rather than ending the run on an inconclusive one.
+        }
+        let BatchPlan { sent, map, letters, .. } = plan;
+        if sent.is_empty() {
+            // Nothing to send from this batch: ask for the next one rather
+            // than ending the run on it.
             if let Some(session) = self.tabs[index].translation.as_mut() {
                 session.batch = Vec::new();
                 session.batch_map = Vec::new();
                 session.batch_span = batch.len();
                 session.offset = offset;
                 session.more = more;
-                session.last_progress = std::time::Instant::now();
+                if skipped_batch_is_progress(session.continued_past_refusal) {
+                    session.last_progress = std::time::Instant::now();
+                }
             }
             self.request_next_batch(index);
+            // The stall deadline is checked on the poller's tick.
+            self.start_translate_poller();
             return;
         }
 
         if let Some(session) = self.tabs[index].translation.as_mut() {
+            // Only letters in the source's own script prove the page is in
+            // the chosen language: dates and numbers never switch the refusal
+            // off (release review R-003).
+            session.pending_source_letters = letters;
             session.batch_span = batch.len();
             session.batch = sent;
             session.batch_map = map;
@@ -4397,7 +4669,9 @@ impl AppState {
         if platform::deliver_translation(&tab.webview, &tab.view, cmd.to_string()) {
             if let Some(session) = self.tabs[index].translation.as_mut() {
                 session.phase = TranslationPhase::Translating;
-                session.last_progress = std::time::Instant::now();
+                if skipped_batch_is_progress(session.continued_past_refusal) {
+                    session.last_progress = std::time::Instant::now();
+                }
             }
         } else {
             self.fail_translation(index, "translate-patch-failed");
@@ -4469,7 +4743,14 @@ impl AppState {
         // that wait has its own progress feed, and its failure already fails
         // the session through on_pack_installed.
         if stalled && !self.pack_downloads.contains_key(pair) {
-            self.fail_translation(index, "translate-timeout");
+            // Nothing ever arrived from the page: a different failure from a
+            // slow engine, and one a reload usually fixes, so it says so.
+            let key = if self.tabs[index].translation_extracted == 0 {
+                "translate-no-text"
+            } else {
+                "translate-timeout"
+            };
+            self.fail_translation(index, key);
             return;
         }
         // Waiting on the page's extract reply: nothing to ask the engine yet.
@@ -4509,6 +4790,19 @@ impl AppState {
         let Some(index) = self.translating_tab() else {
             return;
         };
+        // A session for a page the tab no longer shows is ended here too, not
+        // only when a result comes back: a run waiting on its next batch has
+        // no result coming, and every poll answered would otherwise keep it
+        // alive and holding the translator (release review R-004).
+        let stale = self.tabs[index]
+            .translation
+            .as_ref()
+            .is_some_and(|s| !session_is_current(&s.page, &self.tabs[index].url));
+        if stale {
+            self.tabs[index].translation = None;
+            self.emit_tab_status();
+            return;
+        }
         let Ok(value) = serde_json::from_str::<Value>(json) else {
             return;
         };
@@ -4557,7 +4851,15 @@ impl AppState {
             // about eleven times slower than the Mozilla students and a
             // 200-node batch simply takes longer than that. Silence is the
             // only symptom worth failing on.
-            session.last_progress = std::time::Instant::now();
+            //
+            // But only while the engine HAS work. Between batches the run is
+            // waiting on the page, not the engine, and an idle engine
+            // answering polls must not keep a page that has stopped replying
+            // alive forever (release review R-004): there, the page's own
+            // replies are what count, and request_next_batch set the clock.
+            if !session.batch.is_empty() {
+                session.last_progress = std::time::Instant::now();
+            }
             (session.pair, session.token)
         };
 
@@ -4580,6 +4882,13 @@ impl AppState {
             return;
         }
         if phase == "engine-ready" || (phase == "ready" && loaded_pair != pair) {
+            let may_load = self.tabs[index]
+                .translation
+                .as_ref()
+                .is_some_and(|s| pack_may_load(s.batch.is_empty(), s.source_letters_sent));
+            if !may_load {
+                return;
+            }
             // THE PACK HAS TO EXIST BEFORE THE ENGINE IS ASKED FOR IT. A
             // missing one is the NORMAL first-run state, not an error: no
             // language model ships in the installer, by ruling, so the first
@@ -4804,6 +5113,11 @@ impl AppState {
             session.batch = Vec::new();
             session.submitted = false;
             session.patched_total += count;
+            // The batch's source text has now been through the engine: only
+            // now does it count toward the page's earned trust.
+            if delivered {
+                session.source_letters_sent += std::mem::take(&mut session.pending_source_letters);
+            }
             session.last_progress = std::time::Instant::now();
             session.phase = if delivered {
                 TranslationPhase::Done
@@ -5327,6 +5641,9 @@ impl AppState {
             offset: 0,
             more: false,
             patched_total: 0,
+            source_letters_sent: 0,
+            pending_source_letters: 0,
+            continued_past_refusal: false,
         });
         // THE ONLY PLACE A PAGE IS EVER ASKED TO READ ITSELF. Reached only
         // from a user's click on the tab they are looking at, with a URL this
@@ -6174,7 +6491,104 @@ impl AppState {
         }
     }
 
+    /// Side by Side: show the active tab and `other` together, in the order
+    /// the strip shows them. The active tab keeps the keyboard. Ends any pair
+    /// already showing. Refused while a side pane is docked, which takes the
+    /// same space.
+    pub fn side_by_side_open(&mut self, other: u64) -> Result<(), &'static str> {
+        if self.is_split() {
+            return Err("side_by_side_chat_open");
+        }
+        let left = self.tabs.get(self.active).map(|t| t.id).ok_or("no_tab")?;
+        if other == left {
+            return Err("side_by_side_same_tab");
+        }
+        if !self.tabs.iter().any(|t| t.id == other) {
+            return Err("not_found");
+        }
+        if self.pair.is_some() {
+            self.end_side_by_side_hiding_all_but(left);
+        }
+        let other_index = self.tabs.iter().position(|t| t.id == other).ok_or("not_found")?;
+        self.pair = Some(crate::side_by_side::ordered_pair(
+            (self.active, left),
+            (other_index, other),
+        ));
+        // Showing the right-hand page is set_side_by_side's job, and it never
+        // focuses: the keyboard stays in the left pane, where it already was
+        // (show_and_focus_tab remains the only path that focuses a page).
+        let (lid, rid) = self.pair.ok_or("not_found")?;
+        let l = self.tabs.iter().find(|t| t.id == lid).ok_or("not_found")?;
+        let r = self.tabs.iter().find(|t| t.id == rid).ok_or("not_found")?;
+        platform::set_side_by_side(&self.hosts, Some(((&l.view, &l.webview), (&r.view, &r.webview))));
+        self.relayout();
+        self.emit_tabs_changed();
+        Ok(())
+    }
+
+    /// Side by Side off: the focused pane stays, the other is hidden.
+    pub fn side_by_side_close(&mut self) -> Result<(), &'static str> {
+        if self.pair.is_none() {
+            return Ok(());
+        }
+        let keep = self.tabs.get(self.active).map(|t| t.id).ok_or("no_tab")?;
+        self.end_side_by_side_hiding_all_but(keep);
+        self.relayout();
+        self.emit_tabs_changed();
+        Ok(())
+    }
+
+    /// The shortcut and toolbar toggle: end the pair, or pair the active tab
+    /// with its right-hand neighbor (the left-hand one for the last tab).
+    pub fn side_by_side_toggle(&mut self) -> Result<(), &'static str> {
+        if self.pair.is_some() {
+            return self.side_by_side_close();
+        }
+        let neighbor = crate::side_by_side::toggle_partner(self.tabs.len(), self.active)
+            .ok_or("side_by_side_needs_two")?;
+        let other = self.tabs[neighbor].id;
+        self.side_by_side_open(other)
+    }
+
+    /// A pane took the keyboard (a click into its page): it becomes the
+    /// active tab, so the toolbar, the address bar and every shortcut now
+    /// describe and act on it. Both panes stay on screen.
+    pub fn on_pane_focused(&mut self, id: u64) {
+        let active = self.tabs.get(self.active).map(|t| t.id);
+        if !crate::side_by_side::focus_activates(self.pair, id, active) {
+            return;
+        }
+        if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+            // No refocus: the page already has the keyboard.
+            self.set_active_inner(index, false);
+            self.emit_tabs_changed();
+        }
+    }
+
+    /// End the pair, if any, hiding every page but `keep`'s. Does not
+    /// relayout or emit: the callers do, once, after their own change.
+    fn end_side_by_side_hiding_all_but(&mut self, keep: u64) {
+        let Some((l, r)) = self.pair.take() else { return };
+        platform::set_side_by_side(&self.hosts, None);
+        for id in [l, r] {
+            if id == keep {
+                continue;
+            }
+            if let Some(t) = self.tabs.iter().find(|t| t.id == id) {
+                platform::hide_tab(&t.view, &t.webview);
+            }
+        }
+    }
+
     fn set_active(&mut self, index: usize) {
+        self.set_active_inner(index, true);
+    }
+
+    /// `focus`: false only for a pane switch the user already made by
+    /// clicking into that page (on_pane_focused). Focusing it again would
+    /// generate another focus report, and queued reports would then bounce
+    /// the keyboard between the panes.
+    fn set_active_inner(&mut self, index: usize, focus: bool) {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
@@ -6185,15 +6599,26 @@ impl AppState {
         if self.find.stop(&mut self.find_gen) {
             platform::find_stop(&self.tabs[self.active].webview);
         }
-        platform::hide_tab(
-            &self.tabs[self.active].view,
-            &self.tabs[self.active].webview,
-        );
+        // SIDE BY SIDE. Moving between the two panes keeps both on screen;
+        // choosing any other tab ends the pair and shows that tab alone.
+        let leaving = self.tabs[self.active].id;
+        let arriving = self.tabs[index].id;
+        let pane_switch = crate::side_by_side::on_select(self.pair, leaving, arriving)
+            == crate::side_by_side::Selection::PaneSwitch;
+        if !pane_switch {
+            self.end_side_by_side_hiding_all_but(arriving);
+            platform::hide_tab(
+                &self.tabs[self.active].view,
+                &self.tabs[self.active].webview,
+            );
+        }
         self.active = index;
         // The page gets the keyboard, and a later window activation brings it
         // back there -- unless a modal still covers the window (the strip
         // stays clickable under one): see show_and_focus_tab.
-        self.show_and_focus_tab(index);
+        if focus || !pane_switch {
+            self.show_and_focus_tab(index);
+        }
         // A freshly shown Windows tab may have stale bounds (created hidden,
         // or hidden during a resize); re-apply geometry for it and chrome.
         self.relayout();
@@ -6210,6 +6635,7 @@ impl AppState {
         // re-emit it. Found when the HTTP warning stayed up on a tab that had
         // already continued.
         self.emit_tab_status();
+        crate::reader_view::on_active_changed(self);
     }
 
     pub fn tab_list(&self) -> Value {
@@ -6223,10 +6649,17 @@ impl AppState {
                     "url": tab.url,
                     "title": tab.title,
                     "active": i == self.active,
+                    "group": self.groups.group_of(tab.id),
+                    "paired": match self.pair {
+                        Some((l, _)) if l == tab.id => Some("left"),
+                        Some((_, r)) if r == tab.id => Some("right"),
+                        _ => None,
+                    },
                 })
             })
             .collect();
-        json!({ "items": items })
+        let order: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        json!({ "items": items, "groups": self.groups.to_json(&order) })
     }
 
     pub fn emit_tabs_changed(&self) {
@@ -6596,7 +7029,22 @@ impl AppState {
             .map(|tab| tab.id)
             .collect::<Vec<_>>();
         for id in delayed_closes {
-            let _ = self.close_tab(id);
+            if self.close_tab(id).is_err() {
+                // Refused (the last tab's replacement failed to build): the
+                // tab stays, as an ordinary tab, still in its group, and the
+                // strip is told rather than left showing a close that did
+                // not happen (review round 2, R-005).
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                    tab.close_after_session_wipe = false;
+                    // Its first page was skipped above because the tab was
+                    // closing; it is staying, so load it now (review round
+                    // 3, R-005). Not ready yet on Windows: the guard's
+                    // settle event finishes it, as for any pending tab.
+                    tab.initial_navigation_pending = true;
+                    tab.finish_initial_navigation();
+                }
+                self.emit_tabs_changed();
+            }
         }
     }
 
@@ -6947,6 +7395,7 @@ impl AppState {
             self.emit("load_state", json!({ "loading": loading }));
         }
         crate::page_integrity::on_tab_load_state(self, id, loading);
+        crate::reader_view::on_tab_load_state(self, id, loading);
     }
 }
 
@@ -8178,6 +8627,474 @@ mod translation_session_tests {
         assert!(script_refuses(&counts("el", &english)), "English into el must refuse");
     }
 
+    /// Feeds a page to the handler's own decision, batch by batch: the session
+    /// tally, then plan_batch. Returns the number of strings sent to the
+    /// engine and whether the run was refused.
+    fn replay_batches(source: &str, batches: &[&[&str]]) -> (usize, bool) {
+        let (sent, refused) = replay_sent(source, batches);
+        (sent.len(), refused)
+    }
+
+    /// replay_batches, returning the strings themselves.
+    fn replay_sent(source: &str, batches: &[&[&str]]) -> (Vec<String>, bool) {
+        let mut counts = crate::detect::ScriptCounts::new(source);
+        let mut sent_all = Vec::new();
+        let mut letters_sent = 0usize;
+        let mut continued = false;
+        for b in batches {
+            let owned: Vec<String> = b.iter().map(|s| s.to_string()).collect();
+            counts.add_batch(&owned);
+            let plan = plan_batch(&counts, &owned, letters_sent, continued);
+            if plan.refuse {
+                return (sent_all, true);
+            }
+            continued |= plan.latch;
+            // Each batch's translation comes back before the next is read
+            // (the handler drops a batch posted while one is in flight), so
+            // its letters are credited at once.
+            letters_sent += plan.letters;
+            sent_all.extend(plan.sent);
+        }
+        (sent_all, false)
+    }
+
+    /// THE PROTON MAIL CASE (1.0.4, reported 2026-10-07): a Greek email in an
+    /// English webmail page. The Greek batches went to the engine, then a
+    /// batch of English buttons tipped the page tally past the foreign-share
+    /// ceiling and the run ended with "not written in the language you
+    /// chose". The English must still never reach the Greek model, and the
+    /// run must not be refused.
+    #[test]
+    fn a_foreign_batch_after_source_text_is_skipped_not_refused() {
+        let greek: &[&str] = &[
+            "Κατεβάστε την εφαρμογή και ανακαλύψτε τις προσφορές του Προγράμματος",
+            "από όπου κι αν βρίσκεστε, εύκολα και γρήγορα",
+        ];
+        let chrome: &[&str] =
+            &["Unsubscribe", "This message was sent to", "Reply all", "Forward", "Move to folder"];
+        let footer: &[&str] = &["Άρθρο", "Οι προσφορές αλλάζουν κάθε εβδομάδα"];
+
+        let (sent, refused) = replay_batches("el", &[greek, chrome, footer]);
+        assert!(!refused, "a Greek email in English chrome must not be refused");
+        assert_eq!(sent, 4, "every Greek node, short ones included, and no English");
+    }
+
+    /// The limit of refusing at once: a page whose FIRST batch is all foreign
+    /// is refused there, as in every release, before any pack is fetched. A
+    /// webmail that lists its English chrome before the email is refused.
+    #[test]
+    fn foreign_chrome_before_any_source_text_is_still_refused_at_once() {
+        let chrome: &[&str] =
+            &["Unsubscribe", "This message was sent to", "Reply all", "Forward", "Move to folder"];
+        let greek: &[&str] = &["Κατεβάστε την εφαρμογή και ανακαλύψτε τις προσφορές"];
+        assert_eq!(replay_batches("el", &[chrome, greek]), (0, true));
+    }
+
+    /// A stray source-language word is not enough to switch the refusal off,
+    /// and is refused in its own batch: nothing sent, so no pack is fetched,
+    /// whether or not the page goes on (release review, third pass, R-001).
+    #[test]
+    fn a_few_source_letters_do_not_make_a_foreign_page_pass() {
+        let mut first: Vec<&str> = vec!["Καθένας έχει δικαίωμα στην εκπαίδευση."; 30];
+        first.push("OK");
+        let more_greek: &[&str] = &["Η εκπαίδευση πρέπει να παρέχεται δωρεάν."];
+        assert_eq!(replay_batches("en", &[&first, more_greek]), (0, true));
+        assert_eq!(replay_batches("en", &[&first]), (0, true), "nor end as translated");
+    }
+
+    /// Third pass, R-002: a little real Japanese first, then Chinese, then
+    /// Latin filler that dilutes the tally to Unknown: the all-Han Chinese
+    /// sentence must still not be sent to the Japanese model.
+    #[test]
+    fn diluted_chinese_after_some_japanese_never_reaches_the_model() {
+        let mut first: Vec<&str> = vec!["ですます"; 5];
+        first.extend(std::iter::repeat("2026").take(195));
+        let chinese: Vec<&str> = vec!["中文"; 200];
+        let mut last: Vec<&str> = vec!["abcdefghij"; 198];
+        last.push("这是一个很长的中文句子没有假名在这里");
+        last.push("です");
+        let (sent_all, _) = replay_sent("ja", &[&first, &chinese, &last]);
+        assert!(
+            !sent_all.iter().any(|s| s.contains("中文句子")),
+            "the Chinese sentence reached the Japanese model: {sent_all:?}"
+        );
+    }
+
+    /// Release review of the mixed-page change, reproduced before fixing.
+    /// R-003: a first batch of numbers must not switch the refusal off for
+    /// the Greek that follows on an English-source run. (The numbers
+    /// themselves are sent, as in 1.0.4: they carry no letters to misread.)
+    #[test]
+    fn a_numbers_first_page_in_the_wrong_language_is_still_refused() {
+        let numbers: Vec<&str> = vec!["2026"; 200];
+        let greek: &[&str] = &[
+            "Καλώς ήλθατε στην εφαρμογή του Προγράμματος",
+            "Επιλέξτε Ενεργώ για τον εαυτό μου εφόσον έχετε ΑΦΜ",
+        ];
+        let (sent, refused) = replay_sent("en", &[&numbers, greek]);
+        assert!(refused, "numbers first must not make a Greek page pass for English");
+        assert!(sent.iter().all(|s| s == "2026"), "no Greek sent: {sent:?}");
+    }
+
+    /// R-002: Chinese first on a Japanese-source run: nothing is sent and the
+    /// run is refused at once, so no later batch is ever judged.
+    #[test]
+    fn chinese_after_a_rejected_prefix_never_reaches_a_japanese_model() {
+        let short: Vec<&str> = vec!["中文"; 200];
+        let long: &[&str] = &["这是一个很长的中文句子没有假名在这里"];
+        assert_eq!(replay_batches("ja", &[&short, long]), (0, true));
+        let latin: Vec<&str> = vec!["abcdefghij"; 100];
+        assert_eq!(replay_batches("ja", &[&short, &latin, long]), (0, true));
+    }
+
+    /// R-001: no pack before there is something to translate.
+    #[test]
+    fn a_pack_loads_only_once_the_page_has_given_text_to_translate() {
+        assert!(!pack_may_load(true, 0), "empty batch, nothing sent: wait");
+        assert!(pack_may_load(false, 0), "a batch to send");
+        assert!(pack_may_load(true, 40), "between batches of a page in the source language");
+    }
+
+    /// Pinned against the source: the engine poll ends a session for a page
+    /// the tab no longer shows (R-004), and asks pack_may_load before it
+    /// fetches or loads a pack (R-001).
+    #[test]
+    fn the_engine_poll_checks_the_page_and_the_pack_gate() {
+        let src = include_str!("state.rs");
+        let at = src.find("pub fn on_translate_engine(").expect("handler");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("end of fn")];
+        let stale = body.find("session_is_current(").expect("the handler checks the page");
+        let gate = body.find("pack_may_load(").expect("the handler gates the pack");
+        let fetch = body.find("start_pack_download(").expect("the handler fetches packs");
+        assert!(stale < gate && gate < fetch, "page check, then pack gate, then fetch");
+        // The engine keeps the stall clock alive only while it has work.
+        assert!(body.contains("if !session.batch.is_empty() {\n                session.last_progress"));
+    }
+
+    /// Sixth review R-001, reproduced before fixing: a short Japanese node in
+    /// a batch 1.0.4 refused kept the run from going strict, and the
+    /// all-Han Chinese sentence after it reached the Japanese model.
+    #[test]
+    fn a_short_source_node_in_a_refused_batch_does_not_lift_the_strict_rule() {
+        let mut first: Vec<&str> = vec!["ですます"; 5];
+        first.extend(std::iter::repeat("2026").take(195));
+        let mut second: Vec<&str> = vec!["中文"; 199];
+        second.push("です");
+        let third: &[&str] = &["这是一个很长的中文句子没有假名在这里"];
+        let (sent, refused) = replay_sent("ja", &[&first, &second, third]);
+        assert!(!refused);
+        assert!(!sent.iter().any(|s| s.contains("中文")), "Chinese reached the model: {sent:?}");
+        assert!(sent.iter().any(|s| s == "です"), "the Japanese node is still sent");
+    }
+
+    /// Sixth review R-002, reproduced before fixing: past a batch 1.0.4
+    /// refused, a mostly-Greek node with Latin letters in it went to the
+    /// Greek model. 1.0.4 sent nothing from that point on.
+    #[test]
+    fn past_a_refusal_no_node_with_a_foreign_letter_is_sent() {
+        let mut first: Vec<&str> = vec!["Καλημέρα"; 5];
+        first.extend(std::iter::repeat("2026").take(195));
+        let second: Vec<&str> = vec!["Unsubscribe"; 200];
+        let third: &[&str] = &["Καλημέρα κόσμε abcdef", "Καλημέρα κόσμε"];
+        let (sent, refused) = replay_sent("el", &[&first, &second, third]);
+        assert!(!refused);
+        assert!(!sent.iter().any(|s| s.contains("abcdef")), "Latin reached the model: {sent:?}");
+        assert!(sent.iter().any(|s| s == "Καλημέρα κόσμε"), "pure Greek is still sent");
+    }
+
+    /// NOTHING WORSE THAN 1.0.4, checked on generated pages rather than only
+    /// the cases each review found. Every page is replayed through 1.0.4's
+    /// rule and through plan_batch, node by node:
+    ///   (a) every node 1.0.4 sent is still sent;
+    ///   (b) any node sent that 1.0.4 did not send is written wholly in the
+    ///       source's writing system, with a letter of its own script;
+    ///   (c) a page 1.0.4 translated is never refused, and a page refused
+    ///       now is refused at the same batch as in 1.0.4;
+    ///   (d) a page 1.0.4 refused goes on only if MIN_SOURCE_LETTERS_SENT
+    ///       letters of the source's own script were translated before that
+    ///       batch.
+    /// Purity in (b) is judged by an oracle written out here from Unicode
+    /// blocks, not by detect.rs, so a defect there cannot pass its own test.
+    #[test]
+    fn generated_pages_are_never_worse_than_1_0_4() {
+        fn wholly_source(source: &str, text: &str) -> bool {
+            // Unicode Scripts.txt: the Greek block's U+03E2..U+03EF are Coptic.
+            // U+AB65 is a Greek letter inside Latin Extended-E.
+            let greek = |c: char| {
+                (matches!(c, '\u{0370}'..='\u{03FF}' | '\u{1F00}'..='\u{1FFF}')
+                    && !matches!(c, '\u{03E2}'..='\u{03EF}'))
+                    || c == '\u{AB65}'
+            };
+            let kana = |c: char| matches!(c, '\u{3040}'..='\u{30FF}');
+            let han = |c: char| matches!(c, '\u{4E00}'..='\u{9FFF}');
+            let latin = |c: char| c.is_ascii_alphabetic() || matches!(c, '\u{00C0}'..='\u{024F}');
+            let letters: Vec<char> = text.chars().filter(|c| c.is_alphabetic()).collect();
+            match source {
+                "el" => letters.iter().any(|&c| greek(c)) && letters.iter().all(|&c| greek(c)),
+                "ja" => letters.iter().any(|&c| kana(c)) && letters.iter().all(|&c| kana(c) || han(c)),
+                _ => letters.iter().any(|&c| latin(c)) && letters.iter().all(|&c| latin(c)),
+            }
+        }
+        let vocab: &[&str] = &[
+            "Καλημέρα", "Νέα", "Καλημέρα κόσμε", "Καλημέρα κόσμε abcdef",
+            "Κατεβάστε την εφαρμογή και ανακαλύψτε", "Unsubscribe", "OK", "Inbox",
+            "This message was sent to you", "2026", "12:30", "ですます", "です",
+            "これは日本語の文章です東京", "これはGoogleです", "中文", "東京都中央区日本橋",
+            "这是一个很长的中文句子没有假名在这里", "abcdefghij", "Νέα ab",
+            "ϣϣϣϣϣϣϣϣ", "Καλημέρα ϣϯ", "Welcome", "\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}",
+            "\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}abcdefghij",
+            "ϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣϣ", "ϣϣϣ",
+        ];
+        let mut seed: u64 = 0x5eed_1e55;
+        let mut next = |n: usize| {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as usize) % n
+        };
+        let (mut saw_latch, mut saw_refusal, mut saw_extra) = (0, 0, 0);
+        for page in 0..4000 {
+            let source = ["el", "ja", "en"][next(3)];
+            let batches: Vec<Vec<String>> = (0..1 + next(5))
+                .map(|_| {
+                    let pick = next(vocab.len());
+                    let repeat = [1, 1, 5, 40, 200][next(5)];
+                    let mut b: Vec<String> = Vec::new();
+                    for _ in 0..1 + next(12) {
+                        let w = if next(3) == 0 { pick } else { next(vocab.len()) };
+                        for _ in 0..1 + next(repeat) {
+                            b.push(vocab[w].to_string());
+                        }
+                    }
+                    b
+                })
+                .collect();
+            // 1.0.4.
+            let mut old_counts = crate::detect::ScriptCounts::new(source);
+            let mut old_sent = std::collections::HashSet::new();
+            let mut old_refused_at = None;
+            for (bi, b) in batches.iter().enumerate() {
+                old_counts.add_batch(b);
+                let (_, map) = filter_batch(&old_counts, b, crate::detect::NodeRules::RELEASE_1_0_4);
+                if map.is_empty() {
+                    if script_refuses(&old_counts) {
+                        old_refused_at = Some(bi);
+                        break;
+                    }
+                    continue;
+                }
+                old_sent.extend(map.into_iter().map(|i| (bi, i)));
+            }
+            // Now.
+            let mut counts = crate::detect::ScriptCounts::new(source);
+            let (mut letters, mut latched) = (0usize, false);
+            let mut refused_at = None;
+            let mut new_sent = std::collections::HashSet::new();
+            for (bi, b) in batches.iter().enumerate() {
+                counts.add_batch(b);
+                let plan = plan_batch(&counts, b, letters, latched);
+                if plan.refuse {
+                    refused_at = Some(bi);
+                    break;
+                }
+                if old_refused_at == Some(bi) {
+                    assert!(
+                        letters >= MIN_SOURCE_LETTERS_SENT,
+                        "page {page} ({source}): went on where 1.0.4 refused, on {letters} letters"
+                    );
+                    saw_latch += 1;
+                }
+                latched |= plan.latch;
+                letters += plan.letters;
+                for i in plan.map {
+                    new_sent.insert((bi, i));
+                    if !old_sent.contains(&(bi, i)) {
+                        saw_extra += 1;
+                        assert!(
+                            wholly_source(source, &b[i]),
+                            "page {page} ({source}): {:?} sent, 1.0.4 did not send it",
+                            b[i]
+                        );
+                    }
+                }
+            }
+            for at in &old_sent {
+                assert!(new_sent.contains(at), "page {page} ({source}): lost {at:?} that 1.0.4 sent");
+            }
+            if let Some(at) = refused_at {
+                assert_eq!(old_refused_at, Some(at), "page {page} ({source}): refused where 1.0.4 was not");
+                saw_refusal += 1;
+            }
+        }
+        // The generator must actually reach each case it is checking.
+        assert!(saw_latch > 50 && saw_refusal > 50 && saw_extra > 50, "{saw_latch} {saw_refusal} {saw_extra}");
+    }
+
+    /// Eleventh review R-001: `more` is read exactly as 1.0.4 read it. An
+    /// empty batch that claims more once ended the page, and so a run Done
+    /// with nothing translated, where 1.0.4 asked again and then refused the
+    /// Greek that followed. Past a refusal, such batches do not reset the
+    /// stall clock, so they cannot hold a run open either.
+    #[test]
+    fn more_is_read_as_1_0_4_read_it() {
+        let src = include_str!("state.rs");
+        let at = src.find("pub fn on_content_translate(").expect("handler");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("end of fn")];
+        assert!(body.contains("let more = value.get(\"more\").and_then(Value::as_bool).unwrap_or(false);"));
+        assert!(!skipped_batch_is_progress(true));
+        // The reviewer's sequence: an empty batch, then Greek on an English
+        // run. Refused, as in 1.0.4.
+        let empty: &[&str] = &[];
+        let greek: &[&str] = &["Καλημέρα κόσμε Καλημέρα κόσμε"];
+        assert_eq!(replay_batches("en", &[empty, greek]), (0, true));
+    }
+
+    /// Tenth review, reproduced before fixing: the baseline is 1.0.4's own
+    /// classifier. R-001: twenty U+AB65 (Latin to 1.0.4) and ten Latin
+    /// letters on a Greek-source run are refused at once, as in 1.0.4. R-002:
+    /// Coptic beside real Greek headings sends all three nodes, as in 1.0.4.
+    #[test]
+    fn the_baseline_is_1_0_4s_own_classifier() {
+        let mixed = format!("{}abcdefghij", "\u{AB65}".repeat(20));
+        assert_eq!(replay_batches("el", &[&[mixed.as_str()]]), (0, true));
+        let coptic = "ϣ".repeat(20);
+        let (sent, refused) = replay_sent("el", &[&["Καλημέρα", coptic.as_str(), "Νέα"]]);
+        assert!(!refused && sent.len() == 3, "{sent:?}");
+    }
+
+    /// Ninth review R-001: a run that timed out, failed or finished takes no
+    /// late reply from the page, checked before anything in it is accepted.
+    #[test]
+    fn a_finished_or_failed_run_takes_no_more_text() {
+        assert!(run_takes_batches(&TranslationPhase::Preparing));
+        assert!(run_takes_batches(&TranslationPhase::Translating));
+        assert!(!run_takes_batches(&TranslationPhase::Done));
+        assert!(!run_takes_batches(&TranslationPhase::Failed("translate-timeout")));
+        let src = include_str!("state.rs");
+        let at = src.find("pub fn on_content_translate(").expect("handler");
+        let body = &src[at..at + src[at..].find("\n    }\n").expect("end of fn")];
+        let guard = body.find("run_takes_batches(&s.phase)").expect("the handler checks the phase");
+        let parse = body.find("value.get(\"batch\")").expect("batch parsed");
+        assert!(guard < parse, "the phase is checked before the batch is read");
+    }
+
+    /// Eighth review R-002: past a batch 1.0.4 refused, batches that send
+    /// nothing do not reset the stall clock, in the handler or when the next
+    /// batch is requested, so a page cannot hold the run open forever.
+    #[test]
+    fn past_a_refusal_skipped_batches_do_not_hold_the_run_open() {
+        assert!(skipped_batch_is_progress(false), "as in 1.0.4");
+        assert!(!skipped_batch_is_progress(true));
+        let src = include_str!("state.rs");
+        let body_of = |name: &str| {
+            let at = src.find(name).expect(name);
+            &src[at..at + src[at..].find("\n    }\n").expect("end of fn")]
+        };
+        for (name, n) in [("pub fn on_content_translate(", 1), ("fn request_next_batch(", 1)] {
+            let body = body_of(name);
+            assert_eq!(
+                body.matches("if skipped_batch_is_progress(session.continued_past_refusal) {\n").count(),
+                n,
+                "{name}: the refresh is gated"
+            );
+        }
+        let req = body_of("fn request_next_batch(");
+        assert_eq!(req.matches("session.last_progress = std::time::Instant::now();").count(), 1);
+    }
+
+    /// Pinned against the source: the batch handler drops a batch posted
+    /// while another is with the engine (sixth review R-003) before it
+    /// accepts the offset or folds the text in, then plans the batch,
+    /// refuses or latches from the plan, and records the letters only for a
+    /// batch it queues: the order replay_sent mirrors.
+    #[test]
+    fn the_batch_handler_follows_the_replayed_order() {
+        let src = include_str!("state.rs");
+        // Each search is bounded to its own function: this test's strings
+        // are in the same file and would otherwise be found instead.
+        let body_of = |name: &str| {
+            let at = src.find(name).expect(name);
+            &src[at..at + src[at..].find("\n    }\n").expect("end of fn")]
+        };
+        let rest = body_of("pub fn on_content_translate(");
+        let in_flight = rest.find("|s| !s.batch.is_empty()").expect("one batch at a time");
+        let accept = rest
+            .find("self.tabs[index].translation_extracted = offset")
+            .expect("offset accepted");
+        let fold = rest.find("session.script_counts.add_batch(&batch);").expect("tally");
+        assert!(in_flight < accept && accept < fold);
+        let plan = rest.find("plan_batch(").expect("the plan");
+        let refuse = rest.find("if plan.refuse {").expect("refusal");
+        let latch = rest.find("session.continued_past_refusal = true;").expect("latch");
+        let queue = rest.find("session.pending_source_letters = letters;").expect("pending");
+        assert!(fold < plan && plan < refuse && refuse < latch && latch < queue);
+        // A free function: it ends at the first unindented brace.
+        let planner = {
+            let at = src.find("fn plan_batch(").expect("plan_batch");
+            &src[at..at + src[at..].find("\n}\n").expect("end of fn")]
+        };
+        assert!(planner.contains("NodeRules::RELEASE_1_0_4"));
+        assert!(planner.contains("continued_past_refusal || refusal_point"));
+        // Letters count only once the engine's result is delivered.
+        let res = body_of("pub fn on_translate_result(");
+        let credit = res
+            .find("session.source_letters_sent += std::mem::take(&mut session.pending_source_letters);")
+            .expect("credited on delivery");
+        assert!(res[..credit].contains("if delivered {"));
+    }
+
+    /// Fourth pass, reproduced before fixing: none of these normal pages may
+    /// lose text that 1.0.4 translated.
+    #[test]
+    fn normal_pages_keep_what_1_0_4_translated() {
+        // R-001: a Greek page whose second batch tips the tally with one
+        // English button: both Greek nodes are still sent, never refused.
+        let mut b1: Vec<&str> = vec!["Καλημέρα"];
+        b1.extend(std::iter::repeat("2026").take(199));
+        let mut b2: Vec<&str> = vec!["Καλημέρα", "Unsubscribe"];
+        b2.extend(std::iter::repeat("2026").take(198));
+        let (sent, refused) = replay_sent("el", &[&b1, &b2]);
+        assert!(!refused, "a Greek page was refused");
+        assert_eq!(sent.iter().filter(|s| *s == "Καλημέρα").count(), 2);
+        assert!(!sent.iter().any(|s| s == "Unsubscribe"));
+        // R-002: kanji-only text on a page already shown to be Japanese.
+        let mut j1: Vec<&str> = vec!["ですます"; 5];
+        j1.extend(std::iter::repeat("2026").take(195));
+        let j2: &[&str] = &["東京都中央区日本橋"];
+        let (sent, refused) = replay_sent("ja", &[&j1, j2]);
+        assert!(!refused && sent.iter().any(|s| s == "東京都中央区日本橋"));
+        // Fifth pass R-001: a Japanese page with English buttons in its only
+        // batch: the tally is a mismatch, and the kanji-only address is still
+        // sent, as in 1.0.4.
+        let mixed: &[&str] = &["これは日本語の文章です東京", "東京都中央区日本橋", "Unsubscribe"];
+        let (sent, refused) = replay_sent("ja", &[mixed]);
+        assert!(!refused && sent.len() == 2 && !sent.iter().any(|s| s == "Unsubscribe"), "{sent:?}");
+        // R-003: a short Japanese page whose census is still Unknown.
+        let short: &[&str] = &["東京都中央区日本橋", "です"];
+        let (sent, refused) = replay_sent("ja", &[short]);
+        assert!(!refused && sent.len() == 2, "{sent:?}");
+    }
+
+    /// The incident guard, after the change: a page with nothing in the source
+    /// script is still refused at its first batch, sends nothing, and so
+    /// fetches no pack.
+    #[test]
+    fn a_wholly_foreign_page_is_still_refused_at_its_first_batch() {
+        let greek: &[&str] = &[
+            "Καλώς ήλθατε στην εφαρμογή",
+            "Επιλέξτε Ενεργώ για τον εαυτό μου εφόσον έχετε ΑΦΜ και Κλειδάριθμο",
+        ];
+        assert_eq!(replay_batches("en", &[greek]), (0, true));
+        assert_eq!(replay_batches("en", &[greek, greek, greek]), (0, true));
+        let mut counts = crate::detect::ScriptCounts::new("en");
+        let owned: Vec<String> = greek.iter().map(|s| s.to_string()).collect();
+        counts.add_batch(&owned);
+        assert!(plan_batch(&counts, &owned, 0, false).refuse);
+        assert!(plan_batch(&counts, &owned, MIN_SOURCE_LETTERS_SENT - 1, false).refuse);
+        let past = plan_batch(&counts, &owned, MIN_SOURCE_LETTERS_SENT, false);
+        assert!(!past.refuse && past.latch && past.sent.is_empty());
+        let latched = plan_batch(&counts, &owned, MIN_SOURCE_LETTERS_SENT, true);
+        assert!(!latched.refuse && !latched.latch && latched.sent.is_empty());
+    }
+
     /// Every detection failure key the guard can produce has a panel case, so
     /// a refusal renders a real message rather than degrading to the generic
     /// one. Mirrors the langpack test for PackError keys.
@@ -8189,6 +9106,7 @@ mod translation_session_tests {
             "translate-source-unknown",
             "translate-pair-unavailable",
             "translate-busy",
+            "translate-no-text",
         ] {
             assert_eq!(translation_failure_key(key), key, "{key} must survive the allowlist");
             assert!(
@@ -8204,6 +9122,40 @@ mod translation_session_tests {
     /// call it whenever it likes -- pretending otherwise would be theatre.
     /// What stops unprompted text being accepted is not the UI, which a page
     /// cannot reach, but this refusal.
+    #[test]
+    fn text_after_an_in_place_address_change_is_accepted_on_the_same_site() {
+        // Proton Mail: Translate pressed with the tab at the inbox (its last
+        // full load); the page has since opened an email in place.
+        let inbox = "https://mail.proton.me/u/0/inbox";
+        let email = "https://mail.proton.me/u/0/inbox/AbC123?x=1#y";
+        assert!(extract_is_acceptable(Some(inbox), inbox, "extract", email));
+        assert!(extract_is_acceptable(Some(inbox), inbox, "extract", inbox));
+        // Another site is still refused, however the page labels it.
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", "https://evil.example/u/0/inbox"));
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", "http://mail.proton.me/u/0/inbox"));
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", "https://mail.proton.me:8443/u/0/inbox"));
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", "not a url"));
+        // A full navigation since Translate still ends it.
+        assert!(!extract_is_acceptable(Some(inbox), "https://mail.proton.me/u/0/sent", "extract", email));
+        // An opaque origin is never "the same site": only the identical
+        // address passes, as in 1.0.4 (and no run starts on data: anyway).
+        assert!(!extract_is_acceptable(Some("data:text/html,x"), "data:text/html,x", "extract", "data:text/html,y"));
+        // Review R-001: nested blob URLs are refused without being unwrapped,
+        // and quickly.
+        let nested = format!("{}{inbox}", "blob:".repeat(40_000));
+        let started = std::time::Instant::now();
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", &nested));
+        assert!(!extract_is_acceptable(Some(inbox), inbox, "extract", &format!("blob:{inbox}")));
+        assert!(started.elapsed() < std::time::Duration::from_millis(200));
+        // Second review R-001: a long but identical address is accepted as
+        // before; the cap applies only to an address changed in place.
+        let long = format!("{inbox}?q={}", "x".repeat(6000));
+        assert!(extract_is_acceptable(Some(&long), &long, "extract", &long));
+        assert!(!extract_is_acceptable(Some(&long), &long, "extract", &format!("{long}y")));
+        // Default and explicit port are the same origin.
+        assert!(extract_is_acceptable(Some(inbox), inbox, "extract", "https://mail.proton.me:443/u/0/x"));
+    }
+
     #[test]
     fn text_from_a_page_with_no_session_is_refused() {
         let page = "https://example.com/a";

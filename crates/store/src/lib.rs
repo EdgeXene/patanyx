@@ -84,7 +84,7 @@ mod writer_tests;
 pub use error::StoreError;
 pub use model::{
     normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
-    DownloadRecord, PageSnapshot, RecordedDigest, Shelf, ShelfTab, StoreData,
+    DownloadRecord, PageSnapshot, RecordedDigest, Shelf, ShelfGroup, ShelfTab, StoreData,
 };
 // Re-exported so callers of the bookmark API don't need to name the
 // integrity crate in their own manifests.
@@ -623,8 +623,18 @@ impl Store {
     /// rolled back: Ok is the ONLY state in which the shelf exists, which
     /// is what shelving relies on when it closes tabs after this returns.
     pub fn add_shelf(&mut self, name: String, tabs: Vec<ShelfTab>) -> Result<Shelf, StoreError> {
+        self.add_shelf_grouped(name, tabs, None)
+    }
+
+    /// `add_shelf` for a shelf saved from a Tab Group.
+    pub fn add_shelf_grouped(
+        &mut self,
+        name: String,
+        tabs: Vec<ShelfTab>,
+        group: Option<ShelfGroup>,
+    ) -> Result<Shelf, StoreError> {
         let seq_before = self.data.next_shelf_seq;
-        let shelf = self.data.plan_new_shelf(name, tabs, now_unix());
+        let shelf = self.data.plan_new_shelf_grouped(name, tabs, group, now_unix());
         if let Err(err) = self.save() {
             self.data.shelves.pop();
             self.data.next_shelf_seq = seq_before;

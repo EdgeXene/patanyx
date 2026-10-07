@@ -1,0 +1,23 @@
+[package]
+name = "patanyx-reader"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2021"
+
+[dependencies]
+# Already in Cargo.lock at this exact version (wry pulls it for Android and
+# its own tests). A real HTML5 tree builder is used here, rather than the
+# integrity tokenizer, because Reader View DISPLAYS what it extracts: full
+# named-entity decoding and the spec's error recovery matter for text a
+# person reads, while integrity's tokenizer must stay frozen for its hashes.
+# The markdown feature is not needed.
+dom_query = { version = "0.27.0", default-features = false }
+# The parser dom_query is built on, at the version it pins (already in
+# Cargo.lock through it, so nothing new is compiled or shipped). Used directly
+# for its TreeSink, which lets depth.rs measure the tree as it is built.
+html5ever = "0.38.0"
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.4"
+version = "1.0.5"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -75,6 +75,7 @@ fluent-bundle = "0.16"
 unic-langid = "0.9"
 patanyx-vault = { path = "../vault" }
 patanyx-integrity = { path = "../integrity" }
+patanyx-reader = { path = "../reader" }
 patanyx-corroborate = { path = "../corroborate" }
 patanyx-store = { path = "../store" }
 patanyx-update = { path = "../update" }

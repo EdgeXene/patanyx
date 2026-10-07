@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'"
+      content="default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src blob:; connect-src 'none'; form-action 'none'; base-uri 'none'"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <link rel="stylesheet" href="chrome.css" />
@@ -198,6 +198,24 @@
         </svg>
         <span class="feature-label" data-msg="chrome.btn.bookmark.span">Bookmark this page</span>
       </button>
+      <!-- Reader View. A page drawn as three lines of text: straight runs
+           only, the same hard geometry as the rest of the set. -->
+      <button
+        id="btn-reader"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Reader View: this page's article as plain text (F9)"
+        aria-label="Reader View"
+       data-msg-aria-label="chrome.btn.reader.aria.label" data-msg-title="chrome.btn.reader.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3 2 H13 V14 H3 Z" />
+          <path d="M5.5 5.5 H10.5" />
+          <path d="M5.5 8 H10.5" />
+          <path d="M5.5 10.5 H8.5" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.reader.span">Reader View</span>
+      </button>
       <button
         id="btn-quarantine-menu"
         class="feature-btn"
@@ -338,6 +356,37 @@
                prefix of the accessible name, so the two do not disagree for
                anyone driving this by voice. -->
         <span class="feature-label" data-msg="chrome.btn.tab.span">TA</span>
+      </button>
+      <!-- Tab Groups. Three stacked tabs, straight runs only, the same hard
+           geometry as the rest of the set. -->
+      <button
+        id="btn-tab-group"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        aria-label="Tab Groups"
+        title="Tab Groups: name, color and shelve sets of tabs (or right-click a tab)"
+       data-msg-aria-label="chrome.btn.tab.group.aria.label" data-msg-title="chrome.btn.tab.group.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2 5 H7 V3 H14 V13 H2 Z" />
+          <path d="M2 8 H14" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.tab.group.span">Groups</span>
+      </button>
+      <!-- Side by Side. Two panes with the split between them. -->
+      <button
+        id="btn-side-by-side"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        aria-label="Side by Side"
+        title="Side by Side: this tab and the one beside it, or end it (Ctrl+Shift+S)"
+       data-msg-aria-label="chrome.btn.side.aria.label" data-msg-title="chrome.btn.side.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2 3 H14 V13 H2 Z" />
+          <path d="M8 3 V13" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.side.span">Side by Side</span>
       </button>
 
       <!-- Padlock = the vault, and the shackle opens when it is unlocked, so
@@ -628,6 +677,24 @@
          the version that clears the floor, and what to do meanwhile. Dismiss
          is for this launch only; the check runs again at the next start,
          which is the one time the state can have changed. -->
+    <!-- THE FEATURE VIDEOS (1.0.5). Raised once at boot, after the first-run
+         tour when that is showing, until Watch or Not now answers it; both
+         write a marker (prefs.rs). The videos stay one click away in About. -->
+    <div id="tutorial-banner" role="status" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M2.5 3.5 H13.5 V12.5 H2.5 Z" />
+        <path d="M6.8 6 L10.2 8 L6.8 10 Z" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title" data-msg="chrome.tutorial.banner.title.span">New in 1.0.5: Reader View, Tab Groups and Side by Side</span>
+        <span data-msg="chrome.tutorial.banner.body.span">Three short, silent videos show how each one works. They are built into PATANYX, so watching them downloads nothing. They stay in About for later.</span>
+      </div>
+      <div class="banner-actions">
+        <button id="tutorial-banner-watch" type="button" class="small" data-msg="chrome.tutorial.banner.watch.button">Watch</button>
+        <button id="tutorial-banner-later" type="button" class="small" data-msg="chrome.tutorial.banner.later.button">Not now</button>
+      </div>
+    </div>
+
     <div id="engine-floor-warning" role="alert" hidden>
       <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
         <path d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11 13.8 8 14.8 C5 13.8 2.5 11.5 2.5 8 V3.5 Z" />
@@ -3347,6 +3414,92 @@
          The third-party list is fetched only when its section is opened. It is
          around 300 KB for the Windows build, which is not a thing to push
          across the IPC boundary every time somebody glances at About. -->
+    <!-- Reader View. The article on the current page as plain text.
+
+         WHERE IT COMES FROM: the page the server sent, as the engine already
+         received it (reader_view.rs), extracted in Rust into typed blocks of
+         plain strings. Nothing runs in the page to produce it, and no image
+         or other resource is loaded to show it.
+
+         HOW IT IS DRAWN: every block is built with createElement and
+         textContent (chrome.js, renderReaderArticle). Page text arriving in
+         the trusted chrome document is never parsed as markup.
+
+         LIFETIME: memory only. Closing the panel, switching tabs, or the
+         page loading something new clears it (reader_cleared). -->
+    <section id="tutorial-panel" class="panel-wide" hidden>
+      <h1 data-msg="chrome.tutorial.panel.h1">Feature videos</h1>
+      <div id="tutorial-topics" class="reader-controls" role="group" aria-label="Choose a video" data-msg-aria-label="chrome.tutorial.topics.aria.label">
+        <button id="tutorial-topic-reader" type="button" class="small" aria-pressed="true" data-msg="chrome.tutorial.topic.reader.button">Reader View</button>
+        <button id="tutorial-topic-groups" type="button" class="small" aria-pressed="false" data-msg="chrome.tutorial.topic.groups.button">Tab Groups</button>
+        <button id="tutorial-topic-side" type="button" class="small" aria-pressed="false" data-msg="chrome.tutorial.topic.side.button">Side by Side</button>
+      </div>
+      <video id="tutorial-video" class="tutorial-video" controls playsinline preload="metadata" aria-label="Feature video" data-msg-aria-label="chrome.tutorial.video.aria.label"></video>
+      <p id="tutorial-error" class="panel-foot" role="status" hidden data-msg="chrome.tutorial.error.p">This video could not play. The steps below still apply.</p>
+      <ol id="tutorial-steps" class="tutorial-steps"></ol>
+    </section>
+
+    <section id="reader-panel" class="panel-wide" hidden>
+      <h1 data-msg="chrome.reader.panel.h1">Reader View</h1>
+      <div class="reader-controls" role="group" aria-label="Reader View text settings" data-msg-aria-label="chrome.reader.controls.aria.label">
+        <button id="reader-smaller" type="button" class="small" title="Smaller text" aria-label="Smaller text" data-msg-title="chrome.reader.smaller.title" data-msg-aria-label="chrome.reader.smaller.aria.label">A&#8722;</button>
+        <button id="reader-larger" type="button" class="small" title="Larger text" aria-label="Larger text" data-msg-title="chrome.reader.larger.title" data-msg-aria-label="chrome.reader.larger.aria.label">A+</button>
+        <button id="reader-font" type="button" class="small" aria-pressed="false" data-msg="chrome.reader.font.button">Serif</button>
+      </div>
+      <p id="reader-status" class="panel-foot" role="status"></p>
+      <button id="reader-retry" type="button" class="small" hidden data-msg="chrome.reader.retry.button">Read this page</button>
+      <article id="reader-body" class="reader-body" hidden>
+        <h2 id="reader-title"></h2>
+        <p id="reader-meta" class="reader-meta" hidden></p>
+        <div id="reader-blocks"></div>
+        <p id="reader-truncated" class="panel-foot" hidden data-msg="chrome.reader.truncated.p">This article is very long, so only the first part is shown.</p>
+      </article>
+      <p class="panel-foot" data-msg="chrome.reader.note.p">Text only, read from the page this tab already loaded.</p>
+    </section>
+
+    <!-- Tab Groups. Acts on one tab: the one right-clicked in the strip, or
+         the tab on screen when opened from the toolbar. Groups are live
+         only, like the tabs; "Shelve this group" is the one way to keep
+         one, and it goes to the encrypted Library. Group names are the
+         user's own text and are only ever set with textContent / .value. -->
+    <section id="group-panel" hidden>
+      <h1 data-msg="chrome.group.panel.h1">Tab Groups</h1>
+      <p class="panel-foot"><span data-msg="chrome.group.target.label">This tab:</span> <span id="group-target"></span></p>
+      <div id="group-new">
+        <h2 data-msg="chrome.group.new.h2">New group</h2>
+        <input id="group-name-new" type="text" maxlength="40" autocomplete="off" spellcheck="false" placeholder="Name (optional)" aria-label="Group name" data-msg-placeholder="chrome.group.name.placeholder" data-msg-aria-label="chrome.group.name.aria.label"/>
+        <div id="group-colors-new" class="group-colors" role="group" aria-label="Group color" data-msg-aria-label="chrome.group.colors.aria.label"></div>
+        <button id="group-create" type="button" data-msg="chrome.group.create.button">Make a group with this tab</button>
+      </div>
+      <div id="group-existing" hidden>
+        <h2 data-msg="chrome.group.existing.h2">Add to a group</h2>
+        <div id="group-existing-list" class="group-existing"></div>
+      </div>
+      <div id="group-current" hidden>
+        <h2 data-msg="chrome.group.current.h2">This tab's group</h2>
+        <div class="group-row">
+          <input id="group-name-edit" type="text" maxlength="40" autocomplete="off" spellcheck="false" aria-label="Group name" data-msg-aria-label="chrome.group.name.aria.label"/>
+          <button id="group-rename" type="button" class="small" data-msg="chrome.group.rename.button">Rename</button>
+        </div>
+        <div id="group-colors-edit" class="group-colors" role="group" aria-label="Group color" data-msg-aria-label="chrome.group.colors.aria.label"></div>
+        <div class="group-actions">
+          <button id="group-collapse-toggle" type="button" data-msg="chrome.group.collapse.button">Hide the group's tabs</button>
+          <button id="group-remove-tab" type="button" data-msg="chrome.group.remove.button">Take this tab out of the group</button>
+          <button id="group-save-shelf" type="button" data-msg="chrome.group.save.button">Shelve this group</button>
+          <button id="group-ungroup" type="button" data-msg="chrome.group.ungroup.button">Ungroup</button>
+          <button id="group-close" type="button" data-msg="chrome.group.close.button">Close the group's tabs</button>
+          <button id="group-close-confirm" type="button" class="danger" hidden></button>
+        </div>
+      </div>
+      <div id="group-side">
+        <h2 data-msg="chrome.group.side.h2">Side by Side</h2>
+        <button id="group-side-open" type="button" data-msg="chrome.group.side.open.button">Show beside the tab on screen</button>
+        <button id="group-side-close" type="button" hidden data-msg="chrome.group.side.close.button">End Side by Side</button>
+      </div>
+      <p id="group-status" class="panel-foot" role="status"></p>
+      <p class="panel-foot" data-msg="chrome.group.note.p">Groups last until you close PATANYX. Shelving a group closes its tabs and keeps it in your encrypted Library, and restoring the shelf brings the group back.</p>
+    </section>
+
     <section id="about-panel" hidden>
       <h1 id="about-title" data-msg="chrome.about.title.h1">About</h1>
       <p class="panel-intro" id="about-build"></p>
@@ -3354,6 +3507,7 @@
         <button id="about-tour-again" type="button" class="small" data-msg="chrome.about.tour.again.button">
           Show the tour again
         </button>
+        <button id="about-videos" type="button" class="small" data-msg="chrome.about.videos.button">Watch the feature videos</button>
       </div>
       <div id="about-description"></div>
 

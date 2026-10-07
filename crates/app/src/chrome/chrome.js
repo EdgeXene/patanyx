@@ -480,7 +480,7 @@
         // tabs_changed. Reorder replies enter through the same writer, so a
         // drop renders the canonical Rust order rather than trusting its DOM
         // preview.
-        acceptTabItems((msg.data && msg.data.items) || []);
+        acceptTabItems((msg.data && msg.data.items) || [], msg.data && msg.data.groups);
         break;
       case "find_open":
         openFindBar();
@@ -624,6 +624,19 @@
       // pressing a toolbar pill a second time.
       case "open_command_palette":
         togglePanelNamed("palette");
+        break;
+      // Ctrl+Shift+S could not pair (one tab, chat pane docked, ...).
+      case "side_by_side_error":
+        toast(friendly({ message: (msg.data && msg.data.code) || "" }), true);
+        break;
+      // F9, resolved natively in Rust like Ctrl+K above.
+      case "toggle_reader_view":
+        togglePanelNamed("reader");
+        break;
+      case "reader_article":
+      case "reader_error":
+      case "reader_cleared":
+        readerEvent(msg.event, msg.data || {});
         break;
       // The per-tab status feed. Nothing handled this and nothing emitted it,
       // so every per-tab indicator was frozen at its markup default — most
@@ -1012,6 +1025,20 @@
       // in ipc.rs that fails when a code is missing from this table, so the
       // claim is enforced rather than repeated.
       no_tab: i18nText("chrome-js-error-no-tab", "No active tab. Open or select one, then try again."),
+      // Reader View (reader_view.rs). Each says what happened and, where
+      // there is one, what to do; none promises a retry will help when it
+      // will not.
+      reader_unsupported_url: i18nText("chrome-js-error-reader-unsupported-url", "Reader View works on web pages (http and https) only."),
+      reader_unsupported: i18nText("chrome-js-error-reader-unsupported", "Reader View is not available in this browser engine right now."),
+      reader_page_loading: i18nText("chrome-js-error-reader-page-loading", "This page is still loading. Try again when it has finished."),
+      reader_page_unavailable: i18nText("chrome-js-error-reader-page-unavailable", "Reader View could not read this copy of the page. Some reloads and very large pages arrive without text it can use."),
+      reader_no_article: i18nText("chrome-js-error-reader-no-article", "No article was found on this page. Pages built by scripts, lists and forms have none to show."),
+      reader_unsupported_encoding: i18nText("chrome-js-error-reader-unsupported-encoding", "Reader View cannot read this page's text encoding."),
+      reader_busy: i18nText("chrome-js-error-reader-busy", "Reader View is still preparing the last page. Try again in a moment."),
+      too_many_groups: i18nText("chrome-js-error-too-many-groups", "That is the most groups PATANYX keeps at once. Ungroup one first."),
+      side_by_side_needs_two: i18nText("chrome-js-error-side-needs-two", "Side by Side needs a second tab. Open one, then try again."),
+      side_by_side_same_tab: i18nText("chrome-js-error-side-same-tab", "That is the tab already on screen. Choose a different tab to show beside it."),
+      side_by_side_chat_open: i18nText("chrome-js-error-side-chat-open", "Close the side pane first: it uses the space Side by Side needs."),
       not_ready:
         i18nText("chrome-js-error-not-ready", "The update has not finished downloading and verifying yet. Wait for it to complete, then try again."),
       install_failed:
@@ -1251,6 +1278,12 @@
   // chip the pointer was holding. Chips are now keyed by tab id; a repaint
   // updates each one in place and moves only the ones whose place changed.
   const tabChipsById = new Map();
+  // Tab Groups as Rust last sent them: [{id, name, color, collapsed}], in
+  // strip order. Live only; nothing here is stored.
+  let lastTabGroups = [];
+  // The palette, mirrored from tab_groups.rs COLORS. Each word maps to a
+  // class in chrome.css; a color is never a free-form CSS value.
+  const GROUP_COLORS = ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan"];
   // The pointer drag in progress, or null. It holds a tab id and some
   // geometry, never a payload: this is pointer events on our own elements,
   // not HTML5 drag and drop, so nothing is ever placed where another
@@ -1268,8 +1301,11 @@
   const TAB_SLIDE_MS = 150;
   let tabSettleTimer = 0;
 
-  function acceptTabItems(items) {
+  function acceptTabItems(items, groups) {
     lastTabItems = Array.isArray(items) ? items : [];
+    // Tab Groups (tab_groups.rs) arrive beside the items. A caller that
+    // has none keeps the last known set rather than wiping every group.
+    if (Array.isArray(groups)) lastTabGroups = groups;
     // The first tab's url_changed can fire before this script has loaded, so
     // the bar may never have been told which tab its address belongs to --
     // and without that, the first redirect after launch replaced whatever was
@@ -1395,6 +1431,10 @@
     }
     tabDrag = {
       id: Number(chip.dataset.tabId),
+      // A press on the group label is that label's click, whichever element
+      // the engine then delivers the click to: after pointer capture the
+      // spec retargets it to the chip, which would switch tabs instead.
+      fromLabel: hasClassName(target, "chip-group-label"),
       chip,
       wrap,
       pointerId: ev.pointerId,
@@ -1415,7 +1455,12 @@
   }
 
   function startTabDrag(drag) {
-    const chips = tabChipList(drag.wrap);
+    // Visible chips only: a collapsed group's hidden members have no box,
+    // and measuring them as zero-width slots moved tabs the screen did not
+    // show moving. They are put back in place when the drop is committed
+    // (expandHiddenTabs).
+    const chips = tabChipList(drag.wrap).filter((chip) => !chip.hidden);
+    drag.allIds = tabDomIds(drag.wrap);
     drag.from = chips.indexOf(drag.chip);
     if (drag.from < 0 || chips.length < 2) return false;
     // A drag can begin while the last slide is still settling. Measure the
@@ -1520,13 +1565,28 @@
     if (!drag || ev.pointerId !== drag.pointerId) return;
     tabDrag = null;
     releaseTabCapture(drag);
-    if (!drag.started) return; // a click: it goes on to switch tabs
+    if (!drag.started) {
+      if (drag.fromLabel) {
+        // The group label was clicked: fold or unfold, and keep the chip's
+        // own click from switching tabs.
+        tabClickSuppressed = true;
+        toggleGroupOfTab(drag.id);
+      }
+      return; // otherwise a plain click: it goes on to switch tabs
+    }
     tabClickSuppressed = true;
-    const next = movedTabIds(drag.ids, drag.from, drag.to);
-    const changed = !sameTabIds(
-      next,
-      lastTabItems.map((tab) => tab.id),
-    );
+    // A drag that ends in the slot it started from moves nothing, whatever
+    // the hidden members' anchors would make of it (review round 4, R-003).
+    const next =
+      drag.from === drag.to
+        ? null
+        : groupAwareOrder(expandHiddenTabs(movedTabIds(drag.ids, drag.from, drag.to), [drag.id]), drag.id);
+    const changed =
+      next !== null &&
+      !sameTabIds(
+        next,
+        lastTabItems.map((tab) => tab.id),
+      );
     settleTabDrag(drag, changed ? next : null);
     // Committed on release, not on every crossing: Rust revalidates the whole
     // permutation once, and its reply is the order the strip keeps.
@@ -1590,7 +1650,7 @@
       if (!reply || !Array.isArray(reply.items)) throw new Error("bad_reply");
       // The strip's order was only a preview. Rust has revalidated the full
       // permutation and this is its canonical order, including active flags.
-      acceptTabItems(reply.items);
+      acceptTabItems(reply.items, reply.groups);
       if (focusId !== undefined && focusId !== null) {
         const chip = tabChipsById.get(focusId);
         if (chip) chip.focus();
@@ -1647,6 +1707,10 @@
       ev.preventDefault();
       rb("tab_close", { id }).catch(() => {});
     });
+    chip.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault();
+      openGroupPanelFor(id);
+    });
     chip.addEventListener("pointerdown", (ev) => beginTabPress(wrap, chip, ev));
     chip.addEventListener("pointermove", moveTabDrag);
     chip.addEventListener("pointerup", endTabDrag);
@@ -1660,8 +1724,16 @@
       if (tabDrag && tabDrag.started) return;
       const ids = tabDomIds(wrap);
       const from = ids.indexOf(id);
-      const to = from + (ev.key === "ArrowLeft" ? -1 : 1);
+      let to = from + (ev.key === "ArrowLeft" ? -1 : 1);
       if (from < 0 || to < 0 || to >= ids.length) return;
+      // A group is one step: moving next to another group's tab jumps its
+      // whole run, which Rust would otherwise undo by regathering the group.
+      const own = (lastTabItems.find((t) => t.id === id) || {}).group;
+      const next1 = lastTabItems.find((t) => t.id === ids[to]);
+      if (next1 && typeof next1.group === "number" && next1.group !== own) {
+        const run = ids.filter((x) => (lastTabItems.find((t) => t.id === x) || {}).group === next1.group);
+        to = ev.key === "ArrowLeft" ? ids.indexOf(run[0]) : ids.indexOf(run[run.length - 1]);
+      }
       ev.preventDefault();
       const next = movedTabIds(ids, from, to);
       slideTabs(wrap, () => putTabDomInOrder(wrap, next));
@@ -1715,6 +1787,154 @@
     }
   }
 
+  // TAB GROUPS ON THE STRIP. No header element is added to #tabs: the
+  // strip places chips by index and the drag measures chips, so a group is
+  // drawn ON its chips instead. Every member wears its color band; the
+  // first member carries the name, which is also the collapse toggle; a
+  // collapsed group shows only that first chip (and the active tab, so the
+  // tab on screen is never missing from the strip).
+  function paintTabGroups(list) {
+    // Side by Side: mark the two paired chips, and the toolbar button.
+    let anyPaired = false;
+    for (const tab of list) {
+      const chip = tabChipsById.get(tab.id);
+      if (!chip) continue;
+      chip.classList.toggle("paired", tab.paired === "left" || tab.paired === "right");
+      chip.classList.toggle("paired-left", tab.paired === "left");
+      chip.classList.toggle("paired-right", tab.paired === "right");
+      if (tab.paired) anyPaired = true;
+    }
+    const sideBtn = $("btn-side-by-side");
+    if (sideBtn) sideBtn.setAttribute("aria-pressed", anyPaired ? "true" : "false");
+    const groups = new Map(lastTabGroups.map((g) => [g.id, g]));
+    const seen = new Map(); // group id -> count so far
+    for (const tab of list) {
+      const chip = tabChipsById.get(tab.id);
+      if (!chip) continue;
+      const g = typeof tab.group === "number" ? groups.get(tab.group) : null;
+      for (const c of GROUP_COLORS) chip.classList.toggle("group-color-" + c, !!g && g.color === c);
+      chip.classList.toggle("in-group", !!g);
+      let label = chip.querySelector(".chip-group-label");
+      const first = !!g && !seen.has(g.id);
+      if (g) seen.set(g.id, (seen.get(g.id) || 0) + 1);
+      chip.classList.toggle("group-first", first);
+      // Never hide a tab whose page is on screen: the active one, or either
+      // Side by Side pane.
+      chip.hidden = !!g && g.collapsed && !first && !tab.active && !tab.paired;
+      if (!first) {
+        if (label) chip.removeChild(label);
+        continue;
+      }
+      if (!label) {
+        label = el("button", "chip-group-label", "");
+        label.type = "button";
+        label.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          // Pointer clicks are handled where the press ended (endTabDrag),
+          // because after pointer capture the engine may deliver them to
+          // the chip instead. Only a keyboard click (detail 0) lands here.
+          if (ev.detail !== 0) return;
+          const gid = Number(label.dataset.groupId);
+          const cur = lastTabGroups.find((x) => x.id === gid);
+          if (!cur) return;
+          rb("group_collapse", { group: gid, collapsed: !cur.collapsed }).catch((e) => toast(friendly(e), true));
+        });
+        // Not a drag handle of its own: a press on the label still starts
+        // the chip's drag, which carries the whole group.
+        chip.insertBefore(label, chip.firstChild);
+      }
+      label.dataset.groupId = String(g.id);
+      const count = list.filter((t) => t.group === g.id).length;
+      // Count FIRST when folded: a long name is cut with an ellipsis, and the
+      // count is the one part that must survive the cut.
+      const text = g.collapsed ? "(" + count + ")" + (g.name ? " " + g.name : "") : g.name;
+      if (label.textContent !== text) label.textContent = text;
+      label.setAttribute("aria-expanded", g.collapsed ? "false" : "true");
+      label.title = g.collapsed
+        ? i18nText("chrome-js-group-expand-title", "Show this group's tabs")
+        : i18nText("chrome-js-group-collapse-title", "Hide this group's tabs");
+    }
+  }
+
+  // Put a collapsed group's hidden members back, so a drop always proposes
+  // every tab. Each one goes back after the nearest visible member of its
+  // group that came before it in the strip (or, if none did, in front of the
+  // nearest one after it). A collapsed group can show two chips, its first
+  // and the active tab; putting every hidden member after the first one
+  // reordered the group on a drag that crossed nothing (review round 2,
+  // R-003). The tabs being dragged are anchors only when nothing else in
+  // the group is visible: a member that is not the group's first moves
+  // alone, and a hidden member must not ride along with it (review round 3,
+  // R-002).
+  // `moving`: the ids being dragged (the drag moves one tab).
+  function expandHiddenTabs(order, moving) {
+    const hidden = lastTabItems.filter((t) => {
+      const chip = tabChipsById.get(t.id);
+      return chip && chip.hidden && !order.includes(t.id);
+    });
+    if (!hidden.length) return order;
+    const shown = new Set(order);
+    const after = new Map();
+    const before = new Map();
+    const loose = [];
+    const add = (map, key, id) => {
+      if (!map.has(key)) map.set(key, []);
+      map.get(key).push(id);
+    };
+    const dragged = new Set(moving || []);
+    const sameGroupShown = (h, from, step, allowDragged) => {
+      for (let i = from; i >= 0 && i < lastTabItems.length; i += step) {
+        const t = lastTabItems[i];
+        if (t.group === h.group && shown.has(t.id) && (allowDragged || !dragged.has(t.id))) return t.id;
+      }
+      return null;
+    };
+    for (const h of hidden) {
+      const at = lastTabItems.findIndex((t) => t.id === h.id);
+      let placed = false;
+      for (const allowDragged of [false, true]) {
+        const prev = sameGroupShown(h, at - 1, -1, allowDragged);
+        if (prev !== null) {
+          add(after, prev, h.id);
+          placed = true;
+          break;
+        }
+        const next = sameGroupShown(h, at + 1, 1, allowDragged);
+        if (next !== null) {
+          add(before, next, h.id);
+          placed = true;
+          break;
+        }
+      }
+      if (!placed) loose.push(h.id);
+    }
+    const out = [];
+    for (const id of order) {
+      out.push(...(before.get(id) || []), id, ...(after.get(id) || []));
+    }
+    return out.concat(loose);
+  }
+
+  function toggleGroupOfTab(tabId) {
+    const tab = lastTabItems.find((t) => t.id === tabId);
+    const g = tab && lastTabGroups.find((x) => x.id === tab.group);
+    if (!g) return;
+    rb("group_collapse", { group: g.id, collapsed: !g.collapsed }).catch((e) => toast(friendly(e), true));
+  }
+
+  // Dragging a group's first chip moves the whole group with it; any other
+  // member moves alone and Rust gathers its group back together.
+  function groupAwareOrder(next, draggedId) {
+    const tab = lastTabItems.find((t) => t.id === draggedId);
+    if (!tab || typeof tab.group !== "number") return next;
+    const members = lastTabItems.filter((t) => t.group === tab.group).map((t) => t.id);
+    if (members[0] !== draggedId) return next;
+    const rest = next.filter((id) => !members.includes(id) || id === draggedId);
+    const at = rest.indexOf(draggedId);
+    const others = members.filter((id) => id !== draggedId);
+    return [...rest.slice(0, at + 1), ...others, ...rest.slice(at + 1)];
+  }
+
   function renderTabs(items) {
     const wrap = $("tabs");
     wireTabStrip(wrap);
@@ -1737,7 +1957,7 @@
     if (
       tabDrag &&
       (!ids.includes(tabDrag.id) ||
-        (tabDrag.started && !sameTabIds(tabDrag.ids, ids)))
+        (tabDrag.started && !sameTabIds(tabDrag.allIds || tabDrag.ids, ids)))
     ) {
       cancelTabDrag();
     }
@@ -1750,6 +1970,7 @@
       }
       paintTabChip(chip, tab);
     }
+    paintTabGroups(list);
     const live = new Set(ids);
     const stale = Array.from(tabChipsById).filter(([id]) => !live.has(id));
     if (stale.length || !sameTabIds(tabDomIds(wrap), ids)) {
@@ -2311,6 +2532,12 @@
           "page-covers-chrome",
           !!(r && r.page_covers_chrome),
         );
+        // A solid backdrop where the engine cannot repaint a translucent one
+        // cleanly (WebKitGTK without compositing; see chrome_caps).
+        document.body.classList.toggle(
+          "solid-backdrop",
+          !!(r && r.solid_backdrop),
+        );
         // Whether the accent reaches the scrollbars of pages ("live" on
         // WebView2; "unsupported" on WebKitGTK, which has no
         // scrollbar-color). The sentence is shown only where it is true,
@@ -2842,6 +3069,10 @@
   /// for in the first place.
   const FOCUSABLE = [
     "a[href]",
+    // The feature videos' native controls (plan review, 2026-10-07): without
+    // this, Tab wrapped from the last topic button to Close and the player
+    // could not be reached from the keyboard.
+    "video[controls]",
     "button:not([disabled])",
     "input:not([disabled])",
     "select:not([disabled])",
@@ -3668,6 +3899,10 @@
         return i18nText("chrome-translate-status-failed-timeout",
           "This took too long and was stopped. The page is unchanged and still readable.",
         );
+      case "translate-no-text":
+        return i18nText("chrome-translate-status-failed-no-text",
+          "The page's text never reached the translator. The page is unchanged. Reload it, then translate again.",
+        );
       case "translate-pair-unavailable":
         return i18nText("chrome-translate-status-failed-unavailable",
           "There is no language pack for that translation direction yet. The page is unchanged.",
@@ -4230,6 +4465,167 @@
       .catch(hideSavePasswordBanner);
   });
 
+  // ---- feature videos (1.0.5) ----
+  //
+  // Three silent recordings compiled into the browser (tutorial.rs), handed
+  // over IPC and played from a blob URL (media-src blob:), so watching one
+  // contacts nobody. A blob, not a chrome-origin URL, because WebKitGTK's
+  // media pipeline only fetches http(s), file and blob sources. A panel of
+  // the chrome, not a web tab: a tab would need an app protocol on every
+  // content webview, which any web page could then reach. Opened from the
+  // one-time banner and, always, from About.
+  let tutorialTopic = "reader-view";
+  const TUTORIAL_TOPICS = [
+    ["reader-view", "tutorial-topic-reader"],
+    ["tab-groups", "tutorial-topic-groups"],
+    ["side-by-side", "tutorial-topic-side"],
+  ];
+  // Per topic: the object URL once fetched (one each, kept for the session:
+  // three videos, about 2 MB in all), whether a request is in flight (one at
+  // a time, however often the topic is clicked), and whether its video
+  // failed (the error line stays with that topic until it loads). Every
+  // reply and failure is shown only if its topic is the one on screen.
+  const tutorialUrls = new Map();
+  const tutorialPending = new Set();
+  const tutorialFailed = new Set();
+  function showTutorialError() {
+    $("tutorial-error").hidden = !tutorialFailed.has(tutorialTopic);
+  }
+  function loadTutorialVideo(topic) {
+    const video = $("tutorial-video");
+    showTutorialError();
+    const ready = tutorialUrls.get(topic);
+    if (ready) {
+      if (video.getAttribute("src") !== ready) video.setAttribute("src", ready);
+      return;
+    }
+    video.removeAttribute("src");
+    // Reset the element, so events still queued for the previous video are
+    // dropped rather than landing on this topic.
+    if (typeof video.load === "function") video.load();
+    if (tutorialPending.has(topic)) return;
+    tutorialPending.add(topic);
+    rb("tutorial_video", { name: topic })
+      .then((reply) => {
+        const binary = atob((reply && reply.data) || "");
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+        tutorialUrls.set(topic, URL.createObjectURL(new Blob([bytes], { type: "video/webm" })));
+        tutorialFailed.delete(topic);
+        // A reply for a topic the user has already left is kept, not shown.
+        if (tutorialTopic === topic) {
+          video.setAttribute("src", tutorialUrls.get(topic));
+          showTutorialError();
+        }
+      })
+      .catch(() => {
+        tutorialFailed.add(topic);
+        if (tutorialTopic === topic) showTutorialError();
+      })
+      .finally(() => tutorialPending.delete(topic));
+  }
+  function tutorialSteps(topic) {
+    if (topic === "tab-groups") {
+      return [
+        i18nText("chrome-js-tutorial-groups-step-1", "Right-click a tab, choose a color and an optional name, then click Make a group with this tab."),
+        i18nText("chrome-js-tutorial-groups-step-2", "Right-click another tab and pick the group under Add to a group. Click the colored label at the start of the group to fold its tabs away, and again to bring them back."),
+        i18nText("chrome-js-tutorial-groups-step-3", "Shelve this group closes its tabs and keeps the group in your encrypted Library; Restore, under Tab Shelf, brings it back. Groups you do not shelve end when you close PATANYX."),
+      ];
+    }
+    if (topic === "side-by-side") {
+      return [
+        i18nText("chrome-js-tutorial-side-step-1", "Click Side by Side in the toolbar, or press Ctrl+Shift+S, to show this tab beside the one next to it."),
+        i18nText("chrome-js-tutorial-side-step-2", "To choose the pair yourself, right-click the other tab and click Show beside the tab on screen."),
+        i18nText("chrome-js-tutorial-side-step-3", "Click into either half to work in it. Click Side by Side again to go back to one page."),
+      ];
+    }
+    return [
+      i18nText("chrome-js-tutorial-reader-step-1", "Click Reader View in the toolbar, or press F9, to read the article on this page as plain text, without the menus, ads and pop-ups around it."),
+      i18nText("chrome-js-tutorial-reader-step-2", "A− and A+ change the text size. Serif switches the typeface."),
+      i18nText("chrome-js-tutorial-reader-step-3", "Press F9 again, or click Close, to go back to the page."),
+    ];
+  }
+  function renderTutorial() {
+    for (const [topic, id] of TUTORIAL_TOPICS) {
+      $(id).setAttribute("aria-pressed", topic === tutorialTopic ? "true" : "false");
+    }
+    loadTutorialVideo(tutorialTopic);
+    const list = $("tutorial-steps");
+    list.textContent = "";
+    for (const line of tutorialSteps(tutorialTopic)) list.appendChild(el("li", "", line));
+  }
+  for (const [topic, id] of TUTORIAL_TOPICS) {
+    $(id).addEventListener("click", () => {
+      tutorialTopic = topic;
+      renderTutorial();
+    });
+  }
+  // A video that cannot play (a missing decoder) still leaves the steps.
+  // Media events belong to the video the element is playing, found by its
+  // src, not to whichever topic is selected now: an event can still arrive
+  // for the previous one. A video that loads clears its own failure.
+  function tutorialTopicOfSrc() {
+    const src = $("tutorial-video").getAttribute("src");
+    for (const [topic, url] of tutorialUrls) if (url === src) return topic;
+    return null;
+  }
+  $("tutorial-video").addEventListener("error", () => {
+    const topic = tutorialTopicOfSrc();
+    if (topic === null) return;
+    tutorialFailed.add(topic);
+    showTutorialError();
+  });
+  $("tutorial-video").addEventListener("loadeddata", () => {
+    const topic = tutorialTopicOfSrc();
+    if (topic === null) return;
+    tutorialFailed.delete(topic);
+    showTutorialError();
+  });
+  registerPanel("tutorial", {
+    el: $("tutorial-panel"),
+    button: $("about-videos"),
+    // Tall: a 1280x800 video and its steps. 800 is the chrome's ceiling.
+    heightPx: 800,
+    onOpen: () => renderTutorial(),
+    onClose: () => {
+      const video = $("tutorial-video");
+      if (video && typeof video.pause === "function") video.pause();
+    },
+  });
+  rebuildOnLocaleFill(() => {
+    if (openPanelName === "tutorial") renderTutorial();
+  });
+  // Watch and Not now both answer the banner for good (the marker), and
+  // About keeps the way back.
+  function answerTutorialBanner() {
+    const banner = $("tutorial-banner");
+    if (!banner.hidden) {
+      banner.hidden = true;
+      syncChromeInsets();
+    }
+    rb("tutorial_seen_set").catch(() => {});
+  }
+  $("tutorial-banner-watch").addEventListener("click", () => {
+    answerTutorialBanner();
+    if (openPanelName !== "tutorial") togglePanelNamed("tutorial");
+  });
+  $("tutorial-banner-later").addEventListener("click", answerTutorialBanner);
+  // Asked after the first-run tour, never over it: called from the boot
+  // check when the tour is already resolved, and from the tour's close.
+  function maybeShowTutorialBanner() {
+    rb("tutorial_seen_get")
+      .then((data) => {
+        if (data && data.seen === false) {
+          const banner = $("tutorial-banner");
+          if (banner.hidden) {
+            banner.hidden = false;
+            syncChromeInsets();
+          }
+        }
+      })
+      .catch(() => {});
+  }
+
   // ---- first-run tour ----
   //
   // Auto-opened by the boot check further down when `onboarding_seen_get`
@@ -4243,6 +4639,7 @@
     heightPx: CHROME_OPEN_PX,
     onClose: () => {
       rb("onboarding_seen_set").catch(() => {});
+      maybeShowTutorialBanner();
     },
   });
   $("onboarding-done").addEventListener("click", () => closeOpenPanel());
@@ -4266,6 +4663,9 @@
       { label: i18nText("chrome-js-tabs-new-tab", "New tab"), buttonId: "btn-newtab" },
       { label: i18nText("chrome-js-palette-new-quarantine", "New quarantine tab"), buttonId: "btn-quarantine-menu" },
       { label: i18nText("chrome-js-palette-bookmark", "Bookmark this page"), buttonId: "btn-bookmark" },
+      { label: i18nText("chrome-js-palette-reader", "Open Reader View"), buttonId: "btn-reader" },
+      { label: i18nText("chrome-js-palette-group", "Group this tab"), buttonId: "btn-tab-group" },
+      { label: i18nText("chrome-js-palette-side", "Side by Side"), buttonId: "btn-side-by-side" },
       { label: i18nText("chrome-js-palette-privacy", "Open Privacy"), buttonId: "btn-privacy" },
       { label: i18nText("chrome-js-palette-theme", "Open Theme"), buttonId: "btn-theme" },
       { label: i18nText("chrome-js-palette-freeze", "Toggle freeze for this tab"), buttonId: "btn-freeze" },
@@ -7437,7 +7837,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   // The first tabs_changed may also fire before this script loaded, so the
   // initial strip is fetched explicitly.
   rb("tab_list")
-    .then((data) => acceptTabItems(data && data.items))
+    .then((data) => acceptTabItems(data && data.items, data && data.groups))
     .catch(() => {});
 
   // Put the keyboard where a launch means it: the address bar, or the page
@@ -7465,6 +7865,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         // what a vault is in this browser is the wrong order to meet it in.
         return null;
       }
+      // The tour is already resolved, so the feature-videos banner may ask.
+      maybeShowTutorialBanner();
       // THE VAULT OPENS ITSELF at launch on every later run. Bookmarks, saved
       // passwords and download records all unlock with it, so a locked vault
       // is the state in which most of the browser quietly does nothing -- the
@@ -7543,6 +7945,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     "adlist-warning",
     // The engine-below-floor warning, raised at boot: same band, same rule.
     "engine-floor-warning",
+    // The feature-videos banner (1.0.5): same band, same rule.
+    "tutorial-banner",
     // The find bar. NOT a banner by role (role="search"), which is exactly how
     // it escaped the toolbar gate's role=alert|status sweep and this list.
     // With the toolbar across the top the closed strip is measured against a
@@ -7654,6 +8058,18 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     retireBlockedOnNavigation(st);
     if (!st) return;
     lastTabStatus = st;
+    // The hosts the freeze really lets through, from Rust. An exception that
+    // failed to install is rolled back there, and the ledger must not keep
+    // showing it as Allowed (final review, R-003).
+    if (Array.isArray(st.allowed_hosts) && typeof st.id === "number") {
+      const prev = allowedHosts.get(st.id);
+      const next = new Set(st.allowed_hosts.filter((h) => typeof h === "string"));
+      const same = prev && prev.size === next.size && [...next].every((h) => prev.has(h));
+      if (!same) {
+        allowedHosts.set(st.id, next);
+        if (lastLedger) renderLedger(lastLedger);
+      }
+    }
     // The engine-confirmed rows belong HERE, not in applyPrivacyStatus: every
     // one of them is a property of THIS tab, and this is the payload that
     // carries them. Called first so the section is populated even if something
@@ -8813,6 +9229,9 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         const r = await rb("shelf_restore", { id: shelf.id });
         if (r.opened < r.total) {
           toast("Restored " + r.opened + "/" + r.total + " tabs. Shelf kept.");
+        }
+        if (r.ungrouped) {
+          toast(i18nText("chrome-js-group-restore-ungrouped", "The tabs are back, but not as a group: PATANYX already has as many groups as it keeps."));
         }
         // The shelf is KEPT on purpose: restore is never the destructive
         // step, so the row stays exactly as it was.
@@ -14238,6 +14657,398 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     } catch (e) {
       toast(friendly(e), true);
     }
+  });
+
+  // ---- Reader View ----
+  // The article on the current page, extracted in Rust from the bytes the
+  // engine already received (reader_view.rs) and delivered as typed blocks
+  // of plain strings. Every node below is built with createElement and
+  // textContent: this is page content inside the trusted chrome document,
+  // and none of it is ever parsed as markup. Tag names come from the fixed
+  // tables here, never from the page.
+  const READER_SIZE_STEPS = 7; // reader-size-0 .. reader-size-6 in chrome.css
+  let readerSize = 3;
+  let readerSerif = true;
+  // The request this panel is showing or waiting for. CHOSEN HERE and sent
+  // with reader_open, so the panel knows which answer is its own before
+  // Rust replies; an earlier version learned it from the reply and accepted
+  // any answer in between, which let a stale article paint after a quick
+  // close and reopen (review R-002, reproduced).
+  let readerRequest = 0;
+  let readerSeq = 0;
+
+  function readerSetStatus(text, offerRetry) {
+    const status = $("reader-status");
+    status.textContent = text || "";
+    status.hidden = !text;
+    $("reader-retry").hidden = !offerRetry;
+  }
+
+  function clearReader() {
+    $("reader-blocks").textContent = "";
+    $("reader-title").textContent = "";
+    $("reader-meta").textContent = "";
+    $("reader-meta").hidden = true;
+    $("reader-truncated").hidden = true;
+    $("reader-body").hidden = true;
+  }
+
+  function applyReaderStyle() {
+    const body = $("reader-body");
+    for (let i = 0; i < READER_SIZE_STEPS; i += 1) {
+      body.classList.toggle("reader-size-" + i, i === readerSize);
+    }
+    body.classList.toggle("reader-sans", !readerSerif);
+    $("reader-font").setAttribute("aria-pressed", readerSerif ? "true" : "false");
+    $("reader-smaller").disabled = readerSize === 0;
+    $("reader-larger").disabled = readerSize === READER_SIZE_STEPS - 1;
+  }
+
+  function readerHeadingTag(level) {
+    // The article title is the panel's h2; the page's own headings sit
+    // below it.
+    const n = Number(level);
+    if (n <= 2) return "h3";
+    if (n === 3) return "h4";
+    return "h5";
+  }
+
+  function renderReaderArticle(article) {
+    clearReader();
+    const str = (v) => (typeof v === "string" ? v : "");
+    $("reader-title").textContent = str(article.title);
+    const meta = [str(article.byline), str(article.site)].filter(Boolean).join(" | ");
+    if (meta) {
+      $("reader-meta").textContent = meta;
+      $("reader-meta").hidden = false;
+    }
+    const out = $("reader-blocks");
+    for (const b of Array.isArray(article.blocks) ? article.blocks : []) {
+      if (!b || typeof b !== "object") continue;
+      let node = null;
+      switch (b.kind) {
+        case "heading":
+          node = el(readerHeadingTag(b.level), null, str(b.text));
+          break;
+        case "para":
+          node = el("p", null, str(b.text));
+          break;
+        case "quote":
+          node = el("blockquote", null, str(b.text));
+          break;
+        case "pre":
+          node = el("pre", null, str(b.text));
+          break;
+        case "caption":
+          node = el("p", "reader-caption", str(b.text));
+          break;
+        case "list":
+          node = el(b.ordered === true ? "ol" : "ul");
+          for (const item of Array.isArray(b.items) ? b.items : []) {
+            node.appendChild(el("li", null, str(item)));
+          }
+          break;
+        default:
+          break;
+      }
+      if (node) out.appendChild(node);
+    }
+    $("reader-truncated").hidden = article.truncated !== true;
+    applyReaderStyle();
+    $("reader-body").hidden = false;
+  }
+
+  async function openReader() {
+    clearReader();
+    readerSeq += 1;
+    const request = readerSeq;
+    readerRequest = request;
+    readerSetStatus(i18nText("chrome-js-reader-reading", "Reading this page..."), false);
+    try {
+      await rb("reader_open", { request });
+    } catch (e) {
+      // Only the request still current may report; a superseded one's
+      // failure says nothing about the page on screen now.
+      if (openPanelName === "reader" && readerRequest === request) {
+        readerSetStatus(friendly(e), true);
+      }
+    }
+  }
+
+  function readerEvent(name, data) {
+    if (openPanelName !== "reader") return;
+    if (name === "reader_cleared") {
+      // A clear names the request it ends. One for an older request, still
+      // queued when the panel was closed and opened again, says nothing about
+      // the article on screen now (review round 2, R-002).
+      const ended = typeof data.request === "number" ? data.request : -1;
+      if (readerRequest === 0 || ended !== readerRequest) return;
+      readerRequest = 0;
+      clearReader();
+      readerSetStatus(
+        i18nText("chrome-js-reader-cleared", "The tab changed, so Reader View was cleared."),
+        true,
+      );
+      return;
+    }
+    const req = typeof data.request === "number" ? data.request : -1;
+    // Only the answer to the request this panel asked for, never another.
+    if (readerRequest === 0 || req !== readerRequest) return;
+    if (name === "reader_article") {
+      readerSetStatus("", false);
+      renderReaderArticle(data.article || {});
+    } else if (name === "reader_error") {
+      readerSetStatus(friendly({ message: typeof data.code === "string" ? data.code : "" }), true);
+    }
+  }
+
+  $("reader-smaller").addEventListener("click", () => {
+    if (readerSize > 0) readerSize -= 1;
+    applyReaderStyle();
+  });
+  $("reader-larger").addEventListener("click", () => {
+    if (readerSize < READER_SIZE_STEPS - 1) readerSize += 1;
+    applyReaderStyle();
+  });
+  $("reader-font").addEventListener("click", () => {
+    readerSerif = !readerSerif;
+    applyReaderStyle();
+  });
+  $("reader-retry").addEventListener("click", () => {
+    openReader();
+  });
+
+  registerPanel("reader", {
+    el: $("reader-panel"),
+    button: $("btn-reader"),
+    // Tall: this panel is for reading. 800 is the chrome's ceiling
+    // (CHROME_TOP_RANGE), the same one the Library sits under.
+    heightPx: 800,
+    onOpen: () => {
+      applyReaderStyle();
+      openReader();
+    },
+    onClose: () => {
+      readerRequest = 0;
+      clearReader();
+      readerSetStatus("", false);
+      rb("reader_close").catch(() => {});
+    },
+  });
+
+  // ---- Tab Groups panel ----
+  // Opened from the toolbar (for the active tab) or by right-clicking a tab
+  // chip (for that tab). Every name below is the user's own text and is set
+  // with textContent or .value; colors are buttons from GROUP_COLORS.
+  let groupPanelTab = null; // the tab the panel is acting on
+  let groupNewColor = null; // the color picked for a new group
+  let groupCloseArmed = false;
+
+  // Literal keys, one per color: the catalog gates find message ids by
+  // reading the source, so an id assembled at run time would be invisible.
+  function groupColorName(c) {
+    switch (c) {
+      case "grey": return i18nText("chrome-js-group-color-grey", "Gray");
+      case "blue": return i18nText("chrome-js-group-color-blue", "Blue");
+      case "red": return i18nText("chrome-js-group-color-red", "Red");
+      case "yellow": return i18nText("chrome-js-group-color-yellow", "Yellow");
+      case "green": return i18nText("chrome-js-group-color-green", "Green");
+      case "pink": return i18nText("chrome-js-group-color-pink", "Pink");
+      case "purple": return i18nText("chrome-js-group-color-purple", "Purple");
+      case "cyan": return i18nText("chrome-js-group-color-cyan", "Cyan");
+      default: return c;
+    }
+  }
+
+  function buildColorRow(host, selected, onPick) {
+    host.textContent = "";
+    for (const c of GROUP_COLORS) {
+      const b = el("button", "group-swatch group-color-" + c, "");
+      b.type = "button";
+      b.setAttribute("aria-label", groupColorName(c));
+      b.title = groupColorName(c);
+      b.setAttribute("aria-pressed", c === selected ? "true" : "false");
+      b.addEventListener("click", () => onPick(c));
+      host.appendChild(b);
+    }
+  }
+
+  function groupStatus(text, isError) {
+    const st = $("group-status");
+    st.textContent = text || "";
+    st.classList.toggle("error", !!isError);
+  }
+
+  async function groupCall(cmd, args) {
+    try {
+      const reply = await rb(cmd, args);
+      if (reply && Array.isArray(reply.items)) acceptTabItems(reply.items, reply.groups);
+      return reply;
+    } catch (e) {
+      groupStatus(friendly(e), true);
+      return null;
+    }
+  }
+
+  function renderGroupPanel() {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    if (!tab) {
+      groupStatus(i18nText("chrome-js-group-tab-gone", "That tab has closed."), true);
+      $("group-new").hidden = true;
+      $("group-current").hidden = true;
+      $("group-existing").hidden = true;
+      return;
+    }
+    $("group-target").textContent = chipLabel(tab);
+    const paired = lastTabItems.some((t) => t.paired);
+    $("group-side-close").hidden = !paired;
+    $("group-side-open").hidden = paired || !!tab.active;
+    // Nothing to offer (the tab on screen, no pair): no empty heading.
+    $("group-side").hidden = $("group-side-open").hidden && $("group-side-close").hidden;
+    const g = typeof tab.group === "number" ? lastTabGroups.find((x) => x.id === tab.group) : null;
+    $("group-new").hidden = !!g;
+    $("group-current").hidden = !g;
+    const others = lastTabGroups.filter((x) => !g || x.id !== g.id);
+    $("group-existing").hidden = others.length === 0;
+    const list = $("group-existing-list");
+    list.textContent = "";
+    for (const other of others) {
+      const b = el("button", "group-join group-color-" + (GROUP_COLORS.includes(other.color) ? other.color : "grey"), other.name || groupColorName(other.color));
+      b.type = "button";
+      b.addEventListener("click", async () => {
+        if (await groupCall("group_add", { group: other.id, tab: tab.id })) renderGroupPanel();
+      });
+      list.appendChild(b);
+    }
+    if (!g) {
+      if (!groupNewColor) {
+        groupNewColor = GROUP_COLORS.find((c) => !lastTabGroups.some((x) => x.color === c)) || "grey";
+      }
+      buildColorRow($("group-colors-new"), groupNewColor, (c) => {
+        groupNewColor = c;
+        renderGroupPanel();
+      });
+      return;
+    }
+    if (document.activeElement !== $("group-name-edit")) $("group-name-edit").value = g.name;
+    buildColorRow($("group-colors-edit"), g.color, async (c) => {
+      if (await groupCall("group_color", { group: g.id, color: c })) renderGroupPanel();
+    });
+    $("group-collapse-toggle").textContent = g.collapsed
+      ? i18nText("chrome-js-group-expand", "Show the group's tabs")
+      : i18nText("chrome-js-group-collapse", "Hide the group's tabs");
+    const count = lastTabItems.filter((t) => t.group === g.id).length;
+    $("group-close").hidden = groupCloseArmed;
+    $("group-close-confirm").hidden = !groupCloseArmed;
+    const confirmBtn = $("group-close-confirm");
+    confirmBtn.textContent = "Close " + count + (count === 1 ? " tab" : " tabs");
+    i18nResolve("chrome-js-group-close-confirm", { count }, confirmBtn.textContent).then((t) => {
+      confirmBtn.textContent = t;
+    });
+  }
+
+  function openGroupPanelFor(tabId) {
+    groupPanelTab = tabId;
+    groupNewColor = null;
+    groupCloseArmed = false;
+    if (openPanelName !== "group") togglePanelNamed("group");
+    else renderGroupPanel();
+  }
+
+  $("group-create").addEventListener("click", async () => {
+    const name = $("group-name-new").value;
+    const reply = await groupCall("group_create", { tabs: [groupPanelTab], name, color: groupNewColor });
+    if (reply) {
+      $("group-name-new").value = "";
+      groupStatus("", false);
+      renderGroupPanel();
+    }
+  });
+  $("group-rename").addEventListener("click", async () => {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    if (!tab || typeof tab.group !== "number") return;
+    if (await groupCall("group_rename", { group: tab.group, name: $("group-name-edit").value })) {
+      groupStatus(i18nText("chrome-js-group-renamed", "Renamed."), false);
+    }
+  });
+  $("group-collapse-toggle").addEventListener("click", async () => {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    const g = tab && lastTabGroups.find((x) => x.id === tab.group);
+    if (g && (await groupCall("group_collapse", { group: g.id, collapsed: !g.collapsed }))) renderGroupPanel();
+  });
+  $("group-remove-tab").addEventListener("click", async () => {
+    if (await groupCall("group_remove", { tab: groupPanelTab })) renderGroupPanel();
+  });
+  $("group-ungroup").addEventListener("click", async () => {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    if (tab && typeof tab.group === "number" && (await groupCall("group_ungroup", { group: tab.group }))) {
+      renderGroupPanel();
+    }
+  });
+  $("group-save-shelf").addEventListener("click", async () => {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    if (!tab || typeof tab.group !== "number") return;
+    const reply = await groupCall("shelf_create", { group: tab.group });
+    if (reply) {
+      togglePanelNamed("group");
+      const leftOut =
+        reply.left_out > 0
+          ? await i18nResolve(
+              "chrome-shelf-left-out",
+              { count: reply.left_out },
+              " " + reply.left_out + " left out: ephemeral and internal pages stay open.",
+            )
+          : "";
+      toast(i18nText("chrome-js-group-saved", "Shelved: its tabs closed and the group is in your Library.") + leftOut);
+    }
+  });
+  $("group-close").addEventListener("click", () => {
+    groupCloseArmed = true;
+    renderGroupPanel();
+  });
+  $("group-close-confirm").addEventListener("click", async () => {
+    const tab = lastTabItems.find((t) => t.id === groupPanelTab);
+    groupCloseArmed = false;
+    if (tab && typeof tab.group === "number" && (await groupCall("group_close", { group: tab.group }))) {
+      togglePanelNamed("group");
+    }
+  });
+
+  $("group-side-open").addEventListener("click", async () => {
+    const reply = await groupCall("side_by_side_open", { with: groupPanelTab });
+    if (reply) togglePanelNamed("group");
+  });
+  $("group-side-close").addEventListener("click", async () => {
+    const reply = await groupCall("side_by_side_close", {});
+    if (reply) renderGroupPanel();
+  });
+  $("btn-side-by-side").addEventListener("click", async () => {
+    try {
+      const reply = await rb("side_by_side_toggle", {});
+      if (reply && Array.isArray(reply.items)) acceptTabItems(reply.items, reply.groups);
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+  });
+
+  registerPanel("group", {
+    el: $("group-panel"),
+    button: $("btn-tab-group"),
+    heightPx: CHROME_OPEN_PX,
+    onOpen: () => {
+      // Opened from the toolbar: act on the tab on screen.
+      if (groupPanelTab === null || !lastTabItems.some((t) => t.id === groupPanelTab)) {
+        const active = lastTabItems.find((t) => t.active);
+        groupPanelTab = active ? active.id : null;
+      }
+      groupStatus("", false);
+      renderGroupPanel();
+    },
+    onClose: () => {
+      groupPanelTab = null;
+      groupCloseArmed = false;
+      groupStatus("", false);
+    },
   });
 
   registerPanel("about", {

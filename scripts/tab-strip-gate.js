@@ -318,6 +318,18 @@ check("native focus into a page happens only where a modal is checked first", ()
     "state.rs focuses a page in " + (total - allowed) + " place(s) outside " +
       "the three guarded functions",
   );
+  // Side by Side shows its second page through platform::set_side_by_side,
+  // which must only SHOW, never focus, on both backends.
+  for (const name of ["windows", "unix"]) {
+    const src = rustSources[name];
+    const at = src.indexOf("pub fn set_side_by_side(");
+    if (at < 0) continue;
+    const body = src.slice(at, src.indexOf("\n}\n", at));
+    assert(
+      !/focus/.test(body.replace(/\/\/[^\n]*/g, "")),
+      name + ".rs set_side_by_side moves the keyboard; it may only show",
+    );
+  }
   const shows = state.split("platform::show_tab(").length - 1;
   assert(
     shows === 1 && fnBody("fn show_and_focus_tab(").includes("platform::show_tab("),

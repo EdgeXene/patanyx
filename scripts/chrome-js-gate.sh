@@ -338,6 +338,90 @@ else
   echo "  (no site-forget gate in this tree)"
 fi
 
+# Reader View renders PAGE CONTENT inside the trusted chrome document. The
+# gate proves the text stays text, the page never picks an element, and only
+# the current request paints -- and each of those is proven able to fail
+# against a planted defect, so a refactor cannot leave a check passing over
+# code it no longer reaches.
+# The feature videos (1.0.5): the one-time banner, the video panel and the
+# way back from About, proven against each defect the gate guards.
+if [ -f scripts/tutorial-gate.js ]; then
+  node scripts/tutorial-gate.js
+  for plant in banners marker tour-first stale dedup abandoned sticky-error recover attribution reset focus pause; do
+    if PATANYX_TUTORIAL_PLANT=$plant node scripts/tutorial-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: tutorial-gate.js passed with the '$plant' defect" >&2
+      echo "  planted; its checks no longer reach the code they guard" >&2
+      exit 1
+    fi
+    echo "  ok  tutorial-gate.js catches the planted '$plant' defect"
+  done
+fi
+
+if [ -f scripts/reader-panel-gate.js ]; then
+  if ! grep -q 'id="reader-panel"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/reader-panel-gate.js exists but index.html has" >&2
+    echo "  no #reader-panel; the panel was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/reader-panel-gate.js
+  for plant in stale stale-clear tag; do
+    if PATANYX_READER_PLANT="$plant" node scripts/reader-panel-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: reader-panel-gate.js passed with the '$plant' defect" >&2
+      echo "  planted; its checks no longer reach the code they guard" >&2
+      exit 1
+    fi
+    echo "  ok  reader-panel-gate.js catches the planted '$plant' defect"
+  done
+else
+  echo "  (no reader panel gate in this tree)"
+fi
+
+# Tab Groups are drawn on the tab chips, so collapse, whole-group drag and
+# the name/color handling could break with every other strip check still
+# green. Each check is proven able to fail against a planted defect.
+if [ -f scripts/tab-groups-gate.js ]; then
+  if ! grep -q 'id="group-panel"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/tab-groups-gate.js exists but index.html has" >&2
+    echo "  no #group-panel; the panel was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/tab-groups-gate.js
+  for plant in collapse drag color; do
+    if PATANYX_TAB_GROUPS_PLANT="$plant" node scripts/tab-groups-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: tab-groups-gate.js passed with the '$plant' defect" >&2
+      echo "  planted; its checks no longer reach the code they guard" >&2
+      exit 1
+    fi
+    echo "  ok  tab-groups-gate.js catches the planted '$plant' defect"
+  done
+else
+  echo "  (no tab groups gate in this tree)"
+fi
+
+# Side by Side: the chrome chooses which tab goes beside the one on screen
+# and marks which tab is where; both proven able to fail.
+if [ -f scripts/side-by-side-gate.js ]; then
+  if ! grep -q 'id="btn-side-by-side"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/side-by-side-gate.js exists but index.html has" >&2
+    echo "  no #btn-side-by-side; the control was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/side-by-side-gate.js
+  for plant in with mark hide refocus; do
+    if PATANYX_SIDE_PLANT="$plant" node scripts/side-by-side-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: side-by-side-gate.js passed with the '$plant' defect" >&2
+      echo "  planted; its checks no longer reach the code they guard" >&2
+      exit 1
+    fi
+    echo "  ok  side-by-side-gate.js catches the planted '$plant' defect"
+  done
+else
+  echo "  (no side by side gate in this tree)"
+fi
+
 echo
 echo "=== gate 1g2: clear cookies for all sites ==="
 # The browser-wide counterpart to the gate above, and the more dangerous of the

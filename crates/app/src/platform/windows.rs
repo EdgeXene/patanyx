@@ -189,6 +189,26 @@ fn connect_focus_tracking(
     }
 }
 
+/// Side by Side: which tab's page took the keyboard, so the pane clicked
+/// into becomes the one every toolbar command and shortcut acts on.
+fn connect_pane_focus(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: u64) {
+    use webview2_com::FocusChangedEventHandler;
+    use wry::WebViewExtWindows;
+
+    let proxy = proxy.clone();
+    let controller = webview.controller();
+    let mut token = Default::default();
+    unsafe {
+        let _ = controller.add_GotFocus(
+            &FocusChangedEventHandler::create(Box::new(move |_sender, _args| {
+                let _ = proxy.send_event(UserEvent::PaneFocused(id));
+                Ok(())
+            })),
+            &mut token,
+        );
+    }
+}
+
 // `vk_key` moved to shortcuts.rs, beside `keypad_scan_code` and the resolver
 // it feeds. It is a pure u32 -> Key mapping with no Win32 types in it, and
 // living in a #[cfg(windows)] file meant NOTHING could test it from the Linux
@@ -1680,6 +1700,7 @@ pub fn build_content(
     );
     connect_shortcuts(&webview, proxy);
     connect_focus_tracking(&webview, proxy, crate::state::FocusSurface::Content);
+    connect_pane_focus(&webview, proxy, id);
     // Tabs start hidden; AppState activates one via show_tab + layout. A
     // fresh WebView2 child defaults to visible, so hide it before it can
     // paint over the chrome strip or another tab.
@@ -5876,6 +5897,12 @@ pub fn blocked_total(view: &TabView) -> u64 {
 /// immediately before every app-issued content navigation, so the
 /// local-network boundary can tell the user's navigation from the page's
 /// (`TabState::note_app_navigation`).
+/// A navigation the browser is about to start. Nothing to do here: WebView2
+/// decides per request, and `on_load_started` (NavigationStarting) already
+/// lets an AUTO freeze yield before the document is requested. The Linux
+/// backend has to lift a compiled filter; see unix.rs.
+pub fn yield_auto_freeze(_webview: &WebView, _view: &TabView) {}
+
 pub fn note_app_navigation(view: &TabView, url: &str) {
     view.state.borrow_mut().note_app_navigation(url);
 }
@@ -5985,6 +6012,11 @@ pub fn profile_mode(view: &TabView) -> ProfileMode {
 
 pub fn freeze_phase(view: &TabView) -> FreezePhase {
     view.state.borrow().freeze.phase()
+}
+
+/// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
+pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
+    view.state.borrow().freeze.overrides()
 }
 
 /// Whether the block behind a freeze is actually in place. See
@@ -6933,6 +6965,8 @@ pub fn layout(
     hosts: &Hosts,
     chrome: &WebView,
     active: Option<&WebView>,
+    // Side by Side: two pages, left and right, in place of `active`.
+    pair: Option<(&WebView, &WebView)>,
     chrome_height: i32,
     chrome_strip: i32,
     chrome_left: i32,
@@ -6994,15 +7028,15 @@ pub fn layout(
                 chrome_right,
                 arrangement,
             ));
-            if let Some(webview) = active {
-                let _ = webview.set_bounds(content_rect(
-                    &hosts.window,
-                    crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
-                    chrome_left,
-                    chrome_right,
-                    0,
-                ));
-            }
+            place_pages(
+                hosts,
+                active,
+                pair,
+                crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
+                chrome_left,
+                chrome_right,
+                0,
+            );
         }
 
         // A modal. Two geometries, decided by what `arm_translucent_overlay`
@@ -7086,20 +7120,33 @@ pub fn layout(
                 // thing many people do -- maximise the window -- happens with
                 // a modal open. `content_rect` reads the window's current
                 // size, so that is covered here too.
-                if let Some(webview) = active {
-                    let _ = webview.set_bounds(content_rect(
-                        &hosts.window,
-                        crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
-                        chrome_left,
-                        chrome_right,
-                        0,
-                    ));
-                }
-            } else if let Some(webview) = active {
-                let _ = webview.set_bounds(Rect {
+                place_pages(
+                    hosts,
+                    active,
+                    pair,
+                    crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
+                    chrome_left,
+                    chrome_right,
+                    0,
+                );
+            } else {
+                // Zero-sized, both pages when there are two: the legacy modal
+                // hides the page area entirely.
+                let zero = || Rect {
                     position: LogicalPosition::new(0.0, 0.0).into(),
                     size: LogicalSize::new(0.0, 0.0).into(),
-                });
+                };
+                match pair {
+                    Some((l, r)) => {
+                        let _ = l.set_bounds(zero());
+                        let _ = r.set_bounds(zero());
+                    }
+                    None => {
+                        if let Some(webview) = active {
+                            let _ = webview.set_bounds(zero());
+                        }
+                    }
+                }
             }
         }
 
@@ -7125,19 +7172,12 @@ pub fn layout(
                 position: LogicalPosition::new(0.0, 0.0).into(),
                 size: LogicalSize::new(size.width, size.height).into(),
             });
-            if let Some(webview) = active {
-                // Side strips and the pane all coexist: page_rect subtracts
-                // left chrome from the left and both right-hand widths from
-                // the right.
-                #[allow(clippy::cast_possible_truncation)]
-                let _ = webview.set_bounds(content_rect(
-                    &hosts.window,
-                    chrome_height,
-                    chrome_left,
-                    chrome_right,
-                    pane as i32,
-                ));
-            }
+            // Side strips and the pane all coexist: page_rect subtracts
+            // left chrome from the left and both right-hand widths from
+            // the right. (Side by Side is ended before the chat pane docks,
+            // so `pair` is None here in practice; placed the same way if not.)
+            #[allow(clippy::cast_possible_truncation)]
+            place_pages(hosts, active, pair, chrome_height, chrome_left, chrome_right, pane as i32);
         }
     }
 }
@@ -7149,9 +7189,69 @@ pub fn layout(
 /// browser. The clamp lives here rather than in the UI so a bad width from any
 /// caller -- a dragged handle, a restored setting, a malformed IPC frame --
 /// lands somewhere survivable.
+/// Put the page, or the two Side by Side pages, where the arrangement says.
+fn place_pages(
+    hosts: &Hosts,
+    active: Option<&WebView>,
+    pair: Option<(&WebView, &WebView)>,
+    top: i32,
+    left: i32,
+    right: i32,
+    pane: i32,
+) {
+    match pair {
+        Some((l, r)) => {
+            let size = hosts
+                .window
+                .inner_size()
+                .to_logical::<f64>(hosts.window.scale_factor());
+            let rect = crate::platform::page_rect(
+                size.width,
+                size.height,
+                top,
+                left,
+                right,
+                pane,
+                crate::platform::PAGE_FRAME_PX,
+            );
+            let (a, b) = crate::platform::split_page_rect(rect, crate::platform::SIDE_BY_SIDE_GAP_PX);
+            for (webview, (x, y, w, h)) in [(l, a), (r, b)] {
+                let _ = webview.set_bounds(Rect {
+                    position: LogicalPosition::new(x, y).into(),
+                    size: LogicalSize::new(w, h).into(),
+                });
+            }
+        }
+        None => {
+            if let Some(webview) = active {
+                let _ = webview.set_bounds(content_rect(&hosts.window, top, left, right, pane));
+            }
+        }
+    }
+}
+
+/// Side by Side: each page is its own child window, placed by `layout`;
+/// this only makes both visible. It never focuses either (the keyboard
+/// stays where it is; see AppState::show_and_focus_tab).
+pub fn set_side_by_side(
+    _hosts: &Hosts,
+    pair: Option<((&TabView, &WebView), (&TabView, &WebView))>,
+) {
+    if let Some(((_, l), (_, r))) = pair {
+        let _ = l.set_visible(true);
+        let _ = r.set_visible(true);
+    }
+}
+
 const MAX_PANE_FRACTION: f64 = 0.5;
 
 /// Whether a docked pane can actually be laid out on this backend.
+/// WebView2 always composites; the Linux-only fault this guards against does
+/// not exist here (see unix.rs `compositing_disabled`).
+pub fn compositing_disabled() -> bool {
+    false
+}
+
 pub fn split_supported() -> bool {
     true
 }

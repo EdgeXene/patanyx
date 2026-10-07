@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.5" date="2026-10-07">
+      <description>
+        <p>Three new features, all free. Reader View (F9) shows the article as plain text, without images, menus, ads, pop-ups or cookie banners. It uses the page the tab already received, keeps captions, and has nothing to show for a page built entirely by scripts. Tab Groups (right-click a tab) keep tabs together in named, colored groups that fold away with one click. Groups last until PATANYX closes; shelving one closes its tabs and keeps it in your encrypted Library. Side by Side (Ctrl+Shift+S) shows two tabs at once. On Linux, a Strict Tab now accepts typed addresses after its first page loads, and shrinking panels no longer leave faded text where the web engine draws without hardware compositing.</p>
+      </description>
+    </release>
     <release version="1.0.4" date="2026-10-07">
       <description>
         <p>This version needs WebKitGTK 2.54.0 or newer, which fixes security problems a web page could trigger (WebKitGTK advisory WSA-2026-0006), and does not start with an older version. On Windows, the Spotify web player can now play instead of only controlling another device.</p>

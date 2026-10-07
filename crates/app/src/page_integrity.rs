@@ -105,6 +105,10 @@ enum Pending {
     /// other scan, which is what lets a scan be replaced or dropped without
     /// cancelling reads one by one.
     TabSearch { tab_id: u64, scan: u64 },
+    /// A Reader View read of one tab. Reader View owns its own staleness
+    /// rules (reader_view.rs); the token lives here only so there is one
+    /// token space for every main-resource answer.
+    Reader { tab_id: u64, request: u64 },
     #[cfg(feature = "chat")]
     CorroborateBegin {
         peer_hash: String,
@@ -362,6 +366,13 @@ pub fn issue_tab_search_fetch(state: &mut AppState, tab_id: u64, scan: u64) -> u
     state.integrity.issue(Pending::TabSearch { tab_id, scan })
 }
 
+/// Register a Reader View byte read of the ACTIVE tab and return its token.
+/// Same reasoning as issue_tab_search_fetch: one token space.
+pub fn issue_reader_fetch(state: &mut AppState, request: u64) -> u64 {
+    let tab_id = state.tabs.get(state.active).map_or(0, |t| t.id);
+    state.integrity.issue(Pending::Reader { tab_id, request })
+}
+
 /// The corroborate crate deliberately never reads a clock; the app supplies
 /// unix seconds at CAPTURE time.
 ///
@@ -562,7 +573,9 @@ pub fn on_tab_closed(state: &mut AppState, tab_id: u64) {
                 return false;
             }
         }
-        true
+        // A closed tab's engine may never answer; its Reader read is
+        // dropped here rather than left in the map for the session.
+        !matches!(purpose, Pending::Reader { tab_id: t, .. } if *t == tab_id)
     });
     for target in interrupted {
         emit_check_error(state, &target, "fetch_failed");
@@ -709,6 +722,9 @@ pub fn handle_event(state: &mut AppState, event: IntegrityEvent) {
                 }
                 Pending::TabSearch { tab_id, scan } => {
                     finish_tab_search_row(state, tab_id, scan, result)
+                }
+                Pending::Reader { request, .. } => {
+                    crate::reader_view::on_bytes(state, request, result)
                 }
                 #[cfg(feature = "chat")]
                 Pending::CorroborateBegin {

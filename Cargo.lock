@@ -2389,7 +2389,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "patanyx"
-version = "1.0.4"
+version = "1.0.5"
 dependencies = [
  "bsdiff",
  "ed25519-dalek",
@@ -2406,6 +2406,7 @@ dependencies = [
  "patanyx-integrity",
  "patanyx-licence",
  "patanyx-ocr",
+ "patanyx-reader",
  "patanyx-store",
  "patanyx-tunnel",
  "patanyx-update",
@@ -2486,6 +2487,17 @@ dependencies = [
  "image",
  "png",
  "tract-onnx",
+]
+
+[[package]]
+name = "patanyx-reader"
+version = "0.1.0"
+dependencies = [
+ "dom_query",
+ "html5ever",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

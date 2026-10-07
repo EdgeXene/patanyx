@@ -309,6 +309,15 @@ body.translucent-backdrop.modal-open::before {
 body.translucent-backdrop.modal-open::after {
   background: rgba(13, 14, 18, 0.62);
 }
+/* WebKitGTK WITHOUT COMPOSITING paints a translucent repaint over its own
+   previous pixels instead of clearing them first, so a panel that got shorter
+   left its old contents showing, faded, through the 62% backdrop (measured
+   2026-10-07). The page is not visible through the backdrop in that mode
+   anyway, so the backdrop goes solid there: an opaque repaint overwrites. Set
+   from chrome_caps.solid_backdrop. */
+body.translucent-backdrop.solid-backdrop.modal-open::after {
+  background: var(--sf-scrim);
+}
 
 /* The strip stays above the scrim and stays clickable, so a feature button can
    switch panels directly instead of forcing a close-then-open. The dismissal
@@ -2400,6 +2409,27 @@ textarea {
   display: none;
 }
 #resolver-warning .ico {
+  flex: none;
+  margin-top: 1px;
+}
+
+/* The feature videos (1.0.5). Informational, in the update banner's
+   palette: nothing is wrong, there is something new to see. */
+#tutorial-banner {
+  display: flex;
+  gap: 10px;
+  align-items: flex-start;
+  padding: 10px 14px;
+  background: var(--st-upd-bg);
+  color: var(--st-upd-text);
+  border-bottom: 1px solid var(--ln);
+  font-size: 13px;
+  line-height: 1.4;
+}
+#tutorial-banner[hidden] {
+  display: none;
+}
+#tutorial-banner .ico {
   flex: none;
   margin-top: 1px;
 }
@@ -4517,6 +4547,7 @@ html {
     #blocked-warning,
     #update-banner,
     #engine-floor-warning,
+    #tutorial-banner,
     #resolver-warning,
     #save-password-banner,
     #lock-warning,
@@ -4532,6 +4563,7 @@ html {
     #blocked-warning,
     #update-banner,
     #engine-floor-warning,
+    #tutorial-banner,
     #resolver-warning,
     #save-password-banner,
     #lock-warning,
@@ -4696,5 +4728,243 @@ body.page-covers-chrome #confirm-overlay {
   padding: 2px 6px;
   border-radius: 5px;
   background: var(--accent-choice-bg, rgba(79, 140, 255, 0.12));
+  color: var(--tx);
+}
+
+/* READER VIEW.
+   A reading column, not a dashboard: narrower than panel-wide's 1180px so a
+   line stays near 70 characters at the default size. Colors come from the
+   same tokens every panel uses, so Reader View follows the theme and the
+   light/dark setting with no table of its own. Text sizes are classes, not
+   inline styles, so the chrome CSP (style-src 'self') is untouched. */
+.panel-modal#reader-panel {
+  width: min(860px, calc(100vw - 48px));
+  /* A FIXED HEIGHT, the full space .panel-modal allows. A reading surface
+     should not jump in size as its contents change, and there is a second
+     reason, measured: on WebKitGTK the area a shrinking card left behind
+     was not repainted, so after a tab switch cleared the article its old
+     text stayed visible, dimmed, below the short "cleared" card. A card that
+     never changes size leaves nothing behind. */
+  height: calc(
+    100vh - var(--chrome-strip-px, var(--chrome-closed-px, 148px)) - 24px
+  );
+  box-sizing: border-box;
+}
+.reader-controls {
+  display: flex;
+  gap: 0.4rem;
+  flex-wrap: wrap;
+  margin: 0.25rem 0 0.75rem;
+}
+#reader-retry {
+  margin-bottom: 0.75rem;
+}
+.reader-body {
+  max-width: 42em;
+  margin: 0 auto;
+  color: var(--tx-bright);
+  line-height: 1.65;
+  font-family: Georgia, "Iowan Old Style", "Palatino Linotype", "Book Antiqua", serif;
+  overflow-wrap: anywhere;
+}
+.reader-body.reader-sans {
+  font-family: system-ui, -apple-system, "Segoe UI", Ubuntu, Cantarell, sans-serif;
+}
+.reader-body.reader-size-0 { font-size: 14px; }
+.reader-body.reader-size-1 { font-size: 15px; }
+.reader-body.reader-size-2 { font-size: 16px; }
+.reader-body.reader-size-3 { font-size: 18px; }
+.reader-body.reader-size-4 { font-size: 20px; }
+.reader-body.reader-size-5 { font-size: 23px; }
+.reader-body.reader-size-6 { font-size: 26px; }
+.reader-body h2 {
+  font-size: 1.6em;
+  line-height: 1.25;
+  margin: 0.2em 0 0.3em;
+}
+.reader-body h3 { font-size: 1.3em; margin: 1.4em 0 0.4em; }
+.reader-body h4 { font-size: 1.15em; margin: 1.2em 0 0.4em; }
+.reader-body h5 { font-size: 1em; margin: 1em 0 0.3em; }
+.reader-body p {
+  margin: 0 0 1em;
+  /* Line breaks the page wrote with <br> arrive as "\n". */
+  white-space: pre-line;
+}
+.reader-meta {
+  color: var(--tx-dim);
+  font-size: 0.85em;
+}
+.reader-body blockquote {
+  margin: 0 0 1em;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 3px solid var(--accent);
+  color: var(--tx);
+  white-space: pre-line;
+}
+.reader-body pre {
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln-soft);
+  border-radius: 6px;
+  padding: 0.75em;
+  overflow-x: auto;
+  white-space: pre;
+  overflow-wrap: normal;
+  font-size: 0.85em;
+  line-height: 1.45;
+}
+.reader-body ul,
+.reader-body ol {
+  margin: 0 0 1em;
+  padding-left: 1.5em;
+}
+.reader-body li {
+  margin: 0.25em 0;
+}
+.reader-body .reader-caption {
+  color: var(--tx-dim);
+  font-style: italic;
+  font-size: 0.9em;
+}
+
+/* TAB GROUPS.
+   The palette is fixed (tab_groups.rs COLORS); each word is a class that sets
+   one custom property, so no color value ever comes from user or page text.
+   Chosen to read on both the dark and light chrome. */
+.group-color-grey { --group-c: #8a8f98; }
+.group-color-blue { --group-c: #4c8bf5; }
+.group-color-red { --group-c: #e5534b; }
+.group-color-yellow { --group-c: #d4a72c; }
+.group-color-green { --group-c: #3fb950; }
+.group-color-pink { --group-c: #db61a2; }
+.group-color-purple { --group-c: #a371f7; }
+.group-color-cyan { --group-c: #39c5cf; }
+
+/* Every member wears its group's band along the BOTTOM edge of the chip:
+   the active tab already marks its top edge with the accent, and a blue
+   group band there read as a second active tab. */
+.tab-chip.in-group {
+  box-shadow: inset 0 -3px 0 var(--group-c);
+}
+/* The first member carries the group's name, which is also the
+   collapse toggle. An unnamed group shows a dot of its color. */
+.chip-group-label {
+  flex: 0 0 auto;
+  max-width: 10em;
+  margin-right: 6px;
+  padding: 0 6px;
+  border: 0;
+  border-radius: 4px;
+  background: var(--group-c);
+  color: #101216;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+}
+.chip-group-label:empty {
+  width: 10px;
+  height: 10px;
+  padding: 0;
+  border-radius: 50%;
+}
+
+/* The Tab Groups panel. */
+#group-panel h2 {
+  font-size: 0.95rem;
+  margin: 1rem 0 0.4rem;
+}
+#group-name-new,
+#group-name-edit {
+  width: 100%;
+  max-width: 22rem;
+  box-sizing: border-box;
+}
+.group-row {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+.group-colors {
+  display: flex;
+  gap: 0.45rem;
+  margin: 0.6rem 0;
+}
+.group-swatch {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 50%;
+  background: var(--group-c);
+  border: 2px solid transparent;
+  cursor: pointer;
+}
+.group-swatch[aria-pressed="true"] {
+  border-color: var(--tx-bright);
+  box-shadow: 0 0 0 2px var(--sf-card);
+}
+.group-existing,
+.group-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+.group-join {
+  border-left: 4px solid var(--group-c);
+}
+#group-status.error {
+  color: var(--st-err);
+}
+/* Tall enough for the tallest common state (new group plus an "Add to a
+   group" list), so switching between states rarely SHRINKS the card: on
+   WebKitGTK a shrinking card can leave its old contents visible below it
+   (seen on every panel; tracked separately). */
+.panel-modal#group-panel {
+  min-height: 34rem;
+}
+
+/* SIDE BY SIDE. The two paired chips carry a small two-pane mark, filled on
+   the side that tab occupies, so the strip says which tab is where. */
+.tab-chip.paired::before {
+  content: "";
+  flex: 0 0 auto;
+  width: 11px;
+  height: 9px;
+  margin-right: 6px;
+  border: 1.5px solid var(--accent);
+  border-radius: 2px;
+}
+.tab-chip.paired-left::before {
+  background: linear-gradient(to right, var(--accent) 50%, transparent 50%);
+}
+.tab-chip.paired-right::before {
+  background: linear-gradient(to left, var(--accent) 50%, transparent 50%);
+}
+#group-side {
+  margin-top: 0.5rem;
+}
+
+/* FEATURE VIDEOS (1.0.5). A 1280x800 recording at the panel's width, the
+   steps under it. Sizes are classes, so the CSP's style-src 'self' holds. */
+.panel-modal#tutorial-panel {
+  width: min(1000px, calc(100vw - 48px));
+}
+.tutorial-video {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1280 / 800;
+  max-height: calc(100vh - var(--chrome-strip-px, var(--chrome-closed-px, 148px)) - 215px);
+  background: #000;
+  border-radius: 8px;
+  margin: 0.6rem 0;
+}
+.tutorial-steps {
+  margin: 0.4rem 0 0 1.2rem;
+  line-height: 1.5;
+}
+#tutorial-topics button[aria-pressed="true"] {
+  border-color: var(--accent, #4f8cff);
   color: var(--tx);
 }

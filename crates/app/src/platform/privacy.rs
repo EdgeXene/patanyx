@@ -559,6 +559,110 @@ impl InterceptionState {
 /// on that inhibition); an explicit `freeze()` is always honoured because it
 /// is the user's stated intent, and is therefore the control to reach for
 /// when the heuristic is wrong in either direction.
+/// WebKitGTK's freeze is a compiled content filter, compiled asynchronously.
+/// This keeps the two facts that must not be confused apart: which freeze
+/// filter the tab WANTS (the latest request) and which are INSTALLED in the
+/// engine. Pure, so every rule is tested here; unix.rs does the engine calls
+/// it returns.
+///
+/// The rules:
+/// - A replacement freeze (allowing one host on a frozen tab) does not remove
+///   the old filter when it is requested. The old one stays until the new one
+///   is installed, so a frozen tab never has a moment with no freeze.
+/// - A compile result for anything but the current request, or after the tab
+///   stopped being frozen, changes nothing: success installs nothing, failure
+///   reports nothing.
+/// - Lifting removes every installed freeze filter and nothing else.
+#[derive(Clone, Debug, Default)]
+pub struct FreezeFilterBook {
+    /// The filter id AND a generation: ids are hashes of the rules, so two
+    /// freezes with the same exceptions share an id, and only the generation
+    /// tells a stale compile from the current one.
+    wanted: Option<(String, u64)>,
+    installed: Vec<String>,
+    next_generation: u64,
+    /// The hosts the wanted filter lets through, and the ones the installed
+    /// filter does: when a replacement fails while the old filter still
+    /// blocks, the tab's exceptions go back to the installed set, or the
+    /// panel would show a host as allowed that is still blocked (final
+    /// review, R-003).
+    wanted_hosts: Vec<String>,
+    installed_hosts: Option<Vec<String>>,
+}
+
+/// What to do with a freeze filter whose compile just finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompiledFreeze {
+    /// Add it to the engine, then remove these (superseded) freeze filters.
+    Install { remove: Vec<String> },
+    /// Stale: add nothing, report nothing.
+    Discard,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl FreezeFilterBook {
+    /// Ask for `id`; returns the generation the compile must quote back.
+    pub fn request(&mut self, id: String) -> u64 {
+        self.request_with_hosts(id, Vec::new())
+    }
+
+    /// Ask for `id`, a filter that lets `hosts` through.
+    pub fn request_with_hosts(&mut self, id: String, hosts: Vec<String>) -> u64 {
+        self.next_generation += 1;
+        self.wanted = Some((id, self.next_generation));
+        self.wanted_hosts = hosts;
+        self.next_generation
+    }
+
+    /// The hosts the installed freeze filter lets through, if one is in.
+    pub fn installed_hosts(&self) -> Option<Vec<String>> {
+        self.installed_hosts.clone()
+    }
+
+    fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.wanted
+            .as_ref()
+            .is_some_and(|(w, g)| w == id && *g == generation)
+    }
+
+    pub fn on_compiled(&mut self, id: &str, generation: u64, still_frozen: bool) -> CompiledFreeze {
+        if !still_frozen || !self.is_current(id, generation) {
+            return CompiledFreeze::Discard;
+        }
+        let remove = self
+            .installed
+            .iter()
+            .filter(|x| x.as_str() != id)
+            .cloned()
+            .collect();
+        self.installed = vec![id.to_string()];
+        self.installed_hosts = Some(self.wanted_hosts.clone());
+        CompiledFreeze::Install { remove }
+    }
+
+    /// Whether a failed compile of `id` is about the freeze the tab wants
+    /// now. A failure for a superseded request must not mark the current
+    /// freeze as failed.
+    pub fn failure_is_current(&self, id: &str, generation: u64) -> bool {
+        self.is_current(id, generation)
+    }
+
+    /// Whether a freeze filter is actually in the engine. A replacement that
+    /// fails to compile leaves the previous one enforcing; a first freeze
+    /// that fails leaves nothing.
+    pub fn has_installed(&self) -> bool {
+        !self.installed.is_empty()
+    }
+
+    /// The freeze ends: every installed freeze filter comes off.
+    pub fn lift(&mut self) -> Vec<String> {
+        self.wanted = None;
+        self.wanted_hosts.clear();
+        self.installed_hosts = None;
+        std::mem::take(&mut self.installed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FreezeController {
     auto: bool,
@@ -599,6 +703,13 @@ impl FreezeController {
 
     pub fn phase(&self) -> FreezePhase {
         self.phase
+    }
+
+    /// Frozen by the heuristic (Strict Tab's freeze-after-load), not by the
+    /// user. This is the freeze that yields to the next top-level navigation;
+    /// a manual one never does.
+    pub fn is_auto_frozen(&self) -> bool {
+        self.phase == FreezePhase::Frozen && !self.manual
     }
 
     /// Whether the engine-level block behind a freeze is ACTUALLY in place.
@@ -735,6 +846,12 @@ impl FreezeController {
 
     pub fn add_override(&mut self, host: &str) {
         self.overrides.insert(host.to_lowercase());
+    }
+
+    /// Replace the exceptions with `hosts`: what an installed filter really
+    /// lets through, after a replacement carrying more failed to install.
+    pub fn set_overrides(&mut self, hosts: Vec<String>) {
+        self.overrides = hosts.into_iter().collect();
     }
 
     /// Sorted (BTreeSet) so the unix freeze filter's JSON is deterministic.
@@ -926,6 +1043,16 @@ pub struct TabState {
     pub policy: TabPolicy,
     pub ledger: Ledger,
     pub freeze: FreezeController,
+    /// WebKitGTK only: which freeze filter the tab wants and which are in
+    /// the engine. See `FreezeFilterBook`.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub freeze_filters: FreezeFilterBook,
+    /// WebKitGTK only: this top-level load began on an auto-frozen tab and
+    /// the freeze was lifted at its start, so a content-blocker refusal of
+    /// THIS document belongs to the freeze, not the ad list. Cleared when
+    /// the next load starts or this one finishes.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub freeze_lifted_this_load: bool,
     /// The one host this tab may reach despite the ad/tracker list, after the
     /// user answered the held-page banner.
     ///
@@ -1254,6 +1381,8 @@ impl TabState {
             policy: policy.clone(),
             ledger: Ledger::default(),
             freeze: FreezeController::new(policy.freeze_after_load),
+            freeze_filters: FreezeFilterBook::default(),
+            freeze_lifted_this_load: false,
             adlist_override: None,
             toplevel: crate::toplevel_request::TopLevelRequests::default(),
             last_top_level_method: "GET".to_string(),
@@ -4091,6 +4220,167 @@ mod tests {
             TabPolicy::default().requested_profile_mode(),
             ProfileMode::Persistent
         );
+    }
+
+    #[test]
+    fn a_replacement_freeze_keeps_the_old_one_until_it_is_installed() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        assert_eq!(book.on_compiled("a", ga, true), CompiledFreeze::Install { remove: vec![] });
+        assert!(book.has_installed());
+        // Allow one host: a new filter is requested; the old one is NOT
+        // removed on request, only once the new one is in.
+        let gb = book.request("b".into());
+        assert!(book.has_installed(), "the old freeze still enforces while b compiles");
+        assert_eq!(
+            book.on_compiled("b", gb, true),
+            CompiledFreeze::Install { remove: vec!["a".into()] }
+        );
+    }
+
+    #[test]
+    fn stale_compiles_change_nothing_success_or_failure() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        let gb = book.request("b".into());
+        assert_eq!(book.on_compiled("a", ga, true), CompiledFreeze::Discard, "superseded success");
+        assert!(!book.failure_is_current("a", ga), "superseded failure must not mark b failed");
+        assert!(book.failure_is_current("b", gb));
+        // A compile finishing after the tab thawed installs nothing.
+        let mut thawed = FreezeFilterBook::default();
+        let gc = thawed.request("c".into());
+        assert_eq!(thawed.on_compiled("c", gc, false), CompiledFreeze::Discard);
+        let _ = thawed.lift();
+        assert!(!thawed.failure_is_current("c", gc));
+    }
+
+    #[test]
+    fn the_same_rules_in_a_new_freeze_are_not_mistaken_for_the_old_compile() {
+        // Freeze, unfreeze, freeze again with the same exceptions: both
+        // compiles carry the same id. Only the generation separates them.
+        let mut book = FreezeFilterBook::default();
+        let g1 = book.request("same".into());
+        let _ = book.lift();
+        let g2 = book.request("same".into());
+        assert_ne!(g1, g2);
+        assert!(!book.failure_is_current("same", g1), "the old compile's failure is stale");
+        assert_eq!(book.on_compiled("same", g1, true), CompiledFreeze::Discard);
+        assert_eq!(book.on_compiled("same", g2, true), CompiledFreeze::Install { remove: vec![] });
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_installed_filters_hosts() {
+        // Final review (R-003): allowing a host builds a replacement filter;
+        // if it fails to install, the old one still blocks that host, and
+        // the exceptions must say so.
+        let mut book = FreezeFilterBook::default();
+        let g1 = book.request_with_hosts("a".into(), vec!["one.example".into()]);
+        let _ = book.on_compiled("a", g1, true);
+        let g2 = book.request_with_hosts("b".into(), vec!["one.example".into(), "two.example".into()]);
+        assert!(book.failure_is_current("b", g2) && book.has_installed());
+        assert_eq!(book.installed_hosts(), Some(vec!["one.example".to_string()]));
+        let mut freeze = FreezeController::new(true);
+        freeze.add_override("one.example");
+        freeze.add_override("two.example");
+        freeze.set_overrides(book.installed_hosts().unwrap());
+        assert_eq!(freeze.overrides(), vec!["one.example".to_string()]);
+        let _ = book.lift();
+        assert_eq!(book.installed_hosts(), None);
+    }
+
+    #[test]
+    fn lifting_removes_every_installed_freeze_and_only_those() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        let _ = book.on_compiled("a", ga, true);
+        assert_eq!(book.lift(), vec!["a".to_string()]);
+        assert_eq!(book.lift(), Vec::<String>::new(), "nothing left to lift");
+        assert!(!book.has_installed());
+    }
+
+    #[test]
+    fn the_linux_auto_freeze_timer_records_an_automatic_freeze() {
+        // Pinned against the source: the bug this guards was the timer
+        // calling `freeze()` (the manual one), which survives navigation, so
+        // every Linux Strict Tab refused the next typed address.
+        let unix = include_str!("unix.rs");
+        let at = unix.find("fn schedule_auto_freeze(").expect("unix.rs has schedule_auto_freeze");
+        let body = &unix[at..at + unix[at..].find("\n}\n").expect("end of fn")];
+        assert!(body.contains("st.freeze.freeze_auto_now();"), "the timer must record an AUTO freeze");
+        assert!(!body.contains("st.freeze.freeze();"), "the timer must not record a manual freeze");
+    }
+
+    #[test]
+    fn linux_freeze_changes_outside_a_load_refresh_the_toolbar() {
+        // Pinned against the source. The Linux event loop has no auto-freeze
+        // tick (tick_auto_freeze returns nothing there), so a freeze state
+        // that changes from a GTK callback, or from a navigation that never
+        // becomes a load, reaches the toolbar ONLY through this wake. Without
+        // it the chip said Live on a frozen tab, "Freezing..." on an
+        // installed freeze, and Frozen on a thawed one.
+        let unix = include_str!("unix.rs");
+        let body = |name: &str| {
+            let at = unix.find(name).unwrap_or_else(|| panic!("unix.rs has {name}"));
+            &unix[at..at + unix[at..].find("\n}\n").expect("end of fn")]
+        };
+        for f in [
+            "fn connect_load_events(",
+            "fn schedule_auto_freeze(",
+            "pub fn yield_auto_freeze(",
+            "fn report_freeze_failure(",
+        ] {
+            assert!(
+                body(f).contains("wake_freeze_status();"),
+                "{f} must refresh the toolbar"
+            );
+        }
+        // Each completion branch on its own: one branch's wake must not
+        // satisfy the other's assertion.
+        let saved = body("unsafe extern \"C\" fn on_filter_saved(");
+        let between = |from: &str, to: &str| {
+            let rest = &saved[saved.find(from).unwrap_or_else(|| panic!("no {from}"))..];
+            &rest[..rest.find(to).unwrap_or_else(|| panic!("no {to} after {from}"))]
+        };
+        let installed = between("note_enforced();", "} else if");
+        assert!(
+            installed.contains("wake_freeze_status();"),
+            "an installed freeze must refresh the toolbar"
+        );
+        let no_filter = between("Neither an error nor a filter", "g_object_unref");
+        assert!(
+            no_filter.contains("note_enforcement_failed();"),
+            "the no-filter branch reports the failure"
+        );
+        assert!(
+            no_filter.contains("wake_freeze_status();"),
+            "a freeze that came back with no filter must refresh the toolbar"
+        );
+    }
+
+    #[test]
+    fn only_the_heuristic_freeze_counts_as_auto_frozen() {
+        // The Linux timer used to record the heuristic as a manual freeze,
+        // which survives navigation by design, so a Strict Tab refused every
+        // address typed into it. Auto and manual must stay distinguishable.
+        let mut auto = FreezeController::new(true);
+        auto.on_load_finished(Instant::now());
+        auto.freeze_auto_now();
+        assert!(auto.is_auto_frozen());
+        auto.on_load_started();
+        assert_eq!(auto.phase(), FreezePhase::Loading, "an auto freeze yields to a navigation");
+        assert!(!auto.is_auto_frozen());
+
+        let mut manual = FreezeController::new(true);
+        manual.freeze();
+        assert!(!manual.is_auto_frozen(), "a manual freeze is not the heuristic");
+        manual.on_load_started();
+        assert_eq!(manual.phase(), FreezePhase::Frozen, "a manual freeze survives navigation");
+
+        let mut thawed = FreezeController::new(true);
+        thawed.on_load_finished(Instant::now());
+        thawed.freeze_auto_now();
+        thawed.unfreeze(Instant::now());
+        assert!(!thawed.is_auto_frozen());
     }
 
     /// The displayed storage mode follows the ENGINE, not the request.

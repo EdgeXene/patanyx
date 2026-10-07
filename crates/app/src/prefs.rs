@@ -1013,6 +1013,34 @@ fn onboarding_marker_path() -> PathBuf {
         .join("onboarding-seen")
 }
 
+/// `<vault dir>/tutorial-1.0.5-seen`: the feature-videos banner has been
+/// answered (Watch or Not now). Its own marker, for the reason the
+/// onboarding one is: Prefs is not on disk for most installs. Versioned in
+/// the name, so a later release with new videos can ask once more without
+/// reading this one.
+fn tutorial_marker_path() -> PathBuf {
+    let vault = patanyx_vault::Vault::default_path();
+    vault
+        .parent()
+        .map_or_else(|| PathBuf::from("."), |p| p.to_path_buf())
+        .join("tutorial-1.0.5-seen")
+}
+
+/// Whether the feature-videos banner was answered on this install.
+pub fn tutorial_seen() -> bool {
+    tutorial_marker_path().exists()
+}
+
+/// Marks the banner answered. A write failure only means the banner shows
+/// once more on the next launch.
+pub fn mark_tutorial_seen() {
+    let path = tutorial_marker_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(path, b"");
+}
+
 /// The decision table, separated from the I/O that feeds it so it can be
 /// tested exhaustively without touching a real filesystem or the real
 /// environment variables `Vault::default_path` reads -- both of which this
