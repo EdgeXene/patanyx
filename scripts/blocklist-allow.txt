@@ -345,8 +345,8 @@ ffm.to                  # 11008 Music smart-links, 9.1y.
 # route in. None of them is a phishing site.
 telegram.im          # Telegram profile/username links, Tranco #7716. A whole
                      # messaging service's link domain; blocking it takes every
-                     # t.me-style profile link with it. WORTH A SECOND LOOK by
-                     # a person: it is a third-party-operated Telegram
+                     # t.me-style profile link with it. WORTH A SECOND LOOK:
+                     # it is a third-party-operated Telegram
                      # mirror rather than Telegram itself, so if the intent is
                      # to block mirrors, move it to blocklist-confirm.txt.
 playmods.net         # Modded-APK distribution, Tranco #8280. Warez, not
@@ -402,10 +402,10 @@ intensedebate.com    # 9675  Automattic's comment system, embedded across many
                      #       blogs. Reverse DNS on 192.0.123.246 returns
                      #       intensedebate.com; MarkMonitor, registered 2006.
 
-# --- Decision 2026-09-09 --------------------------------------------------
+# --- Ruling 2026-09-09 ----------------------------------------------------
 # PhishDestroy listed the LINE apex on 2026-09-08 and the tripwire refused
 # every build for the next day (Tranco #415, refuse band). The proposer's
-# recommendation was ALLOW; accepted on 2026-09-09.
+# recommendation was ALLOW, and it was ruled ALLOW on 2026-09-09.
 
 line.me              # 415   LINE, the messaging platform. GlobalSign OV
                      #       certificate names "LY Corporation" (Tokyo); the
@@ -416,3 +416,29 @@ line.me              # 415   LINE, the messaging platform. GlobalSign OV
                      #       page is a claim about that page, not about the
                      #       service. Exact-match: a listed subdomain stays
                      #       blocked.
+
+# --- Ruling 2026-09-16 ----------------------------------------------------
+# PhishDestroy listed the Dribbble apex; the tripwire refused three hourly
+# builds (Tranco #1214, refuse band) before it was ruled ALLOW.
+
+dribbble.com         # 1214  Dribbble, the design portfolio site. RDAP records
+                     #       registration on 2008-03-19 and 1API GmbH as the
+                     #       CURRENT registrar; it does not say who registered
+                     #       it then, and domains change hands. Authoritative
+                     #       DNS is ns1-4.dnsimple-edge.*, which is
+                     #       nameservice and not where the site is served.
+                     #       ONLY PhishDestroy carries it; Phishing.Database,
+                     #       phishunt, both ShadowWhisperer lists and CERT.pl
+                     #       do not, so it is a single-source uncorroborated
+                     #       allegation, the same shape as the
+                     #       PhishDestroy-only entries above. The certificate
+                     #       is a DV wildcard (*.dribbble.com, issued by
+                     #       Amazon) and so names NO organisation: eighteen
+                     #       years of registration and a top-1500 rank are
+                     #       longevity and reach, not proof of who runs it
+                     #       today. What decides it is scope. The site is
+                     #       user-generated content, so a phishing page hosted
+                     #       under it is a claim about that page, not about
+                     #       the service, and an apex block takes every
+                     #       designer's portfolio with it. Exact-match: a
+                     #       listed subdomain stays blocked.

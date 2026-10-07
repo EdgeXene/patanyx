@@ -1175,7 +1175,9 @@ thread_local! {
 /// listed host (every IP-lookup service is one) had the main document refused,
 /// and WebKit drew its own error page with nothing to explain it.
 ///
-/// Facts this leans on, all MEASURED on 2.52.6 on 2026-09-15 rather than read
+/// Facts this leans on, all MEASURED on 2.52.6 on 2026-09-15 (and again on
+/// 2.54.0 on 2026-10-02, unchanged: code 104, main frame only, TRUE suppresses
+/// the engine's page, the base URI is kept) rather than read
 /// from a header: the refusal arrives as load-failed with domain
 /// WebKitPolicyError and code 104; it fires for the MAIN frame only, a blocked
 /// iframe leaves the parent untouched and fires nothing here; returning TRUE

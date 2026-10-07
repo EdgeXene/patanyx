@@ -92,7 +92,7 @@ The toolchain is pinned to **Rust 1.98.1** by `rust-toolchain.toml` as part of P
 
 ### Linux (native build)
 
-PATANYX renders with WebKitGTK. Building needs the GTK 3 and WebKitGTK development packages (Debian: `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`); running needs WebKitGTK 2.52.6 or newer (Debian 13 security, 2.52.6-1~deb13u1).
+PATANYX renders with WebKitGTK. Building needs the GTK 3 and WebKitGTK development packages (Debian: `libgtk-3-dev`, `libwebkit2gtk-4.1-dev`); running needs WebKitGTK 2.54.0 or newer (Debian 13 security, 2.54.0-1~deb13u1).
 
 ```bash
 git clone https://github.com/EdgeXene/patanyx.git

@@ -159,9 +159,30 @@ parse_confirm() {
 # 17 as of 2026-09-02: the fifteen above plus workdeadlinededicate.com and
 # kettledroopingcontinuation.com, armed by that morning's Tranco snapshot and
 # confirmed malicious on independent multi-vendor classification.
-check "confirm file parses to 17 hosts" "17" "$(parse_confirm | wc -l)"
+# 18 as of 2026-09-14: spendsdetachment.com, armed at #9247 by that morning's
+# snapshot and ruled block. Circumstantial like the clusters above, and recorded
+# in the confirm file as precautionary: it was registered at eNom seven seconds
+# after the already-confirmed workdeadlinededicate.com and runs on identical
+# hosting and nameservers, but no vendor has classified this domain itself and
+# no phishing page was observed on it.
+# 20 as of 2026-09-21: realizationnewestfangs.com (#7420) and zoologyfibre.com
+# (#9304), armed together by that morning's snapshot and ruled block. Same
+# publicdnsservice cluster and, measured this time rather than asserted, a
+# response byte-identical to spendsdetachment.com's: nginx/1.28.2, 301 to
+# https://google.com/, 169 bytes, same sha256. Recorded as precautionary for the
+# same reason as #18 -- shared nameservers, address pool and default redirect
+# are ONE provider signal, not several, so common purpose is not established and
+# no vendor has classified either domain.
+check "confirm file parses to 20 hosts" "20" "$(parse_confirm | wc -l)"
+check "  the 2026-09-21 pair is among them" "yes" \
+  "$(parse_confirm | grep -qx 'realizationnewestfangs.com' \
+     && parse_confirm | grep -qx 'zoologyfibre.com' && echo yes || echo no)"
 check "  googll.store is among them" "yes" \
   "$(parse_confirm | grep -qx 'googll.store' && echo yes || echo no)"
+# Pinned by name, not only by count, because a count pin alone would let a
+# future edit swap one ruling for another and still pass.
+check "  spendsdetachment.com is among them" "yes" \
+  "$(parse_confirm | grep -qx 'spendsdetachment.com' && echo yes || echo no)"
 check "  multi-line comment blocks do not leak entries" "0" \
   "$(parse_confirm | grep -cvE '^[a-z0-9.-]+\.[a-z0-9-]+$' || true)"
 

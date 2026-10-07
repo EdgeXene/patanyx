@@ -43,6 +43,11 @@
 # 2.52.5, the Flatpak must be HELD -- do not lower MIN_WEBKITGTK to make it
 # start. The native Debian 13 package is unaffected: trixie security carries
 # 2.52.6-1~deb13u1.
+#
+# FLOOR RAISED AGAIN, 2026-10-02: MIN_WEBKITGTK is now 2.54.0 (WSA-2026-0006,
+# 232 CVEs). Everything above about 2.52.6 now reads 2.54.0: the runtime must
+# report 2.54.0 or newer before this channel is clear. Not re-probed on that
+# date; the hold stands until it is.
 app-id: io.edgexene.Patanyx
 runtime: org.gnome.Platform
 runtime-version: "50"

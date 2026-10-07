@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.4" date="2026-10-07">
+      <description>
+        <p>This version needs WebKitGTK 2.54.0 or newer, which fixes security problems a web page could trigger (WebKitGTK advisory WSA-2026-0006), and does not start with an older version. On Windows, the Spotify web player can now play instead of only controlling another device.</p>
+      </description>
+    </release>
     <release version="1.0.3" date="2026-09-28">
       <description>
         <p>You can change your vault passphrase again, from Backup and recovery. Your bookmarks and the rest of your Library now open with the vault, so one passphrase covers both, and your recovery key opens the Library too. Only one window of PATANYX 1.0.3 or later can use the Library at a time, and if the vault file is lost, the Library is lost with it.</p>

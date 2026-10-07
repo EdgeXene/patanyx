@@ -76,7 +76,7 @@ cash.app       # 8291  Block's payment service, reported by PhishDestroy
 # it is circumstantial -- infrastructure shared between disposable domains, not
 # an observed phishing page. Recorded so the tripwire stops re-asking.
 
-# Cluster A. Four domains, one registrant: all Amazon Registrar, all AWS Route 53
+# Cluster A. Four domains, run together: all Amazon Registrar, all AWS Route 53
 # nameservers, all registered between 2025-11-04 and 2025-12-12, all with DV
 # certificates from Google Trust Services, all three-random-English-word names,
 # and ALL FOUR resolving to the single IP 94.242.247.34, which has no reverse
@@ -102,7 +102,7 @@ b7510.com            # 1723  Serves an empty 200, application/octet-stream,
                      #       block registered to networkclaim-com (NL).
                      #       Review read this as adtech or SDK telemetry and
                      #       recommended allowing it as out of scope; the
-                     #       decision went the other way on 2026-09-01 and it
+                     #       ruling of 2026-09-01 went the other way and it
                      #       stays blocked. Recorded plainly because the file
                      #       is worth nothing if it hides which calls were
                      #       contested.
@@ -112,7 +112,7 @@ bangcdn.net          # 4725  NXDOMAIN. Resolves nowhere, so it cannot serve
 13o.net              # 8417  Cloudflare, but a DIFFERENT nameserver pair from
                      #       cluster B, so the profile fits and the cluster
                      #       evidence does not exist. NameCheap, 2023. Kept
-                     #       blocked by decision, 2026-09-01.
+                     #       blocked by the ruling of 2026-09-01.
 
 # --- Tranco snapshot of 2026-09-02 armed these two -------------------------
 # Both arrived with ShadowWhisperer's Malware list and sat in the 10000-100000
@@ -127,7 +127,7 @@ bangcdn.net          # 4725  NXDOMAIN. Resolves nowhere, so it cannot serve
 # moment, and it is exactly what a Google-impersonation kit shows a visitor it
 # does not want. Independent classification outranked it.
 #
-# Decision 2026-09-01, on evidence this machine could not see:
+# Ruling 2026-09-01, on evidence this machine could not see:
 
 workdeadlinededicate.com  # 9109  Phishing per Malwarebytes and ANY.RUN, with
                           #       multi-vendor detections and GOOGLE-BRAND
@@ -138,3 +138,101 @@ workdeadlinededicate.com  # 9109  Phishing per Malwarebytes and ANY.RUN, with
 kettledroopingcontinuation.com # 8923  Phishing per Kaspersky and SafeToOpen,
                           #       multiple independent malicious detections and
                           #       further phishing-report corroboration.
+
+# --- Tranco snapshot of 2026-09-14 armed a third domain --------------------
+# spendsdetachment.com arrived with ShadowWhisperer's Malware list, sat in the
+# report band, and the weekly snapshot moved it from #10682 to #9247, which held
+# the snapshot refresh until it was ruled on. Single-source here: none of the
+# other five feeds carries it (PhishDestroy, Phishing.Database, phishunt.io,
+# CERT.pl and ShadowWhisperer.Scam are all zero).
+#
+# MEASURED 2026-09-14, recorded exactly so a later reader can repeat it and see
+# whether the infrastructure moved:
+#
+#   registrar    eNom, LLC (IANA 48), registered 2024-09-03T08:21:13Z,
+#                last changed 2026-08-04T10:56:27Z
+#   nameservers  ns1.publicdnsservice.com, ns2.publicdnsservice.com
+#   A records    23.111.84.4, 23.111.84.220, 23.111.84.228, 172.240.108.68,
+#                172.240.108.76, 172.240.108.84, 172.240.127.234,
+#                172.240.127.242, 172.240.127.243, 172.240.127.244,
+#                172.240.253.132, 172.255.141.4   (no PTR on any of them)
+#   certificate  Let's Encrypt YR2, serial 054BEFEB9C959D48DBE2C89C35FB7394B342,
+#                notBefore 2026-08-26T04:27:12Z
+#   probe        301 to https://google.com/, 169 bytes, text/html, identical
+#                under a default and a browser user-agent
+#
+# The same measurements for workdeadlinededicate.com, confirmed above:
+# registered at eNom 2024-09-03T08:21:06Z, last changed 2026-08-04T10:57:30Z,
+# the same two nameservers, THE SAME TWELVE ADDRESSES, certificate serial
+# 06E6AFF59EF0B2EB74CA6BE1C94F9980DA6D notBefore 2026-08-26T05:39:42Z, and the
+# same 301/169-byte response. For kettledroopingcontinuation.com: eNom
+# 2024-09-01T11:04:51Z, the same two nameservers, the same twelve addresses, the
+# same 301/169-byte response, but a certificate from 2026-08-23T00:02:23Z -- so
+# the certificate timing links two of the three, not all three, and is recorded
+# that way rather than rounded up into a cluster-wide signal.
+#
+# WHAT THAT DOES AND DOES NOT SHOW. The load-bearing observation is the
+# registration pair: two names entered at one registrar SEVEN SECONDS apart is a
+# bulk run, and bulk runs are not shared between unrelated buyers. Everything
+# else is weaker than it looks and is NOT a second, third and fourth independent
+# confirmation of it: one hosting provider serves many customers the same
+# address pool, one DNS provider gives many customers the same nameserver pair,
+# and ACME clients issue certificates on whatever day they are pointed at a
+# name. Those three can co-vary for reasons that have nothing to do with common
+# control. Nor does the probe add much on its own -- the 2026-09-02 note above
+# says exactly why a 301 to google.com proves nothing, and that still holds. It
+# is recorded because it is now measured identically on all three, which was
+# asserted here in an earlier draft without ever having been written down.
+#
+# So: common registration is well supported, common control is a reasonable
+# inference from it, and common PURPOSE is not established at all. The phishing
+# classifications from Malwarebytes, ANY.RUN, Kaspersky and SafeToOpen are
+# findings about the two siblings. Nothing here is a vendor classification of
+# THIS domain, and no phishing page was observed on it.
+#
+# Ruling 2026-09-14: block. Recorded as a PRECAUTIONARY decision under
+# this file's own standard -- a malware feed lists it, it is a bulk-registered
+# sibling of two confirmed phishing domains on identical infrastructure, nothing
+# of value is known to be reachable on it, and a wrong block here is visible and
+# overridable per tab while a wrong allow is silent and permanent. If it is ever
+# disputed, the thing to re-examine is the leap from common registration to
+# shared purpose, because that is the step carrying the decision.
+
+spendsdetachment.com  # 9247  Bulk-registered seven seconds after
+                      #       workdeadlinededicate.com at the same registrar,
+                      #       on identical hosting and nameservers. Blocked as
+                      #       a precaution, not on a classification of its own.
+
+# Ruling 2026-09-21: block. Two more gibberish-compound .com domains
+# newly in the Tranco top 10,000, held by the tripwire (GlitchTip event
+# 01a0c365477476ad8f19208335d3dd56, stage=adjudicate, count=2).
+#
+# MEASURED TODAY, on both: nameservers ns1/ns2.publicdnsservice.com; an A set of
+# nine addresses (172.240.108.68/.76/.84, 172.240.127.234/.242/.243/.244,
+# 172.240.253.132, 172.255.141.4) that is a SUBSET of the twelve recorded for the
+# 2026-09-02/14 cluster, the 23.111.84.x addresses being absent; and a response
+# BYTE-IDENTICAL to spendsdetachment.com's -- nginx/1.28.2, HTTP 301 to
+# https://google.com/, Content-Length 169, same sha256. That 169-byte figure was
+# cited in an earlier write-up without ever having been measured; it is measured
+# now, on four hosts.
+#
+# WHAT THAT DOES AND DOES NOT SHOW. It is the same reasoning the review
+# corrected on spendsdetachment.com, so it is stated the way that review
+# required: shared nameservers, a shared address pool and a shared default
+# redirect are ONE signal, not four, because a single provider hands all of them
+# to every customer alike. Common hosting is well supported. Common control is an
+# inference. Common PURPOSE is NOT established: no vendor has classified either
+# domain and no phishing page was observed on either. Neither serves anything but
+# the redirect.
+#
+# So these are PRECAUTIONARY blocks, decided under this file's
+# own standard: nothing of value is known to be reachable on them, and a wrong
+# block is visible and overridable per tab while a wrong allow is silent. If
+# disputed, re-examine the same step as before -- the leap from common
+# infrastructure to shared purpose.
+
+realizationnewestfangs.com  # 7420  publicdnsservice cluster. Serves only a
+                            #       301 to google.com, byte-identical to
+                            #       spendsdetachment.com. Precautionary.
+zoologyfibre.com            # 9304  Same nameservers, same nine-address pool,
+                            #       same byte-identical 301. Precautionary.

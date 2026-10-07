@@ -2,10 +2,12 @@
 #
 # The build host MUST NOT be Debian 12. Its webkit2gtk is end-of-life at
 # 2.50.6 (Debian security tracker, DSA-6232-1), so it will never receive the
-# WSA-2026-0004 fixes (23 CVEs) nor the WSA-2026-0005 fixes (9 more, among
-# them an iframe sandbox violation and use-after-free), all reachable by
-# visiting a page. Trixie security carries 2.52.6-1~deb13u1, which is the
-# floor `platform::MIN_WEBKITGTK` enforces at runtime.
+# WSA-2026-0004 fixes (23 CVEs), the WSA-2026-0005 fixes (9 more) nor the
+# WSA-2026-0006 fixes (232 more, among them sandbox escapes and memory
+# corruption), most of them reachable by visiting a page. Trixie security carries
+# 2.54.0-1~deb13u1 (DSA-6534-1), which is the floor `platform::MIN_WEBKITGTK`
+# enforces at runtime. An image built before 1 October 2026 holds 2.52.6 and
+# fails the check below: rebuild it with --no-cache, or the apt layer is reused.
 #
 # This is a container rather than a host upgrade on purpose: the machine this
 # was developed on runs 19 unrelated pm2 services, and a dist-upgrade to pick
@@ -37,10 +39,10 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
 RUN set -eu; \
     v="$(dpkg-query -W -f='${Version}' libwebkit2gtk-4.1-dev)"; \
     echo "webkit2gtk-4.1-dev = $v"; \
-    if dpkg --compare-versions "$v" ge 2.52.6; then \
-      echo "at or above the 2.52.6 floor"; \
+    if dpkg --compare-versions "$v" ge 2.54.0; then \
+      echo "at or above the 2.54.0 floor"; \
     else \
-      echo "REFUSING: $v is below the 2.52.6 security floor" >&2; exit 1; \
+      echo "REFUSING: $v is below the 2.54.0 security floor" >&2; exit 1; \
     fi
 
 # Pinned toolchain. rust-toolchain.toml pins the channel, but rustup must
