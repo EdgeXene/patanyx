@@ -6,8 +6,10 @@
 # its allowlist protects reachability. These rules silently drop subresource
 # REQUESTS, so an entry here protects the browser's own plumbing and this
 # project's first-party infrastructure from ever being filtered by a bad
-# upstream pull -- nothing else. "This ad network is legitimate" is NOT a
-# reason: legitimate ad networks are exactly what the feature blocks.
+# upstream pull -- and, below the first-party block, a host a site cannot
+# work without, reproduced before it is added. Nothing else. "This ad network
+# is legitimate" is NOT a reason: legitimate ad networks are exactly what the
+# feature blocks.
 #
 # EXACT MATCH ONLY, same parse as the blocklist allowlist: removing
 # `example.com` does not remove `sub.example.com`.
@@ -45,3 +47,17 @@ geo2.ggpht.com
 geo3.ggpht.com
 # NOT allowed, deliberately: csi.gstatic.com and metric.gstatic.com are
 # client-side instrumentation and nothing renders from them.
+
+# ---- Spotify playback gateway, added 2026-10-05 ----
+# Dual use. guc-spclient.spotify.com is one of Spotify's regional client API
+# front ends (spclient). The web player registers itself as a playback device
+# through it (track-playback/v1/devices) before it will play a note, and a
+# host rule cannot separate that from anything else Spotify sends through the
+# same host. Upstream files it under Tracking. Reproduced on Windows 1.0.x:
+# with this host refused, the web player signs in and can remote-control a
+# phone, but cannot play in the browser; with ad and tracker blocking off, the
+# same page plays.
+guc-spclient.spotify.com  # Spotify device registration and playback.
+# NOT allowed, deliberately: pixel.spotify.com, pixels.spotify.com,
+# adeventtracker.spotify.com, crashdump.spotify.com, bloodhound.spotify.com
+# and ads.spotify.com. They are ads and telemetry, not the player.

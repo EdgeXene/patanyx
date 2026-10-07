@@ -2975,6 +2975,13 @@ mod shipped_adlist_guard {
     //! that one, and with consent stored the same page worked with every
     //! other rule still on.
     //!
+    //! `guc-spclient.spotify.com` is the same mistake on another site. It is
+    //! the client API the Spotify web player registers itself through as a
+    //! playback device, filed upstream under Tracking. Refused, the player
+    //! signs in and can steer a phone but cannot play in the browser; found on
+    //! Windows 1.0.x, where turning ad and tracker blocking off made the same
+    //! page play.
+    //!
     //! These names are in `scripts/adlist-allow.txt`, so a regeneration drops
     //! them again. This test is the part that fails loudly if one comes back
     //! by another route.
@@ -2993,6 +3000,8 @@ mod shipped_adlist_guard {
             "t2.gstatic.com",
             "geo1.ggpht.com",
             "geo3.ggpht.com",
+            // Spotify's playback gateway: the web player cannot play without it.
+            "guc-spclient.spotify.com",
         ] {
             assert!(
                 !rules.blocks_host(host),
@@ -3006,7 +3015,17 @@ mod shipped_adlist_guard {
         // The counterpart assertion. Without it, "fix the breakage" could be
         // satisfied by shipping an empty list, and this test would still pass.
         let rules = RuleSet::from_lines(&format!("{ADLIST_ADS}\n{ADLIST_TRACKING}"));
-        for host in ["csi.gstatic.com", "metric.gstatic.com", "google-analytics.com"] {
+        for host in [
+            "csi.gstatic.com",
+            "metric.gstatic.com",
+            "google-analytics.com",
+            // Spotify's ads and telemetry stay refused; only the playback
+            // gateway was let through.
+            "pixel.spotify.com",
+            "adeventtracker.spotify.com",
+            "crashdump.spotify.com",
+            "ads.spotify.com",
+        ] {
             assert!(rules.blocks_host(host), "{host} should still be blocked");
         }
     }

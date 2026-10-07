@@ -1,4 +1,4 @@
-# PATANYX ad and tracker rules: Tracking -- 116386 hosts.
+# PATANYX ad and tracker rules: Tracking -- 116385 hosts.
 # Regenerate with scripts/build-adlist.sh. Retrieved 2026-09-01.
 #
 # Source: ShadowWhisperer -- https://github.com/ShadowWhisperer/BlockLists --
@@ -37581,7 +37581,6 @@ guardenvironment.com
 guardiananalytics.com
 guardsquare.com
 gubagootracking.com
-guc-spclient.spotify.com
 gucir.bakerssquare.com
 gudme.lokai.com
 gudvs.millennialmagazine.com
