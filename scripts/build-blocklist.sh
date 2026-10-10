@@ -31,13 +31,24 @@ PDB_URL="https://raw.githubusercontent.com/Phishing-Database/Phishing.Database/m
 PHISHUNT_URL="https://phishunt.io/feed.txt"
 
 # PhishDestroy's PRIMARY list, and the distinction matters more than the URL
-# does. The same repo also publishes community/blocklist.txt, "aggregated from
-# 13+ sources" -- and that account mirrors OpenPhish, GPL-3.0 scam-database and
-# others. A CC0 label on aggregated third-party data cannot grant rights the
-# upstreams withheld, and OpenPhish's no-redistribution term is the exact reason
-# this script already rejects it. Primary is their own investigative work, so
-# CC0 is theirs to give. Never point this at the community feed.
-PHISHDESTROY_URL="https://raw.githubusercontent.com/phishdestroy/destroylist/main/list.txt"
+# does. The same dataset also publishes community/blocklist.json, "aggregated
+# from 13+ sources" -- and that account mirrors OpenPhish, GPL-3.0
+# scam-database and others. A permissive label on aggregated third-party data
+# cannot grant rights the upstreams withheld, and OpenPhish's no-redistribution
+# term is the exact reason this script already rejects it. Primary is their own
+# investigative work, so the licence is theirs to give. Never point this at the
+# community feed.
+#
+# WHY HUGGING FACE. The GitHub account (phishdestroy/destroylist) vanished on
+# 2026-10-07: account and repository both 404, not a redirect, and every hourly
+# run failed from 08:02 Central that day. PhishDestroy's own Hugging Face
+# account publishes the same primary list as domains.txt, synced hourly and
+# still moving after GitHub went away. Checked 2026-10-09 against the last
+# GitHub copy this publisher fetched: 216,862 of its 216,863 hosts present,
+# plus 2,194 added since. Licence: MIT on the dataset card, the same terms
+# NOTICE already carries. The URL redirects (307) to Hugging Face's file
+# cache; $CURL follows it and refuses any non-https hop.
+PHISHDESTROY_URL="https://huggingface.co/datasets/phishdestroy/destroylist/resolve/main/domains.txt"
 
 # ShadowWhisperer, added 2026-09-01. TWO lists, fetched and floored separately
 # because they are different feeds wearing one repository: Malware commits
@@ -120,6 +131,12 @@ PHISHUNT_FLOOR=100
 # 183,460 on 2026-08-10. Same reasoning as the others: clear of ordinary churn,
 # high enough that a truncated fetch cannot pass for a real list.
 PHISHDESTROY_FLOOR=120000
+# And a CEILING, added with the move to Hugging Face. The same dataset carries
+# the aggregated community feed (1,119,738 entries on 2026-10-09) that this
+# script must never ship; if it were ever folded into domains.txt, the floor
+# would wave it through. The primary list was 219,056 that day, so 400,000
+# leaves room for years of honest growth and none for a merge.
+PHISHDESTROY_CEILING=400000
 # Measured 2026-09-01: Scam 7,309 hosts, Malware 43,848. Same reasoning as the
 # floors above -- clear of ordinary churn, high enough that a truncated fetch
 # cannot pass for a real list.
@@ -653,6 +670,12 @@ fi
 if [ "$PD_N" -lt "$PHISHDESTROY_FLOOR" ]; then
   say "FAIL: PhishDestroy returned $PD_N hosts, floor is $PHISHDESTROY_FLOOR."
   say "  $OUT is unchanged."
+  exit 1
+fi
+if [ "$PD_N" -gt "$PHISHDESTROY_CEILING" ]; then
+  say "FAIL: PhishDestroy returned $PD_N hosts, ceiling is $PHISHDESTROY_CEILING."
+  say "  That is the size of their aggregated community feed, not the primary"
+  say "  list; it must not ship. $OUT is unchanged."
   exit 1
 fi
 
@@ -1612,22 +1635,41 @@ cat > "$WORK/out.txt" <<HEADER
 # suspicion based on automated heuristics and third-party signals. It is not
 # a legal finding ... False positives and false negatives occur routinely."
 #
-# 3. PhishDestroy -- https://phishdestroy.io/ -- list.txt (their PRIMARY
-#    dataset, not the aggregated community feed) -- $PD_N hosts, of which
-#    $NEW_FROM_PD were not already covered by either list above.
+# 3. PhishDestroy -- https://phishdestroy.io/ -- domains.txt from their
+#    Hugging Face dataset, phishdestroy/destroylist (their PRIMARY list, not
+#    the aggregated community feed) -- $PD_N hosts, of which $NEW_FROM_PD
+#    were not already covered by either list above.
 #
-# Creative Commons CC0 1.0 Universal (public domain dedication). From their
-# dataset page: "Released under CC0 1.0 Universal -- no restrictions, no
-# attribution required. Use freely for research, commercial products, or ML
-# training. Repository code and tooling are separately licensed under MIT."
-# Attribution is given here anyway, on the same principle as phishunt above.
+# MIT License, as stated on the dataset card. The copyright line is the one in
+# the LICENSE file of their GitHub repository (verified 2026-09-01 at revision
+# 12f5dfc39bb2), which is where this list came from until it disappeared on
+# 2026-10-07.
+# Copyright (c) 2019 PhishDestroy
 #
-# ONLY THE PRIMARY LIST IS USED. The same repository publishes a community
-# feed aggregated from 13+ upstreams, and the account mirrors OpenPhish and
-# GPL-3.0 sources among others. A CC0 dedication cannot pass on rights the
-# original publishers withheld, and OpenPhish's no-redistribution term is the
-# very reason it is refused further down this file. Primary is PhishDestroy's
-# own investigative work, which is theirs to dedicate.
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+#
+# ONLY THE PRIMARY LIST IS USED. The same dataset publishes a community feed
+# aggregated from 13+ upstreams, and the account mirrors OpenPhish and
+# GPL-3.0 sources among others. A permissive licence cannot pass on rights
+# the original publishers withheld, and OpenPhish's no-redistribution term is
+# the very reason it is refused further down this file. Primary is
+# PhishDestroy's own investigative work, which is theirs to license.
 #
 # WHY IT WAS ADDED. A single bulk source is a single point of failure, and
 # Phishing.Database stopped publishing on 2026-08-01: the floors still passed

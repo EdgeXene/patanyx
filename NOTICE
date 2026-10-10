@@ -35,14 +35,20 @@ Third-Party Acknowledgements
 3. PhishDestroy (bundled malicious-host list)
    Copyright (c) 2019 PhishDestroy
    Licensed under the MIT License.
-   Source: https://github.com/phishdestroy/destroylist (list.txt)
-   Licence verified 2026-09-01 against the repository's LICENSE file, at
-   revision 12f5dfc39bb2.
+   (The full MIT text is preserved in crates/app/src/blocklist.txt, as for
+   entry 1, so it travels with the data itself.)
+   Source: https://huggingface.co/datasets/phishdestroy/destroylist
+   (domains.txt) since 2026-10-09; before that
+   https://github.com/phishdestroy/destroylist (list.txt), which is no
+   longer available.
+   Licence verified 2026-09-01 against the GitHub repository's LICENSE file,
+   at revision 12f5dfc39bb2, and 2026-10-09 against the Hugging Face dataset
+   card (license: mit).
    (Added as a source on 2026-08-10 and merged into crates/app/src/blocklist.txt
    by scripts/build-blocklist.sh; this acknowledgement was omitted at the time,
    so builds from 2026-08-10 onward redistributed the data without the notice
-   MIT requires. THE PRIMARY LIST ONLY. The same repository publishes
-   community/blocklist.txt, aggregated from 13+ upstreams including ones whose
+   MIT requires. THE PRIMARY LIST ONLY. The same source also publishes a
+   community feed, aggregated from 13+ upstreams including ones whose
    terms forbid redistribution; a permissive label on an aggregate cannot pass
    on rights the upstreams withheld, so the aggregate is deliberately not used.)
 

@@ -77,18 +77,34 @@
 #    dataset, not the aggregated community feed) -- 216106 hosts, of which
 #    207527 were not already covered by either list above.
 #
-# Creative Commons CC0 1.0 Universal (public domain dedication). From their
-# dataset page: "Released under CC0 1.0 Universal -- no restrictions, no
-# attribution required. Use freely for research, commercial products, or ML
-# training. Repository code and tooling are separately licensed under MIT."
-# Attribution is given here anyway, on the same principle as phishunt above.
+# MIT License, per the LICENSE file of the GitHub repository this data was
+# retrieved from (verified 2026-09-01 at revision 12f5dfc39bb2).
+# Copyright (c) 2019 PhishDestroy
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
 #
 # ONLY THE PRIMARY LIST IS USED. The same repository publishes a community
 # feed aggregated from 13+ upstreams, and the account mirrors OpenPhish and
-# GPL-3.0 sources among others. A CC0 dedication cannot pass on rights the
+# GPL-3.0 sources among others. A permissive licence cannot pass on rights the
 # original publishers withheld, and OpenPhish's no-redistribution term is the
 # very reason it is refused further down this file. Primary is PhishDestroy's
-# own investigative work, which is theirs to dedicate.
+# own investigative work, which is theirs to license.
 #
 # WHY IT WAS ADDED. A single bulk source is a single point of failure, and
 # Phishing.Database stopped publishing on 2026-08-01: the floors still passed
