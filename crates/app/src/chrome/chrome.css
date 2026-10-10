@@ -2823,8 +2823,15 @@ textarea {
    behaviour in `title`. It was also the widest label in the row at 129px.
 
    Both buttons here are icon-only ONLY because their glyphs carry themselves.
-   Neither is an argument for hiding a label that is doing work. */
+   Neither is an argument for hiding a label that is doing work.
+
+   READER VIEW JOINED THEM in 1.0.6, judged from the row as it renders: the
+   page-with-three-lines glyph is the only one of its kind in the
+   strip, the button carries no live state, and the word was the widest thing
+   in row one. The full name stays in `aria-label`, the behaviour and the F9
+   key in `title`, and the panel heading says "Reader View" once it opens. */
 #btn-bookmark .feature-label,
+#btn-reader .feature-label,
 #btn-quarantine-menu .feature-label {
   display: none;
 }

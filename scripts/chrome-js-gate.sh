@@ -692,6 +692,7 @@ if [ -f "$DIVERGENCE_SCRIPT" ]; then
   # it prints is published. It pins the exact set of techniques that succeed,
   # so a change in either direction has to be made on purpose.
   node scripts/divergence-detect-gate.js
+  node scripts/divergence-recovery-gate.js
 
   # Workers get NO divergence since 1.0.1 (22ea1a3): the Worker wrapper broke
   # sites whose CSP refuses blob: workers. This pins that self.Worker is the
@@ -714,6 +715,21 @@ echo "=== gate 1m2: the local-network boundary's WebSocket guard ==="
 # child realms, and that it never reaches the chrome webview (Private Chat)
 # or Linux.
 node scripts/local-network-guard-gate.js
+
+echo
+echo "=== gate 1m3: YouTube video ads script ==="
+# Edits replies the page asked for, in the page's own world, so the two
+# failures that matter are removing something that is not an ad and breaking
+# a reply it should have left alone. Runs the real script against Node's own
+# Response; every planted defect must fail it.
+node scripts/youtube-ads-gate.js
+for plant in $(PATANYX_YT_LIST_PLANTS=1 node scripts/youtube-ads-gate.js); do
+  if PATANYX_YT_PLANT="$plant" node scripts/youtube-ads-gate.js >/dev/null 2>&1; then
+    echo "GATE FAIL: planted defect '$plant' passed scripts/youtube-ads-gate.js" >&2
+    exit 1
+  fi
+done
+echo "  planted defects caught: $(PATANYX_YT_LIST_PLANTS=1 node scripts/youtube-ads-gate.js | wc -l)"
 
 echo
 echo "=== gate 1n: the malicious-site blocked banner ==="

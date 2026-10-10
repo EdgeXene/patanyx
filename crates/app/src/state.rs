@@ -1834,6 +1834,9 @@ fn build_tab(
     // The engine zooms on keys this process never sees; this is how the
     // indicator learns about it.
     platform::connect_zoom_changed(&webview, proxy, id);
+    // A page's own fullscreen element (a video's full screen button). The
+    // engine reports it; AppState decides what the window does.
+    platform::connect_fullscreen(hosts, &webview, proxy, id);
     // Download plumbing wry cannot express on its own: the webkit2gtk
     // Response-policy workaround on unix, a no-op on Windows where wry's
     // download handlers are implemented natively.
@@ -2343,6 +2346,14 @@ pub struct AppState {
     /// `active` is always the pane with the keyboard, so every command that
     /// acts on the active tab acts on the focused pane.
     pub pair: Option<(u64, u64)>,
+    /// The tab whose page holds the screen through its own fullscreen
+    /// element (a video's "full screen" button), or None. While set, the
+    /// toolbar is out of the way and the window is fullscreen; see
+    /// fullscreen.rs for everything that ends it.
+    pub page_fullscreen: Option<u64>,
+    /// Bumped each time the "Press Esc to exit" notice is shown, so the timer
+    /// of an earlier notice cannot hide a later one.
+    fullscreen_notice_gen: u64,
     /// Outstanding download comparisons we asked for. Memory only, like the
     /// page-corroboration map beside it.
     #[cfg(feature = "chat")]
@@ -2719,6 +2730,8 @@ impl AppState {
             reader: crate::reader_view::ReaderState::default(),
             groups: crate::tab_groups::TabGroups::default(),
             pair: None,
+            page_fullscreen: None,
+            fullscreen_notice_gen: 0,
             #[cfg(feature = "chat")]
             download_compare: crate::download_compare::DownloadCompareState::default(),
             pending_save: None,
@@ -3136,6 +3149,27 @@ impl AppState {
     /// needed after resize, scale-factor change, tab switch, and chrome
     /// height change. unix: no-op, GTK packing owns layout there.
     pub fn relayout(&self) {
+        // Which pages may take the screen right now. Published on every
+        // relayout because everything that changes the answer (tab switch,
+        // Side by Side, a modal) passes through here; the Linux engine asks
+        // it BEFORE the window changes, so a refused request never touches
+        // the window at all.
+        platform::set_fullscreen_eligible(
+            &self.hosts,
+            &crate::fullscreen::eligible_tabs(
+                self.tabs.get(self.active).map(|t| t.id),
+                self.pair,
+                self.modal_covers_window(),
+            ),
+        );
+        // A fullscreen page takes the whole window and the toolbar steps
+        // aside; nothing below applies until it leaves.
+        if let Some(id) = self.page_fullscreen {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                platform::layout_fullscreen(&self.hosts, &self.chrome, &tab.webview);
+                return;
+            }
+        }
         // Before the geometry: the title bar comes back in the system colour
         // after a maximize or a restore, and every such transition arrives
         // here as a resize. Writing the same colours again does not repaint
@@ -3204,6 +3238,10 @@ impl AppState {
     pub fn set_chrome_arrangement(&mut self, next: platform::ChromeLayout) {
         if self.chrome_arrangement == next {
             return;
+        }
+        // A modal must never open behind a fullscreen page.
+        if matches!(next, platform::ChromeLayout::Overlay) {
+            self.exit_page_fullscreen();
         }
         // The docked chat pane and Side by Side do not share the window:
         // docking the pane ends the pair, keeping the focused page.
@@ -3435,6 +3473,11 @@ impl AppState {
     }
 
     pub fn close_tab(&mut self, id: u64) -> Result<(), &'static str> {
+        // Before anything is removed, so Side by Side's hidden pane is
+        // restored while both panes still exist.
+        if self.page_fullscreen == Some(id) {
+            self.leave_page_fullscreen();
+        }
         if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
             if tab.blocked_pending.borrow().is_some() {
                 self.emit("navigation_blocked_retired", json!({ "tab_id": id }));
@@ -3975,6 +4018,7 @@ impl AppState {
             "freeze_after_load": self.privacy.freeze_after_load,
             "javascript": self.privacy.javascript,
             "ephemeral": self.privacy.ephemeral,
+            "block_youtube_ads": self.privacy.block_youtube_ads,
             "network_blocking_supported": platform::network_blocking_supported(),
             "freeze_enforced": platform::freeze_enforced(),
             "forget_all": {
@@ -4022,6 +4066,7 @@ impl AppState {
                 "ephemeral_confirmed": "not_attempted",
                 "hardened_environment": "not_attempted",
                 "session_lock_registered": "not_attempted",
+                "sandbox": "not_attempted",
                 "translation": { "active": false },
                 // Same degraded default as everything else in this
                 // unreachable arm; the measured value lives in the tab arm.
@@ -4126,6 +4171,11 @@ impl AppState {
             // guarding it. The user is told that rather than left with a
             // setting that reads as on.
             "session_lock_registered": engine_settings.session_lock_registered,
+            // Per-tab, read back from WebKitGTK: whether this tab's web and
+            // network processes run inside the engine's sandbox. "failed"
+            // means a renderer exploit would run with the user's full
+            // privileges, which is what every Linux build before 1.0.6 did.
+            "sandbox": engine_settings.sandbox,
             // Whether the content-script + message-handler registration this
             // tab's autofill save/fill flow depends on actually succeeded.
             // The fill/save affordance must never be offered on the strength
@@ -4266,6 +4316,108 @@ impl AppState {
                 "zoom_changed",
                 json!({ "percent": (level * 100.0).round() }),
             );
+        }
+    }
+
+    /// The engine says a tab's page entered or left its fullscreen element.
+    ///
+    /// Entering is honoured only for a page in `fullscreen::eligible_tabs`.
+    /// On Linux the engine already refused anything else; on Windows the
+    /// report comes after the fact and an ineligible page simply keeps a
+    /// tab-sized fullscreen, which is what every earlier build did.
+    pub fn on_page_fullscreen(&mut self, id: u64, on: bool) {
+        if !on {
+            if self.page_fullscreen == Some(id) {
+                self.leave_page_fullscreen();
+            }
+            return;
+        }
+        if self.page_fullscreen == Some(id) {
+            return;
+        }
+        let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let active = self.tabs.get(self.active).map(|t| t.id);
+        if !crate::fullscreen::eligible_tabs(active, self.pair, self.modal_covers_window()).contains(&id) {
+            return;
+        }
+        // The other Side by Side pane already holds the screen: one at a time.
+        self.exit_page_fullscreen();
+        if let Some((l, r)) = self.pair {
+            let other = if l == id { r } else { l };
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == other) {
+                platform::hide_tab(&tab.view, &tab.webview);
+            }
+        }
+        // The state BEFORE any layout runs, so every relayout from here on is
+        // the fullscreen one: on Linux the engine has already fullscreened the
+        // window, and a normal layout in between would flash the toolbar.
+        self.page_fullscreen = Some(id);
+        platform::set_page_fullscreen(&self.hosts, true);
+        // A pane the user clicked in may not be the active one yet (the focus
+        // report and the fullscreen report race). The same path as that focus
+        // report: the pane becomes active without a refocus, the pair stays,
+        // and the strip is told which pane is active. set_active_inner keeps
+        // fullscreen when the tab it switches to is the fullscreen one.
+        if index != self.active {
+            self.on_pane_focused(id);
+        }
+        self.relayout();
+        self.show_fullscreen_notice();
+    }
+
+    /// Ends page fullscreen from the browser's side (a shortcut, a modal, a
+    /// tab switch). No-op when nothing is fullscreen.
+    ///
+    /// The window and the toolbar come back natively. The PAGE is not asked
+    /// to leave: script is never evaluated in a content webview (see
+    /// `chrome`), so on Windows its element can stay fullscreen inside the
+    /// tab's rectangle until the user presses Esc, as in every earlier build.
+    pub fn exit_page_fullscreen(&mut self) {
+        if self.page_fullscreen.is_some() {
+            self.leave_page_fullscreen();
+        }
+    }
+
+    fn leave_page_fullscreen(&mut self) {
+        self.page_fullscreen = None;
+        // Any notice timer still running belongs to the fullscreen that just
+        // ended.
+        self.fullscreen_notice_gen += 1;
+        platform::set_fullscreen_notice(&self.hosts, None);
+        platform::set_page_fullscreen(&self.hosts, false);
+        // Side by Side: the other pane was hidden for the duration.
+        if let Some((l, r)) = self.pair {
+            let a = self.tabs.iter().find(|t| t.id == l);
+            let b = self.tabs.iter().find(|t| t.id == r);
+            if let (Some(a), Some(b)) = (a, b) {
+                platform::set_side_by_side(&self.hosts, Some(((&a.view, &a.webview), (&b.view, &b.webview))));
+            }
+        }
+        self.relayout();
+    }
+
+    /// "Full screen. Press Esc to exit." for `fullscreen::NOTICE_SECS`.
+    ///
+    /// The one defence against a page that draws a fake browser once it owns
+    /// the screen: the user is told, by the browser, that a page has the
+    /// screen and how to take it back.
+    fn show_fullscreen_notice(&mut self) {
+        self.fullscreen_notice_gen += 1;
+        let generation = self.fullscreen_notice_gen;
+        let text = self.i18n.text(crate::i18n::keys::CHROME_FULLSCREEN_NOTICE);
+        platform::set_fullscreen_notice(&self.hosts, Some(&text));
+        let proxy = self.proxy.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(crate::fullscreen::NOTICE_SECS));
+            let _ = proxy.send_event(UserEvent::FullscreenNoticeEnd(generation));
+        });
+    }
+
+    pub fn on_fullscreen_notice_end(&mut self, generation: u64) {
+        if generation == self.fullscreen_notice_gen {
+            platform::set_fullscreen_notice(&self.hosts, None);
         }
     }
 
@@ -6592,6 +6744,13 @@ impl AppState {
         if index >= self.tabs.len() || index == self.active {
             return;
         }
+        // Showing another page ends fullscreen first: the window must not
+        // stay fullscreen around a page that never asked for it. Switching TO
+        // the fullscreen page (a Side by Side pane whose fullscreen report
+        // beat its focus report) keeps it.
+        if self.page_fullscreen.is_some_and(|fs| fs != self.tabs[index].id) {
+            self.exit_page_fullscreen();
+        }
         // Find sessions are per-tab: highlights must not stay lit on a tab
         // the user is leaving, and a count arriving late must find nothing
         // to describe. The chrome closes its bar off the url_changed this
@@ -7377,6 +7536,11 @@ impl AppState {
 
     /// The URL bar's loading indicator tracks the active tab only.
     pub fn on_load_state(&mut self, id: u64, loading: bool) {
+        // A new document in the fullscreen tab: the page that asked for the
+        // screen is gone, so the browser takes it back.
+        if loading && self.page_fullscreen == Some(id) {
+            self.leave_page_fullscreen();
+        }
         // Probe deltas describe one document, never a tab's lifetime. A real
         // load start is the host-owned boundary; URL changes alone include
         // same-document fragment navigation and must not erase the reading.

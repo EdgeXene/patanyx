@@ -173,7 +173,7 @@ parse_confirm() {
 # same reason as #18 -- shared nameservers, address pool and default redirect
 # are ONE provider signal, not several, so common purpose is not established and
 # no vendor has classified either domain.
-check "confirm file parses to 20 hosts" "20" "$(parse_confirm | wc -l)"
+check "confirm file parses to 23 hosts" "23" "$(parse_confirm | wc -l)"
 check "  the 2026-09-21 pair is among them" "yes" \
   "$(parse_confirm | grep -qx 'realizationnewestfangs.com' \
      && parse_confirm | grep -qx 'zoologyfibre.com' && echo yes || echo no)"

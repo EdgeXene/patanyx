@@ -31,6 +31,9 @@
     window.__rb || {};
 
   var POLL_MS = 1000;
+  // Where a broken install is fixed: a fresh copy. Fixed, like every other
+  // URL the chrome opens; nothing per-install is added to it.
+  var DOWNLOAD_URL = "https://patanyx.net/download/";
   var pollTimer = null;
 
   var panel = null;
@@ -252,10 +255,12 @@
     panel.appendChild(els.channelNote);
 
     els.status = make("div");
+    els.status.id = "update-status";
     setStyles(els.status, { color: "#e9e9ee", marginBottom: "4px" });
     panel.appendChild(els.status);
 
     els.detail = make("div");
+    els.detail.id = "update-detail";
     setStyles(els.detail, { marginBottom: "10px", whiteSpace: "pre-wrap" });
     panel.appendChild(els.detail);
 
@@ -263,17 +268,28 @@
     setStyles(row, { display: "flex", gap: "8px", marginBottom: "10px" });
     els.check = makeButton("Check now");
     els.install = makeButton("Download and install");
+    els.install.id = "update-install";
     els.restart = makeButton("Restart and update now");
+    els.restart.id = "update-restart";
+    els.help = makeButton("How to update your system");
+    els.download = makeButton("Download PATANYX");
+    els.download.id = "update-download";
     // Built once; the labels follow the locale through the same rebuild
     // hook the chrome's own tables use.
     rebuildOnLocaleFill(function () {
       els.check.textContent = i18nText("chrome-js-update-check-label", "Check now");
       els.install.textContent = i18nText("chrome-js-update-install-label", "Download and install");
       els.restart.textContent = i18nText("chrome-js-update-restart-label", "Restart and update now");
+      els.help.textContent = i18nText("chrome-js-update-engine-help-label", "How to update your system");
+      els.download.textContent = i18nText("chrome-js-update-download-label", "Download PATANYX");
     });
     row.appendChild(els.check);
     row.appendChild(els.install);
     row.appendChild(els.restart);
+    row.appendChild(els.help);
+    els.help.style.display = "none";
+    row.appendChild(els.download);
+    els.download.style.display = "none";
     panel.appendChild(row);
 
     // The background-download switch. A LABELLED checkbox rather than the
@@ -392,6 +408,13 @@
     els.check.addEventListener("click", onCheck);
     els.install.addEventListener("click", onInstall);
     els.restart.addEventListener("click", onRestartClick);
+    els.help.addEventListener("click", function () {
+      var url = window.__rbEngineHelpUrl;
+      if (url) window.__rb.request("tab_new", { url: url }).catch(function () {});
+    });
+    els.download.addEventListener("click", function () {
+      window.__rb.request("tab_new", { url: DOWNLOAD_URL }).catch(function () {});
+    });
 
     return button;
   }
@@ -485,31 +508,48 @@
   function maybeApply(st) {
     if (applying || !userInstalled || st.state !== "ready" || !st.wired) return;
     applying = true;
-    window.__rb.request("update_apply").catch(function () {
-      // A failure leaves the staged file in place and the phase reports it;
-      // re-arm so the user can retry rather than being stuck at "installing".
-      applying = false;
-    });
+    window.__rb.request("update_apply").catch(onApplyFailed);
+  }
+
+  // Both install paths end here when update_apply is refused. Most refusals
+  // leave the phase where it was (not_ready, install_failed, engine_too_old),
+  // so the panel says what happened itself. A failed restore is the one that
+  // MOVES the phase, to install_broken, which tells the person how to get a
+  // working copy: re-read it rather than covering it with the short summary.
+  //
+  // The automatic apply used to swallow every refusal, leaving "Ready to
+  // install." on screen with no button (review r3 R-001). Dropping
+  // userInstalled brings the Restart button back, so a retry is the person's
+  // own click and never a loop on the next render.
+  function onApplyFailed(e) {
+    applying = false;
+    userInstalled = false;
+    if (e && e.message === "install_restore_failed") {
+      refresh();
+      return;
+    }
+    showError(e);
+    // The explanation stays (errorShown keeps the status lines), but the
+    // buttons follow the status: without this render the Restart button
+    // stayed hidden after an automatic apply failed (review r4 R-003).
+    refresh();
   }
 
   function onRestartClick() {
     if (applying) return;
     applying = true;
     clearError();
-    window.__rb.request("update_apply").catch(function (e) {
-      // Rust refuses BEFORE the phase moves (not_ready, install_failed), so
-      // "the phase reports it" was never true for this path: the click did
-      // nothing visible (launch sweep F-003).
-      //
-      // AND THEN THE FIX RE-ADDED THE SILENCE. It showed the code and called
-      // refresh(), whose async render overwrote the explanation with the
-      // ordinary ready text a moment later, leaving the panel identical
-      // before and after a failed install (review R-004). There is nothing to
-      // re-read: the phase did not move, which is exactly why this path
-      // exists. The error stands until the person asks for something new.
-      applying = false;
-      showError(e);
-    });
+    // Rust refuses BEFORE the phase moves (not_ready, install_failed), so
+    // "the phase reports it" was never true for this path: the click did
+    // nothing visible (launch sweep F-003).
+    //
+    // AND THEN THE FIX RE-ADDED THE SILENCE. It showed the code and called
+    // refresh(), whose async render overwrote the explanation with the
+    // ordinary ready text a moment later, leaving the panel identical
+    // before and after a failed install (review R-004). For those codes there
+    // is nothing to re-read, and the error stands until the person asks for
+    // something new. The one exception, a failed restore, is in onApplyFailed.
+    window.__rb.request("update_apply").catch(onApplyFailed);
   }
 
   var renderGen = 0;
@@ -570,6 +610,24 @@
         "Downloading version " + st.offered + "…");
       detailText = i18nText("chrome-js-update-downloading-detail",
         "The download is verified against the signed manifest before it is kept.");
+    } else if (st.state === "refused" &&
+        (st.refusal_kind === "engine_too_old" || st.refusal_kind === "engine_unknown")) {
+      // HELD BY THIS COMPUTER'S ENGINE, not a security event about the
+      // update: localized, calm, and with the way out on a button.
+      stateText = i18nText("chrome-js-update-engine-held-state", "Update your system first.");
+      detailText = st.refusal_kind === "engine_too_old"
+        ? await i18nResolve("chrome-js-update-engine-held",
+          { version: st.offered, engine: st.engine, needed: st.engine_needed, running: st.engine_running },
+          "PATANYX " + st.offered + " needs " + st.engine + " " + st.engine_needed +
+            " or newer, and this computer has " + st.engine_running +
+            ". Install your system's updates, reopen PATANYX, then press Check now. " +
+            "Nothing has been downloaded or installed.")
+        : await i18nResolve("chrome-js-update-engine-unknown",
+          { version: st.offered, engine: st.engine, needed: st.engine_needed },
+          "PATANYX " + st.offered + " needs " + st.engine + " " + st.engine_needed +
+            " or newer, and this computer's " + st.engine +
+            " version could not be read. Nothing has been downloaded or installed. " +
+            "Install your system's updates, reopen PATANYX, then press Check now.");
     } else if (st.state === "refused") {
       stateText = i18nText("chrome-js-update-refused", "Update refused.");
       detailColor = "#e2a1a1";
@@ -588,6 +646,17 @@
         (st.detail || "") +
         (await i18nResolve("chrome-js-update-nothing-installed", {},
           "\n\nNothing was installed."));
+    } else if (st.state === "install_broken") {
+      // Not "failed": that text ends with "Nothing was installed", and here
+      // the new file IS installed and will not start. The way out is a fresh
+      // download, one step anyone can take, with the button beside it. No
+      // file paths: they are in the log and diagnostics for support.
+      stateText = i18nText("chrome-js-update-install-broken-state", "The update did not work.");
+      detailColor = "#e2a1a1";
+      detailText = i18nText("chrome-js-update-install-broken",
+        "PATANYX could not start the new version, and could not put your previous version back. " +
+          "This window keeps working until you close it. To fix it, download PATANYX again and " +
+          "use it to replace your current copy. Your settings, Vault and browsing data are kept.");
     } else if (st.state === "ready") {
       stateText = await i18nResolve("chrome-js-update-ready-state",
         { version: st.offered },
@@ -698,6 +767,10 @@
     var canRestart =
       st.available && st.state === "ready" && st.wired && !userInstalled;
     els.restart.style.display = canRestart ? "" : "none";
+    var engineHeld = st.state === "refused" &&
+      (st.refusal_kind === "engine_too_old" || st.refusal_kind === "engine_unknown");
+    els.help.style.display = engineHeld ? "" : "none";
+    els.download.style.display = st.state === "install_broken" ? "" : "none";
 
     if (!busy) stopPolling();
   }

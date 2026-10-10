@@ -14,7 +14,8 @@ verifies binaries. See "Two keys, two blast radii" below before touching
 either.
 
 ONE THING REMAINS, and it is not code: **that host must actually serve
-`/v1/<platform>.json`.** Until it does, checks fail with a network error rather
+`/v1/windows-x86_64.json` and, from 1.0.6, `/v2/linux-x86_64.json`** (and the
+frozen Linux `/v1` bridge files, see "Two Linux feeds"). Until it does, checks fail with a network error rather
 than "not configured" — still loud, still safe, and still not an update
 channel.
 
@@ -125,9 +126,13 @@ is checked:
   "size": <size of that exact file, in bytes>,
   "published_at": <unix seconds>,
   "notes": "<optional: a short user-facing blurb, shown in the update panel>",
-  "engine_floor": {"webview2": "152.0.4191.66", "webkitgtk": "2.52.6"}
+  "engine_floor": {"webview2": "152.0.4191.66", "webkitgtk": "2.54.0"}
 }
 ```
+
+On Linux the `webkitgtk` floor is REQUIRED from 1.0.6 (a 1.0.6+ client refuses
+an offer without it) and must equal the strict build's compiled floor
+(`MIN_WEBKITGTK`); `scripts/check-linux-feeds.py` checks both.
 
 `engine_floor` is optional and is how an engine advisory reaches installed
 browsers WITHOUT a browser release; see "The engine floor" below.
@@ -154,12 +159,22 @@ sha256sum patanyx-1.0.0-windows-x86_64.exe
 stat -c %s patanyx-1.0.0-windows-x86_64.exe
 ```
 
-Then sign. A release is one manifest per platform, and `sign-all` does the
-whole set in one invocation:
+Then sign. `sign-all` signs a whole batch in one invocation, and a batch holds
+at most ONE payload per platform and ONE signing domain. From 1.0.6 a release
+is therefore FOUR batches (stable and beta are separate batches because they
+name the same platform; Linux /v2 is separate because it has its own domain):
 
 ```powershell
-.\patanyx-sign.exe sign-all publisher.key windows-x86_64.json linux-x86_64.json
+# Windows + the /v1 bridge (1.0.6 only; later releases: Windows alone), stable, then beta
+.\patanyx-sign.exe sign-all publisher.key stable\windows-x86_64.json stable\linux-x86_64.v1.json
+.\patanyx-sign.exe sign-all publisher.key beta\windows-x86_64.json beta\linux-x86_64.v1.json
+# Linux /v2, stable, then beta: the Linux /v2 domain, never plain sign-all
+.\patanyx-sign.exe sign-all-linux-v2 publisher.key stable\linux-x86_64.json
+.\patanyx-sign.exe sign-all-linux-v2 publisher.key beta\linux-x86_64.json
 ```
+
+A Linux payload must never go through plain `sign-all` for /v2: a 1.0.6+ copy
+rejects it, and an old copy could accept it if it were ever served at /v1.
 
 It writes `<name>.signed.json` for each and prints ONE combined object keyed by
 platform, so a release is a single artifact to move rather than one per
@@ -211,10 +226,11 @@ Flatpak, the app id and the host name -- none of which a user reads as a name.
 packaging habit and it does not belong here. Nothing needs it: the extension
 already separates `PATANYX.exe` from `PATANYX` in the same directory, and the
 platform is carried by the MANIFEST, which is per-platform by construction --
-`/v1/windows-x86_64.json` and `/v1/linux-x86_64.json` each point at their own
+`/v1/windows-x86_64.json` and `/v2/linux-x86_64.json` each point at their own
 `url`. The manifest path is compiled into every binary (`manifest_url` builds
-`/v1/<platform>.json`) and CANNOT be renamed; the binary it points at is free,
-and is named for the product.
+`/v1/<platform>.json` on Windows and, from 1.0.6, `/v2/<platform>.json` on
+Linux; every Linux build before 1.0.6 reads `/v1`) and CANNOT be renamed; the
+binary it points at is free, and is named for the product.
 
 **No version in the filename.** Settled in 6b43fe9 and restated since. The
 version is a property of the bytes, and the place it is meant to be read is the
@@ -307,7 +323,8 @@ directory invites someone installing it by hand later.
 Serve each manifest at:
 
 ```
-<UPDATE_BASE_URL>/v1/<platform>.json
+<UPDATE_BASE_URL>/v1/<platform>.json      Windows
+<UPDATE_BASE_URL>/v2/<platform>.json      Linux, from 1.0.6 (see "Two Linux feeds")
 ```
 
 and the binary at the `url` inside it. Both over TLS.
@@ -323,6 +340,59 @@ Recommendation: host manifests and binaries on the same origin the browser
 already contacts for anything else, so a check is one DNS lookup, one TLS
 session, one disclosure event.
 
+## Two Linux feeds, from 1.0.6
+
+Windows has one feed, `/v1/windows-x86_64*.json`. Linux has TWO, and the reason
+is in the client, not the server.
+
+Linux builds before 1.0.6 read `/v1/linux-x86_64*.json` and install whatever it
+offers. Their `decide` checks platform and version, never the engine, and since
+2026-07-25 a release build refuses to start below its compiled WebKitGTK floor
+(2.52.5 in 0.9.x, 2.52.6 in 1.0.0 to 1.0.3, 2.54.0 from 1.0.4). So a
+`/v1` offer of a build they cannot run would replace a working browser with one
+that does not open. From 1.0.6 the client checks the engine before installing
+(`RunningEngine` in `decide`, again in `installer::apply`, and the new file's own
+`--preflight` run before the swap), and reads `/v2` instead.
+
+| Feed | Read by | Offers | Changes |
+| --- | --- | --- | --- |
+| `/v1/linux-x86_64*.json` | every Linux build before 1.0.6 (0.9.0 through 1.0.5) | the 1.0.6 BRIDGE build (feature `linux-bridge`: compiled floor 2.52.5, the lowest any /v1 reader enforced; warns below 2.54.0 instead of refusing) | re-signed ONCE, for 1.0.6, LAST in that publish, then frozen forever |
+| `/v2/linux-x86_64*.json` | Linux 1.0.6 and later | the STRICT build (compiled floor = `MIN_WEBKITGTK`) | every release |
+
+Rules, each enforced by `scripts/check-linux-feeds.py` (tested by
+`scripts/check-linux-feeds-test.sh`):
+
+- `/v1` carries the bridge and nothing else; its compiled floor is exactly
+  2.52.5, the lowest floor any published /v1 reader refused below (0.9.x; the
+  refusal itself landed 2026-07-25, before 0.9.0). So the bridge
+  starts on every machine any of those copies could run on. `/v2` carries the strict build; its compiled floor equals the
+  manifest's `engine_floor.webkitgtk`. Each binary is asked `--build-identity`;
+  file names prove nothing.
+- Every Linux manifest carries `engine_floor.webkitgtk`. A 1.0.6+ client
+  REFUSES an offer without one (fail closed: an unknown requirement may not
+  start).
+- Every check covers the BETA manifests too (`--v1-beta-manifest`,
+  `--v2-beta-manifest`): pre-1.0.6 beta copies read /v1's beta file the same way.
+- After 1.0.6, every release MUST pass `--v1-frozen` and `--v1-beta-frozen` (the
+  sha256 of the two /v1 files published with 1.0.6); the check refuses a release
+  that neither publishes the bridge nor proves /v1 unchanged, so nobody overwrites
+  the bridge with a build old clients cannot run. A copy
+  that was offline for months still gets the bridge first, then moves to `/v2`.
+- `/v2` Linux manifests are signed with `sign-all-linux-v2` (domain
+  `PATANYX-UPDATE-MANIFEST-LINUX-V2`), never `sign-all`. No Linux build before
+  1.0.6 can verify that domain, so a /v2 manifest served at the /v1 address (a
+  compromised server, a broken TLS path) is refused by every old copy instead of
+  stranding it; and 1.0.6+ Linux verifies only that domain, so the bridge or any
+  older /v1 manifest cannot be replayed to it. Check with `verify-linux-v2`.
+- Windows and the /v1 bridge are signed with `sign-all` as before. `sign-all`
+  still refuses two payloads for one platform in a batch: the Linux files are
+  always in different batches anyway (one per domain).
+- Old clients install the bridge only after the user's Restart click unless
+  they turned on automatic install (1.0.3's `update_auto_apply` defaults off).
+  The bridge's signed `notes` say what that click does.
+- Self-update replaces the file in place: it needs the PATANYX file in a folder
+  the user can write to. The Download page says so.
+
 ## The beta channel: a second fixed URL, not a version scheme
 
 An install may opt in to `Beta` (`Prefs.update_channel`, `chrome/update.js`'s
@@ -331,10 +401,12 @@ pre-release suffix, or anything `decide()` needs to know about specially --
 it changes only which URL is fetched:
 
 ```
-<UPDATE_BASE_URL>/v1/<platform>-beta.json
+<UPDATE_BASE_URL>/v1/<platform>-beta.json      Windows
+<UPDATE_BASE_URL>/v2/<platform>-beta.json      Linux, from 1.0.6
 ```
 
-Publish it exactly like the stable manifest, same signing process, same
+(Linux before 1.0.6 reads `/v1/linux-x86_64-beta.json`, which is frozen with the
+bridge like the stable one.) Publish it exactly like the stable manifest, same signing process, same
 `sign`/`verify` steps below, same TLS-only rule. The property that matters is
 preserved by construction: every Beta subscriber fetches this one fixed
 address, indistinguishable from every other Beta subscriber, exactly as every

@@ -55,6 +55,12 @@ pub struct TabPolicy {
     pub javascript: bool,
     pub block_ads: bool,
     pub freeze_after_load: bool,
+    /// The YouTube page script (`YOUTUBE_ADS_SCRIPT`). Separate from
+    /// `block_ads` on purpose: YouTube changes often, and a person whose
+    /// video stops playing can turn this one off without losing the rest of
+    /// their blocking. Takes effect at the next YouTube page load (scripts
+    /// register per document; nothing is evaluated in a live page).
+    pub block_youtube_ads: bool,
 }
 
 impl Default for TabPolicy {
@@ -73,6 +79,7 @@ impl Default for TabPolicy {
             javascript: true,
             block_ads: true,
             freeze_after_load: false,
+            block_youtube_ads: true,
         }
     }
 }
@@ -88,6 +95,7 @@ impl TabPolicy {
             javascript: false,
             block_ads: true,
             freeze_after_load: true,
+            block_youtube_ads: true,
         }
     }
 
@@ -109,6 +117,7 @@ impl TabPolicy {
             javascript: true,
             block_ads: true,
             freeze_after_load: false,
+            block_youtube_ads: true,
         }
     }
 
@@ -471,6 +480,13 @@ pub struct EngineSettings {
     /// port deliberately accepts nothing, so the tunnel is not carrying
     /// traffic and the row must say so -- as well as "broken".
     pub tunnel: &'static str,
+    /// Per-tab, read back from the engine: whether this tab's WebKitGTK
+    /// context confines its web and network processes in the engine's
+    /// bubblewrap/seccomp sandbox (`is_sandbox_enabled`). Always
+    /// "not_attempted" on Windows, where WebView2's own process model
+    /// applies and nothing here asks for it. Added after the 2026-10-08
+    /// audit found every Linux web process running unconfined.
+    pub sandbox: &'static str,
 }
 
 impl SettingState {
@@ -1138,6 +1154,9 @@ pub struct TabState {
     /// and SmartScreen stays ON, sending every URL the user visits to
     /// Microsoft -- in a browser sold on privacy. That has to be visible.
     pub smartscreen_off: SettingState,
+    /// Whether the engine confirmed its process sandbox for this tab's
+    /// context (WebKitGTK `is_sandbox_enabled`). `NotAttempted` on Windows.
+    pub sandbox: SettingState,
     /// Which tracking-prevention level was actually accepted. Needs Runtime
     /// 111+; `Failed` means the requested level was not confirmed.
     pub tracking_prevention: TrackingPreventionState,
@@ -1221,6 +1240,22 @@ pub struct TabState {
     /// swapped through the content manager instead, and on a tab whose
     /// registration the engine refused.
     pub scrollbar_script_id: Option<String>,
+    /// Windows: the engine's id for this tab's YouTube ad script, so turning
+    /// the switch off can remove it. `youtube_script_adding` covers the one
+    /// COM round trip before the id arrives: the completion handler reads the
+    /// policy again and removes the script itself if the switch went off
+    /// meanwhile. Unused on unix, which keeps the script object instead.
+    pub youtube_script_id: Option<String>,
+    pub youtube_script_adding: bool,
+}
+
+/// See `TabState::youtube_script_step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum YoutubeScriptStep {
+    Add,
+    Remove,
+    Nothing,
 }
 
 /// A committed document's standing for the local-network boundary.
@@ -1396,6 +1431,7 @@ impl TabState {
             interception: InterceptionState::NotAttempted,
             script_setting: SettingState::NotAttempted,
             smartscreen_off: SettingState::NotAttempted,
+            sandbox: SettingState::NotAttempted,
             tracking_prevention: TrackingPreventionState::NotAttempted,
             navigation_tracking: SettingState::NotAttempted,
             autofill_off: SettingState::NotAttempted,
@@ -1410,6 +1446,8 @@ impl TabState {
             new_window_tracking: false,
             permissions_registered: SettingState::NotAttempted,
             scrollbar_script_id: None,
+            youtube_script_id: None,
+            youtube_script_adding: false,
         }
     }
 
@@ -1602,7 +1640,30 @@ impl TabState {
     /// it is recorded and diagnosed); only "no answer yet" holds it.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn initial_navigation_ready(&self) -> bool {
-        !self.waiting_for_wipe && self.local_network_guard != SettingState::NotAttempted
+        // The YouTube ad script counts too: a first page created before its
+        // registration is answered would show ads with the switch on (final
+        // review YT R-001). Its overdue release is the guard's timer below.
+        !self.waiting_for_wipe
+            && self.local_network_guard != SettingState::NotAttempted
+            && !self.youtube_script_adding
+    }
+
+    /// What to do with this tab's YouTube ad script registration (Windows,
+    /// `sync_youtube_script`), from what is wanted and what is in place. A
+    /// registration still in flight is left alone either way: its completion
+    /// handler reads the policy again and keeps or removes what it added.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn youtube_script_step(&self) -> YoutubeScriptStep {
+        match (
+            self.policy.block_youtube_ads,
+            self.youtube_script_id.is_some(),
+            self.youtube_script_adding,
+        ) {
+            (_, _, true) => YoutubeScriptStep::Nothing,
+            (true, false, false) => YoutubeScriptStep::Add,
+            (false, true, false) => YoutubeScriptStep::Remove,
+            _ => YoutubeScriptStep::Nothing,
+        }
     }
 
     /// The engine accepted the guard's registration call but has not
@@ -1612,11 +1673,19 @@ impl TabState {
     /// answer still records what the engine said.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn on_local_network_guard_overdue(&mut self) -> bool {
-        if self.local_network_guard != SettingState::NotAttempted {
-            return false;
+        let mut changed = false;
+        if self.local_network_guard == SettingState::NotAttempted {
+            self.local_network_guard = SettingState::Failed;
+            changed = true;
         }
-        self.local_network_guard = SettingState::Failed;
-        true
+        // The same timer releases a YouTube ad script registration that was
+        // never answered, so neither one can hold a tab blank forever. A late
+        // answer is still handled (the completion handler keeps one copy).
+        if self.youtube_script_adding {
+            self.youtube_script_adding = false;
+            changed = true;
+        }
+        changed
     }
 
     /// WebView2 `NewWindowRequested`, raised while the page that asked is
@@ -2787,6 +2856,27 @@ pub const DIVERGENCE_TEMPLATE: &str = include_str!("../content_scripts/fingerpri
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const LOCAL_NETWORK_GUARD_SCRIPT: &str = include_str!("../content_scripts/local_network_guard.js");
 
+/// Removes YouTube's video ads and sponsored items from the page's own data
+/// before the player reads it; see the script's header. Registered at
+/// document start, every frame, while `TabPolicy::block_youtube_ads` is on.
+/// The script checks the host itself first (WebView2 cannot scope a
+/// registration to a site); WebKitGTK additionally gets
+/// `YOUTUBE_URL_PATTERNS`, so on Linux it is not even loaded elsewhere.
+/// Gated by scripts/youtube-ads-gate.js.
+pub const YOUTUBE_ADS_SCRIPT: &str = include_str!("../content_scripts/youtube_ads.js");
+
+/// The hosts the YouTube script acts on, as WebKit URL patterns. Must name
+/// exactly the hosts in the script's own `HOSTS` set (a test pins both).
+#[cfg_attr(windows, allow(dead_code))]
+pub const YOUTUBE_URL_PATTERNS: &[&str] = &[
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://m.youtube.com/*",
+    "https://music.youtube.com/*",
+    "https://www.youtube-nocookie.com/*",
+    "https://youtube-nocookie.com/*",
+];
+
 /// (normal, ephemeral). `None` inside the OnceLock records that OS
 /// randomness failed at first use; every later call then skips divergence
 /// rather than retrying into a half-seeded session.
@@ -2870,6 +2960,107 @@ pub fn divergence_script(ephemeral: bool) -> Option<String> {
         ephemeral,
         &crate::state::divergence_overrides_snapshot(),
     )
+}
+
+#[cfg(test)]
+mod youtube_ads_tests {
+    use super::{
+        SettingState, TabPolicy, TabState, YoutubeScriptStep, YOUTUBE_ADS_SCRIPT,
+        YOUTUBE_URL_PATTERNS,
+    };
+
+    fn tab(on: bool) -> TabState {
+        let mut st = TabState::new(&TabPolicy {
+            block_youtube_ads: on,
+            ..TabPolicy::default()
+        });
+        st.local_network_guard = SettingState::Applied;
+        st
+    }
+
+    /// Windows' add/remove decisions, every combination: an in-flight
+    /// registration is never doubled or raced, and removal needs an id.
+    #[test]
+    fn the_registration_step_follows_the_switch_and_never_doubles() {
+        let mut st = tab(true);
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Add);
+        st.youtube_script_adding = true;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "a second add while one is in flight");
+        st.policy.block_youtube_ads = false;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "the handler decides an in-flight add");
+        st.youtube_script_adding = false;
+        st.youtube_script_id = Some("1".into());
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Remove);
+        st.policy.block_youtube_ads = true;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "already registered");
+        st.policy.block_youtube_ads = false;
+        st.youtube_script_id = None;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "off and nothing in place");
+    }
+
+    /// The first page waits for the YouTube registration's answer, and the
+    /// guard's overdue timer releases it if no answer ever comes.
+    #[test]
+    fn the_first_page_waits_for_the_registration_but_never_forever() {
+        let mut st = tab(true);
+        assert!(st.initial_navigation_ready());
+        st.youtube_script_adding = true;
+        assert!(!st.initial_navigation_ready(), "first page created before the script was registered");
+        assert!(st.on_local_network_guard_overdue(), "overdue must release the YouTube wait");
+        assert!(st.initial_navigation_ready());
+        assert!(!st.on_local_network_guard_overdue(), "nothing left to release");
+    }
+
+    /// The hosts in the script's own check and the WebKit patterns must be
+    /// the same list: a host in one and not the other is either a page the
+    /// script never reaches on Linux, or one it acts on only on Windows.
+    #[test]
+    fn script_hosts_and_url_patterns_name_the_same_hosts() {
+        let start = YOUTUBE_ADS_SCRIPT.find("const HOSTS = new Set([").expect("HOSTS set");
+        let end = start + YOUTUBE_ADS_SCRIPT[start..].find("]);").expect("end of HOSTS");
+        let mut in_script: Vec<&str> = YOUTUBE_ADS_SCRIPT[start..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let mut in_patterns: Vec<&str> = YOUTUBE_URL_PATTERNS
+            .iter()
+            .map(|p| {
+                p.strip_prefix("https://")
+                    .and_then(|r| r.strip_suffix("/*"))
+                    .expect("https://<host>/* pattern")
+            })
+            .collect();
+        in_script.sort_unstable();
+        in_patterns.sort_unstable();
+        assert_eq!(in_script, in_patterns);
+        assert!(in_script.iter().all(|h| *h == "youtube.com"
+            || h.ends_with(".youtube.com")
+            || *h == "youtube-nocookie.com"
+            || h.ends_with(".youtube-nocookie.com")));
+    }
+
+    /// The host check is the first thing the script does: on Windows it is
+    /// the only thing keeping the hooks off every other site.
+    #[test]
+    fn the_script_checks_the_host_before_touching_anything() {
+        let gate = YOUTUBE_ADS_SCRIPT.find("if (!HOSTS.has(host)) return;").expect("host gate");
+        for hook in ["defineProperty(Win", "XHR.prototype", "createElement"] {
+            let at = YOUTUBE_ADS_SCRIPT.find(hook).unwrap_or_else(|| panic!("{hook} missing"));
+            assert!(gate < at, "{hook} comes before the host check");
+        }
+        assert!(!YOUTUBE_ADS_SCRIPT.to_ascii_lowercase().contains("patanyx"));
+    }
+
+    /// On by default in every preset: a person who installs an ad-blocking
+    /// browser gets it without hunting for a switch, and turns it off only if
+    /// YouTube breaks.
+    #[test]
+    fn every_preset_blocks_youtube_ads() {
+        assert!(TabPolicy::default().block_youtube_ads);
+        assert!(TabPolicy::quarantine().block_youtube_ads);
+        assert!(TabPolicy::ephemeral().block_youtube_ads);
+    }
 }
 
 #[cfg(test)]
@@ -3131,6 +3322,10 @@ mod shipped_adlist_guard {
             "geo3.ggpht.com",
             // Spotify's playback gateway: the web player cannot play without it.
             "guc-spclient.spotify.com",
+            // Instagram's own API (scripts/adlist-allow.txt, 2026-10-10).
+            "gateway.instagram.com",
+            "graphql.instagram.com",
+            "graph-fallback.instagram.com",
         ] {
             assert!(
                 !rules.blocks_host(host),
@@ -3579,6 +3774,30 @@ mod tests {
         // curated-to-bigger-list swap quietly UNBLOCKED something.
         assert!(bundled_rules().blocks_host("connect.facebook.net"));
         assert!(bundled_ads().blocks_host("connect.facebook.net"));
+    }
+
+    #[test]
+    fn dailymotion_plays_with_its_ad_servers_blocked() {
+        // scripts/adlist-allow.txt, 2026-10-10. Two hosts the player cannot
+        // start without: dmxleo (the video CDN; upstream lists it as an ad
+        // host) and dmads (its ad LIBRARY, which only asks the ad servers).
+        // Either blocked, "Playback error" on every video. Both allowed, loads
+        // with no ad scheduled play; loads that schedule an ad still fail
+        // (open, ads-notes/P0-RESULTS.md item 3). The ad SERVERS stay blocked.
+        assert!(bundled_rules().blocks_host("pubads.g.doubleclick.net"));
+        assert!(bundled_rules().blocks_host("pebed.dm-event.net"));
+        for host in [
+            "dmads.dailymotion.com",
+            "www.dailymotion.com",
+            "dailymotion.com",
+            "geo.dailymotion.com",
+            "static1.dmcdn.net",
+            "dmxleo.dailymotion.com",
+            "dmxleo.com",
+            "cdndirector.dailymotion.com",
+        ] {
+            assert!(!bundled_rules().blocks_host(host), "{host} must not be blocked");
+        }
     }
 
     #[test]

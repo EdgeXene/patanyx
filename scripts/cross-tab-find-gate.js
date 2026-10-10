@@ -183,6 +183,30 @@ check(
   },
 );
 
+// Premium is on sale, and this note is also what a paying user with a locked
+// vault sees, so it must never say Premium has yet to launch. It said exactly
+// that in 1.0.3 ("Available when PATANYX Premium launches"). It now matches the
+// Tab Switcher's note, which was already true in both cases.
+check("the premium note never says Premium has yet to launch", () => {
+  const html = fs.readFileSync(path.join(chromeDir, "index.html"), "utf8");
+  const ftl = fs.readFileSync(
+    path.join(chromeDir, "i18n/locales/en.ftl"),
+    "utf8",
+  );
+  const note = (html.match(
+    /<p[^>]*id="findtabs-premium"[^>]*>([\s\S]*?)<\/p>/,
+  ) || [])[1];
+  const msg = (ftl.match(/^chrome-findtabs-premium-p = (.*)$/m) || [])[1];
+  const switcher = (ftl.match(/^chrome-switcher-premium-p = (.*)$/m) || [])[1];
+  assert(note && msg && switcher, "the premium notes were not found");
+  for (const text of [note.trim(), msg]) {
+    assert(!/launch|arriv|coming soon/i.test(text),
+      "the Find across tabs premium note says Premium has not launched: " + text);
+  }
+  assert(msg === switcher,
+    "the Find across tabs and Tab Switcher premium notes should say the same thing");
+});
+
 check(
   "a search round-trips even a whitespace query: Rust is the authority",
   async () => {

@@ -110,6 +110,17 @@ pub mod keys {
     pub const CHROME_ENGINE_FLOOR_BODY: &str = "chrome-engine-floor-body";
     pub const CHROME_ENGINE_FLOOR_EVERGREEN: &str = "chrome-engine-floor-evergreen";
     pub const CHROME_ENGINE_FLOOR_BODY_RESTART: &str = "chrome-engine-floor-body-restart";
+    pub const CHROME_FULLSCREEN_NOTICE: &str = "chrome-fullscreen-notice";
+    pub const ENGINE_WINDOW_TITLE: &str = "engine-window-title";
+    pub const ENGINE_WINDOW_BODY: &str = "engine-window-body";
+    pub const ENGINE_WINDOW_ACTION: &str = "engine-window-action";
+    pub const ENGINE_WINDOW_ACTION_BUTTON: &str = "engine-window-action-button";
+    pub const ENGINE_WINDOW_DEBIAN12: &str = "engine-window-debian12";
+    pub const ENGINE_WINDOW_COMMAND: &str = "engine-window-command";
+    pub const ENGINE_WINDOW_MORE: &str = "engine-window-more";
+    pub const ENGINE_WINDOW_OPEN_UPDATER: &str = "engine-window-open-updater";
+    pub const ENGINE_WINDOW_COPY: &str = "engine-window-copy";
+    pub const ENGINE_WINDOW_CLOSE: &str = "engine-window-close";
 
     /// Every key, for the coverage checks. A constant added above and
     /// forgotten here fails `every_key_resolves` the moment nothing else
@@ -127,6 +138,17 @@ pub mod keys {
         CHROME_ENGINE_FLOOR_BODY,
         CHROME_ENGINE_FLOOR_EVERGREEN,
         CHROME_ENGINE_FLOOR_BODY_RESTART,
+        CHROME_FULLSCREEN_NOTICE,
+        ENGINE_WINDOW_TITLE,
+        ENGINE_WINDOW_BODY,
+        ENGINE_WINDOW_ACTION,
+        ENGINE_WINDOW_ACTION_BUTTON,
+        ENGINE_WINDOW_DEBIAN12,
+        ENGINE_WINDOW_COMMAND,
+        ENGINE_WINDOW_MORE,
+        ENGINE_WINDOW_OPEN_UPDATER,
+        ENGINE_WINDOW_COPY,
+        ENGINE_WINDOW_CLOSE,
     ];
 }
 

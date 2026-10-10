@@ -146,6 +146,48 @@ for (const m of MIRRORS) {
     );
   }
 
+  check(
+    `${m.where}: retained old-vault copies are named without costing the recovery key`,
+    async () => {
+      global.rbCalls.length = 0;
+      global.rbReject = null;
+      global.rbResolve = {
+        vault_import: { recovery_key: "AAAA-BBBB", bookmarks: 0, library: "replaced", retained_copies: 2 },
+      };
+      fill(m.prefix);
+      global.$(m.prefix + "form")._fire("submit");
+      await flush();
+      assert(global.$("vault-recovery").hidden === false, "the retained-copies warning displaced the recovery-key screen");
+      assert(global.$("recovery-key").textContent === "AAAA-BBBB", "the retained-copies warning cost the recovery key");
+      const note = global.$(m.prefix + "error");
+      assert(/kept/i.test(note.textContent) && /earlier passphrase/i.test(note.textContent), "retained copies were not named to the user");
+      // The form's pane is hidden behind the recovery screen, so the warning
+      // must ALSO be on that screen, visible, or the user never sees it.
+      const shown = global.$("recovery-import-note");
+      assert(shown && shown.hidden === false && /kept/i.test(shown.textContent), "the retained-copies warning is not visible on the recovery screen");
+      // And both notes when the Library also failed.
+      global.rbResolve = {
+        vault_import: { recovery_key: "CCCC-DDDD", bookmarks: 0, library: "not_replaced", retained_copies: 1 },
+      };
+      fill(m.prefix);
+      global.$(m.prefix + "form")._fire("submit");
+      await flush();
+      const both = global.$(m.prefix + "error").textContent;
+      assert(/unavailable/i.test(both) && /kept/i.test(both), "the Library note and the retained-copies note must both show");
+      const bothShown = global.$("recovery-import-note").textContent;
+      assert(/unavailable/i.test(bothShown) && /kept/i.test(bothShown), "both notes must reach the recovery screen");
+      // Zero retained: no warning.
+      global.rbResolve = {
+        vault_import: { recovery_key: "EEEE-FFFF", bookmarks: 0, library: "replaced", retained_copies: 0 },
+      };
+      fill(m.prefix);
+      global.$(m.prefix + "form")._fire("submit");
+      await flush();
+      assert(!/kept/i.test(global.$(m.prefix + "error").textContent), "a clean import must not warn about kept copies");
+      assert(global.$("recovery-import-note").hidden === true, "a clean import must leave the recovery screen's note hidden");
+    },
+  );
+
   // THE IMPORTANT ONE. Import destroys the current vault, so a submission that
   // should not have gone through must not reach Rust at all. Validating after
   // the call would mean a typo'd confirmation still wiped the vault.

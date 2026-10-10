@@ -60,6 +60,13 @@ impl WebContextImpl {
   pub fn create_context(context: WebContext) -> Self {
     let automation = false;
     context.set_automation_allowed(automation);
+    // PATANYX patch (third hunk, see PATANYX-PATCH.md): confine every web
+    // and network process of this context in WebKitGTK's bubblewrap/seccomp
+    // sandbox. The GTK3 API leaves it off unless the embedder asks, and it
+    // must be asked before the context spawns its first process, which is
+    // exactly now -- every wry context (default, data-directory, ephemeral)
+    // passes through here before any WebView exists on it.
+    context.set_sandbox_enabled(true);
 
     // e.g. wry 0.9.4
     let app_info = ApplicationInfo::new();

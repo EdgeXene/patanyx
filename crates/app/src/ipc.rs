@@ -176,6 +176,42 @@ fn counts_as_presence(cmd: &str) -> bool {
             // (`cred_autofill_fill`) is a real click and is deliberately NOT
             // listed here.
             | "cred_autofill_offer_get"
+            // PAGE-DRIVEN, which is worse than polled (security audit
+            // 2026-10-08, HIGH). `tab_status` is what the chrome asks for in
+            // reaction to engine events -- every `login_submit_detected`
+            // triggers one -- and `i18n_resolve` is what every non-English
+            // chrome issues on EVERY tab-status push (the toolbar's site
+            // button re-renders its title through the bridge). A page that
+            // reloads itself, or resubmits a form on a timer, therefore drove
+            // a steady stream of frames that all counted as the user being
+            // here, and an unlocked vault on an unattended machine never
+            // locked. Neither is a human doing anything; nor is the locale
+            // list the picker reads at boot.
+            | "tab_status"
+            | "i18n_resolve"
+            | "ui_locale_get"
+            // Two more page-driven frames (review of the fix, same day):
+            // `refreshPermissions` runs on every tab-status push while the
+            // Privacy panel is open and asks `permission_status`; the
+            // save-password banner's appearance re-measures the chrome and
+            // sends `set_chrome_insets`. Neither is a human.
+            | "permission_status"
+            | "set_chrome_insets"
+            // And the Library's reaction to `downloads_changed`, which a page
+            // raises by starting a download the browser accepts without a
+            // click: the panel re-reads the list (and, in a chat build, the
+            // contacts the compare rows name). Passive reads, both.
+            | "download_list"
+            | "chat_contacts"
+            // Two more passive reads the chrome makes in reaction to pushed
+            // events: the translate panel re-reads the pack inventory on
+            // `packs_status`, and the compare rows read the backup status.
+            | "packs_status"
+            | "vault_backup_status"
+            // `closeFindBar` runs on every `url_changed`, so a page-driven
+            // navigation with the find bar open sends this; closing the bar
+            // by hand loses one re-arm, which is the cheaper mistake.
+            | "find_stop"
             // Fired once by the chrome when it finishes loading, to put the
             // keyboard in the address bar (or the page, for a URL launch).
             // The browser starting is not the user doing something.
@@ -1784,6 +1820,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if let Some(v) = args.get("ephemeral").and_then(Value::as_bool) {
                 policy.ephemeral = v;
             }
+            if let Some(v) = args.get("block_youtube_ads").and_then(Value::as_bool) {
+                policy.block_youtube_ads = v;
+            }
             state.set_privacy(policy);
             Ok(state.privacy_status())
         }
@@ -2151,6 +2190,8 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // the vault: the credentials are already saved by this point, and
             // refusing the whole import because a bookmark did not survive
             // would be the wrong trade.
+            // Read before the move: the reply names it.
+            let retained_copies = vault.import_retained_leftovers();
             state.vault = Some(vault);
             let library = finish_library_replacement(state, new_passphrase);
             let restored = restore_bookmarks(state, carried.as_deref());
@@ -2166,6 +2207,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::chat_panel::on_vault_unlocked(state);
             Ok(json!({
                 "recovery_key": recovery.to_printable(),
+                // Vault-shaped files beside the vault that the import could
+                // not prove were the replaced vault's own generations, so it
+                // kept them. Not zero means a copy the user believes gone may
+                // still open under the old passphrase; the panel must say so.
+                "retained_copies": retained_copies,
                 "bookmarks": restored,
                 "library": library,
             }))
@@ -7301,6 +7347,21 @@ mod tests {
             "premium_status",
             // Fired once by the chrome at boot to place the keyboard.
             "startup_focus",
+            // Page-driven (audit 2026-10-08): the chrome asks for tab_status
+            // after every login_submit_detected, and a non-English chrome
+            // resolves strings through the bridge on every tab-status push.
+            // A page that reloads or resubmits on a timer must not be able to
+            // keep the vault open.
+            "tab_status",
+            "i18n_resolve",
+            "ui_locale_get",
+            "permission_status",
+            "set_chrome_insets",
+            "download_list",
+            "chat_contacts",
+            "packs_status",
+            "vault_backup_status",
+            "find_stop",
         ] {
             assert!(
                 !super::counts_as_presence(cmd),

@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.5"
+version = "1.0.6"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -57,6 +57,12 @@ relay-client = ["chat", "patanyx-chat/relay-client"]
 # unconditional there and has no network code to gate — so this forwards
 # only to the HTTP client.
 updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
+# The one-time 1.0.6 Linux BRIDGE build, published ONLY on the old /v1 Linux
+# feed: refuses to start below WebKitGTK 2.52.5 (the lowest floor any /v1 reader
+# enforced, 0.9.x) instead of
+# 2.54.0, and warns with the engine banner in between. See
+# platform::COMPILED_WEBKITGTK_FLOOR. Never on by default, never on Windows.
+linux-bridge = []
 
 [dependencies]
 wry = { version = "0.55", features = ["devtools"] }
@@ -190,6 +196,8 @@ windows = { version = "0.61", features = [
 # GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
 # them. All uses live in src/platform/unix.rs.
 [target.'cfg(unix)'.dependencies]
+# kill(2) on the update preflight's process group (updater::installer::preflight).
+libc = "0.2"
 gtk = "0.18"
 # Same crate+features wry itself uses; needed for the Response policy
 # handler wry does not expose (see fix_downloads in src/platform/unix.rs).

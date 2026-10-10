@@ -61,3 +61,38 @@ guc-spclient.spotify.com  # Spotify device registration and playback.
 # NOT allowed, deliberately: pixel.spotify.com, pixels.spotify.com,
 # adeventtracker.spotify.com, crashdump.spotify.com, bloodhound.spotify.com
 # and ads.spotify.com. They are ads and telemetry, not the player.
+
+# ---- Dailymotion video delivery, added 2026-10-10 ----
+# dmxleo is Dailymotion's video CDN: every video page fetches its stream
+# manifest from dmxleo.dailymotion.com/cdn/manifest/video/<id>.m3u8 and the
+# segments follow. ShadowWhisperer lists it as an ad host; blocking it is
+# "Playback error" on every Dailymotion video. Reproduced in a PATANYX 1.0.6
+# development build on WebKitGTK 2.54 (Linux; WebView2 not reproduced; engine log: "content blocker prevented ... loading a
+# resource from https://dmxleo.dailymotion.com/cdn/manifest/video/...").
+# The ad servers the player calls stay in the shipped lists; dmads.dailymotion.com,
+# the ad library, is allowed below.
+dmxleo.dailymotion.com
+dmxleo.com           # The same CDN's own apex, from the Tracking list.
+# dmads.dailymotion.com is Dailymotion's ad LIBRARY, not an ad server, and the
+# player will not start without it: with this one host blocked every video
+# shows "Playback error". With it allowed, loads where no ad is scheduled play
+# normally and the ad servers it calls (pubads.g.doubleclick.net and others)
+# stay blocked, so no ad plays; loads where an ad IS scheduled still end in
+# "Playback error" (open, ads-notes/P0-RESULTS.md item 3). Bisected host by
+# host in a PATANYX 1.0.6 development build on WebKitGTK 2.54 (Linux),
+# 2026-10-10; WebView2 not reproduced.
+# Absent from the upstream lists today; this entry keeps it that way.
+dmads.dailymotion.com
+
+# ---- Instagram's own API, added 2026-10-10 ----
+# gateway.instagram.com, graphql.instagram.com and graph-fallback.instagram.com
+# are instagram.com's own API endpoints (its page scripts call them for the
+# site's own content); the upstream Tracking list carried all three, found in
+# a sweep of Meta hosts on 2026-10-10. NOT yet reproduced in a signed-in
+# session (no Instagram account on the test server); on the Windows checklist.
+# Allowed now on the same rule as the Dailymotion CDN above: a request filter
+# must never cut a site off from its own API. Instagram's ad and telemetry
+# hosts stay listed.
+gateway.instagram.com
+graphql.instagram.com
+graph-fallback.instagram.com

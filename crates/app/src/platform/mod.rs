@@ -1082,6 +1082,42 @@ pub const CHROME_ORIGIN_PREFIX: &str = "http://rbchrome.localhost/";
 /// minimum and should never be lowered to silence the banner.
 pub const MIN_WEBKITGTK: [u32; 3] = [2, 54, 0];
 
+/// The floor below which THIS build refuses to start, as opposed to
+/// `MIN_WEBKITGTK`, the security floor the engine banner warns below.
+///
+/// They are the same number in every build but one. The one-time 1.0.6
+/// BRIDGE build (feature `linux-bridge`) is published only on the old /v1
+/// Linux feed, which Linux builds before 1.0.6 read and install from without
+/// any engine check. It therefore has to start everywhere any of those builds
+/// started: every published /v1 reader is 0.9.0 or later, and the lowest floor
+/// any of them refused below was 2.52.5 (0.9.x), so the bridge refuses
+/// below 2.52.5 and only WARNS (the banner, through `MIN_WEBKITGTK`) between
+/// 2.52.5 and 2.54.0.
+/// Its job is to carry those installs onto the engine-aware /v2 feed without
+/// leaving any of them with a browser that will not open. Downloads and /v2
+/// carry the strict build.
+#[cfg(not(feature = "linux-bridge"))]
+pub const COMPILED_WEBKITGTK_FLOOR: [u32; 3] = MIN_WEBKITGTK;
+#[cfg(feature = "linux-bridge")]
+pub const COMPILED_WEBKITGTK_FLOOR: [u32; 3] = BRIDGE_WEBKITGTK_FLOOR;
+
+/// The lowest compiled floor any published /v1 reader enforced (0.9.x:
+/// 2.52.5; 1.0.0 to 1.0.3: 2.52.6, raised for Linux 1.0.0 in cb42324; the start refusal itself landed
+/// 2026-07-25, before 0.9.0). The bridge must not exceed it.
+#[cfg_attr(not(feature = "linux-bridge"), allow(dead_code))]
+pub const BRIDGE_WEBKITGTK_FLOOR: [u32; 3] = [2, 52, 5];
+
+/// "strict" or "bridge", for `--build-identity`, `--preflight` and the
+/// diagnostics, so a published file can be checked against the feed it is on.
+pub const BUILD_VARIANT: &str = if cfg!(feature = "linux-bridge") {
+    "bridge"
+} else {
+    "strict"
+};
+
+#[cfg(all(feature = "linux-bridge", not(target_os = "linux")))]
+compile_error!("`linux-bridge` is the one-time Linux bridge build; it has no meaning on this platform");
+
 /// Why the WebKitGTK floor is where it is, in the words printed when a
 /// runtime is below it. Beside the constant so the two move together: a
 /// floor raised for a new advisory with last year's explanation under it
@@ -2214,7 +2250,8 @@ mod engine_tests {
     use super::{
         below_floor, effective_floor_from, engine_floor_body, join_version, merge_running,
         parse_version_fields, resolve_engine_version, EngineInfo, EngineVersionSource,
-        RunningVersion, MIN_WEBKITGTK, MIN_WEBVIEW2, WEBKITGTK_ADVISORY, WEBVIEW2_ADVISORY,
+        RunningVersion, BRIDGE_WEBKITGTK_FLOOR, BUILD_VARIANT, COMPILED_WEBKITGTK_FLOOR, MIN_WEBKITGTK,
+        MIN_WEBVIEW2, WEBKITGTK_ADVISORY, WEBVIEW2_ADVISORY,
     };
 
     /// The parse that decides whether a fix is present. Four fields survive,
@@ -2248,6 +2285,25 @@ mod engine_tests {
         assert!(below_floor(&[2, 53, 92], &MIN_WEBKITGTK)); // the last 2.53 development release
         assert!(below_floor(&[2, 48, 0], &MIN_WEBKITGTK));
         assert!(below_floor(&[1, 99, 99], &MIN_WEBKITGTK));
+    }
+
+    /// The bridge must start wherever any /v1 reader started: 0.9.x refused
+    /// only below 2.52.5 (git 37b4686; 1.0.0 shipped 2.52.6 after cb42324).
+    #[test]
+    fn the_bridge_floor_is_the_lowest_v1_readers_floor() {
+        assert_eq!(BRIDGE_WEBKITGTK_FLOOR, [2, 52, 5]);
+        assert!(below_floor(&BRIDGE_WEBKITGTK_FLOOR, &MIN_WEBKITGTK));
+    }
+
+    #[test]
+    fn the_compiled_floor_matches_the_variant() {
+        if cfg!(feature = "linux-bridge") {
+            assert_eq!(BUILD_VARIANT, "bridge");
+            assert_eq!(COMPILED_WEBKITGTK_FLOOR, BRIDGE_WEBKITGTK_FLOOR);
+        } else {
+            assert_eq!(BUILD_VARIANT, "strict");
+            assert_eq!(COMPILED_WEBKITGTK_FLOOR, MIN_WEBKITGTK);
+        }
     }
 
     #[test]

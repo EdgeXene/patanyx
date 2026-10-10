@@ -104,6 +104,7 @@ chrome-resolver-retry-button = Check again
 chrome-resolver-dismiss-button = Dismiss
 chrome-engine-floor-title-span = The web engine on this computer needs a security update
 chrome-engine-floor-dismiss-button = Dismiss
+chrome-engine-floor-help-button = How to update your system
 chrome-tunnel-warning-title-span = The tunnel is not carrying traffic
 chrome-tunnel-warning-body-span = Pages are not loading because the tunnel is down. PATANYX will NOT fall back to a direct connection. Open the tunnel panel.
 chrome-tunnel-warning-open-button = Open Tunnel panel
@@ -172,7 +173,7 @@ chrome-findtabs-query-placeholder = Search open tabs
 chrome-findtabs-query-aria-label = Search open tabs
 chrome-findtabs-run-button = Search tabs
 chrome-findtabs-note-p = Search reads pages as the server delivered them. It misses text built by scripts. Quarantine tabs are not searched.
-chrome-findtabs-premium-p = Available when PATANYX Premium launches. Check the Vault.
+chrome-findtabs-premium-p = Premium required. Check your status in the Vault.
 chrome-findtabs-empty-p = No tab contains that.
 chrome-findtabs-locked-p = Unlock the Vault, then search again.
 chrome-findtabs-close-button = Close
@@ -296,6 +297,8 @@ chrome-privacy-panel-h1 = Privacy protections
 chrome-privacy-panel-p = Current and future tabs.
 chrome-privacy-panel-span = Block ads and trackers
 chrome-pv-block-ads-note-span = Blocked requests never leave your computer.
+chrome-pv-youtube-ads-span = Block YouTube video ads
+chrome-pv-youtube-ads-note-span = Removes most video ads and sponsored listings on YouTube. Applies to YouTube pages you open or reload after changing it.
 chrome-privacy-panel-span-n2 = Freeze pages after they load
 chrome-pv-freeze-note-span = Breaks chat, maps, and other live pages.
 chrome-privacy-panel-span-n3 = Allow JavaScript
@@ -591,6 +594,7 @@ chrome-js-engine-hardened-environment = Hardened engine environment
 chrome-js-engine-navigation-tracking = Navigation tracking
 chrome-js-engine-script-setting = JavaScript setting
 chrome-js-engine-session-lock-registered = Lock vault when the screen locks
+chrome-js-engine-sandbox = Web process sandbox
 chrome-js-engine-smartscreen-off = SmartScreen reporting off
 chrome-js-engine-state-applied = confirmed by the engine
 chrome-js-engine-state-failed = REFUSED by the engine
@@ -630,6 +634,8 @@ chrome-js-error-export-auth-failed = Wrong export passphrase, or the file is cor
 chrome-js-error-export-not-confirmed = Type the confirmation sentence exactly to continue.
 chrome-js-error-fill-failed = Could not fill that password into the page.
 chrome-js-error-install-failed = The verified update could not be installed. The downloaded file is kept, so you can try again.
+chrome-js-error-install-restore-failed = The update could not start, and the previous version could not be put back automatically. Open Updates to see how to fix it.
+chrome-js-error-engine-too-old = This update needs a newer web engine than this computer has. Nothing was installed, and this version keeps working. Install your system's updates, then reopen PATANYX and try again.
 chrome-js-error-io = Could not read or write to this computer's storage
 chrome-js-error-library-not-replaced = The previous profile's Library could not be replaced, so bookmarks, Tab Shelf, and download records are unavailable. The imported vault and its passwords are still available.
 chrome-js-error-library-replace-refused = The Library could not be prepared for safe replacement, so the vault was not imported.
@@ -751,6 +757,7 @@ chrome-js-freeze-title-pending = Freezing this tab; requests may continue
 chrome-js-freeze-title-unavailable = Freezing is not available on this platform
 chrome-js-freeze-unfreeze-button = Unfreeze this tab
 chrome-js-import-no-export-pass = Enter the passphrase that protects the backup file.
+chrome-js-import-retained-copies = PATANYX kept some vault files it found beside your vault because it could not confirm they belonged to the vault you replaced. If they are older copies of it, they may still open with an earlier passphrase or recovery key. They are in the same folder as your vault file; their names start with vault.rbv. or .tmp-, and some may be hidden. Delete them by hand if you do not want them.
 chrome-js-import-no-file-placeholder = No file chosen yet
 chrome-js-import-library-not-opened = The vault was imported and the previous Library was replaced, but the new Library could not be opened. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.
 chrome-js-import-library-not-replaced = The vault was imported, but the previous profile's Library could not be replaced. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.
@@ -971,6 +978,27 @@ chrome-engine-floor-evergreen = Windows installs engine updates on its own, usua
 ## "this computer does not have it yet" would be false here, so this one
 ## names the installed build and the one act that clears the warning.
 chrome-engine-floor-body-restart = PATANYX shows pages with { $engine } { $version }. Version { $floor } fixes security bugs that a web page can trigger. A newer engine, { $installed }, is already installed on this computer, but pages in this session still use the older one. Restart PATANYX so pages use the new version.
+
+## Shown over a page that has just taken the whole screen through its own full
+## screen button (a video, a game). The browser's toolbar is hidden at that
+## moment, so this is how the user learns a page has the screen and how to
+## take it back. Esc is the key both engines use to leave.
+chrome-fullscreen-notice = Full screen. Press Esc to exit.
+## The window a Linux build shows instead of quitting when the system's web
+## engine (WebKitGTK) is older than the version it needs. Shown before any
+## browser window exists. Placeables: $engine (always "WebKitGTK"), $needed and
+## $running (version numbers), $url (the help page). The command itself is not
+## translated: it is shown verbatim after engine-window-command.
+engine-window-title = Your system needs a newer web engine
+engine-window-body = PATANYX needs { $engine } { $needed } or newer. This computer has { $running }, which has security bugs a web page can trigger, so PATANYX will not start until it is updated.
+engine-window-action = Install your system's updates, then open PATANYX again.
+engine-window-action-button = Click Open Software Updater, install the updates, then open PATANYX again.
+engine-window-debian12 = To fix this, upgrade to a release built on Debian 13. Debian 12, and systems built on it, will not get a fixed version of this engine.
+engine-window-command = To install them from a terminal, run:
+engine-window-more = More help: { $url }
+engine-window-open-updater = Open Software Updater
+engine-window-copy = Copy command
+engine-window-close = Close
 chrome-js-error-unknown-message = This build does not carry that text
 
 ## Locally-argued messages, resolved through the i18n_resolve arm. Selects
@@ -1093,9 +1121,16 @@ chrome-js-update-offered-detail = You run { $running }. The download is { $size 
 chrome-js-update-downloading = Downloading version { $version }…
 chrome-js-update-downloading-detail = The download is verified against the signed manifest before it is kept.
 chrome-js-update-refused = Update refused.
+chrome-js-update-engine-held-state = Update your system first.
+chrome-js-update-engine-held = PATANYX { $version } needs { $engine } { $needed } or newer, and this computer has { $running }. Install your system's updates, reopen PATANYX, then press Check now. Nothing has been downloaded or installed.
+chrome-js-update-engine-unknown = PATANYX { $version } needs { $engine } { $needed } or newer, and this computer's { $engine } version could not be read. Nothing has been downloaded or installed. Install your system's updates, reopen PATANYX, then press Check now.
+chrome-js-update-engine-help-label = How to update your system
 chrome-js-update-nothing-installed = {"\u000A"}{"\u000A"}Nothing was installed.
 chrome-js-update-download-failed = The download failed.
 chrome-js-update-check-failed = The update check failed.
+chrome-js-update-install-broken-state = The update did not work.
+chrome-js-update-install-broken = PATANYX could not start the new version, and could not put your previous version back. This window keeps working until you close it. To fix it, download PATANYX again and use it to replace your current copy. Your settings, Vault and browsing data are kept.
+chrome-js-update-download-label = Download PATANYX
 chrome-js-update-ready-state = Version { $version } is downloaded and verified.
 chrome-js-update-restart-finish = Installed. Restart PATANYX to finish. The new version is already running in a new window.{"\u000A"}
 chrome-js-update-ready-install = Ready to install.

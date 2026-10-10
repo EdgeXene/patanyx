@@ -95,6 +95,98 @@ check("a build with no update networking still shows the fixed channel without o
   assert(!global.$("update-channel-beta"), "no Beta button in any build");
 });
 
+const BROKEN = {
+  available: true,
+  state: "install_broken",
+  running: "1.0.6",
+  detail: "the update could not start (x) and the previous version could not be put back (y)",
+  exe: "/opt/p/PATANYX",
+  kept_at: "/opt/p/PATANYX.prev",
+};
+
+check("a broken install offers a fresh download, and never says 'Nothing was installed'", async () => {
+  global.rbResolve.update_status = BROKEN;
+  global.rbResolve.update_channel_get = { channel: "stable" };
+  reopenUpdatePanel();
+  await flush();
+  const status = global.$("update-status").textContent;
+  const detail = global.$("update-detail").textContent;
+  assert(/did not work/.test(status), `state line: ${JSON.stringify(status)}`);
+  assert(/download PATANYX again/.test(detail), `the way out is missing: ${JSON.stringify(detail)}`);
+  assert(!/Nothing was installed/.test(detail), "the new file IS installed; saying otherwise is false");
+  // The status carries both paths for diagnostics; the panel shows neither.
+  assert(!detail.includes(BROKEN.exe) && !detail.includes(BROKEN.kept_at) && !status.includes(BROKEN.exe),
+    `a file path reached the panel: ${JSON.stringify(detail)}`);
+  assert(global.$("update-restart").style.display === "none", "no Restart button from a broken install");
+  const download = global.$("update-download");
+  assert(download && download.style.display !== "none", "the Download PATANYX button must be offered");
+  global.rbCalls.length = 0;
+  download._fire("click");
+  await flush();
+  const opened = global.rbCalls.filter((c) => c.cmd === "tab_new");
+  assert(opened.length === 1 && opened[0].args.url === "https://patanyx.net/download/",
+    `the button must open the download page: ${JSON.stringify(opened)}`);
+});
+
+check("the Download PATANYX button is not offered in ordinary states", async () => {
+  global.rbResolve.update_status = { available: true, state: "uptodate", running: "1.0.6" };
+  reopenUpdatePanel();
+  await flush();
+  assert(global.$("update-download").style.display === "none", "Download shown while nothing is broken");
+});
+
+check("a Restart click refused with install_restore_failed re-reads the panel instead of a summary", async () => {
+  global.rbResolve.update_status = { available: true, state: "ready", wired: true, offered: "1.0.7", running: "1.0.6" };
+  global.rbResolve.update_channel_get = { channel: "stable" };
+  reopenUpdatePanel();
+  await flush();
+  const restart = global.$("update-restart");
+  assert(restart.style.display !== "none", "the Restart button should be offered from a background-ready state");
+  // Rust moves the phase to install_broken and refuses the command.
+  global.rbResolve.update_apply = new Error("install_restore_failed");
+  global.rbResolve.update_status = BROKEN;
+  global.rbCalls.length = 0;
+  restart._fire("click");
+  await flush();
+  assert(global.rbCalls.some((c) => c.cmd === "update_status"), "the panel did not re-read the status");
+  const detail = global.$("update-detail").textContent;
+  assert(/download PATANYX again/.test(detail), `the panel shows the summary, not the broken-install text: ${JSON.stringify(detail)}`);
+  delete global.rbResolve.update_apply;
+});
+
+check("any other refused Restart keeps its explanation on screen", async () => {
+  global.rbResolve.update_status = { available: true, state: "ready", wired: true, offered: "1.0.7", running: "1.0.6" };
+  reopenUpdatePanel();
+  await flush();
+  global.rbResolve.update_apply = new Error("install_failed");
+  global.$("update-restart")._fire("click");
+  await flush();
+  const status = global.$("update-status").textContent;
+  assert(/went wrong/.test(status), `the refusal was swallowed: ${JSON.stringify(status)}`);
+  delete global.rbResolve.update_apply;
+});
+
+check("a failed AUTOMATIC install explains itself and brings the Restart button back", async () => {
+  // The person pressed Download and install; the download reaches ready and
+  // the panel applies it by itself, which Rust refuses.
+  global.rbResolve.update_status = { available: true, state: "offered", offered: "1.0.7", running: "1.0.6", size: 1 };
+  global.rbResolve.update_install = { available: true, state: "downloading", offered: "1.0.7", running: "1.0.6" };
+  reopenUpdatePanel();
+  await flush();
+  global.$("update-install")._fire("click");
+  await flush();
+  global.rbResolve.update_status = { available: true, state: "ready", wired: true, offered: "1.0.7", running: "1.0.6" };
+  global.rbResolve.update_apply = new Error("install_failed");
+  // The harness has no live timers, so the next status read comes from
+  // reopening the panel; the apply fires from that render either way.
+  reopenUpdatePanel();
+  await flush();
+  const status = global.$("update-status").textContent;
+  assert(/went wrong/.test(status), `the automatic failure was swallowed: ${JSON.stringify(status)}`);
+  assert(global.$("update-restart").style.display !== "none", "the Restart button must come back for a retry");
+  delete global.rbResolve.update_apply;
+});
+
 (async () => {
   for (const [name, fn] of checks) {
     try {

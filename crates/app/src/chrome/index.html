@@ -708,6 +708,9 @@
         <span id="engine-floor-body"></span>
       </div>
       <div class="banner-actions">
+        <button id="engine-floor-help" type="button" class="small" hidden data-msg="chrome.engine.floor.help.button">
+          How to update your system
+        </button>
         <button id="engine-floor-dismiss" type="button" class="small" data-msg="chrome.engine.floor.dismiss.button">
           Dismiss
         </button>
@@ -1137,7 +1140,7 @@
         Search reads pages as the server delivered them. It misses text built by scripts. Quarantine tabs are not searched.
       </p>
       <p class="panel-note" id="findtabs-premium" hidden data-msg="chrome.findtabs.premium.p">
-        Available when PATANYX Premium launches. Check the Vault.
+        Premium required. Check your status in the Vault.
       </p>
       <p id="findtabs-progress" aria-live="polite"></p>
       <ul id="findtabs-list" class="items" role="list"></ul>
@@ -2124,6 +2127,16 @@
         </span>
       </label>
 
+      <label class="toggle-row" for="pv-youtube-ads">
+        <input id="pv-youtube-ads" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title" data-msg="chrome.pv.youtube.ads.span">Block YouTube video ads</span>
+          <span class="toggle-note" data-msg="chrome.pv.youtube.ads.note.span">
+            Removes most video ads and sponsored listings on YouTube. Applies to YouTube pages you open or reload after changing it.
+          </span>
+        </span>
+      </label>
+
       <label class="toggle-row" for="pv-freeze">
         <input id="pv-freeze" type="checkbox" />
         <span class="toggle-text">
@@ -2646,6 +2659,7 @@
           see it once. Nobody can make you another one, including us.
         </p>
         <pre id="recovery-key" class="recovery-key"></pre>
+        <p id="recovery-import-note" class="error" hidden></p>
         <p class="error" data-msg="chrome.vault.recovery.p.n2">
           A backup will not help without this key or your passphrase. Backups
           cover a broken disk, not a forgotten passphrase.

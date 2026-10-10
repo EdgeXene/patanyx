@@ -1,4 +1,4 @@
-# PATANYX ad and tracker rules: Tracking -- 116385 hosts.
+# PATANYX ad and tracker rules: Tracking -- 116381 hosts.
 # Regenerate with scripts/build-adlist.sh. Retrieved 2026-09-01.
 #
 # Source: ShadowWhisperer -- https://github.com/ShadowWhisperer/BlockLists --
@@ -29695,7 +29695,6 @@ dmtrk.net
 dmtry.com
 dmuni.rileybce.com
 dmway.com
-dmxleo.com
 dmyj6.boombrush.com
 dmztm.varley.com
 dn1i8v75r669j.cloudfront.net
@@ -33528,7 +33527,6 @@ gateway-green.junxurecloud.com
 gateway.craftinfocus.com
 gateway.dbandit.com
 gateway.euvou.events
-gateway.instagram.com
 gateway.kickcollection.nl
 gateway.raabe.de
 gateway.yvonthelabel.com
@@ -34494,7 +34492,6 @@ grapeopinion.com
 grapeshot.co.uk
 grapeshot.com
 grapevine.travel
-graph-fallback.instagram.com
 graph.accountkit.com
 graph.fbpigeon.com
 graph.rgpdpharmacie.fr
@@ -34504,7 +34501,6 @@ graphinium.com
 graphite-note.com
 graphly.io
 graphql.acorns.com
-graphql.instagram.com
 graphql.thestar.com
 graphyte.ai
 grapo.doomlings.com

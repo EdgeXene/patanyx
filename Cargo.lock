@@ -2389,7 +2389,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "patanyx"
-version = "1.0.5"
+version = "1.0.6"
 dependencies = [
  "bsdiff",
  "ed25519-dalek",
@@ -2401,6 +2401,7 @@ dependencies = [
  "gtk",
  "javascriptcore-rs",
  "javascriptcore-rs-sys",
+ "libc",
  "patanyx-chat",
  "patanyx-corroborate",
  "patanyx-integrity",

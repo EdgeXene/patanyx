@@ -77,6 +77,10 @@ pub struct Vault {
     /// save still happened; this exists so the UI can be honest about the
     /// backups not working instead of silently implying they are.
     last_backup_error: Option<String>,
+    /// Set by an encrypted import: vault-shaped files beside the destination
+    /// that could not be proven to be generations of the replaced vault and
+    /// were therefore kept (see `backup::discard_replaced_vault_leftovers`).
+    import_retained_leftovers: usize,
     /// SMOKE-ONLY fault injection: make the next `save` fail without
     /// touching the disk, so the app's recovery from a failed write can be
     /// exercised in the e2e gate. Debug builds only; a release binary has
@@ -233,6 +237,7 @@ impl Vault {
         let master = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
         let mut vault = Vault {
             last_backup_error: None,
+            import_retained_leftovers: 0,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
             #[cfg(test)]
@@ -417,6 +422,7 @@ impl Vault {
         let data = Self::parse_payload(&plaintext)?;
         Ok(Vault {
             last_backup_error: None,
+            import_retained_leftovers: 0,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
             #[cfg(test)]
@@ -465,6 +471,7 @@ impl Vault {
         let master = Zeroizing::new(crypto::random_bytes::<{ crypto::KEY_LEN }>());
         let mut vault = Vault {
             last_backup_error: None,
+            import_retained_leftovers: 0,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
             #[cfg(test)]
@@ -558,6 +565,7 @@ impl Vault {
         let guard = lock::acquire(&path).map_err(VaultError::from)?;
         Ok(Self {
             last_backup_error: None,
+            import_retained_leftovers: 0,
             #[cfg(any(debug_assertions, test))]
             fail_next_save: false,
             #[cfg(test)]
@@ -632,6 +640,14 @@ impl Vault {
     /// are not working instead of implying they are.
     pub fn last_backup_error(&self) -> Option<&str> {
         self.last_backup_error.as_deref()
+    }
+
+    /// Vault-shaped siblings an import kept because it could not prove they
+    /// were the replaced vault's own generations. Zero after anything but an
+    /// import. The panel should say so when it is not zero: those files may
+    /// still open under a passphrase the user believes retired.
+    pub fn import_retained_leftovers(&self) -> usize {
+        self.import_retained_leftovers
     }
 
     pub fn save(&mut self) -> Result<(), VaultError> {

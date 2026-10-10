@@ -583,6 +583,35 @@ pub fn verify_manifest(bytes: &[u8], keys: &TrustedKeys) -> Result<Manifest, Upd
     raw.into_manifest()
 }
 
+/// Domain for LINUX release manifests on the /v2 feed (PATANYX 1.0.6 on).
+///
+/// Linux builds before 1.0.6 verify only `SIGNING_DOMAIN` and install whatever
+/// a valid manifest offers without checking the engine. If /v2 manifests were
+/// signed under `SIGNING_DOMAIN` too, any of them (a strict build that refuses
+/// to start below WebKitGTK 2.54) could be served at the old /v1 address by a
+/// compromised server or a broken TLS path, and an old copy on 2.52.x would
+/// install a browser that never opens, with no rollback. Under this domain an
+/// old copy sees a bad signature and installs nothing, wherever the file came
+/// from; and a 1.0.6+ Linux copy verifies ONLY this domain, so a /v1 manifest
+/// (the bridge, or anything older) cannot be replayed to it either.
+pub const SIGNING_DOMAIN_LINUX_V2: &[u8] = b"PATANYX-UPDATE-MANIFEST-LINUX-V2\n";
+
+/// Verify a Linux /v2 release manifest: `SIGNING_DOMAIN_LINUX_V2`, and a
+/// Linux platform. Everything else is `verify_manifest`'s.
+pub fn verify_manifest_linux_v2(bytes: &[u8], keys: &TrustedKeys) -> Result<Manifest, UpdateError> {
+    let payload = verify_envelope(bytes, keys, SIGNING_DOMAIN_LINUX_V2)?;
+    let raw: RawPayload = serde_json::from_str(&payload).map_err(|e| {
+        UpdateError::Malformed(format!("signed payload is not the expected JSON: {e}"))
+    })?;
+    let manifest = raw.into_manifest()?;
+    if !matches!(manifest.platform(), Platform::LinuxX86_64 | Platform::LinuxAarch64) {
+        return Err(UpdateError::Malformed(
+            "a /v2 Linux manifest names a platform that is not Linux".to_string(),
+        ));
+    }
+    Ok(manifest)
+}
+
 /// Domain separation for the BLOCKLIST channel. A different purpose gets a
 /// different domain, so a signature made for one can never be replayed as the
 /// other -- an update manifest cannot be served as a blocklist manifest, and a

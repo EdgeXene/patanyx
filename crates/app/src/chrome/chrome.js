@@ -1043,6 +1043,15 @@
         i18nText("chrome-js-error-not-ready", "The update has not finished downloading and verifying yet. Wait for it to complete, then try again."),
       install_failed:
         i18nText("chrome-js-error-install-failed", "The verified update could not be installed. The downloaded file is kept, so you can try again."),
+      // The new version could not start and the old one could not be put
+      // back. The Updates panel shows the full sentence with the path.
+      install_restore_failed:
+        i18nText("chrome-js-error-install-restore-failed", "The update could not start, and the previous version could not be put back automatically. Open Updates to see how to fix it."),
+      // The engine gate or the new file's own preflight refused the swap:
+      // this computer's web engine cannot run the update. Not a broken
+      // download, so it does not say "try again" until the system is updated.
+      engine_too_old:
+        i18nText("chrome-js-error-engine-too-old", "This update needs a newer web engine than this computer has. Nothing was installed, and this version keeps working. Install your system's updates, then reopen PATANYX and try again."),
       // The engine refused to create a webview -- out of memory, a lost GPU
       // process, or a WebView2 runtime problem. Says what to do, because
       // "engine error" leaves the user with nothing.
@@ -5535,6 +5544,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     { id: "pv-freeze", key: "freeze_after_load" },
     { id: "pv-js", key: "javascript" },
     { id: "pv-ephemeral", key: "ephemeral" },
+    { id: "pv-youtube-ads", key: "block_youtube_ads" },
   ];
 
   for (const t of PRIVACY_TOGGLES) {
@@ -6472,8 +6482,13 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
 
   // Inserted as text, never as HTML, like everything else that crosses the
   // IPC boundary into this trusted page.
-  function showRecoveryKey(key) {
+  function showRecoveryKey(key, note) {
     $("recovery-key").textContent = key;
+    const slot = $("recovery-import-note");
+    if (slot) {
+      slot.textContent = note || "";
+      slot.hidden = !note;
+    }
     showState("recovery");
   }
 
@@ -7380,10 +7395,22 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
             ? i18nText("chrome-js-import-library-not-replaced", "The vault was imported, but the previous profile's Library could not be replaced. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.")
             : i18nText("chrome-js-import-library-not-opened", "The vault was imported and the previous Library was replaced, but the new Library could not be opened. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.");
         }
+        // Copies of the replaced vault the import could not prove were its
+        // own generations were KEPT, and the user must hear it: they may
+        // still open with the passphrase the user believes retired (audit
+        // 2026-10-08). The warning joins the Library note rather than
+        // displacing it, and never costs the one-time recovery-key screen.
+        if (imported && typeof imported.retained_copies === "number" && imported.retained_copies > 0) {
+          const kept = i18nText("chrome-js-import-retained-copies", "PATANYX kept some vault files it found beside your vault because it could not confirm they belonged to the vault you replaced. If they are older copies of it, they may still open with an earlier passphrase or recovery key. They are in the same folder as your vault file; their names start with vault.rbv. or .tmp-, and some may be hidden. Delete them by hand if you do not want them.");
+          err.textContent = err.textContent ? err.textContent + " " + kept : kept;
+        }
         // Import mints a FRESH recovery key, exactly like creation, and it is
         // returned once. The user must see it before anything else happens.
+        // The notes travel WITH it: the form's own error element sits in a
+        // pane the recovery screen hides, and on the no-vault path that pane
+        // is never shown again (compliance audit, same day).
         if (imported && imported.recovery_key) {
-          showRecoveryKey(imported.recovery_key);
+          showRecoveryKey(imported.recovery_key, err.textContent);
         } else {
           showState("open");
         }
@@ -11717,6 +11744,12 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
 
   // ---- the engine underneath is below the security floor -----------------
   //
+  // Where the banner's and the update panel's "How to update your system"
+  // buttons go. One constant; the Rust window (engine_window.rs HELP_URL)
+  // names the same page, and a test there keeps it https.
+  const ENGINE_HELP_URL = "https://patanyx.net/download/#webkitgtk";
+  window.__rbEngineHelpUrl = ENGINE_HELP_URL;
+  //
   // One producer, the `engine_status` reply at boot, because the answer can
   // only change between launches: the engine is loaded once per process, so
   // a runtime that updates while PATANYX is open is still the old one until
@@ -11728,11 +11761,17 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     if (show) {
       $("engine-floor-body").textContent = data.body || "";
     }
+    // WebKitGTK only: there the engine is the operating system's, and the
+    // help page says how to update it. WebView2 updates itself.
+    $("engine-floor-help").hidden = !(show && data && data.name === "WebKitGTK");
     if (banner.hidden !== !show) {
       banner.hidden = !show;
       syncChromeInsets();
     }
   }
+  $("engine-floor-help").addEventListener("click", () => {
+    rb("tab_new", { url: ENGINE_HELP_URL }).catch(() => {});
+  });
   $("engine-floor-dismiss").addEventListener("click", () => {
     $("engine-floor-warning").hidden = true;
     syncChromeInsets();
@@ -12322,6 +12361,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       // the workstation locks, so the vault stays open behind a locked screen
       // until the inactivity timer catches it.
       session_lock_registered: i18nText("chrome-js-engine-session-lock-registered", "Lock vault when the screen locks"),
+      // Per-tab, read back from the engine (Linux): whether this tab's web
+      // processes run inside WebKitGTK's sandbox. "REFUSED" means a page
+      // exploit would run with the user's full privileges.
+      sandbox: i18nText("chrome-js-engine-sandbox", "Web process sandbox"),
       // Whether THIS tab's autofill save/fill channel actually registered.
       // "REFUSED" here means the Passwords section in Tab Activity cannot
       // offer or accept a fill for this tab no matter what the vault holds --

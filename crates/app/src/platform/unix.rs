@@ -95,6 +95,18 @@ pub struct Hosts {
     root: gtk::Overlay,
     /// The content overlay, the other half of that swap.
     content_overlay: gtk::Overlay,
+    /// True while a page holds the screen through its fullscreen element:
+    /// the position handler then gives the page the whole window.
+    fullscreen: Rc<Cell<bool>>,
+    /// The tabs whose page may go fullscreen right now, published by
+    /// AppState on every relayout. Read by each tab's enter-fullscreen
+    /// handler BEFORE the engine touches the window, so a refused request
+    /// never changes it.
+    fullscreen_eligible: Rc<RefCell<Vec<u64>>>,
+    /// True while the fullscreen notice owns the readout label. Every hover
+    /// write and hide below checks it, so a background tab's load or the
+    /// pointer leaving the page cannot take the notice down early.
+    notice_active: Rc<Cell<bool>>,
 }
 
 /// One per tab: the container packed into the content box. Tab visibility
@@ -110,6 +122,9 @@ pub struct TabView {
     /// The page-scrollbar sheet (`set_page_scrollbar`), kept for the same
     /// reason: swapping it out needs the instance that went in.
     scrollbar_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
+    /// The YouTube ad script while `block_youtube_ads` is on
+    /// (`set_youtube_ads`); removing a user script needs the same instance.
+    youtube_script: RefCell<Option<webkit2gtk::UserScript>>,
     /// Host-to-page translation messages for this tab. Shared with the reply
     /// signal handler, which is why it is an Rc rather than owned outright:
     /// GTK is single-threaded, so Rc/RefCell is sufficient and correct here
@@ -166,6 +181,7 @@ pub fn create_hosts(window: Window) -> Hosts {
     let strip_top = Rc::new(Cell::new(CHROME_HEIGHT_PX));
     // Whether a modal is covering the window: `ChromeLayout::Overlay`.
     let lifted = Rc::new(Cell::new(false));
+    let fullscreen = Rc::new(Cell::new(false));
     // GTK3 keeps an Overlay's MAIN child at the BOTTOM of the z-stack, and the
     // chrome used to be that main child with the page overlaid on top of it.
     // That is why the chrome could only ever be seen above the page and never
@@ -200,8 +216,17 @@ pub fn create_hosts(window: Window) -> Hosts {
         let insets = Rc::clone(&insets);
         let strip_top = Rc::clone(&strip_top);
         let lifted = Rc::clone(&lifted);
+        let fullscreen = Rc::clone(&fullscreen);
         root.connect_get_child_position(move |root, child| {
             let alloc = root.allocation();
+            // A fullscreen page: the page takes the whole window, frame and
+            // all. The chrome keeps its full-window rectangle underneath and
+            // is simply covered (the page is the upper overlay child at rest,
+            // and a modal, which would raise the chrome, ends fullscreen
+            // first).
+            if fullscreen.get() && child.widget_name() != CHROME_WIDGET_NAME {
+                return Some(gtk::Rectangle::new(0, 0, alloc.width(), alloc.height()));
+            }
             let (top, left, right) = insets.get();
             let _ = top;
             if child.widget_name() == CHROME_WIDGET_NAME {
@@ -265,6 +290,9 @@ pub fn create_hosts(window: Window) -> Hosts {
         lifted,
         root,
         content_overlay: overlay,
+        fullscreen,
+        fullscreen_eligible: Rc::new(RefCell::new(Vec::new())),
+        notice_active: Rc::new(Cell::new(false)),
     }
 }
 
@@ -309,6 +337,9 @@ pub fn set_hover_readout_scheme(hosts: &Hosts, scheme: crate::prefs::ChromeSchem
 /// `set_text`, NEVER `set_markup`: a link target is page data, and a query
 /// string full of `&` and `<` must not be parsed as Pango markup.
 pub fn set_hover_readout(hosts: &Hosts, text: Option<&str>) {
+    if hosts.notice_active.get() {
+        return;
+    }
     match text {
         Some(t) if hosts.readout_styled.get() && !hosts.readout_suppressed.get() => {
             hosts.readout.set_text(t);
@@ -505,7 +536,11 @@ fn connect_hover_readout(webview: &WebView, hosts: &Hosts) {
     let readout = hosts.readout.clone();
     let styled = hosts.readout_styled.clone();
     let suppressed = hosts.readout_suppressed.clone();
+    let notice = hosts.notice_active.clone();
     core.connect_mouse_target_changed(move |_view, hit, _modifiers| {
+        if notice.get() {
+            return;
+        }
         let shown = hit
             .context_is_link()
             .then(|| hit.link_uri())
@@ -525,8 +560,9 @@ fn connect_hover_readout(webview: &WebView, hosts: &Hosts) {
     // ordinary GTK (signals multi-dispatch); the freeze machinery's handler
     // in connect_load_events is untouched.
     let readout = hosts.readout.clone();
+    let notice = hosts.notice_active.clone();
     core.connect_load_changed(move |_view, event| {
-        if event == LoadEvent::Started {
+        if event == LoadEvent::Started && !notice.get() {
             readout.hide();
         }
     });
@@ -535,8 +571,11 @@ fn connect_hover_readout(webview: &WebView, hosts: &Hosts) {
     // reliably when it leaves the WIDGET. Propagation::Proceed is mandatory:
     // swallowing the crossing event would break WebKit's own hover handling.
     let readout = hosts.readout.clone();
+    let notice = hosts.notice_active.clone();
     core.connect_leave_notify_event(move |_view, _event| {
-        readout.hide();
+        if !notice.get() {
+            readout.hide();
+        }
         gtk::glib::Propagation::Proceed
     });
 }
@@ -814,25 +853,32 @@ pub fn build_content(
     // ONE TOKEN PER WEBVIEW, generated before the script that carries it.
     // See `new_poll_token` and `TranslateOutbox::expected_request`.
     let poll_token = new_poll_token();
-    // The token goes INTO the script source, which wry injects TopFrame-only
-    // (`with_initialization_script` -> `..._for_main_only(js, true)`), so no
+    // The token goes INTO the script source, injected TopFrame-only, so no
     // subframe ever receives it. A placeholder rather than a concatenation
     // because the value has to land inside the script's IIFE rather than on
     // `window`, where a same-origin frame could read it through `parent`.
-    let translate_script =
-        CONTENT_TRANSLATE_SCRIPT.replace("__PATANYX_POLL_REQUEST__", &format!("{TRANSLATE_POLL_REQUEST}:{poll_token}"));
-    let builder = builder.with_initialization_script(translate_script.as_str());
+    //
+    // ONE TOKEN PER DOCUMENT, not per webview (security audit 2026-10-08):
+    // the script is added by hand rather than through wry's builder so that
+    // every main-frame load can swap it for one carrying a fresh token (see
+    // connect_load_events). A token a hostile page learned therefore dies
+    // with that page instead of authenticating a frame in the next one.
     // Built WITHOUT the keyboard: wry defaults to focused, which grab_focus-es
     // every new webview as it is created. Whether a page gets focus is decided
     // in one place, AppState::show_and_focus_tab.
     let builder = builder.with_focused(false);
     let webview = builder.build_gtk(&container)?;
+    let translate_outbox: Rc<RefCell<TranslateOutbox>> =
+        Rc::new(RefCell::new(TranslateOutbox::with_token(&poll_token)));
+    let translate_script: Rc<RefCell<Option<webkit2gtk::UserScript>>> =
+        Rc::new(RefCell::new(install_translate_script(&wry::WebViewExtUnix::webview(&webview), &poll_token)));
     // Register the page-to-host channel the extractor posts through. If the
     // engine gives us no content manager the channel simply does not exist and
     // the capability is reported false, rather than the UI offering a control
     // whose message would go nowhere -- the shape unix.rs:1419 already uses
     // for autofill.
-    let translate_channel = connect_translate_channel(&webview, id, proxy);
+    let translate_channel = translate_script.borrow().is_some()
+        && connect_translate_channel(&webview, id, proxy, translate_outbox.clone());
     ITP_CONFIRMED.with(|c| c.set(enable_itp(&webview)));
     connect_context_menu(&webview, proxy);
     connect_hover_readout(&webview, hosts);
@@ -843,12 +889,11 @@ pub fn build_content(
     // channel above so a tab either has both halves of the conversation or
     // neither -- a page that could send but never be answered would leave the
     // user watching a translation that can never arrive.
-    let translate_outbox: Rc<RefCell<TranslateOutbox>> =
-        Rc::new(RefCell::new(TranslateOutbox::with_token(&poll_token)));
     let translate_reply = connect_translate_reply_channel(&webview, translate_outbox.clone());
     TRANSLATE_CHANNEL_READY.with(|c| c.set(translate_channel && translate_reply));
 
     let state = Rc::new(RefCell::new(TabState::new(policy)));
+    state.borrow_mut().sandbox = sandbox_requested(&webview);
     FREEZE_STATUS_WAKE.with(|w| *w.borrow_mut() = Some(proxy.clone()));
     state.borrow_mut().fingerprint_probe_reporting =
         if connect_fingerprint_probe_messages(&webview, proxy, id) {
@@ -856,7 +901,7 @@ pub fn build_content(
         } else {
             SettingState::Failed
         };
-    connect_load_events(&webview, state.clone(), translate_outbox.clone());
+    connect_load_events(&webview, state.clone(), translate_outbox.clone(), translate_script.clone());
     connect_adlist_hold(&webview, state.clone(), proxy.clone(), id);
     connect_ledger(&webview, state.clone());
     connect_tls_errors(&webview, state.clone());
@@ -866,6 +911,7 @@ pub fn build_content(
         state,
         cosmetic_sheet: RefCell::new(None),
         scrollbar_sheet: RefCell::new(None),
+        youtube_script: RefCell::new(None),
         translate_outbox,
     };
     apply_policy(&webview, &view, policy);
@@ -1306,6 +1352,7 @@ fn connect_load_events(
     webview: &WebView,
     state: Rc<RefCell<TabState>>,
     translate_outbox: Rc<RefCell<TranslateOutbox>>,
+    translate_script: Rc<RefCell<Option<webkit2gtk::UserScript>>>,
 ) {
     use webkit2gtk::{LoadEvent, WebViewExt};
     use wry::WebViewExtUnix;
@@ -1323,6 +1370,19 @@ fn connect_load_events(
                 // the OLD document's JS context, which does not survive this
                 // navigation. See ParkedReply.
                 translate_outbox.borrow_mut().clear();
+                // AND SO DOES THE TOKEN. A fresh one goes into a fresh user
+                // script before the new document is created (load-changed
+                // Started precedes the commit that collects document-start
+                // scripts), and the outbox expects the new value from here on.
+                // The document that was leaving loses nothing it still had:
+                // its session was cleared one line above.
+                let token = new_poll_token();
+                let fresh = install_translate_script(web_view, &token);
+                if let Some(old) = translate_script.borrow_mut().take() {
+                    remove_translate_script(web_view, &old);
+                }
+                *translate_script.borrow_mut() = fresh;
+                translate_outbox.borrow_mut().set_token(&token);
                 // The document's own URL, for the local-network boundary:
                 // it keys on whether THIS PAGE was loaded over plain HTTP.
                 let url = web_view.uri().map(|u| u.to_string());
@@ -2245,6 +2305,7 @@ pub fn connect_translate_channel(
     webview: &WebView,
     id: u64,
     proxy: &EventLoopProxy<UserEvent>,
+    outbox: Rc<RefCell<TranslateOutbox>>,
 ) -> bool {
     use javascriptcore::ValueExt;
     use webkit2gtk::UserContentManagerExt;
@@ -2274,9 +2335,68 @@ pub fn connect_translate_channel(
         if text.len() > MAX_CONTENT_TRANSLATE_BYTES {
             return;
         }
-        let _ = proxy.send_event(UserEvent::ContentTranslate(id, text));
+        // THE TOKEN FIRST (security audit 2026-10-08, MEDIUM). This handler
+        // is registered on the content manager, so every frame of the
+        // document can post to it, and `href` inside the JSON is the page's
+        // own word. The extractor runs top-frame only and prefixes each post
+        // with the poll token only it holds; a post without exactly that
+        // prefix is dropped here, before anything downstream parses it. The
+        // token is rotated on every main-frame load (see connect_load_events),
+        // so one learned in an earlier document authenticates nothing later.
+        let Some(body) = strip_channel_token(&text, outbox.borrow().expected_request()) else {
+            return;
+        };
+        let _ = proxy.send_event(UserEvent::ContentTranslate(id, body.to_string()));
     });
     true
+}
+
+/// The pure half of the one-way channel's gate: `text` must be exactly
+/// `<expected> <json>`, compared in constant time over the token, and the
+/// JSON after the single space is what comes back. `None` for an empty
+/// expectation (an unrandomised token accepts nothing), a short or
+/// mis-prefixed post, or a prefix that ends inside a multi-byte character.
+fn strip_channel_token<'a>(text: &'a str, expected: &str) -> Option<&'a str> {
+    if expected.is_empty() || text.len() < expected.len() + 2 {
+        return None;
+    }
+    if !text.is_char_boundary(expected.len()) {
+        return None;
+    }
+    let (prefix, rest) = text.split_at(expected.len());
+    if !poll_is_accepted(prefix, expected) {
+        return None;
+    }
+    rest.strip_prefix(' ')
+}
+
+/// Adds the extractor to this webview's content manager with `token` baked
+/// in: document-start, TOP FRAME ONLY, exactly what wry's
+/// `with_initialization_script` used to do, minus the part where it could
+/// never be replaced. Returns the script handle so a later load can remove
+/// it, or `None` when the engine gave us no content manager (the channel is
+/// then reported absent, as before).
+fn install_translate_script(native: &webkit2gtk::WebView, token: &str) -> Option<webkit2gtk::UserScript> {
+    use webkit2gtk::{UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime};
+    let ucm = user_content_manager(native)?;
+    let source = CONTENT_TRANSLATE_SCRIPT
+        .replace("__PATANYX_POLL_REQUEST__", &format!("{TRANSLATE_POLL_REQUEST}:{token}"));
+    let script = UserScript::new(
+        &source,
+        UserContentInjectedFrames::TopFrame,
+        UserScriptInjectionTime::Start,
+        &[],
+        &[],
+    );
+    ucm.add_script(&script);
+    Some(script)
+}
+
+fn remove_translate_script(native: &webkit2gtk::WebView, script: &webkit2gtk::UserScript) {
+    use webkit2gtk::UserContentManagerExt;
+    if let Some(ucm) = user_content_manager(native) {
+        ucm.remove_script(script);
+    }
 }
 
 /// The name the page ASKS on. Unlike `TRANSLATE_CHANNEL`, a `postMessage`
@@ -2553,6 +2673,16 @@ impl TranslateOutbox {
     /// accepts nothing, which is what an unrandomised token produces.
     pub fn expected_request(&self) -> &str {
         &self.expected_request
+    }
+
+    /// Replaces the token for the next document (one per main-frame load).
+    /// The same rule as construction: an empty token accepts nothing.
+    pub fn set_token(&mut self, token: &str) {
+        self.expected_request = if token.is_empty() {
+            String::new()
+        } else {
+            format!("{TRANSLATE_POLL_REQUEST}:{token}")
+        };
     }
 
     /// Called by the HOST. Answers a parked poll if there is one, otherwise
@@ -2900,6 +3030,43 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
         SettingState::Failed
     };
     set_ad_blocking(&native, view, policy.block_ads);
+    set_youtube_ads(&native, view, policy.block_youtube_ads);
+}
+
+/// Adds or removes the YouTube ad script on a live view. A user script runs
+/// at the start of each new document, so the change reaches the next YouTube
+/// page load in this tab -- the page already showing keeps what it loaded
+/// with, and the switch's note says so. Scoped to YouTube's hosts twice: the
+/// URL patterns here, and the script's own host check.
+fn set_youtube_ads(native: &webkit2gtk::WebView, view: &TabView, on: bool) {
+    use webkit2gtk::{
+        UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime,
+    };
+    let Some(ucm) = user_content_manager(native) else {
+        // Same degrade-never-crash rule as set_ad_blocking: no content
+        // manager, no script, and YouTube shows its ads.
+        return;
+    };
+    let mut slot = view.youtube_script.borrow_mut();
+    match (on, slot.is_some()) {
+        (true, false) => {
+            let script = UserScript::new(
+                super::privacy::YOUTUBE_ADS_SCRIPT,
+                UserContentInjectedFrames::AllFrames,
+                UserScriptInjectionTime::Start,
+                super::privacy::YOUTUBE_URL_PATTERNS,
+                &[],
+            );
+            ucm.add_script(&script);
+            *slot = Some(script);
+        }
+        (false, true) => {
+            if let Some(script) = slot.take() {
+                ucm.remove_script(&script);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// WebKitGTK's Intelligent Tracking Prevention is only enabled or disabled;
@@ -3239,6 +3406,8 @@ pub fn engine_settings(view: &TabView) -> EngineSettings {
         // Content-script autofill is Windows-only for this pass; see
         // windows.rs's build_content. Nothing was attempted here.
         content_script_registered: SettingState::NotAttempted.as_str(),
+        // Measured, not echoed; see `sandbox_state`.
+        sandbox: sandbox_state(st.sandbox).as_str(),
         // Windows-only feature; see clear_persisted_permissions above.
         permissions_registered: SettingState::NotAttempted.as_str(),
         // Same source as the Windows backend, on purpose: the tunnel is
@@ -3246,6 +3415,168 @@ pub fn engine_settings(view: &TabView) -> EngineSettings {
         // engines read the one measured answer rather than each inventing
         // a local one.
         tunnel: crate::tunnel_control::report(),
+    }
+}
+
+/// Whether the engine's process sandbox is really in force: MEASURED, not
+/// read back from the flag the vendored wry sets (vendor/wry/PATANYX-PATCH.md,
+/// third hunk), because `is_sandbox_enabled` only echoes that request and
+/// WebKit can still launch unconfined (its own escape hatch is an environment
+/// variable). Applied while every WebKitWebProcess of THIS browser has a
+/// bubblewrap ancestor below it; Failed once one is seen without; NotAttempted
+/// while no web process exists yet or the flag was never set. Web processes
+/// only: WebKitGTK does not bubblewrap its network process, so that one is
+/// not a question this row answers. Re-measured every SANDBOX_REMEASURE.
+fn sandbox_requested(webview: &WebView) -> SettingState {
+    use webkit2gtk::{WebContextExt, WebViewExt};
+    use wry::WebViewExtUnix;
+    if webview.webview().context().is_some_and(|c| c.is_sandbox_enabled()) {
+        SettingState::Applied
+    } else {
+        SettingState::Failed
+    }
+}
+
+/// `requested` is what the context said at construction (`sandbox_requested`,
+/// stored in `TabState::sandbox`); the answer is the measurement.
+fn sandbox_state(requested: SettingState) -> SettingState {
+    if requested != SettingState::Applied {
+        return SettingState::Failed;
+    }
+    // Re-measured on a bounded cadence in EVERY state (review of this fix,
+    // same day): a sticky Applied would never notice a renderer respawned
+    // unconfined, and a Failed that re-scanned on every status push would
+    // walk /proc on the UI thread as often as the chrome asks. One scan per
+    // SANDBOX_REMEASURE_SECS, whatever the last answer was, bounds both.
+    SANDBOX_MEASURED.with(|cell| {
+        let (last, at) = cell.get();
+        if let Some(at) = at {
+            let hold = if last == SettingState::NotAttempted { SANDBOX_REMEASURE_UNKNOWN } else { SANDBOX_REMEASURE };
+            if at.elapsed() < hold {
+                return last;
+            }
+        }
+        let measured = measure_sandbox(std::process::id());
+        #[cfg(debug_assertions)]
+        if measured != last {
+            eprintln!("SANDBOX measured={measured:?}");
+        }
+        // A scan that found no web process yet asks again sooner (the first
+        // page is still loading), but never on every push.
+        cell.set((measured, Some(std::time::Instant::now())));
+        measured
+    })
+}
+
+const SANDBOX_REMEASURE: std::time::Duration = std::time::Duration::from_secs(30);
+const SANDBOX_REMEASURE_UNKNOWN: std::time::Duration = std::time::Duration::from_secs(2);
+
+thread_local! {
+    static SANDBOX_MEASURED: std::cell::Cell<(SettingState, Option<std::time::Instant>)> =
+        const { std::cell::Cell::new((SettingState::NotAttempted, None)) };
+}
+
+/// Walks /proc once and hands the tree to `judge_sandbox`.
+fn measure_sandbox(browser: u32) -> SettingState {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return SettingState::NotAttempted;
+    };
+    let mut parent_of = std::collections::HashMap::new();
+    let mut comm_of = std::collections::HashMap::new();
+    for entry in entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else { continue };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else { continue };
+        // `pid (comm) state ppid ...`; comm may hold spaces, so split on the
+        // LAST ')' rather than the first space.
+        let Some(close) = stat.rfind(')') else { continue };
+        let Some(open) = stat.find('(') else { continue };
+        let comm = stat[open + 1..close].to_string();
+        let Some(ppid) = stat[close + 1..].split_whitespace().nth(1).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        parent_of.insert(pid, ppid);
+        comm_of.insert(pid, comm);
+    }
+    judge_sandbox(&parent_of, &comm_of, browser)
+}
+
+/// The pure half. For every web process whose ancestry reaches `browser`,
+/// is there a `bwrap` between the two? The kernel truncates `comm` to 15
+/// bytes, so "WebKitWebProcess" reads as "WebKitWebProces": a prefix match,
+/// never equality, or the measurement sees no web process at all (which is
+/// exactly how the first draft of this function failed under xvfb).
+fn judge_sandbox(
+    parent_of: &std::collections::HashMap<u32, u32>,
+    comm_of: &std::collections::HashMap<u32, String>,
+    browser: u32,
+) -> SettingState {
+    let mut seen_any = false;
+    for (pid, comm) in comm_of {
+        if !comm.starts_with("WebKitWebProces") {
+            continue;
+        }
+        let mut confined = false;
+        let mut ours = false;
+        let mut cur = *pid;
+        for _ in 0..32 {
+            let Some(&pp) = parent_of.get(&cur) else { break };
+            if pp == browser {
+                ours = true;
+                break;
+            }
+            if comm_of.get(&pp).is_some_and(|c| c.starts_with("bwrap")) {
+                confined = true;
+            }
+            if pp <= 1 {
+                break;
+            }
+            cur = pp;
+        }
+        if !ours {
+            continue;
+        }
+        seen_any = true;
+        if !confined {
+            return SettingState::Failed;
+        }
+    }
+    if seen_any { SettingState::Applied } else { SettingState::NotAttempted }
+}
+
+#[cfg(test)]
+mod sandbox_measurement_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn tree(rows: &[(u32, u32, &str)]) -> (HashMap<u32, u32>, HashMap<u32, String>) {
+        let mut p = HashMap::new();
+        let mut c = HashMap::new();
+        for (pid, ppid, comm) in rows {
+            p.insert(*pid, *ppid);
+            c.insert(*pid, (*comm).to_string());
+        }
+        (p, c)
+    }
+
+    #[test]
+    fn a_web_process_under_two_bwrap_levels_counts_as_confined() {
+        // The exact shape measured under xvfb on 2026-10-08, comm truncated.
+        let (p, c) = tree(&[(100, 1, "patanyx"), (101, 100, "WebKitNetworkPr"), (102, 100, "bwrap"), (103, 102, "bwrap"), (104, 103, "WebKitWebProces")]);
+        assert_eq!(judge_sandbox(&p, &c, 100), SettingState::Applied);
+    }
+
+    #[test]
+    fn a_web_process_that_is_a_direct_child_is_unconfined() {
+        // The shape every Linux build before 1.0.6 produced.
+        let (p, c) = tree(&[(100, 1, "patanyx"), (104, 100, "WebKitWebProces")]);
+        assert_eq!(judge_sandbox(&p, &c, 100), SettingState::Failed);
+    }
+
+    #[test]
+    fn another_browsers_processes_do_not_count_and_none_is_not_attempted() {
+        let (p, c) = tree(&[(100, 1, "patanyx"), (200, 1, "patanyx"), (201, 200, "WebKitWebProces")]);
+        assert_eq!(judge_sandbox(&p, &c, 100), SettingState::NotAttempted);
+        // One confined, one not: the unconfined one decides.
+        let (p, c) = tree(&[(100, 1, "patanyx"), (102, 100, "bwrap"), (104, 102, "WebKitWebProces"), (105, 100, "WebKitWebProces")]);
+        assert_eq!(judge_sandbox(&p, &c, 100), SettingState::Failed);
     }
 }
 
@@ -4119,7 +4450,100 @@ pub fn layout(
     hosts
         .readout_suppressed
         .set(matches!(arrangement, ChromeLayout::Overlay));
-    hosts.readout.hide();
+    if !hosts.notice_active.get() {
+        hosts.readout.hide();
+    }
+}
+
+/// A page's own fullscreen element, as WebKitGTK reports it.
+///
+/// enter-fullscreen is asked BEFORE the engine fullscreens the toplevel
+/// window, and returning true stops it, so an ineligible page (a background
+/// tab, or any page while a modal is open) is refused here and the window
+/// never changes. An eligible one proceeds: WebKit fullscreens the window and
+/// AppState moves the toolbar aside. leave-fullscreen (Esc, or the page
+/// itself) is reported and allowed to proceed, so WebKit restores the window.
+pub fn connect_fullscreen(
+    hosts: &Hosts,
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+) {
+    use webkit2gtk::WebViewExt;
+    use wry::WebViewExtUnix;
+
+    let native = webview.webview();
+    let eligible = Rc::clone(&hosts.fullscreen_eligible);
+    let enter_proxy = proxy.clone();
+    native.connect_enter_fullscreen(move |_view| {
+        if !eligible.borrow().contains(&id) {
+            return true; // refused: the engine leaves the window alone
+        }
+        let _ = enter_proxy.send_event(UserEvent::PageFullscreen(id, true));
+        false
+    });
+    let leave_proxy = proxy.clone();
+    native.connect_leave_fullscreen(move |_view| {
+        let _ = leave_proxy.send_event(UserEvent::PageFullscreen(id, false));
+        false
+    });
+}
+
+/// Publishes which tabs may go fullscreen (see `Hosts::fullscreen_eligible`).
+pub fn set_fullscreen_eligible(hosts: &Hosts, tabs: &[u64]) {
+    let mut held = hosts.fullscreen_eligible.borrow_mut();
+    held.clear();
+    held.extend_from_slice(tabs);
+}
+
+/// The window and the page's rectangle. WebKit fullscreens the window itself
+/// on entry and restores it on a page-side exit; asking again is idempotent,
+/// and on a BROWSER-side exit (a shortcut, a modal, a tab switch) the
+/// unfullscreen here is what gives the window back.
+pub fn set_page_fullscreen(hosts: &Hosts, on: bool) {
+    hosts.fullscreen.set(on);
+    hosts
+        ._window
+        .set_fullscreen(on.then_some(tao::window::Fullscreen::Borderless(None)));
+    hosts.root.queue_resize();
+}
+
+/// Nothing to place: the position handler reads `Hosts::fullscreen` on every
+/// allocation. Hover text is hidden, as every layout hides it; the notice
+/// stays.
+pub fn layout_fullscreen(hosts: &Hosts, _chrome: &WebView, _page: &WebView) {
+    hosts.root.queue_resize();
+    if !hosts.notice_active.get() {
+        hosts.readout.hide();
+    }
+}
+
+/// Shows the fullscreen notice, top centre, or takes it down. Uses the hover
+/// readout's label and style; like the readout it stays off when its style
+/// failed to load, rather than drawing unstyled text over a page.
+pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) {
+    match text {
+        Some(text) if hosts.readout_styled.get() => {
+            hosts.notice_active.set(true);
+            hosts.readout.set_halign(gtk::Align::Center);
+            hosts.readout.set_valign(gtk::Align::Start);
+            #[allow(clippy::cast_possible_truncation)]
+            hosts
+                .readout
+                .set_margin_top(crate::hover_style::NOTICE_TOP_MARGIN as i32);
+            hosts.readout.set_text(text);
+            hosts.readout.show();
+        }
+        Some(_) => {}
+        None => {
+            if hosts.notice_active.replace(false) {
+                hosts.readout.hide();
+                hosts.readout.set_halign(gtk::Align::Start);
+                hosts.readout.set_valign(gtk::Align::End);
+                hosts.readout.set_margin_top(0);
+            }
+        }
+    }
 }
 
 /// Whether a docked pane can actually be laid out on this backend.
@@ -4198,8 +4622,12 @@ pub fn engine_info() -> crate::platform::EngineInfo {
             webkit2gtk_sys::webkit_get_micro_version(),
         ]
     });
-    let compiled = &crate::platform::MIN_WEBKITGTK;
-    let floor = crate::platform::effective_floor("WebKitGTK", compiled);
+    // Two floors. `compiled` is where THIS build refuses to start (lower in
+    // the one-time bridge build); the banner warns below the security floor
+    // MIN_WEBKITGTK, raised further by any signed manifest. In the strict
+    // build they are the same number.
+    let compiled = &crate::platform::COMPILED_WEBKITGTK_FLOOR;
+    let floor = crate::platform::effective_floor("WebKitGTK", &crate::platform::MIN_WEBKITGTK);
     crate::platform::EngineInfo {
         name: "WebKitGTK",
         below_floor: crate::platform::below_floor(&found, &floor),
@@ -4554,5 +4982,39 @@ mod compositing_switch_tests {
         assert!(!compositing_disabled_by(Some("0")), "0 means compositing stays on");
         assert!(!compositing_disabled_by(Some("")));
         assert!(!compositing_disabled_by(None));
+    }
+}
+
+#[cfg(test)]
+mod translate_channel_token_tests {
+    use super::*;
+
+    #[test]
+    fn a_post_is_accepted_only_with_the_exact_token_prefix_and_a_space() {
+        let expected = "poll:abc123";
+        assert_eq!(strip_channel_token("poll:abc123 {\"kind\":\"extract\"}", expected), Some("{\"kind\":\"extract\"}"));
+        // No token, wrong token, token without the separator, token glued on.
+        assert_eq!(strip_channel_token("{\"kind\":\"extract\"}", expected), None);
+        assert_eq!(strip_channel_token("poll:abc124 {}", expected), None);
+        assert_eq!(strip_channel_token("poll:abc123", expected), None);
+        assert_eq!(strip_channel_token("poll:abc123{}", expected), None);
+        // Shorter than the token, and a prefix that would split a character.
+        assert_eq!(strip_channel_token("poll:", expected), None);
+        assert_eq!(strip_channel_token("poll:abc12\u{e9} {}", expected), None);
+        // An unrandomised (empty) expectation accepts nothing at all.
+        assert_eq!(strip_channel_token("poll: {}", ""), None);
+        assert_eq!(strip_channel_token(" {}", ""), None);
+    }
+
+    #[test]
+    fn the_outbox_token_rotates_and_an_empty_rotation_accepts_nothing() {
+        let mut outbox = TranslateOutbox::with_token("aa");
+        assert_eq!(outbox.expected_request(), "poll:aa");
+        outbox.set_token("bb");
+        assert_eq!(outbox.expected_request(), "poll:bb");
+        assert!(strip_channel_token("poll:aa {}", outbox.expected_request()).is_none());
+        assert!(strip_channel_token("poll:bb {}", outbox.expected_request()).is_some());
+        outbox.set_token("");
+        assert_eq!(outbox.expected_request(), "");
     }
 }

@@ -62,3 +62,25 @@ As of 2026-08-25, 0.55.1 is the latest released wry. The development branch
 conditions WebView2 handler attachment but still injects the WebKitGTK
 `window.ipc` bootstrap unconditionally, so no released upgrade fixes both
 backends.
+
+## Third hunk (1.0.6): enable the WebKitGTK process sandbox
+
+Security audit 2026-10-08, confirmed at runtime: no context ever called
+`webkit_web_context_set_sandbox_enabled`, so every WebKitWebProcess ran
+unconfined (a direct child of the browser, no bubblewrap). The GTK3 API keeps
+the sandbox off unless the embedder enables it before the context creates its
+first process. `WebContextImpl::create_context` is the one place every wry
+context passes through before a WebView exists on it, so the call lives there.
+
+```diff
+--- registry/wry-0.55.1/src/webkitgtk/web_context.rs
++++ vendor/wry/src/webkitgtk/web_context.rs
+@@ pub fn create_context(context: WebContext) -> Self {
+     let automation = false;
+     context.set_automation_allowed(automation);
++    context.set_sandbox_enabled(true);
+```
+
+Runtime dependency: bubblewrap (`bwrap`) and `xdg-dbus-proxy`, which
+libwebkit2gtk-4.1 already depends on in Debian. The browser reads the state
+back per tab (`EngineSettings::sandbox`).

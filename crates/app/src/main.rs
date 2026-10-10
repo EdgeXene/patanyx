@@ -87,7 +87,12 @@ mod langpack;
 mod languages;
 /// Page-language sanity checking by Unicode script (the corruption guard).
 mod detect;
+/// The "your system needs a newer web engine" window (Linux, strict builds).
+#[cfg(target_os = "linux")]
+mod engine_window;
 mod find;
+/// Page fullscreen (a video's "full screen" button): the decisions.
+mod fullscreen;
 mod hover;
 /// Colours, font metrics and geometry for the hover readout, kept apart from
 /// both backends so the Windows-only arithmetic is testable on any box.
@@ -227,6 +232,14 @@ enum UserEvent {
     QuitForRelaunch,
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
+    /// A tab's page entered (true) or left (false) element fullscreen, as
+    /// the ENGINE reported it. Tagged with the host-recorded tab id; nothing
+    /// a page sends can raise it.
+    PageFullscreen(u64, bool),
+    /// The "Press Esc to exit" notice's time is up. Carries the generation it
+    /// was shown under, so a timer from an earlier fullscreen cannot cut a
+    /// later notice short.
+    FullscreenNoticeEnd(u64),
     AutoLockTick,
     /// Drive one step of an in-flight translation.
     ///
@@ -773,6 +786,15 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
 /// has genuinely decided to accept it. It is deliberately an environment
 /// variable rather than a setting in the UI: this should be an explicit act,
 /// not a checkbox someone clicks past.
+/// What `--preflight` answers: would a RELEASE build of this file start?
+/// Release semantics even in a debug build, so a debug test binary refuses
+/// where the shipped one would: Windows never refuses (WebView2 updates
+/// itself); elsewhere only a runtime below the COMPILED floor refuses, unless
+/// the user set the documented override.
+fn preflight_starts(windows: bool, below_compiled_floor: bool, override_set: bool) -> bool {
+    windows || !below_compiled_floor || override_set
+}
+
 fn enforce_engine_floor() {
     let engine = platform::engine_info();
     if !engine.below_floor {
@@ -806,12 +828,21 @@ fn enforce_engine_floor() {
         // Only a floor raised by a signed manifest is unmet. A signed
         // document may make the browser warn; it may not turn it off.
         eprintln!("  Above the compiled floor; the banner in the window says so. Continuing.");
-    } else if cfg!(debug_assertions) {
+    } else if cfg!(debug_assertions)
+        && !std::env::var("PATANYX_DEBUG_ENFORCE_FLOOR").is_ok_and(|v| v == "1")
+    {
+        // PATANYX_DEBUG_ENFORCE_FLOOR=1 makes a debug build take the release
+        // path below, so the refusal window can be tested without a release.
         eprintln!("  Debug build: continuing anyway.");
     } else if override_set {
         eprintln!("  PATANYX_ALLOW_OLD_ENGINE=1 set: continuing at your own risk.");
     } else {
         eprintln!("  Release build: refusing to start. Set PATANYX_ALLOW_OLD_ENGINE=1 to override.");
+        // Say it where a double-click can see it, then exit as before.
+        #[cfg(target_os = "linux")]
+        if !engine_window::show(&engine) {
+            eprintln!("  (No display to show the explanation window on.)");
+        }
         std::process::exit(2);
     }
 }
@@ -1009,6 +1040,22 @@ fn choose_start_url(positional: Option<String>, smoke_mode: bool) -> String {
 }
 
 #[cfg(test)]
+mod preflight_tests {
+    use super::preflight_starts;
+
+    #[test]
+    fn preflight_answers_with_release_semantics() {
+        // Windows never refuses: WebView2 updates itself.
+        assert!(preflight_starts(true, true, false));
+        // Elsewhere only a runtime below the COMPILED floor refuses...
+        assert!(preflight_starts(false, false, false));
+        assert!(!preflight_starts(false, true, false));
+        // ...unless the user set the documented override.
+        assert!(preflight_starts(false, true, true));
+    }
+}
+
+#[cfg(test)]
 mod start_url_tests {
     use super::{choose_start_url, HOME_URL};
 
@@ -1150,6 +1197,47 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // BUILD IDENTITY, for the publish gate: which variant this file is and
+    // the WebKitGTK floor it refuses to start below. Read-only, no window, no
+    // profile, safe in a release binary; it is how a published file is
+    // checked against the feed it is about to be served on.
+    if std::env::args().any(|arg| arg == "--build-identity") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "variant": platform::BUILD_VARIANT,
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "compiled_webkitgtk_floor": platform::join_version(&platform::COMPILED_WEBKITGTK_FLOOR),
+            })
+        );
+        return;
+    }
+
+    // PREFLIGHT, for the updater: would a release build of THIS file start on
+    // THIS machine's engine? Asked by the RUNNING browser of a freshly verified
+    // update before it replaces itself (updater::installer), because only a
+    // new process loads the engine the new file will actually get. No window,
+    // no profile, no network. Exit 0 = it would start, 3 = it would refuse.
+    if std::env::args().any(|arg| arg == "--preflight") {
+        let engine = platform::engine_info();
+        let override_set = std::env::var("PATANYX_ALLOW_OLD_ENGINE").is_ok_and(|v| v == "1");
+        let starts = preflight_starts(cfg!(windows), engine.below_compiled_floor, override_set);
+        println!(
+            "{}",
+            serde_json::json!({
+                "preflight": 1,
+                "version": env!("CARGO_PKG_VERSION"),
+                "variant": platform::BUILD_VARIANT,
+                "engine": engine.name,
+                "engine_version": engine.version.as_deref().map(platform::join_version),
+                "compiled_floor": platform::join_version(engine.compiled_floor),
+                "starts": starts,
+            })
+        );
+        std::process::exit(if starts { 0 } else { 3 });
     }
 
     let smoke_mode = std::env::args().any(|arg| arg == "--smoke-test");
@@ -1539,6 +1627,10 @@ fn main() {
             Event::UserEvent(UserEvent::ZoomFactorChanged(id, factor)) => {
                 app.on_zoom_factor_changed(id, factor)
             }
+            Event::UserEvent(UserEvent::PageFullscreen(id, on)) => app.on_page_fullscreen(id, on),
+            Event::UserEvent(UserEvent::FullscreenNoticeEnd(generation)) => {
+                app.on_fullscreen_notice_end(generation)
+            }
             Event::UserEvent(UserEvent::SessionWipeFinished) => {
                 app.finish_session_wipe()
             }
@@ -1780,6 +1872,12 @@ fn main() {
             Event::UserEvent(UserEvent::Shortcut(action)) => {
                 use shortcuts::Shortcut;
                 app.touch();
+                // A fullscreen page owns every pixel; a shortcut that needs the
+                // toolbar or another page ends fullscreen BEFORE it acts, so
+                // nothing focuses or opens UI the user cannot see.
+                if !fullscreen::shortcut_keeps_fullscreen(&action) {
+                    app.exit_page_fullscreen();
+                }
                 match action {
                     shortcuts::Shortcut::ZoomIn => app.zoom_active(1),
                     shortcuts::Shortcut::ZoomOut => app.zoom_active(-1),

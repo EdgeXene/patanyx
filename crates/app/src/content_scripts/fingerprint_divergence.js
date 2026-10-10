@@ -115,6 +115,156 @@
     }
 
     var TOKEN = "__DIVERGENCE_TOKEN__";
+    // NATIVES CAPTURED AT DOCUMENT START, before any page script exists
+    // (security audit 2026-10-08, HIGH). cyrb128 hashed TOKEN|host|label
+    // through the LIVE `str.charCodeAt` and `Math.imul`, lazily, at the
+    // first readout -- by which time a page had replaced both and read the
+    // whole token out of `this` and the hash state. Every hash below uses
+    // these captured references and nothing else that a page can redefine.
+    // The worker shim defines the same names itself (see workerShimBody).
+    var imul = Math.imul;
+    // A BOUND caller, not `.call`: `charCodeAt.call(str, i)` looks
+    // `Function.prototype.call` up at call time, and a page that replaced it
+    // received the whole string (compliance audit, same day). `bind` runs
+    // here, before any page script, and a bound function is invoked
+    // directly, through nothing a page can redefine.
+    var charCodeAtOf = Function.prototype.call.bind(String.prototype.charCodeAt);
+    // The same discipline for everything else the noise paths invoke at read
+    // time: a captured native raw read (through a bound `call`, never a
+    // `.call` looked up at call time), the array constructor for a raw
+    // snapshot, and the rounding the rect noise clamps with.
+    var fnCall = Function.prototype.call.bind(Function.prototype.call);
+    // And the same for `apply`: `orig.apply(this, arguments)` looks
+    // `Function.prototype.apply` up at call time, and a page that replaced it
+    // received the NATIVE reader as `this` and could then call it directly,
+    // past every noise pass (review of this fix). Every original below is
+    // invoked through these two and nothing else.
+    var fnApply = Function.prototype.call.bind(Function.prototype.apply);
+    var Bytes = Uint8ClampedArray;
+    var round = Math.round;
+    var floor = Math.floor;
+    var createObject = Object.create;
+    var Str = String;
+    // The ImageData the engine returns is read through its PROTOTYPE
+    // accessors (width, height, data), and a typed array's length through
+    // %TypedArray%.prototype's: a page can replace any of them with a getter
+    // that throws, and the noise pass's catch would then hand back the true
+    // pixels untouched (review of this fix). The getters are captured here,
+    // at document start, and invoked through a bound call; a realm without
+    // ImageData falls back to the plain property read.
+    var getDescriptor = Object.getOwnPropertyDescriptor;
+    var getPrototype = Object.getPrototypeOf;
+    var callBind = Function.prototype.bind.bind(Function.prototype.call);
+    function captureImageAccessors(ImageDataCtor) {
+      var acc = createObject(null);
+      acc.width = null;
+      acc.height = null;
+      acc.data = null;
+      acc.length = null;
+      try {
+        if (typeof ImageDataCtor === "function" && ImageDataCtor.prototype) {
+          var pw = getDescriptor(ImageDataCtor.prototype, "width");
+          var ph = getDescriptor(ImageDataCtor.prototype, "height");
+          var pd = getDescriptor(ImageDataCtor.prototype, "data");
+          if (pw && typeof pw.get === "function") acc.width = callBind(pw.get);
+          if (ph && typeof ph.get === "function") acc.height = callBind(ph.get);
+          if (pd && typeof pd.get === "function") acc.data = callBind(pd.get);
+        }
+        var ta = getPrototype(Bytes.prototype);
+        var pl = ta ? getDescriptor(ta, "length") : null;
+        if (pl && typeof pl.get === "function") acc.length = callBind(pl.get);
+      } catch (e) {
+        /* an unusual realm: plain reads below */
+      }
+      return acc;
+    }
+    var ACC = captureImageAccessors(typeof ImageData === "function" ? ImageData : null);
+    function widthOf(img) {
+      return ACC.width ? ACC.width(img) : img.width;
+    }
+    function heightOf(img) {
+      return ACC.height ? ACC.height(img) : img.height;
+    }
+    function dataOf(img) {
+      return ACC.data ? ACC.data(img) : img.data;
+    }
+    function lengthOf(arr) {
+      return ACC.length ? ACC.length(arr) : arr.length;
+    }
+    // getImageData's coordinates are Web IDL `[EnforceRange] long`: one
+    // ToNumber (the page's valueOf runs once, here), non-finite and anything
+    // outside the signed 32-bit range throw TypeError, the rest truncates.
+    // The engine is handed the resulting numbers, so it converts nothing a
+    // second time (review of this fix: a value whose second conversion threw
+    // used to switch the noise off).
+    // The optional settings dictionary is read ONCE here, each member through
+    // its getter exactly one time, into a plain object the engine then reads
+    // without running page code: a getter that answered differently on the
+    // grown read could otherwise hand the noise a different canvas than the
+    // page received (review of this fix). Unknown members are dropped, as
+    // Web IDL drops them.
+    // A member is validated by the ENGINE, as soon as it is read: a one-pixel
+    // native read with only that member set raises the engine's own
+    // TypeError for a value it rejects, before the next member's getter
+    // runs, which is the order dictionary conversion fixes (review of this
+    // fix; a table of accepted values could not know what this engine
+    // accepts). Any other failure of the probe (a tainted or empty canvas)
+    // is the real read's to raise, after conversion, as before.
+    var TypeErr = TypeError;
+    function checkMember(ctx, orig, name, value) {
+      var probe = createObject(null);
+      probe[name] = value;
+      try {
+        fnCall(orig, ctx, 0, 0, 1, 1, probe);
+      } catch (e) {
+        if (e instanceof TypeErr) throw e;
+      }
+    }
+    function plainSettings(d, ctx, orig) {
+      if (d === undefined || d === null) return undefined;
+      // A non-null primitive is not a dictionary: Web IDL throws, and so
+      // must this, instead of reading with defaults (review of this fix).
+      if (typeof d !== "object" && typeof d !== "function") {
+        throw new TypeError("The provided value is not of type 'ImageDataSettings'");
+      }
+      // No prototype: a setter a page installed on Object.prototype would
+      // otherwise intercept these assignments and plant a getter the engine
+      // then runs on every read (review of this fix).
+      var out = createObject(null);
+      // Converted to PRIMITIVE strings here, once: the engine's enumeration
+      // conversion would otherwise run an object's toString on every read,
+      // and a toString that swaps the canvas on its second call is the same
+      // attack through another door (review of this fix). An invalid value
+      // is still the engine's TypeError to throw, as it would have been.
+      // Each member is validated as soon as it is read, before the next
+      // member's getter runs, as dictionary conversion orders it: an invalid
+      // colorSpace is a TypeError that a throwing pixelFormat getter never
+      // gets to pre-empt (review of this fix).
+      var cs = d.colorSpace;
+      if (cs !== undefined) {
+        cs = Str(cs);
+        checkMember(ctx, orig, "colorSpace", cs);
+        out.colorSpace = cs;
+      }
+      var pf = d.pixelFormat;
+      if (pf !== undefined) {
+        pf = Str(pf);
+        checkMember(ctx, orig, "pixelFormat", pf);
+        out.pixelFormat = pf;
+      }
+      return out;
+    }
+    function toLong(v) {
+      var n = +v;
+      if (n !== n || n === Infinity || n === -Infinity) {
+        throw new TypeError("The provided value is non-finite");
+      }
+      n = n < 0 ? -floor(-n) : floor(n);
+      if (n < -2147483648 || n > 2147483647) {
+        throw new TypeError("The provided value is outside the range of a long");
+      }
+      return n === 0 ? 0 : n;
+    }
 
     // Key on the TOP frame's host, so a third-party fingerprint
     // iframe gets the embedding site's noise rather than its own. Otherwise
@@ -155,7 +305,7 @@
     try {
       if (
         OVERRIDES &&
-        Object.prototype.hasOwnProperty.call(OVERRIDES, topHost)
+        fnCall(Object.prototype.hasOwnProperty, OVERRIDES, topHost)
       ) {
         LEVEL = OVERRIDES[topHost];
       }
@@ -258,16 +408,16 @@
       var h3 = 1013904242;
       var h4 = 2773480762;
       for (var i = 0, k; i < str.length; i++) {
-        k = str.charCodeAt(i);
-        h1 = h2 ^ Math.imul(h1 ^ k, 597399067);
-        h2 = h3 ^ Math.imul(h2 ^ k, 2869860233);
-        h3 = h4 ^ Math.imul(h3 ^ k, 951274213);
-        h4 = h1 ^ Math.imul(h4 ^ k, 2716044179);
+        k = charCodeAtOf(str, i);
+        h1 = h2 ^ imul(h1 ^ k, 597399067);
+        h2 = h3 ^ imul(h2 ^ k, 2869860233);
+        h3 = h4 ^ imul(h3 ^ k, 951274213);
+        h4 = h1 ^ imul(h4 ^ k, 2716044179);
       }
-      h1 = Math.imul(h3 ^ (h1 >>> 18), 597399067);
-      h2 = Math.imul(h4 ^ (h2 >>> 22), 2869860233);
-      h3 = Math.imul(h1 ^ (h3 >>> 17), 951274213);
-      h4 = Math.imul(h2 ^ (h4 >>> 19), 2716044179);
+      h1 = imul(h3 ^ (h1 >>> 18), 597399067);
+      h2 = imul(h4 ^ (h2 >>> 22), 2869860233);
+      h3 = imul(h1 ^ (h3 >>> 17), 951274213);
+      h4 = imul(h2 ^ (h4 >>> 19), 2716044179);
       return [
         (h1 ^ h2 ^ h3 ^ h4) >>> 0,
         (h2 ^ h1) >>> 0,
@@ -292,8 +442,18 @@
     }
     // Per-endpoint labels give domain separation: the canvas stream never
     // reveals the audio fudge and vice versa.
+    // SEED WORDS COMPUTED NOW, at document start, for every label in use:
+    // the token is hashed once, here, where no page script exists yet, and
+    // never again. A label this table does not know falls back to hashing
+    // lazily through the captured natives, so a new label is never silently
+    // unseeded; the recovery gate pins that every label used is listed.
+    var SEED_LABELS = ["canvas", "audio", "clientrects"];
+    var seedWords = {};
+    for (var si = 0; si < SEED_LABELS.length; si++) {
+      seedWords[SEED_LABELS[si]] = cyrb128(TOKEN + "|" + topHost + "|" + SEED_LABELS[si]);
+    }
     function rngFor(label) {
-      var s = cyrb128(TOKEN + "|" + topHost + "|" + label);
+      var s = seedWordsFor(label);
       return sfc32(s[0], s[1], s[2], s[3]);
     }
     // The same key material as rngFor, but handed over as the four words
@@ -301,6 +461,8 @@
     // straight to sample N without replaying N-1 draws, so they index a
     // keyed function rather than pull from a sequence.
     function seedWordsFor(label) {
+      var cached = seedWords[label];
+      if (cached) return cached;
       return cyrb128(TOKEN + "|" + topHost + "|" + label);
     }
 
@@ -343,18 +505,128 @@
     // them, and the pixels that differ would be exactly the noised ones. The
     // parity gate pins them equal; sharing the function is what makes that
     // cheap to keep true.
-    function applyCanvasNoise(data, rng) {
-      for (var i = 0; i + 3 < data.length; i += 4) {
-        var v = rng();
-        if ((v & 7) === 0) {
-          data[i] ^= 1;
-          data[i + 1] ^= (v >>> 3) & 1;
-          data[i + 2] ^= (v >>> 4) & 1;
+    // WHICH pixels are touched and WHAT happens to them are both keyed on the
+    // pixel's ABSOLUTE canvas position (security audit 2026-10-08, MEDIUM, and
+    // its review): selection used to follow a stream indexed from the start
+    // of whatever rectangle was read, so a sub-rectangle read shifted every
+    // pixel onto a different stream index and a few shifted reads voted the
+    // true value back; and the mask used to depend on nothing but seed and
+    // index, so one read of a known solid canvas gave a site the mask and an
+    // XOR took it straight off the fingerprint render. Now: `pixelKey` picks
+    // candidates from (seed, x, y) of the canvas, the same whatever rectangle
+    // is read, and `windowHash` keys the flip on the pixel's 3x3 RAW
+    // neighbourhood, read from the engine one pixel wider than the request so
+    // a rectangle's edge pixels see the same neighbours a full read sees.
+    // The neighbourhood is never read from bytes this pass has already
+    // changed. Same input, same output, so a site's hash stays stable.
+    // Guess-and-check recovery of single pixels remains possible: the public
+    // wording is "noise, not invisibility", and nothing promises more.
+    function pixelKey(seed, ax, ay) {
+      var h = seed[0] ^ imul(ax + 1, 374761393) ^ imul(ay + 1, 668265263);
+      h = imul(h ^ (h >>> 15), 2246822519) ^ seed[1];
+      h = imul(h ^ (h >>> 13), 3266489917);
+      return h ^ (h >>> 16);
+    }
+    function windowHash(seed, raw, rawLen, width, cx, cy, ax, ay) {
+      var h = seed[2] ^ imul(ax + 1, 374761393) ^ imul(ay + 1, 668265263);
+      for (var dy = -1; dy <= 1; dy++) {
+        var yy = cy + dy;
+        if (yy < 0) continue;
+        for (var dx = -1; dx <= 1; dx++) {
+          var xx = cx + dx;
+          if (xx < 0 || xx >= width) continue;
+          var j = (yy * width + xx) * 4;
+          if (j + 3 >= rawLen) continue;
+          var q = raw[j] | (raw[j + 1] << 8) | (raw[j + 2] << 16) | (raw[j + 3] << 24);
+          h = imul(h ^ q, 16777619);
+          h ^= h >>> 13;
+        }
+      }
+      h = imul(h ^ seed[3], 2246822519);
+      h ^= h >>> 15;
+      h = imul(h ^ seed[0], 668265263);
+      return h ^ (h >>> 11);
+    }
+    // One 8-bit level, the size of the byte flip, for floating-point samples.
+    var FLOAT_STEP = 1 / 255;
+    // Floating-point samples as clamped bytes (0..1 scaled to 0..255, the
+    // typed array clamps and rounds), for the neighbourhood hash only.
+    function quantize(arr) {
+      var n = lengthOf(arr);
+      var out = new Bytes(n);
+      for (var i = 0; i < n; i++) out[i] = arr[i] * 255;
+      return out;
+    }
+    // `img` is what the page receives; `ext` is the engine's raw read of the
+    // same rectangle grown by one pixel on every side (origin ox-1, oy-1), or
+    // null when that read was not possible, in which case the neighbourhood
+    // comes from a raw snapshot of `img` itself.
+    function applyCanvasNoise(img, ext, seed, ox, oy) {
+      var data = dataOf(img);
+      var w = widthOf(img) | 0;
+      var h = heightOf(img) | 0;
+      if (!(w > 0 && h > 0)) return;
+      var extData = ext ? dataOf(ext) : null;
+      var grown = !!extData && (widthOf(ext) | 0) === w + 2 && lengthOf(extData) >= (w + 2) * (h + 2) * 4;
+      // `rgba-float16` hands back floating-point samples (0..1 for SDR, more
+      // for HDR): the byte XOR below would coerce them to 0 or 1 (review of
+      // this fix; 1.0.5 did the same on every candidate). Such samples get
+      // a step of one 8-bit level up or down instead, and the neighbourhood
+      // is hashed from an 8-bit quantisation so it still follows content.
+      // Told apart by element size, which every realm's typed array
+      // prototype carries as a non-writable, non-configurable constant (a
+      // prototype identity check misread a byte array from another realm).
+      var isFloat = data.BYTES_PER_ELEMENT !== 1;
+      var raw = grown ? (isFloat ? quantize(extData) : extData) : (isFloat ? quantize(data) : new Bytes(data));
+      var rawLen = lengthOf(raw);
+      var rw = grown ? w + 2 : w;
+      var pad = grown ? 1 : 0;
+      for (var y = 0; y < h; y++) {
+        for (var x = 0; x < w; x++) {
+          var ax = ox + x;
+          var ay = oy + y;
+          var k = pixelKey(seed, ax, ay);
+          // One pixel in four is a candidate and the keyed bit decides whether
+          // it changes at all, so one pixel in eight changes, exactly the rate
+          // the public page states; G and B flip only on a pixel whose R
+          // flipped, as before. Alpha never.
+          if ((k & 3) !== 0) continue;
+          var b = windowHash(seed, raw, rawLen, rw, x + pad, y + pad, ax, ay);
+          var i = (y * w + x) * 4;
+          var r = b & 1;
+          if (r === 0) continue;
+          var g = (b >>> 1) & (k >>> 3) & 1;
+          var bl = (b >>> 2) & (k >>> 4) & 1;
+          if (isFloat) {
+            data[i] += (b >>> 3) & 1 ? FLOAT_STEP : -FLOAT_STEP;
+            if (g) data[i + 1] += (b >>> 4) & 1 ? FLOAT_STEP : -FLOAT_STEP;
+            if (bl) data[i + 2] += (b >>> 5) & 1 ? FLOAT_STEP : -FLOAT_STEP;
+          } else {
+            data[i] ^= 1;
+            data[i + 1] ^= g;
+            data[i + 2] ^= bl;
+          }
         }
       }
     }
-    function noiseData(data) {
-      applyCanvasNoise(data, rngFor("canvas"));
+    // Noises the read `img` of rectangle (sx, sy, sw, sh) on `ctx`, reading
+    // the grown rectangle through the captured native `orig`. A negative
+    // width or height, as getImageData allows, moves the origin.
+    function noiseView(ctx, orig, img, sx, sy, sw, sh, seed, settings) {
+      var w = widthOf(img) | 0;
+      var h = heightOf(img) | 0;
+      var ox = (sx | 0) + ((sw | 0) < 0 ? (sw | 0) : 0);
+      var oy = (sy | 0) + ((sh | 0) < 0 ? (sh | 0) : 0);
+      var ext = null;
+      try {
+        ext = fnCall(orig, ctx, ox - 1, oy - 1, w + 2, h + 2, settings);
+      } catch (e) {
+        ext = null;
+      }
+      applyCanvasNoise(img, ext, seed, ox, oy);
+    }
+    function noiseData(ctx, orig, img, sx, sy, sw, sh, settings) {
+      noiseView(ctx, orig, img, sx, sy, sw, sh, seedWordsFor("canvas"), settings);
     }
 
     var origGID = null;
@@ -368,10 +640,26 @@
         CanvasRenderingContext2D.prototype.getImageData = keepShape(
           function () {
             noteProbe("canvas");
-            var img = origGID.apply(this, arguments);
+            // Fewer than four arguments is the engine's TypeError to throw,
+            // and no noise question arises. Otherwise the coordinates are
+            // converted ONCE, here, and the same numbers go to the engine
+            // and to the noise: a value whose conversion answers differently
+            // the second time (review of this fix) could otherwise make the
+            // noise pass throw and the true pixels come back untouched.
+            if (arguments.length < 4) {
+              return fnApply(origGID, this, arguments);
+            }
+            var sx = toLong(arguments[0]);
+            var sy = toLong(arguments[1]);
+            var sw = toLong(arguments[2]);
+            var sh = toLong(arguments[3]);
+            // The optional settings dictionary (colour space, pixel format)
+            // travels through untouched, to the read and to the grown read.
+            var settings = arguments.length > 4 ? plainSettings(arguments[4], this, origGID) : undefined;
+            var img = fnCall(origGID, this, sx, sy, sw, sh, settings);
             try {
-              if (img && img.data) {
-                noiseData(img.data);
+              if (img) {
+                noiseData(this, origGID, img, sx, sy, sw, sh, settings);
               }
             } catch (e) {
               /* a failed noise pass returns the true pixels; the API works */
@@ -412,8 +700,8 @@
             return null;
           }
           ctx.drawImage(canvas, 0, 0);
-          var img = origGID.call(ctx, 0, 0, w, h);
-          noiseData(img.data);
+          var img = fnCall(origGID, ctx, 0, 0, w, h);
+          noiseData(ctx, origGID, img, 0, 0, w, h, undefined);
           ctx.putImageData(img, 0, 0);
           return c;
         };
@@ -423,12 +711,12 @@
             try {
               var c = noisedClone(this);
               if (c) {
-                return orig.apply(c, arguments);
+                return fnApply(orig, c, arguments);
               }
             } catch (e) {
               /* 0x0 canvas, detached document: fall through to the truth */
             }
-            return orig.apply(this, arguments);
+            return fnApply(orig, this, arguments);
           };
         });
         patchMethod(HTMLCanvasElement.prototype, "toBlob", function (orig) {
@@ -437,12 +725,12 @@
             try {
               var c = noisedClone(this);
               if (c) {
-                return orig.apply(c, arguments);
+                return fnApply(orig, c, arguments);
               }
             } catch (e) {
               /* same fall-through as toDataURL */
             }
-            return orig.apply(this, arguments);
+            return fnApply(orig, this, arguments);
           };
         });
       }
@@ -518,12 +806,12 @@
     // invert every later reading. Each word is now separated from the next
     // by a non-linear round, so none of them can be folded together.
     var mixSample = function (k, digest, index) {
-      var h = Math.imul((index | 0) + 1, 374761393) ^ k[0];
-      h = Math.imul(h ^ (h >>> 15), 2246822519);
-      h = (h ^ Math.imul(digest, 668265263) ^ k[1]) | 0;
-      h = Math.imul(h ^ (h >>> 13), 3266489917);
+      var h = imul((index | 0) + 1, 374761393) ^ k[0];
+      h = imul(h ^ (h >>> 15), 2246822519);
+      h = (h ^ imul(digest, 668265263) ^ k[1]) | 0;
+      h = imul(h ^ (h >>> 13), 3266489917);
       h = (h ^ k[2]) | 0;
-      h = Math.imul(h ^ (h >>> 16), 668265263);
+      h = imul(h ^ (h >>> 16), 668265263);
       h = (h ^ k[3]) | 0;
       h ^= h >>> 16;
       return (h >>> 0) / 4294967296;
@@ -546,14 +834,14 @@
         // fixed value instead of poisoning the hash.
         var q =
           v === v && v !== Infinity && v !== -Infinity ? (v * 8388608) | 0 : 0;
-        h = Math.imul(h ^ (q & 255), 16777619);
-        h = Math.imul(h ^ ((q >>> 8) & 255), 16777619);
-        h = Math.imul(h ^ ((q >>> 16) & 255), 16777619);
-        h = Math.imul(h ^ ((q >>> 24) & 255), 16777619);
+        h = imul(h ^ (q & 255), 16777619);
+        h = imul(h ^ ((q >>> 8) & 255), 16777619);
+        h = imul(h ^ ((q >>> 16) & 255), 16777619);
+        h = imul(h ^ ((q >>> 24) & 255), 16777619);
       }
       // Length participates so two buffers differing only in trailing
       // silence do not share a digest.
-      return Math.imul(h ^ n, 16777619) | 0;
+      return imul(h ^ n, 16777619) | 0;
     };
 
     try {
@@ -628,13 +916,17 @@
         patchMethod(AudioBuffer.prototype, "getChannelData", function (orig) {
           return function (channel) {
             noteProbe("audio");
-            var arr = orig.apply(this, arguments);
+            var arr = fnApply(orig, this, arguments);
             try {
               var ch = channel | 0;
-              if (arr && arr.length && !isMarked(this, ch)) {
+              // Lengths through the captured %TypedArray% getter, for the
+              // same reason as the canvas: a page-replaced getter that throws
+              // would otherwise leave the true samples untouched.
+              var len = arr ? lengthOf(arr) : 0;
+              if (len && !isMarked(this, ch)) {
                 mark(this, ch);
                 var k = audioKey();
-                perturbLinear(arr, arr.length, k, digestOf(arr, arr.length), 0);
+                perturbLinear(arr, len, k, digestOf(arr, len), 0);
               }
             } catch (e) {
               /* true samples, working API */
@@ -653,20 +945,22 @@
             // page true samples.
             var ch = channelNumber | 0;
             var start = bufferOffset === undefined ? 0 : bufferOffset | 0;
-            var out = orig.call(this, destination, ch, start);
+            var out = fnCall(orig, this, destination, ch, start);
             try {
-              if (destination && destination.length && !isMarked(this, ch)) {
+              var dlen = destination ? lengthOf(destination) : 0;
+              if (dlen && !isMarked(this, ch)) {
                 // Unmarked: the live channel still holds true samples, so
                 // the copy in `destination` does too and must be perturbed
                 // here. Digest the WHOLE channel, never just the copied
                 // slice, and index by absolute position -- that is what makes
                 // this call agree, element for element, with a getChannelData
                 // read and with a copy at any other offset.
-                var live = origGetChannelData.call(this, ch);
+                var live = fnCall(origGetChannelData, this, ch);
                 var k = audioKey();
-                var digest = digestOf(live, live.length);
-                var room = (live.length - start) | 0;
-                var n = destination.length < room ? destination.length : room;
+                var llen = lengthOf(live);
+                var digest = digestOf(live, llen);
+                var room = (llen - start) | 0;
+                var n = dlen < room ? dlen : room;
                 if (n > 0) {
                   perturbLinear(destination, n, k, digest, start);
                 }
@@ -730,9 +1024,10 @@
           patchMethod(AnalyserNode.prototype, name, function (orig) {
             return function (array) {
               noteProbe("audio");
-              var out = orig.apply(this, arguments);
+              var out = fnApply(orig, this, arguments);
               try {
-                if (array && array.length) {
+                var alen = array ? lengthOf(array) : 0;
+                if (alen) {
                   // The engine fills only as much as it has bins for; a
                   // longer array keeps whatever was in its tail. Digesting or
                   // perturbing that tail would make the result depend on
@@ -742,7 +1037,7 @@
                     name.indexOf("Frequency") >= 0
                       ? this.frequencyBinCount
                       : this.fftSize;
-                  var n = array.length;
+                  var n = alen;
                   if (typeof bins === "number" && bins >= 0 && bins < n) {
                     n = bins | 0;
                   }
@@ -781,16 +1076,16 @@
             try {
               if (pname === 37445) {
                 noteProbe("webgl");
-                return orig.call(this, 0x1f00);
+                return fnCall(orig, this, 0x1f00);
               }
               if (pname === 37446) {
                 noteProbe("webgl");
-                return orig.call(this, 0x1f01);
+                return fnCall(orig, this, 0x1f01);
               }
             } catch (e) {
               /* fall through to the real answer */
             }
-            return orig.apply(this, arguments);
+            return fnApply(orig, this, arguments);
           };
         });
       };
@@ -812,7 +1107,7 @@
     // seed handed in from here; the pixel loop is the shared applyCanvasNoise
     // either way. Defined as a named function so the worker shim can reuse
     // its exact source rather than a second copy that could drift.
-    function patchOffscreenCanvas(scope, rngFactory, noiseCore, note) {
+    function patchOffscreenCanvas(scope, noiseImage, note) {
       try {
         if (typeof scope.OffscreenCanvasRenderingContext2D !== "undefined") {
           var octx = scope.OffscreenCanvasRenderingContext2D.prototype;
@@ -820,10 +1115,18 @@
             var origOGID = octx.getImageData;
             octx.getImageData = keepShape(function () {
               note("canvas");
-              var img = origOGID.apply(this, arguments);
+              if (arguments.length < 4) {
+                return fnApply(origOGID, this, arguments);
+              }
+              var sx = toLong(arguments[0]);
+              var sy = toLong(arguments[1]);
+              var sw = toLong(arguments[2]);
+              var sh = toLong(arguments[3]);
+              var settings = arguments.length > 4 ? plainSettings(arguments[4], this, origOGID) : undefined;
+              var img = fnCall(origOGID, this, sx, sy, sw, sh, settings);
               try {
-                if (img && img.data) {
-                  noiseCore(img.data, rngFactory());
+                if (img) {
+                  noiseImage(this, origOGID, img, sx, sy, sw, sh, settings);
                 }
               } catch (e) {
                 /* true pixels, working API */
@@ -849,16 +1152,16 @@
                         var cctx = clone.getContext("2d");
                         if (cctx) {
                           cctx.drawImage(this, 0, 0);
-                          var cimg = origOGID.call(cctx, 0, 0, w, h);
-                          noiseCore(cimg.data, rngFactory());
+                          var cimg = fnCall(origOGID, cctx, 0, 0, w, h);
+                          noiseImage(cctx, origOGID, cimg, 0, 0, w, h, undefined);
                           cctx.putImageData(cimg, 0, 0);
-                          return orig.apply(clone, arguments);
+                          return fnApply(orig, clone, arguments);
                         }
                       }
                     } catch (e) {
                       /* 0x0 or detached: fall through to the true encode */
                     }
-                    return orig.apply(this, arguments);
+                    return fnApply(orig, this, arguments);
                   };
                 },
               );
@@ -871,10 +1174,7 @@
     }
     patchOffscreenCanvas(
       typeof self !== "undefined" ? self : window,
-      function () {
-        return rngFor("canvas");
-      },
-      applyCanvasNoise,
+      noiseData,
       noteProbe,
     );
 
@@ -936,17 +1236,37 @@
           "," +
           (canvasSeed[3] >>> 0) +
           "];" +
+          // The shim runs before any worker script, so its Math.imul is the
+          // engine's; captured all the same so the stringified hash reads it
+          // from the same name the main thread does.
+          "var imul=Math.imul;var Bytes=Uint8ClampedArray;var floor=Math.floor;var createObject=Object.create;var Str=String;var fnCall=Function.prototype.call.bind(Function.prototype.call);var fnApply=Function.prototype.call.bind(Function.prototype.apply);" +
+          "var getDescriptor=Object.getOwnPropertyDescriptor;var getPrototype=Object.getPrototypeOf;var callBind=Function.prototype.bind.bind(Function.prototype.call);" +
+          fnSource.call(captureImageAccessors) +
+          "var ACC=captureImageAccessors(typeof ImageData==='function'?ImageData:null);" +
+          fnSource.call(widthOf) +
+          fnSource.call(heightOf) +
+          fnSource.call(dataOf) +
+          fnSource.call(lengthOf) +
           fnSource.call(sfc32) +
+          fnSource.call(pixelKey) +
+          fnSource.call(windowHash) +
+          "var FLOAT_STEP=1/255;" +
+          fnSource.call(quantize) +
           fnSource.call(applyCanvasNoise) +
+          fnSource.call(noiseView) +
+          fnSource.call(toLong) +
+          "var TypeErr=TypeError;" +
+          fnSource.call(checkMember) +
+          fnSource.call(plainSettings) +
           fnSource.call(keepShape) +
           fnSource.call(patchMethod) +
           fnSource.call(patchOffscreenCanvas) +
           "try{" +
-          "var __rng=function(){return sfc32(__s[0],__s[1],__s[2],__s[3]);};" +
-          "patchOffscreenCanvas(self,__rng,applyCanvasNoise,function(){});" +
+          "var __noise=function(ctx,orig,img,sx,sy,sw,sh,settings){noiseView(ctx,orig,img,sx,sy,sw,sh,__s,settings);};" +
+          "patchOffscreenCanvas(self,__noise,function(){});" +
           "var __mask=function(p){patchMethod(p,'getParameter',function(o){" +
-          "return function(n){try{if(n===37445)return o.call(this,7936);" +
-          "if(n===37446)return o.call(this,7937);}catch(e){}return o.apply(this,arguments);};});};" +
+          "return function(n){try{if(n===37445)return fnCall(o,this,7936);" +
+          "if(n===37446)return fnCall(o,this,7937);}catch(e){}return fnApply(o,this,arguments);};});};" +
           "if(typeof WebGLRenderingContext!=='undefined')__mask(WebGLRenderingContext.prototype);" +
           "if(typeof WebGL2RenderingContext!=='undefined')__mask(WebGL2RenderingContext.prototype);" +
           "}catch(e){}";
@@ -1089,7 +1409,7 @@
                 ev.stopImmediatePropagation = function () {
                   stop = true;
                   if (origSIP) {
-                    origSIP.call(ev);
+                    fnCall(origSIP, ev);
                   }
                 };
               } catch (e) {
@@ -1112,7 +1432,7 @@
               }
               try {
                 if (typeof fn === "function") {
-                  fn.call(facade, ev);
+                  fnCall(fn, facade, ev);
                 } else if (fn && typeof fn.handleEvent === "function") {
                   fn.handleEvent(ev);
                 }
@@ -1243,7 +1563,7 @@
             if (terminated) {
               return;
             }
-            var args = Array.prototype.slice.call(arguments);
+            var args = fnCall(Array.prototype.slice, arguments);
             var unproved = !proved && !swapped && queue;
             if (unproved) {
               queue.push(args); // references, not copies (see forward())
@@ -1494,10 +1814,10 @@
         var q =
           v === v && v !== Infinity && v !== -Infinity ? (v * 8192) | 0 : 0;
         var d = 2166136261;
-        d = Math.imul(d ^ (q & 255), 16777619);
-        d = Math.imul(d ^ ((q >>> 8) & 255), 16777619);
-        d = Math.imul(d ^ ((q >>> 16) & 255), 16777619);
-        d = Math.imul(d ^ ((q >>> 24) & 255), 16777619);
+        d = imul(d ^ (q & 255), 16777619);
+        d = imul(d ^ ((q >>> 8) & 255), 16777619);
+        d = imul(d ^ ((q >>> 16) & 255), 16777619);
+        d = imul(d ^ ((q >>> 24) & 255), 16777619);
         return d | 0;
       };
       var farbleDimension = function (v, k, index) {
@@ -1512,7 +1832,7 @@
         // Keep the integer-rounded value identical (see MAGNITUDE): clamp the
         // report into [round(v) - 0.5, round(v) + 0.5), the bucket that
         // rounds to round(v).
-        var r = Math.round(v);
+        var r = round(v);
         var lo = r - 0.5;
         var hi = r + 0.5;
         if (out < lo) {
@@ -1594,7 +1914,7 @@
       var wrapOneRect = function (orig) {
         return function () {
           noteProbe("element_measurement");
-          var rect = orig.apply(this, arguments);
+          var rect = fnApply(orig, this, arguments);
           try {
             return farbleRect(rect);
           } catch (e) {
@@ -1605,7 +1925,7 @@
       var wrapRectList = function (orig) {
         return function () {
           noteProbe("element_measurement");
-          var list = orig.apply(this, arguments);
+          var list = fnApply(orig, this, arguments);
           try {
             return farbleRectList(list);
           } catch (e) {

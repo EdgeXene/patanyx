@@ -236,3 +236,12 @@ realizationnewestfangs.com  # 7420  publicdnsservice cluster. Serves only a
                             #       spendsdetachment.com. Precautionary.
 zoologyfibre.com            # 9304  Same nameservers, same nine-address pool,
                             #       same byte-identical 301. Precautionary.
+# ---- 1.0.6 tripwire rulings, 2026-10-10 (ShadowWhisperer Malware feed; evidence gathered the same day) ----
+goldfishouncereburial.com # 8824  Ad-serving domain: its front page says "Operated by Clickadu
+                          # Advertisement Network" (94.242.247.34). The rank is pop-under ad
+                          # traffic, not visitors. Nobody navigates here; kept blocked.
+attacheatableoverlabor.com # 8922  Same Clickadu ad domain, same host and page as the one above.
+                          # Kept blocked for the same reason.
+myshn.eu                  # 6094  Listed as malware; the name no longer resolves (no A record,
+                          # no HTTP answer, 2026-10-10), so allowing it would unblock nothing a
+                          # person can reach. Kept blocked; re-examine if it resolves again.
