@@ -77,6 +77,10 @@ pub struct Hosts {
     /// True while a modal covers the window (`ChromeLayout::Overlay`) and the
     /// chrome has been reordered above the page.
     lifted: Cell<bool>,
+    /// Page fullscreen, for parity with the other backends' `Hosts`. Written
+    /// by set_page_fullscreen; nothing reads it yet, because no engine event
+    /// can enter fullscreen on this backend (see the page-fullscreen note).
+    fullscreen: Cell<bool>,
 }
 
 /// One per tab. Opaque to the rest of the crate, like unix's.
@@ -90,6 +94,7 @@ pub fn create_hosts(window: Window) -> Hosts {
         _insets: Cell::new((CHROME_HEIGHT_PX, 0, 0)),
         _strip_top: Cell::new(CHROME_HEIGHT_PX),
         lifted: Cell::new(false),
+        fullscreen: Cell::new(false),
     }
 }
 
@@ -1034,6 +1039,11 @@ pub fn engine_settings(view: &TabView) -> EngineSettings {
         // Same source as both other backends on purpose: the tunnel is the
         // one setting here that is genuinely cross-platform.
         tunnel: crate::tunnel_control::report(),
+        // WKWebView's WebContent sandbox is the OS's, always on, and not
+        // queryable through the pinned bindings -- so the per-tab answer stays
+        // TabState's default, "not attempted", exactly like every other
+        // engine state this backend cannot measure.
+        sandbox: st.sandbox.as_str(),
     }
 }
 
@@ -1365,6 +1375,10 @@ pub fn layout(
     hosts: &Hosts,
     chrome: &WebView,
     active: Option<&WebView>,
+    // Side by Side's right-hand page. Both panes are positioned here, the
+    // same one signature as the other backends; the ARRANGEMENT below still
+    // owns the z-order flip.
+    pair: Option<(&WebView, &WebView)>,
     _chrome_height: i32,
     // Where the page starts: the CLOSED strip. An open panel's height rides
     // `chrome_height` and the lift below, never this value.
@@ -1392,6 +1406,23 @@ pub fn layout(
             super::PAGE_FRAME_PX,
         );
         set_bounds_logical(page, x, y, w, h);
+
+        // Side by Side: the right-hand page shares the active page's
+        // rectangle, moved right by its width plus the shared gap. The left
+        // pane IS the active page above — `pair` is ordered left-right and
+        // the active tab is always one of the two panes (state.rs ends the
+        // pair before showing any other tab), so two rectangles cover both
+        // pages and the frame's right edge stays where the single-tab
+        // layout put it.
+        if let Some((_, right_page)) = pair {
+            set_bounds_logical(
+                right_page,
+                x + w + f64::from(super::SIDE_BY_SIDE_GAP_PX),
+                y,
+                (w - f64::from(super::SIDE_BY_SIDE_GAP_PX)).max(0.0),
+                h,
+            );
+        }
 
         // The z-order IS the arrangement, and only content-on-top-of-chrome
         // or chrome-on-top-of-content exist. Reordered only on change: the
@@ -1540,3 +1571,115 @@ pub fn tick_auto_freeze(view: &TabView, now: Instant) -> (bool, Option<Instant>)
 pub fn scrub_download_mark(_path: &std::path::Path) -> super::motw::Outcome {
     super::motw::Outcome::NotApplicable
 }
+
+// ---------------------------------------------------------------------------
+// 1.0.6 API surface, ported from unix.rs / windows.rs. Everything below adds
+// to the existing macOS backend without touching what already shipped.
+
+/// Whether a modal's backdrop must draw OPAQUE. WebKit on macOS composites
+/// normally here (the WKWebView backing is the OS compositor's own), so the
+/// answer is always NO: the translucency the chrome falls back to solid
+/// backdrop for is a WebKitGTK compositing quirk, not a macOS one. The
+/// `Option<&str>` helper mirrors unix's `compositing_disabled_by`, whose
+/// decision logic is unit-tested on the Linux build.
+pub fn compositing_disabled() -> bool {
+    compositing_disabled_by(None)
+}
+
+pub(crate) fn compositing_disabled_by(value: Option<&str>) -> bool {
+    matches!(value, Some(v) if !v.is_empty() && v != "0")
+}
+
+/// The AUTO freeze yields before a browser-issued navigation: lift it now,
+/// reinstall the tab's normal filters, and re-arm the freeze timer in case
+/// this navigation never becomes a load. Same semantics as unix's, but
+/// WITHOUT the GTK-only pieces: no `freeze_json` bookkeeping (state stays in
+/// TabState; `unfreeze` here never had that arm) and no re-arm timer (the
+/// tick driver re-freezes on the next deadline miss; the old page has no
+/// runloop timer of its own to schedule). A manual freeze is left alone.
+pub fn yield_auto_freeze(webview: &WebView, view: &TabView) {
+    if !view.state.borrow().freeze.is_auto_frozen() {
+        return;
+    }
+    let block_ads = {
+        let mut st = view.state.borrow_mut();
+        st.freeze.unfreeze(Instant::now());
+        st.policy.block_ads
+    };
+    let Some(cc) = content_controller(webview) else { return };
+    remove_all_filters(&cc);
+    if block_ads {
+        install_bundled_filters(&cc);
+    }
+}
+
+/// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
+pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
+    view.state.borrow().freeze.overrides()
+}
+
+/// Side by Side: two tabs' pages next to each other, or back to one tab at
+/// a time. There is no packing on this backend — `layout` positions both
+/// pages by hand — so this only manages VISIBILITY, never focus (the
+/// keyboard stays where it is; see AppState::show_and_focus_tab). Both
+/// panes are made visible here; hiding the pane being left is state.rs's
+/// job, as on every backend.
+pub fn set_side_by_side(
+    _hosts: &Hosts,
+    pair: Option<((&TabView, &WebView), (&TabView, &WebView))>,
+) {
+    match pair {
+        Some(((_, left), (_, right))) => {
+            let _ = left.set_visible(true);
+            let _ = right.set_visible(true);
+        }
+        None => {}
+    }
+}
+
+/// Page fullscreen: a page's own element taking the whole screen (a video's
+/// fullscreen button). NOT PORTED: WKWebView reports element fullscreen
+/// through `WKUIDelegate` responses wry 0.55 does not relay, so no engine
+/// event on this backend can ever raise `UserEvent::PageFullscreen`. What
+/// remains reachable is the BROWSER side (`exit_page_fullscreen` — a
+/// shortcut, a modal, a tab switch), and these stubs make it safe: the
+/// window was never fullscreen, `set_page_fullscreen(false)` is the
+/// idempotent give-back, and the notice is a no-op like the hover readout
+/// it borrows its shape from. Feature off, honestly — the same choice the
+/// hover readout made; see the stub philosophy above.
+pub fn connect_fullscreen(
+    _hosts: &Hosts,
+    _webview: &WebView,
+    _proxy: &EventLoopProxy<UserEvent>,
+    _id: u64,
+) {
+}
+
+/// Publishes which tabs may go fullscreen. Nothing on this backend can ask
+/// (see the page-fullscreen note); kept so state.rs has one call shape.
+pub fn set_fullscreen_eligible(_hosts: &Hosts, _tabs: &[u64]) {}
+
+/// The window side of page fullscreen. The browser never ENTERS a page
+/// fullscreen on this backend (nothing can raise the event), but the exit
+/// path is shared (`exit_page_fullscreen` fires `on=false` after a tab
+/// switch away from a pane), so both directions record state and the
+/// window call is unconditional — it is the idempotent give-back.
+pub fn set_page_fullscreen(hosts: &Hosts, on: bool) {
+    hosts.fullscreen.set(on);
+    hosts
+        ._window
+        .set_fullscreen(on.then_some(tao::window::Fullscreen::Borderless(None)));
+}
+
+/// Nothing to place: geometry keeps coming from `layout`, which state.rs
+/// calls on every relayout — including the fullscreen ones, before this
+/// runs (its early return is AFTER `layout_fullscreen` in relayout).
+/// Fullscreen never engages on this backend anyway (see the note above).
+pub fn layout_fullscreen(_hosts: &Hosts, _chrome: &WebView, _page: &WebView) {}
+
+/// The fullscreen notice, top centre. Reuses the hover readout's slot the
+/// way unix does, but the readout is not ported on macOS (its host view
+/// would be another native layer between chrome and page), so this is an
+/// honest no-op — the browser-side fullscreen that could show it never
+/// engages on this backend either.
+pub fn set_fullscreen_notice(_hosts: &Hosts, _text: Option<&str>) {}
