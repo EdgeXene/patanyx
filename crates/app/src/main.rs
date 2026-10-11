@@ -1184,8 +1184,9 @@ fn main() {
     //
     // Unix only. On Windows the rules are answered by a HostSet membership
     // check in our own code rather than compiled by the engine, so there is no
-    // engine verdict to ask for.
-    #[cfg(unix)]
+    // engine verdict to ask for. (macOS: not ported, the WebKitGTK FFI the
+    // probe drives does not exist there.)
+    #[cfg(all(unix, not(target_os = "macos")))]
     if std::env::args().any(|arg| arg == "--verify-content-filter") {
         match platform::verify_content_filters() {
             Ok(()) => {
@@ -1595,7 +1596,18 @@ fn main() {
                         .and_then(|()| ipc::smoke_tab_sequence(&mut app))
                         .and_then(|()| ipc::smoke_partner_sequence(&mut app))
                         .and_then(|()| ipc::smoke_sponsorship_sequence(&mut app))
-                        .and_then(|()| ipc::smoke_readout_sequence(&mut app));
+                        .and_then(|()| if cfg!(target_os = "macos") {
+                            // The macOS port declares the hover readout off;
+                            // the platform stubs report and set nothing,
+                            // honestly. Its live check would assert a widget
+                            // that does not exist on this platform, so it is
+                            // skipped with a marker rather than a silent pass.
+                            // Linux CI still greps for `READOUT ok`.
+                            println!("READOUT skipped (macOS port: hover readout is off)");
+                            Ok(())
+                        } else {
+                            ipc::smoke_readout_sequence(&mut app)
+                        });
                     match result {
                         Ok(()) => {
                             app.smoke_second_ping_requested = true;

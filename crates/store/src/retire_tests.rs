@@ -318,7 +318,9 @@ fn only_the_writers_exact_names_are_considered() {
     fs::remove_dir_all(&dir).ok();
 }
 
-#[cfg(unix)]
+/// Not built on macOS: APFS rejects non-UTF-8 file names outright (errno 92),
+/// so a leftover at a raw-byte name cannot exist there to be retired.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_leftover_at_the_old_name_of_a_library_whose_name_is_not_utf8_is_removed() {
     use std::ffi::OsString;
