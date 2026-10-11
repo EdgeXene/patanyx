@@ -150,9 +150,53 @@ pub fn readout_rect(
     (x, y, w, h)
 }
 
+/// Where the fullscreen notice sits: centred, near the top of the client
+/// area, in physical pixels. The same padding as the readout, so it is the same
+/// widget saying something else, and the same clamps: never wider than the
+/// window, never off it.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn notice_rect(
+    client_w: i32,
+    client_h: i32,
+    text_w: i32,
+    line_h: i32,
+    scale: f64,
+) -> (i32, i32, i32, i32) {
+    if client_w <= 0 || client_h <= 0 {
+        return (0, 0, 0, 0);
+    }
+    let w = (text_w.max(0) + 2 * PAD_X).min(client_w);
+    let h = (line_h.max(0) + 2 * PAD_Y).min(client_h);
+    let x = ((client_w - w) / 2).max(0);
+    #[allow(clippy::cast_possible_truncation)]
+    let margin = (NOTICE_TOP_MARGIN * if scale.is_finite() && scale > 0.0 { scale } else { 1.0 }) as i32;
+    let y = margin.clamp(0, (client_h - h).max(0));
+    (x, y, w, h)
+}
+
+/// Logical pixels between the top of the screen and the fullscreen notice.
+pub const NOTICE_TOP_MARGIN: f64 = 24.0;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notice_is_centred_near_the_top_and_inside_the_window() {
+        let (x, y, w, h) = notice_rect(1920, 1080, 300, 16, 1.0);
+        assert_eq!((w, h), (300 + 2 * PAD_X, 16 + 2 * PAD_Y));
+        assert_eq!(x, (1920 - w) / 2);
+        assert_eq!(y, 24);
+        // 150%: the margin scales with the font.
+        assert_eq!(notice_rect(1920, 1080, 300, 24, 1.5).1, 36);
+        // A text wider than the window is clipped to it, at x = 0.
+        let (x, _, w, _) = notice_rect(200, 100, 5000, 16, 1.0);
+        assert_eq!((x, w), (0, 200));
+        // A window too short for the margin keeps the notice on screen.
+        let (_, y, _, h) = notice_rect(800, 30, 100, 16, 1.0);
+        assert!(y + h <= 30);
+        assert_eq!(notice_rect(0, 0, 10, 10, 1.0), (0, 0, 0, 0));
+    }
 
     /// The Rust constants above and `chrome.css` are two copies of one fact.
     /// This is the only thing keeping them equal.

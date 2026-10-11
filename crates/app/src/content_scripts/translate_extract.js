@@ -69,6 +69,12 @@
   // value. Putting it on `window` would hand it to a same-origin frame
   // through `parent`.
   var POLL = "__PATANYX_POLL_REQUEST__";
+  // NATIVES CAPTURED AT DOCUMENT START (security audit 2026-10-08): the token
+  // passed through the live JSON.stringify and the live postMessage, either of
+  // which a page can replace before the first automatic `detected` post and
+  // read the token out of. Captured here, before any page script exists, and
+  // used through these references only.
+  var stringify = JSON.stringify;
 
   // Elements whose text is not prose, or not the page's to translate.
   var SKIP =
@@ -310,9 +316,23 @@
   function webkitTransport() {
     var mh = window.webkit && window.webkit.messageHandlers;
     if (!mh || !mh[OUT] || !mh[ASK]) return null;
+    var out = mh[OUT];
+    var ask = mh[ASK];
+    if (typeof out.postMessage !== "function" || typeof ask.postMessage !== "function") return null;
+    // BOUND here, at document start, and called directly: `fn.call(obj, x)`
+    // looks `Function.prototype.call` up at call time, and a page that
+    // replaced it read the token out of the first argument (review of this
+    // fix, same day). A bound function is invoked through nothing a page
+    // can redefine.
+    var sendOut = out.postMessage.bind(out);
+    var sendAsk = ask.postMessage.bind(ask);
     return {
+      // The one-way channel carries the same top-frame token the poll does,
+      // ahead of the JSON (security audit 2026-10-08, MEDIUM): the handler is
+      // registered for every frame, so without it a cross-origin iframe could
+      // post extractions into a session the user started on the top page.
       send: function (json) {
-        mh[OUT].postMessage(json);
+        sendOut(POLL + " " + json);
       },
       // A rejection ENDS the pump rather than retrying, because a retry on
       // rejection is exactly the busy loop this shape exists to avoid -- and
@@ -320,7 +340,7 @@
       listen: function pump() {
         var promise;
         try {
-          promise = mh[ASK].postMessage(POLL);
+          promise = sendAsk(POLL);
         } catch (e) {
           return;
         }
@@ -348,9 +368,10 @@
   function webview2Transport() {
     var wv = window.chrome && window.chrome.webview;
     if (!wv || typeof wv.postMessage !== "function") return null;
+    var sendWv = wv.postMessage.bind(wv);
     return {
       send: function (json) {
-        wv.postMessage(json);
+        sendWv(json);
       },
       listen: function () {
         wv.addEventListener("message", function (ev) {
@@ -358,7 +379,7 @@
             // WebView2 delivers PostWebMessageAsJson pre-parsed on `data`.
             // `handle` takes the string form, so this re-serialises rather
             // than growing a second code path -- one parser, one shape.
-            handle(typeof ev.data === "string" ? ev.data : JSON.stringify(ev.data));
+            handle(typeof ev.data === "string" ? ev.data : stringify(ev.data));
           } catch (e) {
             /* As above. */
           }
@@ -370,7 +391,7 @@
 
   function post(payload) {
     try {
-      transport.send(JSON.stringify(payload));
+      transport.send(stringify(payload));
     } catch (e) {
       /* No channel means no translation. Nothing here is worth breaking the
          page over. */

@@ -79,7 +79,8 @@
 //!
 //! ```no_run
 //! use patanyx_update::{
-//!     decide, verify_manifest, verify_payload, Decision, Platform, TrustedKeys, Version,
+//!     decide, verify_manifest, verify_payload, Decision, Platform, RunningEngine, TrustedKeys,
+//!     Version,
 //! };
 //!
 //! // Compiled into the binary; placeholder hex stands in for the publisher's
@@ -100,7 +101,7 @@
 //!     // Err here means "not authentic": bad signature and untrusted key are
 //!     // deliberately the same error.
 //!     let manifest = verify_manifest(bytes, &keys)?;
-//!     match decide(&current, &FLOOR, platform, &manifest) {
+//!     match decide(&current, &FLOOR, platform, &RunningEngine::UNGATED, &manifest) {
 //!         Decision::UpToDate => {}
 //!         // A refusal is a security event; the reason is for the UI to show.
 //!         Decision::Refused(why) => eprintln!("update refused: {why}"),
@@ -140,9 +141,10 @@ pub use delta::{apply_delta, compress as compress_delta};
 pub use error::UpdateError;
 pub use keys::TrustedKeys;
 pub use manifest::{
-    verify_blocklist_manifest, verify_manifest, verify_model_manifest, BlocklistManifest, Delta,
-    EngineFloors, Manifest, ModelManifest, Platform, ReleaseKind, MAX_BLOCKLIST_BYTES,
-    MAX_MODEL_PACK_BYTES, SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST, SIGNING_DOMAIN_MODELS,
+    verify_blocklist_manifest, verify_manifest, verify_manifest_linux_v2, verify_model_manifest,
+    BlocklistManifest, Delta, EngineFloors, Manifest, ModelManifest, Platform, ReleaseKind,
+    MAX_BLOCKLIST_BYTES, MAX_MODEL_PACK_BYTES, SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST,
+    SIGNING_DOMAIN_LINUX_V2, SIGNING_DOMAIN_MODELS,
 };
 pub use payload::{verify_blocklist_bytes, verify_model_bytes, verify_payload};
 pub use version::Version;
@@ -182,6 +184,37 @@ pub enum RefusalReason {
     BelowFloor { offered: Version, floor: Version },
     /// Built for a different platform than the one running.
     WrongPlatform { offered: Platform, running: Platform },
+    /// The release needs a newer web engine than this machine has, and on
+    /// this engine a release refuses to start below its floor. Installing it
+    /// would replace a working browser with one that does not open.
+    EngineTooOld {
+        offered: Version,
+        engine: String,
+        needed: Vec<u32>,
+        running: Vec<u32>,
+    },
+    /// The release names an engine requirement, but this machine's engine
+    /// version could not be read at the precision the requirement needs.
+    /// Unknown is refused here (unlike the banner, which stays quiet): the
+    /// cost of guessing wrong is a browser that does not start.
+    EngineUnknown {
+        offered: Version,
+        engine: String,
+        needed: Vec<u32>,
+    },
+    /// The release names NO requirement for this engine, where one is
+    /// required before installing. A publishing mistake, refused rather than
+    /// trusted: the release might not start here.
+    EngineRequirementMissing { offered: Version, engine: String },
+}
+
+/// `[2, 54, 0]` as "2.54.0".
+fn join_fields(fields: &[u32]) -> String {
+    fields
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(".")
 }
 
 impl fmt::Display for RefusalReason {
@@ -202,7 +235,111 @@ impl fmt::Display for RefusalReason {
                 "this update was built for {offered}, but this installation is {running}; \
                  refusing to install it"
             ),
+            RefusalReason::EngineTooOld {
+                offered,
+                engine,
+                needed,
+                running,
+            } => write!(
+                f,
+                "PATANYX {offered} needs {engine} {needed} or newer, and this computer has \
+                 {running}; update the system, then PATANYX can install it",
+                needed = join_fields(needed),
+                running = join_fields(running),
+            ),
+            RefusalReason::EngineUnknown {
+                offered,
+                engine,
+                needed,
+            } => write!(
+                f,
+                "PATANYX {offered} needs {engine} {needed} or newer, and this computer's \
+                 {engine} version could not be read; it was not installed",
+                needed = join_fields(needed),
+            ),
+            RefusalReason::EngineRequirementMissing { offered, engine } => write!(
+                f,
+                "the update to {offered} does not say which {engine} version it needs, so it \
+                 was not installed"
+            ),
         }
+    }
+}
+
+/// The web engine this installation runs on, as far as an update needs to know.
+///
+/// On WebKitGTK a release build refuses to start below its compiled engine
+/// floor, so an update whose floor this machine does not meet would replace a
+/// working browser with one that never opens. `gates_install` says whether that
+/// is true for this engine; WebView2 updates itself and a below-floor runtime
+/// still starts, so it does not gate.
+#[derive(Debug, Clone, Copy)]
+pub struct RunningEngine<'a> {
+    /// The name the manifest's `engine_floor` keys on ("WebKitGTK", "WebView2").
+    pub name: &'a str,
+    /// Every numeric field the engine reports, in order; `None` when it could
+    /// not be read.
+    pub version: Option<&'a [u32]>,
+    /// Whether an engine below the offered release's floor stops the install.
+    pub gates_install: bool,
+}
+
+impl RunningEngine<'static> {
+    /// No engine gate: Windows, and every test that is not about engines.
+    pub const UNGATED: RunningEngine<'static> = RunningEngine {
+        name: "",
+        version: None,
+        gates_install: false,
+    };
+}
+
+/// Does `found` meet `needed`? Compared field by field from the left over the
+/// fields `needed` has. `None` when `found` has fewer fields than that: the
+/// version is unknown at the precision the requirement needs.
+pub fn engine_meets(found: &[u32], needed: &[u32]) -> Option<bool> {
+    if found.len() < needed.len() {
+        return None;
+    }
+    for (have, want) in found.iter().zip(needed) {
+        if have != want {
+            return Some(have > want);
+        }
+    }
+    Some(true)
+}
+
+/// The engine half of `decide`, for an update that would otherwise install:
+/// `None` when the engine allows it, the refusal when it does not. Public so
+/// the installer can ask the same question again immediately before it
+/// replaces the running binary.
+pub fn engine_refusal(engine: &RunningEngine<'_>, manifest: &Manifest) -> Option<RefusalReason> {
+    if !engine.gates_install {
+        return None;
+    }
+    let offered = manifest.version();
+    let Some(needed) = manifest.engine_floors().for_engine(engine.name) else {
+        return Some(RefusalReason::EngineRequirementMissing {
+            offered,
+            engine: engine.name.to_string(),
+        });
+    };
+    let unknown = || RefusalReason::EngineUnknown {
+        offered,
+        engine: engine.name.to_string(),
+        needed: needed.to_vec(),
+    };
+    let Some(found) = engine.version else {
+        return Some(unknown());
+    };
+    match engine_meets(found, needed) {
+        Some(true) => None,
+        Some(false) => Some(RefusalReason::EngineTooOld {
+            offered,
+            engine: engine.name.to_string(),
+            needed: needed.to_vec(),
+            running: found.to_vec(),
+        }),
+        None => Some(unknown()),
     }
 }
 
@@ -217,10 +354,15 @@ impl fmt::Display for RefusalReason {
 ///
 /// The branch order only chooses WHICH honest reason the user sees; every
 /// non-update branch refuses.
+///
+/// `engine` is checked LAST, so it can only ever stop something that would
+/// otherwise install: an up-to-date or older offer is reported as exactly
+/// that, never as an engine problem.
 pub fn decide(
     current: &Version,
     floor: &Version,
     running: Platform,
+    engine: &RunningEngine<'_>,
     manifest: &Manifest,
 ) -> Decision {
     if manifest.platform() != running {
@@ -243,6 +385,9 @@ pub fn decide(
             offered: manifest.version(),
             running: *current,
         });
+    }
+    if let Some(why) = engine_refusal(engine, manifest) {
+        return Decision::Refused(why);
     }
     Decision::Update(manifest.clone())
 }
@@ -605,7 +750,7 @@ mod tests {
         // The manifest is VALIDLY SIGNED: a replayed old release is exactly
         // the attack a signature cannot stop, so decide() must.
         let m = manifest_for("2.9.0", "linux-x86_64");
-        match decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &m) {
+        match decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m) {
             Decision::Refused(RefusalReason::NotNewer { offered, running }) => {
                 assert_eq!(offered, v("2.9.0"));
                 assert_eq!(running, v("2.10.0"));
@@ -617,7 +762,7 @@ mod tests {
     #[test]
     fn equal_version_is_not_offered_as_an_update() {
         let m = manifest_for("2.10.0", "linux-x86_64");
-        let decision = decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &m);
+        let decision = decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m);
         // Note cross-reference: the brief lists "an equal version is
         // refused" among the required properties. It is refused AS AN UPDATE;
         // the honest label for "offered == running" is UpToDate, not an
@@ -632,7 +777,7 @@ mod tests {
         // would be an update. The floor exists to retire a known-bad release
         // permanently, signature or no signature.
         let m = manifest_for("2.4.0", "linux-x86_64");
-        match decide(&v("2.3.0"), &v("2.5.0"), Platform::LinuxX86_64, &m) {
+        match decide(&v("2.3.0"), &v("2.5.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m) {
             Decision::Refused(RefusalReason::BelowFloor { offered, floor }) => {
                 assert_eq!(offered, v("2.4.0"));
                 assert_eq!(floor, v("2.5.0"));
@@ -650,7 +795,7 @@ mod tests {
         assert!(v("10.0.0") > v("9.9.9"));
         let m = manifest_for("2.10.0", "linux-x86_64");
         assert!(matches!(
-            decide(&v("2.9.0"), &v("2.0.0"), Platform::LinuxX86_64, &m),
+            decide(&v("2.9.0"), &v("2.0.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m),
             Decision::Update(_)
         ));
     }
@@ -661,7 +806,7 @@ mod tests {
             let m = manifest_for(offered, "linux-x86_64");
             assert!(
                 !matches!(
-                    decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &m),
+                    decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m),
                     Decision::Update(_)
                 ),
                 "{offered} must not be offered to a 2.10.0 install"
@@ -673,7 +818,7 @@ mod tests {
     fn wrong_platform_is_refused() {
         let m = manifest_for("2.11.0", "linux-x86_64");
         assert!(matches!(
-            decide(&v("2.10.0"), &v("2.0.0"), Platform::MacosAarch64, &m),
+            decide(&v("2.10.0"), &v("2.0.0"), Platform::MacosAarch64, &RunningEngine::UNGATED, &m),
             Decision::Refused(RefusalReason::WrongPlatform { .. })
         ));
     }
@@ -681,10 +826,208 @@ mod tests {
     #[test]
     fn newer_version_is_offered_as_an_update() {
         let m = manifest_for("2.11.0", "linux-x86_64");
-        match decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &m) {
+        match decide(&v("2.10.0"), &v("2.0.0"), Platform::LinuxX86_64, &RunningEngine::UNGATED, &m) {
             Decision::Update(offered) => assert_eq!(offered, m),
             other => panic!("expected Update, got {other:?}"),
         }
+    }
+
+    // ---- the engine gate ----
+
+    /// A signed manifest for linux-x86_64 carrying `engine_floor` (raw JSON
+    /// object text, e.g. `{"webkitgtk":"2.54.0"}`).
+    fn manifest_with_floor(version: &str, floor: &str) -> Manifest {
+        let payload = payload_json(
+            version,
+            "linux-x86_64",
+            "https://updates.patanyx.example/x",
+            &sha256_hex(BINARY),
+            BINARY.len() as u64,
+            1_735_689_600,
+        )
+        .replace(",\"published_at\"", &format!(",\"engine_floor\":{floor},\"published_at\""));
+        let envelope = sign(&payload, &signing_key(SEED_TRUSTED_A));
+        crate::verify_manifest(envelope.as_bytes(), &trusted_keys()).expect("test manifest must verify")
+    }
+
+    fn webkit(version: Option<&[u32]>) -> RunningEngine<'_> {
+        RunningEngine {
+            name: "WebKitGTK",
+            version,
+            gates_install: true,
+        }
+    }
+
+    fn decide_on(engine: &RunningEngine<'_>, m: &Manifest) -> Decision {
+        decide(&v("1.0.5"), &v("0.0.0"), Platform::LinuxX86_64, engine, m)
+    }
+
+    #[test]
+    fn an_engine_below_the_floor_is_refused() {
+        let m = manifest_with_floor("1.0.6", r#"{"webkitgtk":"2.54.0"}"#);
+        match decide_on(&webkit(Some(&[2, 52, 6])), &m) {
+            Decision::Refused(RefusalReason::EngineTooOld { needed, running, engine, offered }) => {
+                assert_eq!(needed, vec![2, 54, 0]);
+                assert_eq!(running, vec![2, 52, 6]);
+                assert_eq!(engine, "WebKitGTK");
+                assert_eq!(offered, v("1.0.6"));
+            }
+            other => panic!("expected EngineTooOld, got {other:?}"),
+        }
+        // The last 2.53 development release is still below 2.54.0.
+        assert!(matches!(
+            decide_on(&webkit(Some(&[2, 53, 92])), &m),
+            Decision::Refused(RefusalReason::EngineTooOld { .. })
+        ));
+    }
+
+    #[test]
+    fn an_engine_at_or_above_the_floor_is_offered() {
+        let m = manifest_with_floor("1.0.6", r#"{"webkitgtk":"2.54.0"}"#);
+        for found in [&[2, 54, 0][..], &[2, 54, 1], &[2, 56, 0], &[3, 0, 0]] {
+            assert!(
+                matches!(decide_on(&webkit(Some(found)), &m), Decision::Update(_)),
+                "{found:?} meets 2.54.0"
+            );
+        }
+    }
+
+    #[test]
+    fn a_missing_engine_requirement_is_refused_where_the_engine_gates() {
+        // No engine_floor at all, and one naming only the other engine.
+        for m in [
+            manifest_for("1.0.6", "linux-x86_64"),
+            manifest_with_floor("1.0.6", r#"{"webview2":"152.0.4191.62"}"#),
+        ] {
+            assert!(matches!(
+                decide_on(&webkit(Some(&[2, 60, 0])), &m),
+                Decision::Refused(RefusalReason::EngineRequirementMissing { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn an_unreadable_or_short_engine_version_is_refused() {
+        let m = manifest_with_floor("1.0.6", r#"{"webkitgtk":"2.54.0"}"#);
+        assert!(matches!(
+            decide_on(&webkit(None), &m),
+            Decision::Refused(RefusalReason::EngineUnknown { .. })
+        ));
+        assert!(matches!(
+            decide_on(&webkit(Some(&[2, 54])), &m),
+            Decision::Refused(RefusalReason::EngineUnknown { .. })
+        ));
+    }
+
+    #[test]
+    fn an_ungated_engine_is_never_refused_for_its_version() {
+        // Windows: WebView2 updates itself and a below-floor runtime starts.
+        let m = manifest_with_floor("1.0.6", r#"{"webview2":"152.0.4191.62"}"#);
+        let old = [140, 0, 0, 0];
+        let engine = RunningEngine {
+            name: "WebView2",
+            version: Some(&old),
+            gates_install: false,
+        };
+        assert!(matches!(decide_on(&engine, &m), Decision::Update(_)));
+        assert!(matches!(decide_on(&RunningEngine::UNGATED, &manifest_for("1.0.6", "linux-x86_64")), Decision::Update(_)));
+    }
+
+    #[test]
+    fn the_engine_gate_never_relabels_an_older_or_equal_offer() {
+        // Up to date and downgrade answers win over an engine problem: the
+        // engine check only ever stops something that would install.
+        let old_engine = webkit(Some(&[2, 40, 0]));
+        assert_eq!(
+            decide_on(&old_engine, &manifest_with_floor("1.0.5", r#"{"webkitgtk":"2.54.0"}"#)),
+            Decision::UpToDate
+        );
+        assert!(matches!(
+            decide_on(&old_engine, &manifest_with_floor("1.0.4", r#"{"webkitgtk":"2.54.0"}"#)),
+            Decision::Refused(RefusalReason::NotNewer { .. })
+        ));
+    }
+
+    #[test]
+    fn engine_meets_compares_fields_numerically() {
+        assert_eq!(engine_meets(&[2, 54, 0], &[2, 54, 0]), Some(true));
+        assert_eq!(engine_meets(&[2, 100, 0], &[2, 54, 0]), Some(true));
+        assert_eq!(engine_meets(&[2, 9, 9], &[2, 54, 0]), Some(false));
+        assert_eq!(engine_meets(&[2, 54, 0, 7], &[2, 54, 0]), Some(true));
+        assert_eq!(engine_meets(&[2, 54], &[2, 54, 0]), None);
+    }
+
+    #[test]
+    fn engine_refusals_read_as_sentences() {
+        let m = manifest_with_floor("1.0.7", r#"{"webkitgtk":"2.56.0"}"#);
+        let Decision::Refused(why) = decide_on(&webkit(Some(&[2, 54, 0])), &m) else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(
+            why.to_string(),
+            "PATANYX 1.0.7 needs WebKitGTK 2.56.0 or newer, and this computer has 2.54.0; \
+             update the system, then PATANYX can install it"
+        );
+    }
+
+    // ---- feed binding: Linux /v2 manifests under their own domain ----
+
+    fn sign_in(payload: &str, domain: &[u8]) -> String {
+        let key = signing_key(SEED_TRUSTED_A);
+        let mut message = domain.to_vec();
+        message.extend_from_slice(payload.as_bytes());
+        let sig = ed25519_dalek::Signer::sign(&key, &message);
+        serde_json::json!({ "v": 1, "payload": payload, "sig": hex::encode(&sig.to_bytes()) }).to_string()
+    }
+
+    fn linux_payload() -> String {
+        payload_json(
+            "1.0.7",
+            "linux-x86_64",
+            "https://updates.patanyx.example/x",
+            &sha256_hex(BINARY),
+            BINARY.len() as u64,
+            1_735_689_600,
+        )
+    }
+
+    #[test]
+    fn a_v2_linux_manifest_is_refused_by_the_old_verifier() {
+        // What every pre-1.0.6 Linux copy runs: it must see a bad signature.
+        let envelope = sign_in(&linux_payload(), SIGNING_DOMAIN_LINUX_V2);
+        assert!(matches!(
+            verify_manifest(envelope.as_bytes(), &trusted_keys()),
+            Err(UpdateError::BadSignature)
+        ));
+        verify_manifest_linux_v2(envelope.as_bytes(), &trusted_keys()).expect("the v2 verifier accepts it");
+    }
+
+    #[test]
+    fn a_v1_manifest_is_refused_by_the_v2_verifier() {
+        // The bridge or any older /v1 manifest cannot be replayed to 1.0.6+.
+        let envelope = sign_in(&linux_payload(), SIGNING_DOMAIN);
+        assert!(matches!(
+            verify_manifest_linux_v2(envelope.as_bytes(), &trusted_keys()),
+            Err(UpdateError::BadSignature)
+        ));
+    }
+
+    #[test]
+    fn a_v2_manifest_must_name_a_linux_platform() {
+        let windows = linux_payload().replace("linux-x86_64", "windows-x86_64");
+        let envelope = sign_in(&windows, SIGNING_DOMAIN_LINUX_V2);
+        assert!(matches!(
+            verify_manifest_linux_v2(envelope.as_bytes(), &trusted_keys()),
+            Err(UpdateError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn the_linux_v2_domain_is_distinct_from_every_other() {
+        for other in [SIGNING_DOMAIN, SIGNING_DOMAIN_BLOCKLIST, SIGNING_DOMAIN_MODELS] {
+            assert_ne!(SIGNING_DOMAIN_LINUX_V2, other);
+        }
+        assert_eq!(SIGNING_DOMAIN_LINUX_V2, b"PATANYX-UPDATE-MANIFEST-LINUX-V2\n");
     }
 
     // ---- payload verification ----

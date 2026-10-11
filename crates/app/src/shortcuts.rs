@@ -44,6 +44,10 @@ pub enum Key {
     F3,
     /// F6, another spelling of "focus the address bar".
     F6,
+    /// F9, Reader View (the key readers already know for it).
+    F9,
+    /// Ctrl+Shift+S, Side by Side.
+    S,
     F12,
     Left,
     Right,
@@ -119,6 +123,11 @@ pub enum Shortcut {
     OpenFindAcrossTabs,
     FindNext,
     FindPrevious,
+    /// Open or close Reader View. Native for the same reason as the
+    /// palette: the key must work while the page holds focus.
+    ToggleReaderView,
+    /// Show the active tab beside its neighbor, or end Side by Side.
+    ToggleSideBySide,
 }
 
 /// The numeric keypad, by hardware SCAN CODE rather than virtual key.
@@ -187,6 +196,8 @@ pub fn vk_key(virtual_key: u32) -> Option<Key> {
         VK_F5 => Key::F5,
         0x72 => Key::F3,
         0x75 => Key::F6,
+        0x78 => Key::F9,
+        0x53 => Key::S,
         VK_F12 => Key::F12,
         VK_LEFT => Key::Left,
         VK_RIGHT => Key::Right,
@@ -259,6 +270,13 @@ pub fn resolve(mods: Mods, key: Key) -> Option<Shortcut> {
         // state check here.
         Key::F3 if !mods.ctrl && !mods.shift && !mods.alt => Some(Shortcut::FindNext),
         Key::F3 if !mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::FindPrevious),
+
+        // Side by Side. Exactly Ctrl+Shift: plain Ctrl+S is the page's own
+        // save shortcut on many sites, and AltGr (Ctrl+Alt) must still type.
+        Key::S if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::ToggleSideBySide),
+
+        // Reader View, unmodified like F3 and F6.
+        Key::F9 if !mods.ctrl && !mods.shift && !mods.alt => Some(Shortcut::ToggleReaderView),
 
         Key::Left if mods.alt && !mods.ctrl => Some(Shortcut::Back),
         Key::Right if mods.alt && !mods.ctrl => Some(Shortcut::Forward),
@@ -573,6 +591,27 @@ mod tests {
         // And both keys can actually arrive from Windows.
         assert_eq!(vk_key(0x44).and_then(|k| resolve(ALT, k)), Some(Shortcut::FocusUrlBar));
         assert_eq!(vk_key(0x75).and_then(|k| resolve(NONE, k)), Some(Shortcut::FocusUrlBar));
+    }
+
+    #[test]
+    fn ctrl_shift_s_toggles_side_by_side_and_plain_ctrl_s_belongs_to_the_page() {
+        let ctrl_shift = Mods::new(true, true, false);
+        assert_eq!(resolve(ctrl_shift, Key::S), Some(Shortcut::ToggleSideBySide));
+        assert_eq!(resolve(CTRL, Key::S), None, "Ctrl+S is the page's");
+        assert_eq!(resolve(NONE, Key::S), None, "typing \"s\" belongs to the page");
+        assert_eq!(resolve(Mods::new(true, true, true), Key::S), None);
+        assert_eq!(vk_key(0x53).and_then(|k| resolve(ctrl_shift, k)), Some(Shortcut::ToggleSideBySide));
+    }
+
+    #[test]
+    fn f9_toggles_reader_view_and_arrives_from_windows() {
+        assert_eq!(resolve(NONE, Key::F9), Some(Shortcut::ToggleReaderView));
+        assert_eq!(resolve(CTRL, Key::F9), None);
+        assert_eq!(resolve(Mods::new(false, true, false), Key::F9), None);
+        assert_eq!(
+            vk_key(0x78).and_then(|k| resolve(NONE, k)),
+            Some(Shortcut::ToggleReaderView)
+        );
     }
 
     #[test]

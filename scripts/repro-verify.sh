@@ -16,10 +16,21 @@
 # and the host OS. Cross-OS reproducibility is a separate, harder claim and
 # this script does not make it.
 #
-# Usage: scripts/repro-verify.sh [workdir]
+# Usage: scripts/repro-verify.sh [--features <list>] [workdir]
+#
+# --features is forwarded to BOTH builds, so the one-time Linux bridge build
+# (`--features linux-bridge`) gets the same proof as the strict one. The
+# resulting binary is then asked `--build-identity`, so a features list that
+# did not take effect fails here instead of passing as a strict build.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
+FEATURES=()
+if [ "${1:-}" = "--features" ]; then
+  [ $# -ge 2 ] || { echo "--features needs a list" >&2; exit 2; }
+  FEATURES=(--features "$2")
+  shift 2
+fi
 WORK="${1:-$(mktemp -d)}"
 CLEAN_WORK=0
 [ $# -eq 0 ] && CLEAN_WORK=1
@@ -32,7 +43,7 @@ echo "workdir: $WORK"
 # Build A: this checkout, this cargo home.
 echo
 echo "--- build A: original path, original CARGO_HOME"
-CARGO_TARGET_DIR="$WORK/target-a" ./scripts/repro-build.sh >/dev/null
+CARGO_TARGET_DIR="$WORK/target-a" ./scripts/repro-build.sh "${FEATURES[@]}" >/dev/null
 HASH_A="$(sha256sum "$WORK/target-a/release/patanyx" | cut -d' ' -f1)"
 echo "A: $HASH_A"
 
@@ -48,13 +59,25 @@ cp -al "${CARGO_HOME:-$HOME/.cargo}/registry" "$WORK/cargo/registry" 2>/dev/null
   || cp -a "${CARGO_HOME:-$HOME/.cargo}/registry" "$WORK/cargo/registry"
 ( cd "$WORK/src" \
   && CARGO_HOME="$WORK/cargo" CARGO_TARGET_DIR="$WORK/target-b" \
-     ./scripts/repro-build.sh >/dev/null )
+     ./scripts/repro-build.sh "${FEATURES[@]}" >/dev/null )
 HASH_B="$(sha256sum "$WORK/target-b/release/patanyx" | cut -d' ' -f1)"
 echo "B: $HASH_B"
 
 echo
 if [ "$HASH_A" = "$HASH_B" ]; then
   echo "REPRODUCIBLE: $HASH_A"
+  # Which variant was proven, from the binary itself (Linux builds only;
+  # elsewhere the flag is not run).
+  if [ "$(uname -s)" = "Linux" ]; then
+    IDENT="$("$WORK/target-a/release/patanyx" --build-identity 2>/dev/null || true)"
+    echo "identity: $IDENT"
+    case " ${FEATURES[*]:-} " in
+      *linux-bridge*) echo "$IDENT" | grep -q '"variant":"bridge"' \
+        || { echo "FAIL: --features linux-bridge but the binary is not the bridge" >&2; exit 1; } ;;
+      *) echo "$IDENT" | grep -q '"variant":"strict"' \
+        || { echo "FAIL: expected the strict build" >&2; exit 1; } ;;
+    esac
+  fi
   exit 0
 fi
 echo "NOT REPRODUCIBLE" >&2

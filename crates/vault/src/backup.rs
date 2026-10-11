@@ -32,7 +32,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use zeroize::Zeroizing;
 
@@ -139,6 +139,146 @@ pub fn rotate_backups(vault_path: &Path, max_backups: usize) -> Result<Option<Pa
     prune_backups(vault_path, max_backups)?;
     Ok(Some(backup))
 }
+
+/// Removes every copy of the vault at `vault_path` that this crate's writers
+/// leave beside it, ahead of an import that replaces the vault outright.
+///
+/// Three name shapes are candidates, the same ones a passphrase rotation
+/// retires: the stamped backups (`<name>.bak-<stamp>`, with or without the
+/// `.tmp` an interrupted backup write leaves), the `<name>.tmp` older builds
+/// used for the vault itself, and the writer's `.tmp-<32 hex>` leftovers.
+/// A NAME PROVES NOTHING, AND NEITHER DOES THE MAGIC: a candidate is removed
+/// only when it is a vault whose header shares a slot salt with the vault
+/// being replaced. A slot's salt is fixed at slot creation and travels
+/// through every save, so a generation of THIS vault carries one of its
+/// salts, while another vault parked beside it under a leftover's name (the
+/// rotation tests keep exactly such a file) shares none and survives, as
+/// does a note someone saved as `vault.rbv.bak-mine` and the destination
+/// file itself. A vault-shaped sibling that shares NO salt is not proven
+/// foreign either: a generation from before a passphrase change on a vault
+/// without a recovery slot carries none of the current salts (the change
+/// replaces its only one), and the crate's retirement on that change may have
+/// died before it ran. Such a file is KEPT and COUNTED (`retained`), never
+/// deleted on a guess and never passed off as handled: the import reports the
+/// count so the user can be told a copy they believe gone may still open under
+/// the old passphrase. With no readable vault at the destination there is
+/// nothing to prove against and nothing is removed. Must run under the destination's lock
+/// (`Vault::assemble` takes it), so no concurrent save is mid-rename when its
+/// temporary file goes. Returns how many files went; any error leaves the
+/// directory as it was found up to the failing entry, and the caller refuses
+/// the import before anything is replaced.
+pub(crate) struct Discarded {
+    pub removed: usize,
+    pub retained: usize,
+}
+
+pub(crate) fn discard_replaced_vault_leftovers(vault_path: &Path) -> Result<Discarded, ExportError> {
+    use std::io::Read;
+    let dir = vault_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let name = vault_file_name(vault_path)
+        .map_err(|e| ExportError::Io(std::io::Error::other(e.to_string())))?;
+    let backup_prefix = format!("{name}{BACKUP_SUFFIX}");
+    let legacy_temp = format!("{name}.tmp");
+    let mut removed = 0usize;
+    let mut retained = 0usize;
+    let now = SystemTime::now();
+    // The salts of the vault being replaced. Its absence or unreadability
+    // (a truncated file, say) means nothing beside it can be PROVEN its own,
+    // so nothing goes; every vault-shaped sibling is then counted instead,
+    // because a backup of a vault whose current file is damaged is exactly
+    // the copy the old passphrase still opens.
+    let own_salts: Vec<[u8; SALT_LEN]> = slot_salts_of(vault_path)?.unwrap_or_default();
+    let listing = match fs::read_dir(&dir) {
+        Ok(listing) => listing,
+        // No directory means no vault and no leftovers: a first import.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Discarded { removed: 0, retained: 0 }),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in listing {
+        let entry = entry?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else { continue };
+        if file_name == name {
+            continue;
+        }
+        let writer_temp = is_temp_name(file_name);
+        let candidate = file_name.starts_with(backup_prefix.as_str())
+            || file_name == legacy_temp
+            || writer_temp;
+        if !candidate {
+            continue;
+        }
+        let path = entry.path();
+        // O_NOFOLLOW: a planted link is not opened, let alone judged by what
+        // it points at. A link, a directory or anything unreadable is left.
+        match slot_salts_of(&path)? {
+            Some(salts) if !own_salts.is_empty() && salts.iter().any(|s| own_salts.contains(s)) => {
+                // The writer's `.tmp-<hex>` name carries no vault name, and
+                // the lock is per vault file, not per directory: a COPY of
+                // this vault saved under another name beside it shares the
+                // salts, and its save's temp file would be unlinked here
+                // between write and rename (review of this fix). A temp file
+                // younger than TEMP_ABANDONED_AFTER may be that save, so it is
+                // kept and counted; an older one is a crash's leftover and
+                // goes. Backups and the legacy temp are named for this vault.
+                if writer_temp && !abandoned(&path, now) {
+                    retained += 1;
+                } else {
+                    fs::remove_file(&path)?;
+                    removed += 1;
+                }
+            }
+            // Vault-shaped, unproven: kept and counted.
+            Some(_) => retained += 1,
+            None => {}
+        }
+    }
+    Ok(Discarded { removed, retained })
+}
+
+/// How old a writer's temp file must be before an import treats it as a
+/// crash's leftover rather than a save in flight. A save writes and renames
+/// within a second; ten minutes leaves no realistic write inside it.
+const TEMP_ABANDONED_AFTER: Duration = Duration::from_secs(600);
+
+/// Whether `path` was last modified at least `TEMP_ABANDONED_AFTER` before
+/// `now`. Anything unanswerable (no metadata, a clock set back, a file dated
+/// in the future) is NOT abandoned: the leftover is then kept and counted.
+fn abandoned(path: &Path, now: SystemTime) -> bool {
+    fs::symlink_metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|modified| now.duration_since(modified).ok())
+        .is_some_and(|age| age >= TEMP_ABANDONED_AFTER)
+}
+
+/// The slot salts in a vault file's header, or `None` when `path` is not a
+/// readable regular file beginning a vault header (a link, a directory, an
+/// export, a Library temp file, anything shorter than the fixed prefix).
+/// TOLERANT of a cut: a copy a crash truncated inside its slots still names
+/// every slot whose salt bytes are present, because such a copy can still
+/// carry a wrapped key (format.rs, `slot_prefixes_with_key_bytes`) and must
+/// be judged, not skipped. Reads only the bounded header, never the body.
+/// A vault with the magic but no readable slot answers `Some(empty)`: vault-
+/// shaped, proven nothing, so the caller keeps and counts it.
+fn slot_salts_of(path: &Path) -> Result<Option<Vec<[u8; SALT_LEN]>>, ExportError> {
+    use std::io::Read;
+    let Some(mut file) = open_leftover(path)? else { return Ok(None) };
+    let mut head = Vec::with_capacity(4096);
+    file.by_ref().take(HEADER_READ_LIMIT).read_to_end(&mut head)?;
+    if !format::has_known_magic(&head) {
+        return Ok(None);
+    }
+    Ok(Some(format::slot_salts_present(&head)))
+}
+
+/// Enough for any header this format writes (a few slots of a few hundred
+/// bytes); the ciphertext behind it is never read here.
+const HEADER_READ_LIMIT: u64 = 64 << 10;
 
 fn vault_file_name(vault_path: &Path) -> Result<&str, BackupError> {
     vault_path
@@ -923,15 +1063,39 @@ impl Vault {
         };
         // `plaintext` (Zeroizing) wipes itself here.
 
+        // A destination that is a symbolic link would be replaced by NAME
+        // while the real file, and every copy beside it, stayed where the
+        // link pointed, under the retired passphrase. Refused outright.
+        if fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(ExportError::Io(std::io::Error::other(
+                "the vault path is a symbolic link; import refused",
+            )));
+        }
+
         let master = Zeroizing::new(crypto::random_bytes::<KEY_LEN>());
+        // `assemble` takes the destination's lock and writes nothing: from
+        // here on no other Vault can be saving into this directory, which is
+        // what makes the deletion below safe to do at all.
         let mut vault = Vault::assemble(dest.to_path_buf(), master, params, data)?;
+        // EVERYTHING IN THE REPLACED VAULT IS LOST, which is what the import
+        // panel promises and what 1.0.5 did not do (security audit
+        // 2026-10-08): `save()` rotated the vault being replaced into
+        // `.bak-<stamp>`, so up to five copies stayed beside the new vault
+        // and the OLD passphrase opened every one of them. The copies go
+        // BEFORE anything is written, under the lock, while nothing has been
+        // replaced yet, so a removal that fails refuses the import with the
+        // old vault intact and the Library marker's transaction untouched.
+        let retained = discard_replaced_vault_leftovers(dest)?.retained;
         let passphrase_slot =
             vault.build_slot(SlotKind::Passphrase, new_vault_passphrase.as_bytes(), &[])?;
         vault.push_slot(passphrase_slot);
         let recovery = RecoveryKey::generate();
         let recovery_slot = vault.build_slot(SlotKind::Recovery, recovery.as_bytes(), &[])?;
         vault.push_slot(recovery_slot);
-        vault.save()?;
+        // No rotation: a backup taken here would be a copy of the vault being
+        // discarded, under its retired passphrase.
+        vault.save_inner(false)?;
+        vault.import_retained_leftovers = retained;
         Ok((vault, recovery, extra))
     }
 
@@ -2747,5 +2911,233 @@ mod tests {
             .collect();
         out.sort();
         out
+    }
+}
+
+#[cfg(test)]
+mod import_discards_the_replaced_vault {
+    use super::*;
+    use crate::Vault;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("patanyx-vault-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Dates a planted leftover a day back: a crash's leftover, not a save in
+    /// flight.
+    fn age(path: &Path) {
+        let f = fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() - Duration::from_secs(86_400)).unwrap();
+    }
+
+    fn siblings(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    /// The audit's reproduction (2026-10-08): before this change, importing
+    /// over an existing vault rotated the old one into `.bak-<stamp>` and the
+    /// OLD passphrase opened the copy. Now nothing of the old vault survives.
+    #[test]
+    fn import_over_an_existing_vault_leaves_no_old_passphrase_copies() {
+        let dir = scratch("import-discard");
+        let path = dir.join("vault.rbv");
+        let (mut old, _rk) = Vault::create(&path, "old-pass").unwrap();
+        old.add_credential("example.com", Some("example.com"), "alice", "secret-old", "")
+            .unwrap();
+        old.save().unwrap(); // rotates: a .bak-<stamp> copy now exists
+        old.save().unwrap();
+        let export = dir.join("export.rbx");
+        old.export_encrypted(&export, "export-pw").unwrap();
+        drop(old);
+        // Leftovers of every shape the writers can leave.
+        fs::write(dir.join("vault.rbv.bak-1234.tmp"), fs::read(&path).unwrap()).unwrap();
+        fs::write(dir.join(".tmp-0123456789abcdef0123456789abcdef"), fs::read(&path).unwrap()).unwrap();
+        age(&dir.join(".tmp-0123456789abcdef0123456789abcdef"));
+        // A Library-shaped temp file, an unrelated file, and files that only
+        // WEAR a leftover's name must all survive.
+        fs::write(dir.join(".tmp-ffffffffffffffffffffffffffffffff"), b"RBSTORE-not-a-vault").unwrap();
+        fs::write(dir.join("notes.txt"), b"mine").unwrap();
+        fs::write(dir.join("vault.rbv.bak-mine"), b"a note someone saved under this name").unwrap();
+        fs::write(dir.join("vault.rbv.tmp"), b"not a vault either").unwrap();
+        // ANOTHER vault parked under a leftover's name shares no salt with
+        // this one and must survive, as the rotation keeps it too.
+        let foreign_dir = scratch("import-discard-foreign");
+        let (mut foreign, _) = Vault::create(&foreign_dir.join("f.rbv"), "f").unwrap();
+        foreign.save().unwrap();
+        drop(foreign);
+        fs::write(dir.join("vault.rbv.bak-777"), fs::read(foreign_dir.join("f.rbv")).unwrap()).unwrap();
+        fs::write(dir.join(".tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), fs::read(foreign_dir.join("f.rbv")).unwrap()).unwrap();
+        let _ = fs::remove_dir_all(&foreign_dir);
+        assert!(siblings(&dir).iter().any(|n| n.starts_with("vault.rbv.bak-")));
+
+        let (imported, _r2, _carried) =
+            Vault::import_encrypted(&export, &path, "export-pw", "new-pass").unwrap();
+        drop(imported);
+
+        let left = siblings(&dir);
+        assert!(
+            !left.iter().any(|n| (n.starts_with("vault.rbv.bak-") && n != "vault.rbv.bak-mine" && n != "vault.rbv.bak-777")
+                || n == ".tmp-0123456789abcdef0123456789abcdef"),
+            "old-vault copies survived the import: {left:?}"
+        );
+        assert!(left.contains(&"vault.rbv.bak-777".to_string()), "a foreign vault was deleted under a backup name");
+        assert!(left.contains(&".tmp-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()), "a foreign vault was deleted under a temp name");
+        assert!(left.contains(&"vault.rbv.bak-mine".to_string()), "a non-vault file was deleted by name");
+        assert!(left.contains(&"vault.rbv.tmp".to_string()), "a non-vault file was deleted by name");
+        assert!(left.contains(&".tmp-ffffffffffffffffffffffffffffffff".to_string()));
+        assert!(left.contains(&"notes.txt".to_string()));
+        assert!(left.contains(&"export.rbx".to_string()));
+        assert!(Vault::unlock(&path, "new-pass").is_ok());
+        assert!(Vault::unlock(&path, "old-pass").is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A generation from before a passphrase change on a vault without a
+    /// recovery slot shares no salt with the current file. It is not deleted
+    /// on a guess and not passed off as handled: it stays, and the import
+    /// reports it. A copy a crash cut short inside its slots is still judged
+    /// by the salts it carries.
+    #[test]
+    fn an_unprovable_generation_is_kept_and_reported_and_a_cut_copy_is_judged() {
+        let dir = scratch("import-retained");
+        let path = dir.join("vault.rbv");
+        let mut v = Vault::create_without_recovery(&path, "first").unwrap();
+        v.save().unwrap();
+        // The generation a dying retirement would have left: a copy from
+        // before the passphrase change, under a backup name, planted AFTER
+        // the change (the change's own retirement would otherwise remove it,
+        // which is the crate working as designed).
+        let before_change = fs::read(&path).unwrap();
+        v.change_passphrase("first", "second").unwrap();
+        fs::write(dir.join("vault.rbv.bak-5"), &before_change).unwrap();
+        // A copy of the CURRENT file cut inside its single slot (salt present,
+        // key half present) under the writer's temp name: provably ours.
+        let current = fs::read(&path).unwrap();
+        fs::write(dir.join(".tmp-0123456789abcdef0123456789abcdef"), &current[..format::PREFIX_LEN + 30]).unwrap();
+        age(&dir.join(".tmp-0123456789abcdef0123456789abcdef"));
+        let export = dir.join("e.rbx");
+        v.export_encrypted(&export, "e").unwrap();
+        drop(v);
+        let (imported, _, _) = Vault::import_encrypted(&export, &path, "e", "third").unwrap();
+        assert_eq!(imported.import_retained_leftovers(), 1, "the pre-change generation must be counted");
+        drop(imported);
+        let left = siblings(&dir);
+        assert!(left.contains(&"vault.rbv.bak-5".to_string()), "an unprovable generation must be kept, not guessed away");
+        assert!(!left.contains(&".tmp-0123456789abcdef0123456789abcdef".to_string()), "a cut copy of the current vault must go");
+        assert!(Vault::unlock(&path, "third").is_ok());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A destination too damaged to read still has its backups counted: an
+    /// import over a truncated vault reports the intact backup it left.
+    /// A copy of this vault saved under another name beside it shares the
+    /// salts, and its save writes `.tmp-<hex>` then renames; the import must
+    /// not unlink that temp file in between. A fresh temp copy is kept and
+    /// counted; the same copy dated a day back is a crash's leftover and goes.
+    #[test]
+    fn a_fresh_temp_copy_is_a_save_in_flight_and_survives() {
+        let dir = scratch("import-fresh-temp");
+        let path = dir.join("vault.rbv");
+        let (mut v, _rk) = Vault::create(&path, "old").unwrap();
+        v.save().unwrap();
+        let export = dir.join("e.rbx");
+        v.export_encrypted(&export, "e").unwrap();
+        drop(v);
+        let fresh = dir.join(".tmp-0123456789abcdef0123456789abcdef");
+        let stale = dir.join(".tmp-89abcdef0123456789abcdef01234567");
+        fs::write(&fresh, fs::read(&path).unwrap()).unwrap();
+        fs::write(&stale, fs::read(&path).unwrap()).unwrap();
+        age(&stale);
+        let (imported, _, _) = Vault::import_encrypted(&export, &path, "e", "new").unwrap();
+        let left = siblings(&dir);
+        assert!(left.contains(&".tmp-0123456789abcdef0123456789abcdef".to_string()), "a fresh temp file may be a save in flight");
+        assert!(!left.contains(&".tmp-89abcdef0123456789abcdef01234567".to_string()), "an old temp copy is a crash's leftover");
+        assert_eq!(imported.import_retained_leftovers(), 1, "the kept temp copy must be reported");
+        assert!(!left.iter().any(|n| n.starts_with("vault.rbv.bak-")), "backups are named for this vault and go regardless of age");
+    }
+
+    #[test]
+    fn a_damaged_destination_still_counts_its_backups() {
+        let dir = scratch("import-damaged");
+        let path = dir.join("vault.rbv");
+        let (mut v, _) = Vault::create(&path, "old").unwrap();
+        v.save().unwrap();
+        let export = dir.join("e.rbx");
+        v.export_encrypted(&export, "e").unwrap();
+        drop(v);
+        fs::write(dir.join("vault.rbv.bak-5"), fs::read(&path).unwrap()).unwrap();
+        let whole = fs::read(&path).unwrap();
+        fs::write(&path, &whole[..10]).unwrap();
+        let (imported, _, _) = Vault::import_encrypted(&export, &path, "e", "n").unwrap();
+        // Two: the rotation's own backup from the save above, and the planted one.
+        assert_eq!(imported.import_retained_leftovers(), 2, "the backups of a damaged vault must be counted");
+        drop(imported);
+        assert!(siblings(&dir).contains(&"vault.rbv.bak-5".to_string()));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A symbolic link at the destination is refused before anything is
+    /// touched: replacing it by name would leave the real vault behind.
+    #[cfg(unix)]
+    #[test]
+    fn an_import_over_a_symlinked_destination_is_refused() {
+        let dir = scratch("import-symlink");
+        let real = dir.join("real.rbv");
+        let (mut v, _) = Vault::create(&real, "old").unwrap();
+        v.save().unwrap();
+        let export = dir.join("e.rbx");
+        v.export_encrypted(&export, "e").unwrap();
+        drop(v);
+        let link = dir.join("vault.rbv");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert!(Vault::import_encrypted(&export, &link, "e", "n").is_err());
+        assert!(Vault::unlock(&real, "old").is_ok(), "the real vault must be untouched");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// While another Vault holds the destination's lock, the import is
+    /// refused and nothing beside the vault is deleted.
+    #[test]
+    fn an_import_while_the_vault_is_held_deletes_nothing() {
+        let dir = scratch("import-held");
+        let path = dir.join("vault.rbv");
+        let (mut held, _) = Vault::create(&path, "old").unwrap();
+        held.save().unwrap();
+        held.save().unwrap();
+        let export = dir.join("e.rbx");
+        held.export_encrypted(&export, "e").unwrap();
+        let before = siblings(&dir);
+        assert!(before.iter().any(|n| n.starts_with("vault.rbv.bak-")));
+        assert!(Vault::import_encrypted(&export, &path, "e", "n").is_err(), "lock held, import must refuse");
+        assert_eq!(siblings(&dir), before, "a refused import must delete nothing");
+        drop(held);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A first import (no vault, no directory contents) removes nothing and
+    /// still succeeds.
+    #[test]
+    fn a_first_import_has_nothing_to_discard() {
+        let dir = scratch("import-first");
+        let src_dir = scratch("import-first-src");
+        let (mut v, _) = Vault::create(&src_dir.join("v.rbv"), "p").unwrap();
+        v.save().unwrap();
+        let export = src_dir.join("e.rbx");
+        v.export_encrypted(&export, "e").unwrap();
+        drop(v);
+        assert_eq!(discard_replaced_vault_leftovers(&dir.join("vault.rbv")).unwrap().removed, 0);
+        let (imported, _, _) = Vault::import_encrypted(&export, &dir.join("vault.rbv"), "e", "n").unwrap();
+        drop(imported);
+        assert!(!siblings(&dir).iter().any(|n| n.contains(".bak-")));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&src_dir);
     }
 }

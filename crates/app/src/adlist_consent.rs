@@ -353,7 +353,8 @@ pub enum LoadFailure {
 }
 
 /// WebKit's error domain for a policy refusal, and the code a content-filter
-/// block arrives with. MEASURED on WebKitGTK 2.52.6, 2026-09-15, rather than
+/// block arrives with. MEASURED on WebKitGTK 2.52.6, 2026-09-15, and again on
+/// 2.54.0, 2026-10-02 (unchanged), rather than
 /// read from a header: the failure reports domain `WebKitPolicyError` with
 /// code 104 and the message "The URL was blocked by a content blocker".
 pub const WEBKIT_POLICY_ERROR: &str = "WebKitPolicyError";

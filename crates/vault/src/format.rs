@@ -354,6 +354,30 @@ pub fn slot_prefixes_with_key_bytes(bytes: &[u8]) -> Option<Vec<&[u8]>> {
     Some(out)
 }
 
+/// The salt of every slot position whose salt bytes are present in `bytes`
+/// (a whole version 2 header, or one a crash cut short). Empty when `bytes`
+/// do not begin a version 2 header or no slot's salt is complete.
+pub fn slot_salts_present(bytes: &[u8]) -> Vec<[u8; SALT_LEN]> {
+    let mut out = Vec::new();
+    if !has_known_magic(bytes) || bytes.len() < PREFIX_LEN || bytes[7] != VERSION {
+        return out;
+    }
+    let slot_count = bytes[20] as usize;
+    if slot_count == 0 || slot_count > MAX_SLOTS {
+        return out;
+    }
+    for index in 0..slot_count {
+        let base = PREFIX_LEN + index * SLOT_LEN;
+        if bytes.len() < base + 1 + SALT_LEN {
+            break;
+        }
+        let mut salt = [0u8; SALT_LEN];
+        salt.copy_from_slice(&bytes[base + 1..base + 1 + SALT_LEN]);
+        out.push(salt);
+    }
+    out
+}
+
 /// The slots whose bytes are all present in `bytes`: a whole version 2 header,
 /// or the start of one that a crash cut short, which still carries every slot
 /// written before the cut. An empty list when not even one slot is complete.

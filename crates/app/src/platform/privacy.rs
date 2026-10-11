@@ -55,6 +55,12 @@ pub struct TabPolicy {
     pub javascript: bool,
     pub block_ads: bool,
     pub freeze_after_load: bool,
+    /// The YouTube page script (`YOUTUBE_ADS_SCRIPT`). Separate from
+    /// `block_ads` on purpose: YouTube changes often, and a person whose
+    /// video stops playing can turn this one off without losing the rest of
+    /// their blocking. Takes effect at the next YouTube page load (scripts
+    /// register per document; nothing is evaluated in a live page).
+    pub block_youtube_ads: bool,
 }
 
 impl Default for TabPolicy {
@@ -73,6 +79,7 @@ impl Default for TabPolicy {
             javascript: true,
             block_ads: true,
             freeze_after_load: false,
+            block_youtube_ads: true,
         }
     }
 }
@@ -88,6 +95,7 @@ impl TabPolicy {
             javascript: false,
             block_ads: true,
             freeze_after_load: true,
+            block_youtube_ads: true,
         }
     }
 
@@ -109,6 +117,7 @@ impl TabPolicy {
             javascript: true,
             block_ads: true,
             freeze_after_load: false,
+            block_youtube_ads: true,
         }
     }
 
@@ -471,6 +480,13 @@ pub struct EngineSettings {
     /// port deliberately accepts nothing, so the tunnel is not carrying
     /// traffic and the row must say so -- as well as "broken".
     pub tunnel: &'static str,
+    /// Per-tab, read back from the engine: whether this tab's WebKitGTK
+    /// context confines its web and network processes in the engine's
+    /// bubblewrap/seccomp sandbox (`is_sandbox_enabled`). Always
+    /// "not_attempted" on Windows, where WebView2's own process model
+    /// applies and nothing here asks for it. Added after the 2026-10-08
+    /// audit found every Linux web process running unconfined.
+    pub sandbox: &'static str,
 }
 
 impl SettingState {
@@ -559,6 +575,110 @@ impl InterceptionState {
 /// on that inhibition); an explicit `freeze()` is always honoured because it
 /// is the user's stated intent, and is therefore the control to reach for
 /// when the heuristic is wrong in either direction.
+/// WebKitGTK's freeze is a compiled content filter, compiled asynchronously.
+/// This keeps the two facts that must not be confused apart: which freeze
+/// filter the tab WANTS (the latest request) and which are INSTALLED in the
+/// engine. Pure, so every rule is tested here; unix.rs does the engine calls
+/// it returns.
+///
+/// The rules:
+/// - A replacement freeze (allowing one host on a frozen tab) does not remove
+///   the old filter when it is requested. The old one stays until the new one
+///   is installed, so a frozen tab never has a moment with no freeze.
+/// - A compile result for anything but the current request, or after the tab
+///   stopped being frozen, changes nothing: success installs nothing, failure
+///   reports nothing.
+/// - Lifting removes every installed freeze filter and nothing else.
+#[derive(Clone, Debug, Default)]
+pub struct FreezeFilterBook {
+    /// The filter id AND a generation: ids are hashes of the rules, so two
+    /// freezes with the same exceptions share an id, and only the generation
+    /// tells a stale compile from the current one.
+    wanted: Option<(String, u64)>,
+    installed: Vec<String>,
+    next_generation: u64,
+    /// The hosts the wanted filter lets through, and the ones the installed
+    /// filter does: when a replacement fails while the old filter still
+    /// blocks, the tab's exceptions go back to the installed set, or the
+    /// panel would show a host as allowed that is still blocked (final
+    /// review, R-003).
+    wanted_hosts: Vec<String>,
+    installed_hosts: Option<Vec<String>>,
+}
+
+/// What to do with a freeze filter whose compile just finished.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CompiledFreeze {
+    /// Add it to the engine, then remove these (superseded) freeze filters.
+    Install { remove: Vec<String> },
+    /// Stale: add nothing, report nothing.
+    Discard,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+impl FreezeFilterBook {
+    /// Ask for `id`; returns the generation the compile must quote back.
+    pub fn request(&mut self, id: String) -> u64 {
+        self.request_with_hosts(id, Vec::new())
+    }
+
+    /// Ask for `id`, a filter that lets `hosts` through.
+    pub fn request_with_hosts(&mut self, id: String, hosts: Vec<String>) -> u64 {
+        self.next_generation += 1;
+        self.wanted = Some((id, self.next_generation));
+        self.wanted_hosts = hosts;
+        self.next_generation
+    }
+
+    /// The hosts the installed freeze filter lets through, if one is in.
+    pub fn installed_hosts(&self) -> Option<Vec<String>> {
+        self.installed_hosts.clone()
+    }
+
+    fn is_current(&self, id: &str, generation: u64) -> bool {
+        self.wanted
+            .as_ref()
+            .is_some_and(|(w, g)| w == id && *g == generation)
+    }
+
+    pub fn on_compiled(&mut self, id: &str, generation: u64, still_frozen: bool) -> CompiledFreeze {
+        if !still_frozen || !self.is_current(id, generation) {
+            return CompiledFreeze::Discard;
+        }
+        let remove = self
+            .installed
+            .iter()
+            .filter(|x| x.as_str() != id)
+            .cloned()
+            .collect();
+        self.installed = vec![id.to_string()];
+        self.installed_hosts = Some(self.wanted_hosts.clone());
+        CompiledFreeze::Install { remove }
+    }
+
+    /// Whether a failed compile of `id` is about the freeze the tab wants
+    /// now. A failure for a superseded request must not mark the current
+    /// freeze as failed.
+    pub fn failure_is_current(&self, id: &str, generation: u64) -> bool {
+        self.is_current(id, generation)
+    }
+
+    /// Whether a freeze filter is actually in the engine. A replacement that
+    /// fails to compile leaves the previous one enforcing; a first freeze
+    /// that fails leaves nothing.
+    pub fn has_installed(&self) -> bool {
+        !self.installed.is_empty()
+    }
+
+    /// The freeze ends: every installed freeze filter comes off.
+    pub fn lift(&mut self) -> Vec<String> {
+        self.wanted = None;
+        self.wanted_hosts.clear();
+        self.installed_hosts = None;
+        std::mem::take(&mut self.installed)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct FreezeController {
     auto: bool,
@@ -599,6 +719,13 @@ impl FreezeController {
 
     pub fn phase(&self) -> FreezePhase {
         self.phase
+    }
+
+    /// Frozen by the heuristic (Strict Tab's freeze-after-load), not by the
+    /// user. This is the freeze that yields to the next top-level navigation;
+    /// a manual one never does.
+    pub fn is_auto_frozen(&self) -> bool {
+        self.phase == FreezePhase::Frozen && !self.manual
     }
 
     /// Whether the engine-level block behind a freeze is ACTUALLY in place.
@@ -735,6 +862,12 @@ impl FreezeController {
 
     pub fn add_override(&mut self, host: &str) {
         self.overrides.insert(host.to_lowercase());
+    }
+
+    /// Replace the exceptions with `hosts`: what an installed filter really
+    /// lets through, after a replacement carrying more failed to install.
+    pub fn set_overrides(&mut self, hosts: Vec<String>) {
+        self.overrides = hosts.into_iter().collect();
     }
 
     /// Sorted (BTreeSet) so the unix freeze filter's JSON is deterministic.
@@ -926,6 +1059,16 @@ pub struct TabState {
     pub policy: TabPolicy,
     pub ledger: Ledger,
     pub freeze: FreezeController,
+    /// WebKitGTK only: which freeze filter the tab wants and which are in
+    /// the engine. See `FreezeFilterBook`.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub freeze_filters: FreezeFilterBook,
+    /// WebKitGTK only: this top-level load began on an auto-frozen tab and
+    /// the freeze was lifted at its start, so a content-blocker refusal of
+    /// THIS document belongs to the freeze, not the ad list. Cleared when
+    /// the next load starts or this one finishes.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub freeze_lifted_this_load: bool,
     /// The one host this tab may reach despite the ad/tracker list, after the
     /// user answered the held-page banner.
     ///
@@ -1011,6 +1154,9 @@ pub struct TabState {
     /// and SmartScreen stays ON, sending every URL the user visits to
     /// Microsoft -- in a browser sold on privacy. That has to be visible.
     pub smartscreen_off: SettingState,
+    /// Whether the engine confirmed its process sandbox for this tab's
+    /// context (WebKitGTK `is_sandbox_enabled`). `NotAttempted` on Windows.
+    pub sandbox: SettingState,
     /// Which tracking-prevention level was actually accepted. Needs Runtime
     /// 111+; `Failed` means the requested level was not confirmed.
     pub tracking_prevention: TrackingPreventionState,
@@ -1094,6 +1240,22 @@ pub struct TabState {
     /// swapped through the content manager instead, and on a tab whose
     /// registration the engine refused.
     pub scrollbar_script_id: Option<String>,
+    /// Windows: the engine's id for this tab's YouTube ad script, so turning
+    /// the switch off can remove it. `youtube_script_adding` covers the one
+    /// COM round trip before the id arrives: the completion handler reads the
+    /// policy again and removes the script itself if the switch went off
+    /// meanwhile. Unused on unix, which keeps the script object instead.
+    pub youtube_script_id: Option<String>,
+    pub youtube_script_adding: bool,
+}
+
+/// See `TabState::youtube_script_step`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub enum YoutubeScriptStep {
+    Add,
+    Remove,
+    Nothing,
 }
 
 /// A committed document's standing for the local-network boundary.
@@ -1254,6 +1416,8 @@ impl TabState {
             policy: policy.clone(),
             ledger: Ledger::default(),
             freeze: FreezeController::new(policy.freeze_after_load),
+            freeze_filters: FreezeFilterBook::default(),
+            freeze_lifted_this_load: false,
             adlist_override: None,
             toplevel: crate::toplevel_request::TopLevelRequests::default(),
             last_top_level_method: "GET".to_string(),
@@ -1267,6 +1431,7 @@ impl TabState {
             interception: InterceptionState::NotAttempted,
             script_setting: SettingState::NotAttempted,
             smartscreen_off: SettingState::NotAttempted,
+            sandbox: SettingState::NotAttempted,
             tracking_prevention: TrackingPreventionState::NotAttempted,
             navigation_tracking: SettingState::NotAttempted,
             autofill_off: SettingState::NotAttempted,
@@ -1281,6 +1446,8 @@ impl TabState {
             new_window_tracking: false,
             permissions_registered: SettingState::NotAttempted,
             scrollbar_script_id: None,
+            youtube_script_id: None,
+            youtube_script_adding: false,
         }
     }
 
@@ -1473,7 +1640,30 @@ impl TabState {
     /// it is recorded and diagnosed); only "no answer yet" holds it.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn initial_navigation_ready(&self) -> bool {
-        !self.waiting_for_wipe && self.local_network_guard != SettingState::NotAttempted
+        // The YouTube ad script counts too: a first page created before its
+        // registration is answered would show ads with the switch on (final
+        // review YT R-001). Its overdue release is the guard's timer below.
+        !self.waiting_for_wipe
+            && self.local_network_guard != SettingState::NotAttempted
+            && !self.youtube_script_adding
+    }
+
+    /// What to do with this tab's YouTube ad script registration (Windows,
+    /// `sync_youtube_script`), from what is wanted and what is in place. A
+    /// registration still in flight is left alone either way: its completion
+    /// handler reads the policy again and keeps or removes what it added.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn youtube_script_step(&self) -> YoutubeScriptStep {
+        match (
+            self.policy.block_youtube_ads,
+            self.youtube_script_id.is_some(),
+            self.youtube_script_adding,
+        ) {
+            (_, _, true) => YoutubeScriptStep::Nothing,
+            (true, false, false) => YoutubeScriptStep::Add,
+            (false, true, false) => YoutubeScriptStep::Remove,
+            _ => YoutubeScriptStep::Nothing,
+        }
     }
 
     /// The engine accepted the guard's registration call but has not
@@ -1483,11 +1673,19 @@ impl TabState {
     /// answer still records what the engine said.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn on_local_network_guard_overdue(&mut self) -> bool {
-        if self.local_network_guard != SettingState::NotAttempted {
-            return false;
+        let mut changed = false;
+        if self.local_network_guard == SettingState::NotAttempted {
+            self.local_network_guard = SettingState::Failed;
+            changed = true;
         }
-        self.local_network_guard = SettingState::Failed;
-        true
+        // The same timer releases a YouTube ad script registration that was
+        // never answered, so neither one can hold a tab blank forever. A late
+        // answer is still handled (the completion handler keeps one copy).
+        if self.youtube_script_adding {
+            self.youtube_script_adding = false;
+            changed = true;
+        }
+        changed
     }
 
     /// WebView2 `NewWindowRequested`, raised while the page that asked is
@@ -2658,6 +2856,27 @@ pub const DIVERGENCE_TEMPLATE: &str = include_str!("../content_scripts/fingerpri
 #[cfg_attr(not(windows), allow(dead_code))]
 pub const LOCAL_NETWORK_GUARD_SCRIPT: &str = include_str!("../content_scripts/local_network_guard.js");
 
+/// Removes YouTube's video ads and sponsored items from the page's own data
+/// before the player reads it; see the script's header. Registered at
+/// document start, every frame, while `TabPolicy::block_youtube_ads` is on.
+/// The script checks the host itself first (WebView2 cannot scope a
+/// registration to a site); WebKitGTK additionally gets
+/// `YOUTUBE_URL_PATTERNS`, so on Linux it is not even loaded elsewhere.
+/// Gated by scripts/youtube-ads-gate.js.
+pub const YOUTUBE_ADS_SCRIPT: &str = include_str!("../content_scripts/youtube_ads.js");
+
+/// The hosts the YouTube script acts on, as WebKit URL patterns. Must name
+/// exactly the hosts in the script's own `HOSTS` set (a test pins both).
+#[cfg_attr(windows, allow(dead_code))]
+pub const YOUTUBE_URL_PATTERNS: &[&str] = &[
+    "https://www.youtube.com/*",
+    "https://youtube.com/*",
+    "https://m.youtube.com/*",
+    "https://music.youtube.com/*",
+    "https://www.youtube-nocookie.com/*",
+    "https://youtube-nocookie.com/*",
+];
+
 /// (normal, ephemeral). `None` inside the OnceLock records that OS
 /// randomness failed at first use; every later call then skips divergence
 /// rather than retrying into a half-seeded session.
@@ -2741,6 +2960,107 @@ pub fn divergence_script(ephemeral: bool) -> Option<String> {
         ephemeral,
         &crate::state::divergence_overrides_snapshot(),
     )
+}
+
+#[cfg(test)]
+mod youtube_ads_tests {
+    use super::{
+        SettingState, TabPolicy, TabState, YoutubeScriptStep, YOUTUBE_ADS_SCRIPT,
+        YOUTUBE_URL_PATTERNS,
+    };
+
+    fn tab(on: bool) -> TabState {
+        let mut st = TabState::new(&TabPolicy {
+            block_youtube_ads: on,
+            ..TabPolicy::default()
+        });
+        st.local_network_guard = SettingState::Applied;
+        st
+    }
+
+    /// Windows' add/remove decisions, every combination: an in-flight
+    /// registration is never doubled or raced, and removal needs an id.
+    #[test]
+    fn the_registration_step_follows_the_switch_and_never_doubles() {
+        let mut st = tab(true);
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Add);
+        st.youtube_script_adding = true;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "a second add while one is in flight");
+        st.policy.block_youtube_ads = false;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "the handler decides an in-flight add");
+        st.youtube_script_adding = false;
+        st.youtube_script_id = Some("1".into());
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Remove);
+        st.policy.block_youtube_ads = true;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "already registered");
+        st.policy.block_youtube_ads = false;
+        st.youtube_script_id = None;
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "off and nothing in place");
+    }
+
+    /// The first page waits for the YouTube registration's answer, and the
+    /// guard's overdue timer releases it if no answer ever comes.
+    #[test]
+    fn the_first_page_waits_for_the_registration_but_never_forever() {
+        let mut st = tab(true);
+        assert!(st.initial_navigation_ready());
+        st.youtube_script_adding = true;
+        assert!(!st.initial_navigation_ready(), "first page created before the script was registered");
+        assert!(st.on_local_network_guard_overdue(), "overdue must release the YouTube wait");
+        assert!(st.initial_navigation_ready());
+        assert!(!st.on_local_network_guard_overdue(), "nothing left to release");
+    }
+
+    /// The hosts in the script's own check and the WebKit patterns must be
+    /// the same list: a host in one and not the other is either a page the
+    /// script never reaches on Linux, or one it acts on only on Windows.
+    #[test]
+    fn script_hosts_and_url_patterns_name_the_same_hosts() {
+        let start = YOUTUBE_ADS_SCRIPT.find("const HOSTS = new Set([").expect("HOSTS set");
+        let end = start + YOUTUBE_ADS_SCRIPT[start..].find("]);").expect("end of HOSTS");
+        let mut in_script: Vec<&str> = YOUTUBE_ADS_SCRIPT[start..end]
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .collect();
+        let mut in_patterns: Vec<&str> = YOUTUBE_URL_PATTERNS
+            .iter()
+            .map(|p| {
+                p.strip_prefix("https://")
+                    .and_then(|r| r.strip_suffix("/*"))
+                    .expect("https://<host>/* pattern")
+            })
+            .collect();
+        in_script.sort_unstable();
+        in_patterns.sort_unstable();
+        assert_eq!(in_script, in_patterns);
+        assert!(in_script.iter().all(|h| *h == "youtube.com"
+            || h.ends_with(".youtube.com")
+            || *h == "youtube-nocookie.com"
+            || h.ends_with(".youtube-nocookie.com")));
+    }
+
+    /// The host check is the first thing the script does: on Windows it is
+    /// the only thing keeping the hooks off every other site.
+    #[test]
+    fn the_script_checks_the_host_before_touching_anything() {
+        let gate = YOUTUBE_ADS_SCRIPT.find("if (!HOSTS.has(host)) return;").expect("host gate");
+        for hook in ["defineProperty(Win", "XHR.prototype", "createElement"] {
+            let at = YOUTUBE_ADS_SCRIPT.find(hook).unwrap_or_else(|| panic!("{hook} missing"));
+            assert!(gate < at, "{hook} comes before the host check");
+        }
+        assert!(!YOUTUBE_ADS_SCRIPT.to_ascii_lowercase().contains("patanyx"));
+    }
+
+    /// On by default in every preset: a person who installs an ad-blocking
+    /// browser gets it without hunting for a switch, and turns it off only if
+    /// YouTube breaks.
+    #[test]
+    fn every_preset_blocks_youtube_ads() {
+        assert!(TabPolicy::default().block_youtube_ads);
+        assert!(TabPolicy::quarantine().block_youtube_ads);
+        assert!(TabPolicy::ephemeral().block_youtube_ads);
+    }
 }
 
 #[cfg(test)]
@@ -2975,6 +3295,13 @@ mod shipped_adlist_guard {
     //! that one, and with consent stored the same page worked with every
     //! other rule still on.
     //!
+    //! `guc-spclient.spotify.com` is the same mistake on another site. It is
+    //! the client API the Spotify web player registers itself through as a
+    //! playback device, filed upstream under Tracking. Refused, the player
+    //! signs in and can steer a phone but cannot play in the browser; found on
+    //! Windows 1.0.x, where turning ad and tracker blocking off made the same
+    //! page play.
+    //!
     //! These names are in `scripts/adlist-allow.txt`, so a regeneration drops
     //! them again. This test is the part that fails loudly if one comes back
     //! by another route.
@@ -2993,6 +3320,12 @@ mod shipped_adlist_guard {
             "t2.gstatic.com",
             "geo1.ggpht.com",
             "geo3.ggpht.com",
+            // Spotify's playback gateway: the web player cannot play without it.
+            "guc-spclient.spotify.com",
+            // Instagram's own API (scripts/adlist-allow.txt, 2026-10-10).
+            "gateway.instagram.com",
+            "graphql.instagram.com",
+            "graph-fallback.instagram.com",
         ] {
             assert!(
                 !rules.blocks_host(host),
@@ -3006,7 +3339,17 @@ mod shipped_adlist_guard {
         // The counterpart assertion. Without it, "fix the breakage" could be
         // satisfied by shipping an empty list, and this test would still pass.
         let rules = RuleSet::from_lines(&format!("{ADLIST_ADS}\n{ADLIST_TRACKING}"));
-        for host in ["csi.gstatic.com", "metric.gstatic.com", "google-analytics.com"] {
+        for host in [
+            "csi.gstatic.com",
+            "metric.gstatic.com",
+            "google-analytics.com",
+            // Spotify's ads and telemetry stay refused; only the playback
+            // gateway was let through.
+            "pixel.spotify.com",
+            "adeventtracker.spotify.com",
+            "crashdump.spotify.com",
+            "ads.spotify.com",
+        ] {
             assert!(rules.blocks_host(host), "{host} should still be blocked");
         }
     }
@@ -3431,6 +3774,30 @@ mod tests {
         // curated-to-bigger-list swap quietly UNBLOCKED something.
         assert!(bundled_rules().blocks_host("connect.facebook.net"));
         assert!(bundled_ads().blocks_host("connect.facebook.net"));
+    }
+
+    #[test]
+    fn dailymotion_plays_with_its_ad_servers_blocked() {
+        // scripts/adlist-allow.txt, 2026-10-10. Two hosts the player cannot
+        // start without: dmxleo (the video CDN; upstream lists it as an ad
+        // host) and dmads (its ad LIBRARY, which only asks the ad servers).
+        // Either blocked, "Playback error" on every video. Both allowed, loads
+        // with no ad scheduled play; loads that schedule an ad still fail
+        // (open, ads-notes/P0-RESULTS.md item 3). The ad SERVERS stay blocked.
+        assert!(bundled_rules().blocks_host("pubads.g.doubleclick.net"));
+        assert!(bundled_rules().blocks_host("pebed.dm-event.net"));
+        for host in [
+            "dmads.dailymotion.com",
+            "www.dailymotion.com",
+            "dailymotion.com",
+            "geo.dailymotion.com",
+            "static1.dmcdn.net",
+            "dmxleo.dailymotion.com",
+            "dmxleo.com",
+            "cdndirector.dailymotion.com",
+        ] {
+            assert!(!bundled_rules().blocks_host(host), "{host} must not be blocked");
+        }
     }
 
     #[test]
@@ -4072,6 +4439,167 @@ mod tests {
             TabPolicy::default().requested_profile_mode(),
             ProfileMode::Persistent
         );
+    }
+
+    #[test]
+    fn a_replacement_freeze_keeps_the_old_one_until_it_is_installed() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        assert_eq!(book.on_compiled("a", ga, true), CompiledFreeze::Install { remove: vec![] });
+        assert!(book.has_installed());
+        // Allow one host: a new filter is requested; the old one is NOT
+        // removed on request, only once the new one is in.
+        let gb = book.request("b".into());
+        assert!(book.has_installed(), "the old freeze still enforces while b compiles");
+        assert_eq!(
+            book.on_compiled("b", gb, true),
+            CompiledFreeze::Install { remove: vec!["a".into()] }
+        );
+    }
+
+    #[test]
+    fn stale_compiles_change_nothing_success_or_failure() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        let gb = book.request("b".into());
+        assert_eq!(book.on_compiled("a", ga, true), CompiledFreeze::Discard, "superseded success");
+        assert!(!book.failure_is_current("a", ga), "superseded failure must not mark b failed");
+        assert!(book.failure_is_current("b", gb));
+        // A compile finishing after the tab thawed installs nothing.
+        let mut thawed = FreezeFilterBook::default();
+        let gc = thawed.request("c".into());
+        assert_eq!(thawed.on_compiled("c", gc, false), CompiledFreeze::Discard);
+        let _ = thawed.lift();
+        assert!(!thawed.failure_is_current("c", gc));
+    }
+
+    #[test]
+    fn the_same_rules_in_a_new_freeze_are_not_mistaken_for_the_old_compile() {
+        // Freeze, unfreeze, freeze again with the same exceptions: both
+        // compiles carry the same id. Only the generation separates them.
+        let mut book = FreezeFilterBook::default();
+        let g1 = book.request("same".into());
+        let _ = book.lift();
+        let g2 = book.request("same".into());
+        assert_ne!(g1, g2);
+        assert!(!book.failure_is_current("same", g1), "the old compile's failure is stale");
+        assert_eq!(book.on_compiled("same", g1, true), CompiledFreeze::Discard);
+        assert_eq!(book.on_compiled("same", g2, true), CompiledFreeze::Install { remove: vec![] });
+    }
+
+    #[test]
+    fn a_failed_replacement_leaves_the_installed_filters_hosts() {
+        // Final review (R-003): allowing a host builds a replacement filter;
+        // if it fails to install, the old one still blocks that host, and
+        // the exceptions must say so.
+        let mut book = FreezeFilterBook::default();
+        let g1 = book.request_with_hosts("a".into(), vec!["one.example".into()]);
+        let _ = book.on_compiled("a", g1, true);
+        let g2 = book.request_with_hosts("b".into(), vec!["one.example".into(), "two.example".into()]);
+        assert!(book.failure_is_current("b", g2) && book.has_installed());
+        assert_eq!(book.installed_hosts(), Some(vec!["one.example".to_string()]));
+        let mut freeze = FreezeController::new(true);
+        freeze.add_override("one.example");
+        freeze.add_override("two.example");
+        freeze.set_overrides(book.installed_hosts().unwrap());
+        assert_eq!(freeze.overrides(), vec!["one.example".to_string()]);
+        let _ = book.lift();
+        assert_eq!(book.installed_hosts(), None);
+    }
+
+    #[test]
+    fn lifting_removes_every_installed_freeze_and_only_those() {
+        let mut book = FreezeFilterBook::default();
+        let ga = book.request("a".into());
+        let _ = book.on_compiled("a", ga, true);
+        assert_eq!(book.lift(), vec!["a".to_string()]);
+        assert_eq!(book.lift(), Vec::<String>::new(), "nothing left to lift");
+        assert!(!book.has_installed());
+    }
+
+    #[test]
+    fn the_linux_auto_freeze_timer_records_an_automatic_freeze() {
+        // Pinned against the source: the bug this guards was the timer
+        // calling `freeze()` (the manual one), which survives navigation, so
+        // every Linux Strict Tab refused the next typed address.
+        let unix = include_str!("unix.rs");
+        let at = unix.find("fn schedule_auto_freeze(").expect("unix.rs has schedule_auto_freeze");
+        let body = &unix[at..at + unix[at..].find("\n}\n").expect("end of fn")];
+        assert!(body.contains("st.freeze.freeze_auto_now();"), "the timer must record an AUTO freeze");
+        assert!(!body.contains("st.freeze.freeze();"), "the timer must not record a manual freeze");
+    }
+
+    #[test]
+    fn linux_freeze_changes_outside_a_load_refresh_the_toolbar() {
+        // Pinned against the source. The Linux event loop has no auto-freeze
+        // tick (tick_auto_freeze returns nothing there), so a freeze state
+        // that changes from a GTK callback, or from a navigation that never
+        // becomes a load, reaches the toolbar ONLY through this wake. Without
+        // it the chip said Live on a frozen tab, "Freezing..." on an
+        // installed freeze, and Frozen on a thawed one.
+        let unix = include_str!("unix.rs");
+        let body = |name: &str| {
+            let at = unix.find(name).unwrap_or_else(|| panic!("unix.rs has {name}"));
+            &unix[at..at + unix[at..].find("\n}\n").expect("end of fn")]
+        };
+        for f in [
+            "fn connect_load_events(",
+            "fn schedule_auto_freeze(",
+            "pub fn yield_auto_freeze(",
+            "fn report_freeze_failure(",
+        ] {
+            assert!(
+                body(f).contains("wake_freeze_status();"),
+                "{f} must refresh the toolbar"
+            );
+        }
+        // Each completion branch on its own: one branch's wake must not
+        // satisfy the other's assertion.
+        let saved = body("unsafe extern \"C\" fn on_filter_saved(");
+        let between = |from: &str, to: &str| {
+            let rest = &saved[saved.find(from).unwrap_or_else(|| panic!("no {from}"))..];
+            &rest[..rest.find(to).unwrap_or_else(|| panic!("no {to} after {from}"))]
+        };
+        let installed = between("note_enforced();", "} else if");
+        assert!(
+            installed.contains("wake_freeze_status();"),
+            "an installed freeze must refresh the toolbar"
+        );
+        let no_filter = between("Neither an error nor a filter", "g_object_unref");
+        assert!(
+            no_filter.contains("note_enforcement_failed();"),
+            "the no-filter branch reports the failure"
+        );
+        assert!(
+            no_filter.contains("wake_freeze_status();"),
+            "a freeze that came back with no filter must refresh the toolbar"
+        );
+    }
+
+    #[test]
+    fn only_the_heuristic_freeze_counts_as_auto_frozen() {
+        // The Linux timer used to record the heuristic as a manual freeze,
+        // which survives navigation by design, so a Strict Tab refused every
+        // address typed into it. Auto and manual must stay distinguishable.
+        let mut auto = FreezeController::new(true);
+        auto.on_load_finished(Instant::now());
+        auto.freeze_auto_now();
+        assert!(auto.is_auto_frozen());
+        auto.on_load_started();
+        assert_eq!(auto.phase(), FreezePhase::Loading, "an auto freeze yields to a navigation");
+        assert!(!auto.is_auto_frozen());
+
+        let mut manual = FreezeController::new(true);
+        manual.freeze();
+        assert!(!manual.is_auto_frozen(), "a manual freeze is not the heuristic");
+        manual.on_load_started();
+        assert_eq!(manual.phase(), FreezePhase::Frozen, "a manual freeze survives navigation");
+
+        let mut thawed = FreezeController::new(true);
+        thawed.on_load_finished(Instant::now());
+        thawed.freeze_auto_now();
+        thawed.unfreeze(Instant::now());
+        assert!(!thawed.is_auto_frozen());
     }
 
     /// The displayed storage mode follows the ENGINE, not the request.

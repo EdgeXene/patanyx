@@ -219,7 +219,22 @@ pub struct Shelf {
     /// shape is the feature's privacy contract and is pinned by a test.
     #[serde(default)]
     pub note: String,
+    /// Set when the shelf was saved from a Tab Group: the group's name and
+    /// color, so restoring the shelf brings the group back. ADDITIVE, the
+    /// same way `note` is: older shelves have none, older builds ignore the
+    /// key, `SCHEMA_VERSION` stays put. Omitted from the file when absent,
+    /// so a shelf saved without a group is byte-for-byte what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<ShelfGroup>,
     pub tabs: Vec<ShelfTab>,
+}
+
+/// A Tab Group's look, kept with a shelf saved from it. Nothing about the
+/// tabs goes here; they stay the two-key `ShelfTab`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShelfGroup {
+    pub name: String,
+    pub color: String,
 }
 
 /// One tab on a shelf: title + URL. Nothing else is stored anywhere in the
@@ -240,6 +255,17 @@ impl StoreData {
         tabs: Vec<ShelfTab>,
         created_at: u64,
     ) -> Shelf {
+        self.plan_new_shelf_grouped(name, tabs, None, created_at)
+    }
+
+    /// `plan_new_shelf` for a shelf saved from a Tab Group.
+    pub fn plan_new_shelf_grouped(
+        &mut self,
+        name: String,
+        tabs: Vec<ShelfTab>,
+        group: Option<ShelfGroup>,
+        created_at: u64,
+    ) -> Shelf {
         let seq = self.next_shelf_seq;
         self.next_shelf_seq += 1;
         let shelf = Shelf {
@@ -248,6 +274,7 @@ impl StoreData {
             seq,
             created_at,
             note: String::new(),
+            group,
             tabs,
         };
         self.shelves.push(shelf.clone());
@@ -434,6 +461,32 @@ mod tests {
         let mut keys: Vec<&str> = object.keys().map(String::as_str).collect();
         keys.sort();
         assert_eq!(keys, vec!["title", "url"]);
+    }
+
+    #[test]
+    fn a_shelf_without_a_group_serializes_exactly_as_before() {
+        let mut data = StoreData::default();
+        let plain = data.plan_new_shelf("s".to_string(), vec![], 1);
+        let value = serde_json::to_value(&plain).expect("serializes");
+        assert!(value.get("group").is_none(), "no group key on an ungrouped shelf");
+        // An older file, with no group key at all, still reads.
+        let old = r#"{"id":"shelf-9","name":"n","seq":9,"created_at":1,"tabs":[]}"#;
+        let back: Shelf = serde_json::from_str(old).expect("older shelf reads");
+        assert_eq!(back.group, None);
+    }
+
+    #[test]
+    fn a_grouped_shelf_roundtrips_its_group() {
+        let mut data = StoreData::default();
+        let shelf = data.plan_new_shelf_grouped(
+            "Trip".to_string(),
+            vec![],
+            Some(ShelfGroup { name: "Trip".into(), color: "blue".into() }),
+            1,
+        );
+        let text = serde_json::to_string(&shelf).expect("serialize");
+        let back: Shelf = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back.group.unwrap().color, "blue");
     }
 
     #[test]

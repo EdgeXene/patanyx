@@ -1,4 +1,4 @@
-# PATANYX ad and tracker rules: Ads -- 27601 hosts.
+# PATANYX ad and tracker rules: Ads -- 27600 hosts.
 # Regenerate with scripts/build-adlist.sh. Retrieved 2026-09-01.
 #
 # Source: ShadowWhisperer -- https://github.com/ShadowWhisperer/BlockLists --
@@ -12236,7 +12236,6 @@ dmsgroup.com
 dmskgo.com
 dmstrk.com
 dmv-passing.com
-dmxleo.dailymotion.com
 dmzjmp.com
 dn0qt3r0xannq.cloudfront.net
 dnaads.com

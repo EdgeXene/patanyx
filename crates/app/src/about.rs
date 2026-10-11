@@ -350,6 +350,33 @@ const F_BOOKMARKS: Feature = (
      you search for. You can also empty the whole manager in one go, which \
      asks first and cannot be undone.",
 );
+// Checkable against code: the article comes from the main-resource bytes the
+// engine already received (reader_view.rs), rendered as plain text
+// (crates/reader emits typed blocks, chrome.js draws them with textContent).
+// "Loads nothing new" was measured on WebKitGTK (zero requests to the page's
+// server while opening and scrolling it, 2026-10-06) and must be measured on
+// WebView2 before a Windows release carries this row.
+const F_READER: Feature = (
+    "Reader View",
+    "On demand",
+    "Press F9, or Reader View in the toolbar, to read the article on the \
+     current page as plain text, without the menus, ads and pop-ups around it. \
+     It uses the copy of the page this tab already received, so it loads \
+     nothing new. Images are left out and their captions stay. A page built \
+     entirely by scripts has no text for it to show.",
+);
+// Checkable against code: groups live in AppState only (tab_groups.rs) and
+// are never written; "Shelve this group" goes through the encrypted
+// store's shelves, which already exclude ephemeral and Strict tabs.
+const F_TAB_GROUPS: Feature = (
+    "Tab Groups",
+    "On demand",
+    "Right-click a tab, or use Groups in the toolbar, to put tabs in a named, \
+     colored group that stays together in the tab strip and folds away with \
+     one click. Groups last until you close PATANYX. To keep one, shelve it: \
+     its tabs close, the group goes to your encrypted Library, and restoring \
+     the shelf brings it back.",
+);
 const F_TUNNEL: Feature = (
     "Private Tunnel",
     // FREE (decided 2026-08-05): the tunnel costs EdgeXene
@@ -526,6 +553,8 @@ fn features() -> Vec<Feature> {
         // custody model and unlock with it, so the two belong together
         // rather than the manager sitting among the protections.
         F_BOOKMARKS,
+        F_READER,
+        F_TAB_GROUPS,
         F_TUNNEL,
         F_OCR,
         F_INTEGRITY,

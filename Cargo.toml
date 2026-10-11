@@ -4,7 +4,7 @@ resolver = "2"
 # proprietary server infrastructure and lives in its own repository at
 # ../patanyx-relay, consuming the open chat and licence crates by path. The
 # wire protocol it speaks stays open here, in crates/chat.
-members = ["crates/vault", "crates/app", "crates/ocr", "crates/chat", "crates/integrity", "crates/store", "crates/corroborate", "crates/update", "crates/tunnel", "crates/licence"]
+members = ["crates/vault", "crates/app", "crates/ocr", "crates/chat", "crates/integrity", "crates/store", "crates/corroborate", "crates/update", "crates/tunnel", "crates/licence", "crates/reader"]
 
 [patch.crates-io]
 # wry 0.55.1 installs a frozen window.ipc in every content page even when the

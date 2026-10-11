@@ -339,6 +339,55 @@ fn running_platform() -> Option<Platform> {
     .ok()
 }
 
+/// This machine's web engine, read once, owned, for the update decision.
+///
+/// It gates installs on Linux only: there a release build refuses to start
+/// below its compiled WebKitGTK floor, so installing a release whose floor
+/// this machine does not meet would leave a browser that does not open.
+/// WebView2 updates itself and a below-floor runtime still starts.
+struct EngineSnapshot {
+    name: &'static str,
+    version: Option<Vec<u32>>,
+    gates: bool,
+}
+
+impl EngineSnapshot {
+    fn now() -> Self {
+        let info = crate::platform::engine_info();
+        Self {
+            name: info.name,
+            version: info.version,
+            gates: cfg!(target_os = "linux"),
+        }
+    }
+
+    fn running(&self) -> patanyx_update::RunningEngine<'_> {
+        patanyx_update::RunningEngine {
+            name: self.name,
+            version: self.version.as_deref(),
+            gates_install: self.gates,
+        }
+    }
+}
+
+/// (engine, needed, running) for the two refusals that mean "held back by
+/// this machine's engine"; `None` for every other refusal.
+fn engine_held(why: &patanyx_update::RefusalReason) -> Option<(String, String, Option<String>)> {
+    let join = |f: &[u32]| f.iter().map(u32::to_string).collect::<Vec<_>>().join(".");
+    match why {
+        patanyx_update::RefusalReason::EngineTooOld {
+            engine,
+            needed,
+            running,
+            ..
+        } => Some((engine.clone(), join(needed), Some(join(running)))),
+        patanyx_update::RefusalReason::EngineUnknown { engine, needed, .. } => {
+            Some((engine.clone(), join(needed), None))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn trusted_keys() -> Result<TrustedKeys, UpdateError> {
     TrustedKeys::from_hex(PUBLISHER_KEYS)
 }
@@ -375,6 +424,38 @@ pub fn available() -> bool {
     cfg!(feature = "updater-net")
 }
 
+/// Which feed directory a platform reads.
+///
+/// LINUX READS /v2 FROM 1.0.6 ON. Every Linux build before 1.0.6 reads /v1
+/// and installs whatever it offers, engine or no engine, so /v1 must only
+/// ever offer a build that starts wherever those copies run: it was re-signed
+/// ONCE to offer the 1.0.6 bridge build and is frozen after that. Builds that
+/// can check the engine (this one) read /v2, where every later release lives.
+/// Windows never needed the split: WebView2 updates itself and a below-floor
+/// runtime still starts.
+/// How a release manifest is verified on this platform's feed: Linux /v2
+/// manifests are signed under their own domain (see
+/// `patanyx_update::SIGNING_DOMAIN_LINUX_V2`), everything else under the
+/// original one. Used for the check AND for the pending update at startup, so
+/// a /v1 manifest can never reach a 1.0.6+ Linux install by either path.
+fn verify_for_feed(
+    platform: Platform,
+    bytes: &[u8],
+    keys: &TrustedKeys,
+) -> Result<Manifest, UpdateError> {
+    match feed_for(platform) {
+        "v2" => patanyx_update::verify_manifest_linux_v2(bytes, keys),
+        _ => verify_manifest(bytes, keys),
+    }
+}
+
+fn feed_for(platform: Platform) -> &'static str {
+    match platform {
+        Platform::LinuxX86_64 | Platform::LinuxAarch64 => "v2",
+        _ => "v1",
+    }
+}
+
 /// One fixed URL per platform PER CHANNEL, and that qualifier is the whole
 /// design: `Beta` is a second URL every beta subscriber fetches identically,
 /// never a per-install path, so choosing it does not create anything the
@@ -389,12 +470,13 @@ fn manifest_url(platform: Platform, channel: crate::prefs::UpdateChannel) -> Str
             return url;
         }
     }
+    let feed = feed_for(platform);
     match channel {
         crate::prefs::UpdateChannel::Stable => {
-            format!("{UPDATE_BASE_URL}/v1/{}.json", platform.as_str())
+            format!("{UPDATE_BASE_URL}/{feed}/{}.json", platform.as_str())
         }
         crate::prefs::UpdateChannel::Beta => {
-            format!("{UPDATE_BASE_URL}/v1/{}-beta.json", platform.as_str())
+            format!("{UPDATE_BASE_URL}/{feed}/{}-beta.json", platform.as_str())
         }
     }
 }
@@ -426,6 +508,20 @@ enum Phase {
         reason: String,
         offered: Option<Version>,
     },
+    /// Authentic and newer, but this machine's web engine is older than the
+    /// release needs, or could not be read, and on this engine a release
+    /// refuses to start below its floor. Nothing is downloaded. Reported as a
+    /// refusal WITH a machine-readable kind, so the panel can say it in the
+    /// user's language and point to how to update the system; `reason` is
+    /// the English sentence for anything that reads the old shape.
+    EngineHeld {
+        reason: String,
+        offered: Version,
+        engine: String,
+        needed: String,
+        /// `None` when the version could not be read.
+        running: Option<String>,
+    },
     /// An ordinary operational failure (server unreachable, disk full).
     /// Retryable, shown without alarm. `resume` carries the offered
     /// manifest when the failure was mid-download, so "try again" does not
@@ -435,6 +531,18 @@ enum Phase {
         resume: Option<Box<Manifest>>,
     },
     Downloading { manifest: Manifest },
+    /// The new version was put in place but could not start, and the old
+    /// one could not be put back: the file at `exe` is the new one, and the
+    /// old one is at `kept_at` when a copy was still found there. Sticky for
+    /// the rest of this process -- a later check must not paint "up to date"
+    /// or "update available" over the one thing the user has to act on. The
+    /// panel's way out is a fresh download, which needs no path at all; the
+    /// paths are for support and diagnostics.
+    InstallBroken {
+        detail: String,
+        exe: PathBuf,
+        kept_at: Option<PathBuf>,
+    },
     /// `verify_payload` returned Ok and the bytes are on disk. THIS is
     /// where verification ends. Installation (`installer::apply`) begins
     /// after it — and is not wired in this draft, which the status says
@@ -473,6 +581,28 @@ fn lock() -> MutexGuard<'static, Updater> {
     UPDATER.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A worker thread's result, unless the install broke meanwhile. A check or
+/// download that started before an apply failed would otherwise land its
+/// "update available" or "up to date" on top of the one state that tells
+/// the user what to do (review r4 R-004).
+fn commit_phase(u: &mut Updater, phase: Phase) {
+    if !matches!(u.phase, Phase::InstallBroken { .. }) {
+        u.phase = phase;
+    }
+}
+
+/// Whether a check must not start now: one is already running, a download
+/// is in flight, the last one finished moments ago, or an install left the
+/// browser needing the user's hand. That last one is not a cooldown: the
+/// check's result would overwrite the only state that tells the user where
+/// their working copy is.
+fn check_held_off(u: &Updater) -> bool {
+    matches!(
+        u.phase,
+        Phase::Checking | Phase::Downloading { .. } | Phase::InstallBroken { .. }
+    ) || in_cooldown(u.last_check_started, &u.phase)
+}
+
 fn in_cooldown(last_check_started: Option<Instant>, phase: &Phase) -> bool {
     match last_check_started {
         Some(started) => {
@@ -501,9 +631,7 @@ pub fn check_now() -> Value {
             // The snapshot says available:false; the panel explains.
             return status_json(&u);
         }
-        if matches!(u.phase, Phase::Checking | Phase::Downloading { .. })
-            || in_cooldown(u.last_check_started, &u.phase)
-        {
+        if check_held_off(&u) {
             return status_json(&u);
         }
     }
@@ -511,44 +639,59 @@ pub fn check_now() -> Value {
         Some(current) => current,
         None => {
             let mut u = lock();
-            u.phase = Phase::Failed {
-                detail: format!(
-                    "this build reports version {:?}, which is not a semantic version, so it \
-                     cannot be checked against an update",
-                    env!("CARGO_PKG_VERSION")
-                ),
-                resume: None,
-            };
+            commit_phase(
+                &mut u,
+                Phase::Failed {
+                    detail: format!(
+                        "this build reports version {:?}, which is not a semantic version, so it \
+                         cannot be checked against an update",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                    resume: None,
+                },
+            );
             return status_json(&u);
         }
     };
     let Some(platform) = running_platform() else {
         let mut u = lock();
-        u.phase = Phase::Failed {
-            detail: format!(
-                "this build's platform ({}-{}) has no update channel",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            ),
-            resume: None,
-        };
+        commit_phase(
+            &mut u,
+            Phase::Failed {
+                detail: format!(
+                    "this build's platform ({}-{}) has no update channel",
+                    std::env::consts::OS,
+                    std::env::consts::ARCH
+                ),
+                resume: None,
+            },
+        );
         return status_json(&u);
     };
     let keys = match trusted_keys() {
         Ok(keys) => keys,
         Err(_) => {
             let mut u = lock();
-            u.phase = Phase::Failed {
-                detail: "this build's update keys are misconfigured, so update checking is \
-                         disabled"
-                    .to_string(),
-                resume: None,
-            };
+            commit_phase(
+                &mut u,
+                Phase::Failed {
+                    detail: "this build's update keys are misconfigured, so update checking is \
+                             disabled"
+                        .to_string(),
+                    resume: None,
+                },
+            );
             return status_json(&u);
         }
     };
     {
         let mut u = lock();
+        // Again, in the SAME lock as the transition: an apply that failed
+        // since the check above must not be painted over with "Checking"
+        // (review r5 R-003).
+        if check_held_off(&u) {
+            return status_json(&u);
+        }
         u.phase = Phase::Checking;
         u.last_check_started = Some(Instant::now());
     }
@@ -563,11 +706,14 @@ pub fn check_now() -> Value {
             // durable across a restart (remember_pending re-verifies nothing
             // here -- the startup reader does that against the compiled keys).
             let mut envelope_bytes: Option<Vec<u8>> = None;
-            let phase = run_check_observed(
+            let engine = EngineSnapshot::now();
+            let phase = run_check_engine(
                 &keys,
                 &FLOOR,
                 current,
                 platform,
+                &engine.running(),
+                |bytes, keys| verify_for_feed(platform, bytes, keys),
                 || {
                     let fetched =
                         net::get(&url, MAX_MANIFEST_FETCH_BYTES, net::MANIFEST_TIMEOUT);
@@ -608,7 +754,7 @@ pub fn check_now() -> Value {
             {
                 let mut u = lock();
                 u.envelope = envelope_bytes.clone();
-                u.phase = phase;
+                commit_phase(&mut u, phase);
                 u.advisory = Some(advisory);
             }
             if let Some(manifest) = manifest {
@@ -629,15 +775,18 @@ pub fn check_now() -> Value {
                 {
                     remember_pending(&data_dir(), envelope, staged, manifest);
                 }
-                lock().phase = phase;
+                commit_phase(&mut lock(), phase);
             }
         });
     if let Err(e) = spawned {
         let mut u = lock();
-        u.phase = Phase::Failed {
-            detail: format!("could not start the update check ({e})"),
-            resume: None,
-        };
+        commit_phase(
+            &mut u,
+            Phase::Failed {
+                detail: format!("could not start the update check ({e})"),
+                resume: None,
+            },
+        );
         return status_json(&u);
     }
     status()
@@ -699,7 +848,16 @@ pub fn apply_staged(proxy: &tao::event_loop::EventLoopProxy<crate::UserEvent>) -
     };
     // The staged file is left in place on failure: a failed swap must not
     // also destroy the verified download the user already waited for.
-    installer::apply(&staged, &manifest).map_err(|_| "install_failed")?;
+    installer::apply(&staged, &manifest).map_err(|e| {
+        // Always in the log, in full: the code below is a summary.
+        eprintln!("PATANYX: update not installed: {e}");
+        if installer::is_restore_failure(&e) {
+            // The worst case: the new file could not start AND the old one
+            // could not be put back. The panel says how to get a working copy.
+            mark_install_broken(&e);
+        }
+        install_error_code(&e)
+    })?;
     // ONLY after apply returned Ok. A failed swap must leave a working
     // browser running, not close the one the user still has.
     let _ = proxy.send_event(crate::UserEvent::QuitForUpdate);
@@ -748,7 +906,7 @@ pub fn install() -> Result<Value, &'static str> {
             {
                 remember_pending(&data_dir(), envelope, staged, manifest);
             }
-            u.phase = phase;
+            commit_phase(&mut u, phase);
         });
     if let Err(e) = spawned {
         let mut u = lock();
@@ -969,9 +1127,14 @@ fn read_pending_meta(dir: &Path) -> Option<PendingMeta> {
     })
 }
 
-fn clean_pending(dir: &Path) {
-    let _ = std::fs::remove_file(pending_envelope_path(dir));
-    let _ = std::fs::remove_file(pending_meta_path(dir));
+fn clean_pending(dir: &Path) -> std::io::Result<()> {
+    let gone = |r: std::io::Result<()>| match r {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    };
+    let envelope = gone(std::fs::remove_file(pending_envelope_path(dir)));
+    let meta = gone(std::fs::remove_file(pending_meta_path(dir)));
+    envelope.and(meta)
 }
 
 /// Is this pending release allowed to install itself RIGHT NOW?
@@ -1005,21 +1168,27 @@ pub fn apply_pending_at_startup() -> bool {
     };
     // Not authentic = not ours. Remove it so a corrupt file is not re-parsed
     // at every launch forever.
-    let Ok(manifest) = verify_manifest(&envelope, &keys) else {
-        clean_pending(&dir);
+    let Some(platform) = running_platform() else {
+        return false;
+    };
+    let Ok(manifest) = verify_for_feed(platform, &envelope, &keys) else {
+        let _ = clean_pending(&dir);
         return false;
     };
     let Some(meta) = read_pending_meta(&dir) else {
-        clean_pending(&dir);
+        let _ = clean_pending(&dir);
         return false;
     };
-    let (Some(current), Some(platform)) = (current_version(), running_platform()) else {
+    let Some(current) = current_version() else {
         return false;
     };
     // The normal end of the story: the relaunched (updated) process runs this,
     // finds the pending release is no longer newer than itself, and tidies up.
-    let Decision::Update(_) = decide(&current, &FLOOR, platform, &manifest) else {
-        clean_pending(&dir);
+    // The engine is part of the decision here too: it may have changed since
+    // the update was staged, and this is the last moment before the swap.
+    let engine = EngineSnapshot::now();
+    let Decision::Update(_) = decide(&current, &FLOOR, platform, &engine.running(), &manifest) else {
+        let _ = clean_pending(&dir);
         return false;
     };
     if !crate::prefs::load().update_auto_apply {
@@ -1034,11 +1203,50 @@ pub fn apply_pending_at_startup() -> bool {
     // browser and the staged file in place.
     match installer::apply(&staged, &manifest) {
         Ok(()) => {
-            clean_pending(&dir);
+            let _ = clean_pending(&dir);
             let _ = std::fs::remove_file(&staged);
             true
         }
-        Err(_) => false,
+        Err(e) => {
+            // Always in the log. The worst case (old version not put back)
+            // also reaches the Updates panel of this very run, which is the
+            // old version still running from memory.
+            eprintln!("PATANYX: update not installed at startup: {e}");
+            mark_install_broken(&e);
+            false
+        }
+    }
+}
+
+/// Record a restore failure for the panel, and drop the pending update so
+/// nothing tries the same install again by itself: a copy put back by hand,
+/// or the next launch, must not repeat the swap that just went wrong.
+fn mark_install_broken(e: &std::io::Error) {
+    let Some(broken) = installer::restore_failure(e) else {
+        return;
+    };
+    if let Err(err) = clean_pending(&data_dir()) {
+        // Not silent: if the pending update cannot be removed, a copy put
+        // back by hand could try the same install again at its next launch.
+        eprintln!("PATANYX: the failed update could not be removed from the pending folder: {err}");
+    }
+    lock().phase = Phase::InstallBroken {
+        detail: e.to_string(),
+        exe: broken.exe.clone(),
+        kept_at: broken.kept_at.clone(),
+    };
+}
+
+/// The error code `update_apply` returns for an installer failure.
+fn install_error_code(e: &std::io::Error) -> &'static str {
+    if installer::is_restore_failure(e) {
+        "install_restore_failed"
+    } else if e.kind() == std::io::ErrorKind::Unsupported {
+        // This machine's engine cannot run the update (engine gate or the
+        // new file's own preflight). Not a broken download.
+        "engine_too_old"
+    } else {
+        "install_failed"
     }
 }
 
@@ -1106,12 +1314,49 @@ fn status_json(u: &Updater) -> Value {
                 out["offered"] = json!(v.to_string());
             }
         }
+        Phase::EngineHeld {
+            reason,
+            offered,
+            engine,
+            needed,
+            running,
+        } => {
+            // Still "refused" for every reader of the old shape; the kind is
+            // what lets the panel localize it and offer the way out.
+            out["state"] = json!("refused");
+            out["reason"] = json!(reason);
+            out["offered"] = json!(offered.to_string());
+            out["refusal_kind"] = json!(if running.is_some() {
+                "engine_too_old"
+            } else {
+                "engine_unknown"
+            });
+            // engine_* names: "running" already means the running PATANYX
+            // version in this snapshot, and must keep meaning that.
+            out["engine"] = json!(engine);
+            out["engine_needed"] = json!(needed);
+            if let Some(running) = running {
+                out["engine_running"] = json!(running);
+            }
+        }
         Phase::Failed { detail, resume } => {
             out["state"] = json!("failed");
             out["detail"] = json!(detail);
             out["retry"] = json!(resume.is_some());
             if let Some(m) = resume {
                 out["offered"] = json!(m.version().to_string());
+            }
+        }
+        Phase::InstallBroken {
+            detail,
+            exe,
+            kept_at,
+        } => {
+            out["state"] = json!("install_broken");
+            out["detail"] = json!(detail);
+            out["exe"] = json!(exe.to_string_lossy());
+            if let Some(kept_at) = kept_at {
+                out["kept_at"] = json!(kept_at.to_string_lossy());
             }
         }
         Phase::Downloading { manifest } => {
@@ -1147,6 +1392,7 @@ fn status_json(u: &Updater) -> Value {
 // production callers bind the compiled-in constants; tests bind their own.
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 fn run_check_with(
     keys: &TrustedKeys,
     floor: &Version,
@@ -1161,11 +1407,40 @@ fn run_check_with(
 /// `decide` has its say. The engine floor rides on this: a manifest that is
 /// "up to date" for the browser version still carries the newest floor, and
 /// the browser must learn it. Nothing unverified ever reaches `on_verified`.
+// Tests only since 1.0.6: production checks through `run_check_engine`, which
+// takes this machine's engine; this wrapper keeps the engine-free tests short.
+#[cfg(test)]
 fn run_check_observed(
     keys: &TrustedKeys,
     floor: &Version,
     current: Version,
     platform: Platform,
+    fetch_manifest: impl FnOnce() -> Result<Vec<u8>, FetchError>,
+    on_verified: impl FnOnce(&Manifest),
+) -> Phase {
+    run_check_engine(
+        keys,
+        floor,
+        current,
+        platform,
+        &patanyx_update::RunningEngine::UNGATED,
+        verify_manifest,
+        fetch_manifest,
+        on_verified,
+    )
+}
+
+/// `run_check_observed` with this machine's web engine taken into account:
+/// the production path. An offer whose engine floor this machine does not
+/// meet becomes `EngineHeld` and is never downloaded.
+#[allow(clippy::too_many_arguments)]
+fn run_check_engine(
+    keys: &TrustedKeys,
+    floor: &Version,
+    current: Version,
+    platform: Platform,
+    engine: &patanyx_update::RunningEngine<'_>,
+    verify: impl FnOnce(&[u8], &TrustedKeys) -> Result<Manifest, UpdateError>,
     fetch_manifest: impl FnOnce() -> Result<Vec<u8>, FetchError>,
     on_verified: impl FnOnce(&Manifest),
 ) -> Phase {
@@ -1178,7 +1453,7 @@ fn run_check_observed(
             }
         }
     };
-    let manifest = match verify_manifest(&bytes, keys) {
+    let manifest = match verify(&bytes, keys) {
         Ok(manifest) => manifest,
         // Not authentic. This is a REFUSAL, not an operational error: do not
         // retry it silently, do not parse the bytes for hints, tell the user.
@@ -1190,10 +1465,20 @@ fn run_check_observed(
         }
     };
     on_verified(&manifest);
-    match decide(&current, floor, platform, &manifest) {
+    match decide(&current, floor, platform, engine, &manifest) {
         Decision::UpToDate => Phase::UpToDate,
         Decision::Update(manifest) => Phase::Offered { manifest },
         Decision::Refused(patanyx_update::RefusalReason::NotNewer { offered, .. }) => Phase::Ahead { offered },
+        Decision::Refused(why) if engine_held(&why).is_some() => {
+            let (engine, needed, running) = engine_held(&why).expect("checked by the guard");
+            Phase::EngineHeld {
+                reason: why.to_string(),
+                offered: manifest.version(),
+                engine,
+                needed,
+                running,
+            }
+        }
         Decision::Refused(why) => Phase::Refused {
             // The Display impls on RefusalReason were written for users.
             reason: why.to_string(),
@@ -1811,8 +2096,110 @@ pub mod installer {
             )
         })?;
 
+        // THE PRE-SWAP GATE, here because every install path ends here: the
+        // Restart click (apply_staged) and the next-launch install
+        // (apply_pending_at_startup) alike. The engine may have changed since
+        // the offer, and on Linux a release refuses to start below its engine
+        // floor, so installing now could leave a browser that does not open.
+        // Refused as `Unsupported`, which callers report as "engine too old"
+        // rather than as a broken download; the verified file is kept.
+        engine_gate(&super::EngineSnapshot::now().running(), manifest)?;
+
         let current = std::env::current_exe()?;
         swap_and_relaunch(&current, &bytes)
+    }
+
+    /// The engine half of the pre-swap gate, apart from `apply` so it can be
+    /// tested without a test that, if the gate broke, would overwrite and
+    /// relaunch the test binary itself.
+    pub(super) fn engine_gate(
+        engine: &patanyx_update::RunningEngine<'_>,
+        manifest: &Manifest,
+    ) -> std::io::Result<()> {
+        match patanyx_update::engine_refusal(engine, manifest) {
+            Some(why) => Err(std::io::Error::new(std::io::ErrorKind::Unsupported, why.to_string())),
+            None => Ok(()),
+        }
+    }
+
+    /// How long the new file gets to answer `--preflight`. Generous: it only
+    /// loads the engine and prints a line, but a cold disk is not a refusal.
+    #[cfg(target_os = "linux")]
+    const PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Asks the NEW file itself whether it would start on this machine, by
+    /// running it with `--preflight` before it replaces the running browser.
+    ///
+    /// The running process can only see the engine IT loaded; the new file
+    /// will load whatever the system has now. So the new file answers: exit 0
+    /// starts, exit 3 refuses on this engine, anything else (a crash, a
+    /// timeout, a file that cannot run here) is treated as "cannot confirm"
+    /// and refused as well. Every refusal leaves the running browser and its
+    /// file exactly as they were.
+    #[cfg(target_os = "linux")]
+    pub(super) fn preflight(candidate: &Path, timeout: std::time::Duration) -> std::io::Result<()> {
+        use std::process::{Command, Stdio};
+        use std::time::Instant;
+
+        use std::os::unix::process::CommandExt;
+
+        // Only the EXIT CODE is read. No pipe at all: a child (or anything it
+        // spawned) holding an inherited stdout open cannot then stall this
+        // process after the deadline, which reading output could. Its own
+        // process group, so a timeout kills everything it started.
+        let mut child = Command::new(candidate)
+            .arg("--preflight")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()?;
+        let kill_all = |child: &mut std::process::Child| {
+            if let Ok(pgid) = i32::try_from(child.id()) {
+                // SAFETY: kill(2) with a negative pid signals the process
+                // group this child leads; no memory is shared.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+        };
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    kill_all(&mut child);
+                    return Err(error);
+                }
+            }
+            if Instant::now() >= deadline {
+                kill_all(&mut child);
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the update did not confirm it would start on this computer in time; it was \
+                     not installed",
+                ));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        // Anything the child left running in its group is not needed.
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            // SAFETY: as above.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        }
+        match status.code() {
+            Some(0) => Ok(()),
+            Some(3) => Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "this update needs a newer system web engine than this computer has; it was not \
+                 installed",
+            )),
+            other => Err(std::io::Error::other(format!(
+                "the update could not confirm it would start on this computer (exit {other:?}); \
+                 it was not installed"
+            ))),
+        }
     }
 
     /// Unix: write a sibling, then rename over the running binary.
@@ -1823,13 +2210,223 @@ pub mod installer {
     /// not atomic and would leave a half-written browser.
     #[cfg(unix)]
     fn swap_and_relaunch(current: &Path, bytes: &[u8]) -> std::io::Result<()> {
-        use std::os::unix::fs::PermissionsExt;
+        // ONE UPDATE AT A TIME per executable, across processes: two launches
+        // with the same ripe update must not share `.new` and `.prev`.
+        let _lock = lock_update(current)?;
+        // The file at the path must still be the one THIS process started
+        // from. If another PATANYX window installed an update meanwhile, the
+        // version decision this process made is about a file that is gone:
+        // installing now could put an older release over a newer one.
+        if !still_running_file(current)? {
+            return Err(std::io::Error::other(
+                "PATANYX was already updated by another window; restart PATANYX to use it",
+            ));
+        }
+        let staging = sibling(current, "new");
+        write_fresh(&staging, bytes, 0o755)?;
+        // The new file, in the place it will run from, answers for itself
+        // before anything is replaced (see `preflight`).
+        #[cfg(target_os = "linux")]
+        if let Err(error) = preflight(&staging, PREFLIGHT_TIMEOUT) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(error);
+        }
+        // The file about to be installed must still be exactly the verified
+        // bytes: the path was free for the preflight's whole run, and the
+        // rename installs whatever is there now. (Anyone able to change it
+        // could also replace the browser directly; this keeps the update
+        // pipeline's own promise, "only the signed bytes", true.)
+        if std::fs::read(&staging).map_or(true, |now| now != bytes) {
+            let _ = std::fs::remove_file(&staging);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "the update changed on disk before it could be installed; it was not installed",
+            ));
+        }
+        swap_keeping_previous(current, &staging, relaunch)
+    }
 
-        let staging = current.with_extension("new");
-        std::fs::write(&staging, bytes)?;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))?;
-        std::fs::rename(&staging, current)?;
-        relaunch(current)
+    /// The worst outcome of an install: the new file could not start and the
+    /// old one could not be put back. A distinct type inside the io::Error,
+    /// so callers can tell it from an ordinary failure without reading text.
+    /// The paths travel as fields, not only inside the sentence, so the
+    /// Updates panel can say where the old file is and where it goes back
+    /// in the user's language without parsing English.
+    #[derive(Debug)]
+    pub(super) struct RestoreFailed {
+        /// Where PATANYX runs from; the file there now is the new one.
+        pub(super) exe: std::path::PathBuf,
+        /// Where the previous, working version was kept; `None` when no
+        /// copy was found there any more, so nothing claims one exists.
+        pub(super) kept_at: Option<std::path::PathBuf>,
+        pub(super) start_error: String,
+        pub(super) restore_error: String,
+    }
+
+    impl std::fmt::Display for RestoreFailed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "the update could not start ({}) and the previous version could not be put \
+                 back ({}); ",
+                self.start_error, self.restore_error
+            )?;
+            match &self.kept_at {
+                Some(kept_at) => write!(f, "it is kept at {}", kept_at.display()),
+                None => f.write_str("no copy of it was found"),
+            }
+        }
+    }
+
+    impl std::error::Error for RestoreFailed {}
+
+    /// The old-version-not-restored failure inside `e`, if that is what it is.
+    pub(super) fn restore_failure(e: &std::io::Error) -> Option<&RestoreFailed> {
+        e.get_ref().and_then(|inner| inner.downcast_ref::<RestoreFailed>())
+    }
+
+    /// Whether `e` is the old-version-not-restored failure.
+    pub(super) fn is_restore_failure(e: &std::io::Error) -> bool {
+        restore_failure(e).is_some()
+    }
+
+    /// Remove `<exe>.prev` if it is obsolete, and say whether it was removed.
+    ///
+    /// Obsolete means this process is the file at the path, so the new
+    /// version started. The check and the removal both happen UNDER the
+    /// update lock: a swap in another process creates `.prev` under that same
+    /// lock, so it can neither be in progress here nor start between the
+    /// check and the removal. No `.prev`, no lock taken, so an ordinary
+    /// launch never creates the lock file beside the binary.
+    #[cfg(unix)]
+    pub(super) fn remove_previous_if_obsolete(current: &Path) -> bool {
+        let prev = sibling(current, "prev");
+        if std::fs::symlink_metadata(&prev).is_err() {
+            return false;
+        }
+        let Ok(_lock) = lock_update(current) else {
+            return false;
+        };
+        if !matches!(still_running_file(current), Ok(true)) {
+            return false;
+        }
+        std::fs::remove_file(&prev).is_ok()
+    }
+
+    /// `<exe>.<suffix>`: the suffix APPENDED to the whole file name.
+    /// `Path::with_extension` would replace a dotted name's last part, so
+    /// `PATANYX.beta` and `PATANYX` would share update files.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(super) fn sibling(exe: &Path, suffix: &str) -> std::path::PathBuf {
+        let mut name = exe.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+        name.push(".");
+        name.push(suffix);
+        exe.with_file_name(name)
+    }
+
+    /// An exclusive, non-blocking lock on `<exe>.update-lock`, held for the
+    /// whole swap. A second process trying to update the same executable at
+    /// the same moment is refused instead of interleaving with the first.
+    #[cfg(unix)]
+    pub(super) fn lock_update(exe: &Path) -> std::io::Result<std::fs::File> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(sibling(exe, "update-lock"))?;
+        file.try_lock().map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "another PATANYX is installing this update right now",
+            )
+        })?;
+        Ok(file)
+    }
+
+    /// Whether `path` is still the very file this process was started from:
+    /// the same device and inode as `/proc/self/exe`, which keeps pointing at
+    /// the running file even after something replaced it at the path.
+    #[cfg(target_os = "linux")]
+    pub(super) fn still_running_file(path: &Path) -> std::io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let running = std::fs::metadata("/proc/self/exe")?;
+        let at_path = std::fs::metadata(path)?;
+        Ok(running.dev() == at_path.dev() && running.ino() == at_path.ino())
+    }
+
+    #[cfg(all(unix, not(target_os = "linux")))]
+    fn still_running_file(_path: &Path) -> std::io::Result<bool> {
+        Ok(true)
+    }
+
+    /// Writes `bytes` to a file that did not exist a moment ago.
+    ///
+    /// Whatever sat at `path` is removed first (`remove_file` deletes a
+    /// symlink itself, never its target), and the file is then created with
+    /// O_CREAT|O_EXCL, which refuses to follow a symlink planted in between.
+    /// So the verified bytes can only ever land in a fresh file at `path`,
+    /// never through a link into somewhere else.
+    #[cfg(unix)]
+    fn write_fresh(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let _ = std::fs::remove_file(path);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(path)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+    }
+
+    /// Rename `staging` over `current`, keeping the old file as `<exe>.prev`
+    /// until the new one has started and passed its own engine check
+    /// (`clean_previous` removes it then). A relaunch that fails puts the old
+    /// file back, so a failed update leaves the browser that was working.
+    ///
+    /// A hard link, not a copy, where the filesystem allows: the old inode
+    /// simply gains a second name, and the rename then swaps names atomically.
+    #[cfg(unix)]
+    pub(super) fn swap_keeping_previous(
+        current: &Path,
+        staging: &Path,
+        relaunch: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        let prev = sibling(current, "prev");
+        let _ = std::fs::remove_file(&prev);
+        if std::fs::hard_link(current, &prev).is_err() {
+            let copied = std::fs::read(current).and_then(|old| write_fresh(&prev, &old, 0o755));
+            if let Err(error) = copied {
+                let _ = std::fs::remove_file(staging);
+                return Err(error);
+            }
+        }
+        if let Err(error) = std::fs::rename(staging, current) {
+            let _ = std::fs::remove_file(staging);
+            let _ = std::fs::remove_file(&prev);
+            return Err(error);
+        }
+        if let Err(error) = relaunch(current) {
+            // Put the working browser back before reporting failure, and say
+            // so loudly if even that fails: then the file on disk is the new
+            // one that could not start, and the old one is still at `.prev`.
+            if let Err(restore) = std::fs::rename(&prev, current) {
+                return Err(std::io::Error::other(RestoreFailed {
+                    exe: current.to_path_buf(),
+                    // Only claim a copy that is really there: the most
+                    // likely reason the restore failed is that it is gone.
+                    kept_at: std::fs::symlink_metadata(&prev)
+                        .is_ok_and(|m| m.is_file())
+                        .then(|| prev.clone()),
+                    start_error: error.to_string(),
+                    restore_error: restore.to_string(),
+                }));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Windows: move the running binary aside, then put the new one in its
@@ -1898,6 +2495,13 @@ pub mod installer {
     pub fn clean_previous() {
         if let Ok(current) = std::env::current_exe() {
             let _ = std::fs::remove_file(current.with_extension("old"));
+            // Unix keeps the replaced file as `.prev` until the new one has
+            // started. Only the file AT the path may decide that: an old
+            // process still running from memory after a failed startup
+            // install reaches this line too, and there `.prev` may be the
+            // only working copy left.
+            #[cfg(unix)]
+            let _ = remove_previous_if_obsolete(&current);
         }
     }
 }
@@ -1943,7 +2547,7 @@ mod tests {
                  something that is not true yet"
             );
         }
-        for state in ["offered", "ready", "uptodate", "failed", "refused"] {
+        for state in ["offered", "ready", "uptodate", "failed", "refused", "install_broken"] {
             assert!(
                 !in_flight(&json!({ "state": state })),
                 "{state} is a settled answer and must be reported, or the \
@@ -2345,9 +2949,15 @@ mod tests {
             std::fs::read(pending_envelope_path(dir.path())).expect("envelope on disk"),
             b"envelope-bytes"
         );
-        clean_pending(dir.path());
+        clean_pending(dir.path()).expect("both removed");
         assert!(read_pending_meta(dir.path()).is_none());
         assert!(!pending_envelope_path(dir.path()).exists());
+        // Nothing there is not a failure: cleaning twice is fine.
+        clean_pending(dir.path()).expect("already clean");
+        // A removal that fails is reported, so mark_install_broken can say so
+        // instead of assuming the failed update is gone (review r5 R-001).
+        std::fs::create_dir(pending_envelope_path(dir.path())).unwrap();
+        assert!(clean_pending(dir.path()).is_err(), "a failed removal must not read as clean");
     }
 
     /// The reader refuses a `staged` value that is anything but a bare
@@ -2437,6 +3047,92 @@ mod tests {
                 resume: None,
             }
         ));
+    }
+
+    fn broken() -> Phase {
+        Phase::InstallBroken {
+            detail: "the update could not start (x) and the previous version could not be put \
+                     back (y); it is kept at /opt/p/PATANYX.prev"
+                .to_string(),
+            exe: PathBuf::from("/opt/p/PATANYX"),
+            kept_at: Some(PathBuf::from("/opt/p/PATANYX.prev")),
+        }
+    }
+
+    /// The restore failure is its own state with both paths, never "failed":
+    /// the panel's "failed" says "Nothing was installed", which is false here.
+    #[test]
+    fn a_broken_install_reports_both_paths_in_its_own_state() {
+        let u = Updater {
+            phase: broken(),
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        let snap = status_json(&u);
+        assert_eq!(snap["state"], json!("install_broken"));
+        assert_eq!(snap["exe"], json!("/opt/p/PATANYX"));
+        assert_eq!(snap["kept_at"], json!("/opt/p/PATANYX.prev"));
+        assert!(snap["detail"].as_str().unwrap().contains("could not be put back"));
+        assert!(snap.get("retry").is_none(), "nothing to retry from this state");
+    }
+
+    /// A check or download already running when the install broke must not
+    /// land its result on top of the broken-install state.
+    #[test]
+    fn an_in_flight_result_never_replaces_a_broken_install() {
+        let mut u = Updater {
+            phase: broken(),
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        commit_phase(&mut u, Phase::UpToDate);
+        assert!(matches!(u.phase, Phase::InstallBroken { .. }), "got {:?}", u.phase);
+        let mut idle = Updater {
+            phase: Phase::Checking,
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        commit_phase(&mut idle, Phase::UpToDate);
+        assert!(matches!(idle.phase, Phase::UpToDate), "ordinary results still land");
+        // Every worker assignment goes through commit_phase.
+        let src = include_str!("updater.rs");
+        let body = &src[src.find("pub fn check_now()").unwrap()..src.find("fn observe_advisory_after(").unwrap()];
+        let install = &src[src.find("pub fn install()").unwrap()..src.find("fn download_and_stage(").unwrap()];
+        for (name, b) in [("check_now", body), ("install", install)] {
+            assert!(!b.contains("u.phase = phase;") && !b.contains("lock().phase = phase;"),
+                "{name} assigns a worker result directly");
+        }
+        // check_now's own failures go through commit_phase too, and the hold-off
+        // is re-checked in the lock that moves the phase to Checking (r5 R-003).
+        assert!(!body.contains("u.phase = Phase::Failed"), "check_now assigns Failed directly");
+        let checking = body.find("u.phase = Phase::Checking;").expect("check_now starts a check");
+        let held = body[..checking].rfind("check_held_off(&u)").expect("hold-off re-checked");
+        assert!(!body[held..checking].contains("lock()"), "re-check and transition in one lock");
+    }
+
+    /// A later check (the user's, or the scheduled one) must not replace the
+    /// broken-install state, however long ago the last check ran.
+    #[test]
+    fn no_check_overwrites_a_broken_install() {
+        for last in [None, Instant::now().checked_sub(CHECK_COOLDOWN * 2)] {
+            let u = Updater {
+                phase: broken(),
+                last_check_started: last,
+                advisory: None,
+                envelope: None,
+            };
+            assert!(check_held_off(&u), "a check would overwrite the broken install ({last:?})");
+        }
+        let idle = Updater {
+            phase: Phase::Idle,
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        assert!(!check_held_off(&idle), "an idle updater must still check");
     }
 
     #[test]
@@ -3139,6 +3835,482 @@ mod key_class_separation_tests {
         );
     }
 
+}
+
+#[cfg(test)]
+mod pre_swap_tests {
+    use super::installer;
+    use super::tests::{dev_signing_key, dev_trusted_keys, payload_json, sign_with};
+    use patanyx_update::{verify_manifest, RunningEngine};
+    use std::path::{Path, PathBuf};
+
+    fn manifest(floor: &str) -> patanyx_update::Manifest {
+        let payload = payload_json("2.11.0", "linux-x86_64", 47).replace(
+            ",\"published_at\"",
+            &format!(",\"engine_floor\":{floor},\"published_at\""),
+        );
+        let envelope = sign_with(&payload, &dev_signing_key());
+        verify_manifest(envelope.as_bytes(), &dev_trusted_keys()).expect("must verify")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "patanyx-preswap-{name}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_engine_gate_refuses_an_engine_below_the_floor() {
+        let m = manifest(r#"{"webkitgtk":"2.54.0"}"#);
+        let old = [2, 52, 6];
+        let engine = RunningEngine { name: "WebKitGTK", version: Some(&old), gates_install: true };
+        let err = installer::engine_gate(&engine, &m).expect_err("must refuse");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        assert!(err.to_string().contains("2.54.0"));
+        let new = [2, 54, 0];
+        let engine = RunningEngine { name: "WebKitGTK", version: Some(&new), gates_install: true };
+        installer::engine_gate(&engine, &m).expect("2.54.0 meets 2.54.0");
+        installer::engine_gate(&RunningEngine::UNGATED, &m).expect("ungated never refuses");
+    }
+
+    /// Every install path goes through `apply`, so `apply` must run the gate
+    /// before it touches the running binary.
+    #[test]
+    fn apply_runs_the_engine_gate_before_the_swap() {
+        let src = include_str!("updater.rs");
+        let at = src.find("pub fn apply(staged: &Path").expect("apply exists");
+        let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+        let gate = body.find("engine_gate(").expect("apply calls engine_gate");
+        let swap = body.find("swap_and_relaunch(").expect("apply swaps");
+        assert!(gate < swap, "the gate must run before the swap");
+    }
+
+    /// The identity check is only meaningful under the lock (two windows
+    /// could otherwise both pass it) and before anything is written (a
+    /// stale process must not leave even a `.new` behind).
+    #[test]
+    fn the_unix_swap_checks_identity_under_the_lock_before_writing() {
+        let src = include_str!("updater.rs");
+        let at = src.find("fn swap_and_relaunch(current: &Path, bytes: &[u8])").expect("unix swap");
+        let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+        let lock = body.find("lock_update(current)").expect("the swap takes the lock");
+        let identity = body.find("still_running_file(current)").expect("the swap checks identity");
+        let write = body.find("write_fresh(&staging").expect("the swap writes the new file");
+        assert!(lock < identity, "identity must be checked while holding the lock");
+        assert!(identity < write, "identity must be checked before anything is written");
+        // The lock guard must live for the whole swap, not be dropped at once.
+        assert!(body.contains("let _lock = lock_update(current)?;"), "bind the guard to a name");
+    }
+
+    /// On Linux the new file answers `--preflight` BEFORE anything is
+    /// replaced.
+    #[test]
+    fn the_unix_swap_preflights_before_it_replaces_anything() {
+        let src = include_str!("updater.rs");
+        let at = src.find("fn swap_and_relaunch(current: &Path, bytes: &[u8])").expect("unix swap");
+        let body = &src[at..at + src[at..].find("\n    }\n").unwrap()];
+        let preflight = body.find("preflight(&staging").expect("the swap preflights");
+        let swap = body.find("swap_keeping_previous(").expect("the swap keeps the previous file");
+        assert!(preflight < swap);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn script(dir: &Path, name: &str, body: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn preflight_reads_the_new_files_own_answer() {
+        use std::time::Duration;
+        let dir = scratch("preflight");
+        let long = Duration::from_secs(20);
+        // Asserts the flag too: a file asked anything else must not "pass".
+        let ok = script(&dir, "ok", r#"[ "$1" = "--preflight" ] || exit 9; echo '{"starts":true}'; exit 0"#);
+        installer::preflight(&ok, long).expect("exit 0 starts");
+        let refuses = script(&dir, "refuses", r#"echo '{"starts":false}'; exit 3"#);
+        let err = installer::preflight(&refuses, long).expect_err("exit 3 refuses");
+        assert_eq!(err.kind(), std::io::ErrorKind::Unsupported);
+        let crashes = script(&dir, "crashes", "exit 1");
+        let err = installer::preflight(&crashes, long).expect_err("anything else refuses");
+        assert_ne!(err.kind(), std::io::ErrorKind::Unsupported);
+        // A child that exits at once but leaves a descendant holding its
+        // output open must not stall the caller past the deadline.
+        // ...and nothing it started outlives the preflight, on either path.
+        let alive = |pid: &str| std::path::Path::new(&format!("/proc/{}", pid.trim())).exists();
+        let pid_file = dir.join("child.pid");
+        let forks = script(
+            &dir,
+            "forks",
+            &format!("sleep 30 &\necho $! > {}\nexit 0", pid_file.display()),
+        );
+        let started = std::time::Instant::now();
+        installer::preflight(&forks, long).expect("exit 0 starts");
+        assert!(started.elapsed() < Duration::from_secs(5), "returned promptly");
+        let pid = std::fs::read_to_string(&pid_file).expect("the child wrote its pid");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!alive(&pid), "the background child was killed after a normal exit");
+        let pid_file2 = dir.join("child2.pid");
+        let hangs_with_child = script(
+            &dir,
+            "hangs-with-child",
+            &format!("sleep 30 &\necho $! > {}\nsleep 30", pid_file2.display()),
+        );
+        installer::preflight(&hangs_with_child, Duration::from_millis(500)).expect_err("times out");
+        let pid2 = std::fs::read_to_string(&pid_file2).expect("the child wrote its pid");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!alive(&pid2), "the background child was killed on timeout too");
+        let hangs = script(&dir, "hangs", "sleep 30");
+        let err = installer::preflight(&hangs, Duration::from_millis(300)).expect_err("a hang refuses");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(installer::preflight(&dir.join("missing"), long).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_symlink_is_never_written_through() {
+        let dir = scratch("symlink");
+        let current = dir.join("PATANYX");
+        let target = dir.join("elsewhere");
+        std::fs::write(&current, b"old browser").unwrap();
+        std::fs::write(&target, b"untouched").unwrap();
+        // A link planted where the rollback copy goes: the swap must replace
+        // the link itself, never write the old browser through it.
+        std::os::unix::fs::symlink(&target, dir.join("PATANYX.prev")).unwrap();
+        let staging = dir.join("PATANYX.new");
+        std::fs::write(&staging, b"new browser").unwrap();
+        installer::swap_keeping_previous(&current, &staging, |_| Ok(())).expect("swaps");
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched", "the link's target must not change");
+        assert!(!std::fs::symlink_metadata(dir.join("PATANYX.prev")).unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read(dir.join("PATANYX.prev")).unwrap(), b"old browser");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replaced_executable_is_detected_under_the_lock() {
+        // The running test binary is the file at current_exe: same file.
+        let me = std::env::current_exe().unwrap();
+        assert!(installer::still_running_file(&me).unwrap());
+        // Any other file is not the one this process runs.
+        let dir = scratch("identity");
+        let other = dir.join("PATANYX");
+        std::fs::write(&other, b"newer browser").unwrap();
+        assert!(!installer::still_running_file(&other).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn update_files_append_to_the_whole_file_name() {
+        let exe = Path::new("/opt/x/PATANYX.beta");
+        assert_eq!(installer::sibling(exe, "new"), Path::new("/opt/x/PATANYX.beta.new"));
+        assert_eq!(installer::sibling(Path::new("/opt/x/PATANYX"), "prev"), Path::new("/opt/x/PATANYX.prev"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_update_of_the_same_executable_is_refused_while_one_runs() {
+        let dir = scratch("lock");
+        let exe = dir.join("PATANYX");
+        std::fs::write(&exe, b"x").unwrap();
+        let first = installer::lock_update(&exe).expect("first takes the lock");
+        let second = installer::lock_update(&exe).expect_err("second is refused");
+        assert_eq!(second.kind(), std::io::ErrorKind::WouldBlock);
+        drop(first);
+        installer::lock_update(&exe).expect("free again once the first ends");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_restore_is_reported_and_the_old_copy_kept() {
+        let dir = scratch("restore");
+        let current = dir.join("PATANYX");
+        let staging = dir.join("PATANYX.new");
+        std::fs::write(&current, b"old browser").unwrap();
+        std::fs::write(&staging, b"new browser").unwrap();
+        let prev = dir.join("PATANYX.prev");
+        let err = installer::swap_keeping_previous(&current, &staging, |_| {
+            // The restore must fail: move the rollback copy away first.
+            std::fs::rename(dir.join("PATANYX.prev"), dir.join("moved")).unwrap();
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("reported");
+        assert!(err.to_string().contains("could not be put back"), "{err}");
+        assert!(!err.to_string().contains(&prev.display().to_string()), "claims a copy that is gone: {err}");
+        // What the production callers branch on: the type, then the code.
+        assert!(installer::is_restore_failure(&err));
+        assert_eq!(super::install_error_code(&err), "install_restore_failed");
+        // The panel is handed both paths, not a sentence to parse.
+        let broken = installer::restore_failure(&err).expect("typed");
+        assert_eq!(broken.exe, current);
+        // The rollback copy was moved away, so no copy may be claimed.
+        assert_eq!(broken.kept_at, None);
+        assert!(err.to_string().contains("no copy of it was found"), "{err}");
+        assert_eq!(std::fs::read(&current).unwrap(), b"new browser", "the new file is at the path");
+        let plain = std::io::Error::other("relaunch failed");
+        assert!(!installer::is_restore_failure(&plain));
+        assert_eq!(super::install_error_code(&plain), "install_failed");
+        let engine = std::io::Error::new(std::io::ErrorKind::Unsupported, "engine");
+        assert_eq!(super::install_error_code(&engine), "engine_too_old");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The restore can also fail with the copy still in place (here: the
+    /// path became a non-empty directory, which a rename cannot replace).
+    /// Then the copy is named, because it is really there.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_restore_names_the_copy_only_when_it_exists() {
+        let dir = scratch("restore-kept");
+        let current = dir.join("PATANYX");
+        let staging = dir.join("PATANYX.new");
+        std::fs::write(&current, b"old browser").unwrap();
+        std::fs::write(&staging, b"new browser").unwrap();
+        let prev = dir.join("PATANYX.prev");
+        let err = installer::swap_keeping_previous(&current, &staging, |path| {
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("blocker"), b"x").unwrap();
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("reported");
+        let broken = installer::restore_failure(&err).expect("typed");
+        assert_eq!(broken.kept_at.as_deref(), Some(prev.as_path()));
+        assert_eq!(std::fs::read(&prev).unwrap(), b"old browser");
+        assert!(err.to_string().contains(&prev.display().to_string()), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `.prev` is removed only by the process that IS the file at the path,
+    /// and never while another process holds the update lock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_previous_copy_is_kept_unless_the_new_file_is_running() {
+        let dir = scratch("obsolete");
+        let other = dir.join("PATANYX");
+        std::fs::write(&other, b"some other file").unwrap();
+        let other_prev = installer::sibling(&other, "prev");
+        std::fs::write(&other_prev, b"the only working copy").unwrap();
+        assert!(
+            !installer::remove_previous_if_obsolete(&other),
+            "an old process running from memory must not delete the only working copy"
+        );
+        assert!(other_prev.exists());
+
+        let me = std::env::current_exe().unwrap();
+        let my_prev = installer::sibling(&me, "prev");
+        let lock_file = installer::sibling(&me, "update-lock");
+        let _ = std::fs::remove_file(&lock_file);
+        assert!(!installer::remove_previous_if_obsolete(&me), "nothing to remove");
+        assert!(!lock_file.exists(), "an ordinary launch must not create the lock file");
+
+        std::fs::write(&my_prev, b"old").unwrap();
+        let held = installer::lock_update(&me).expect("lock");
+        assert!(!installer::remove_previous_if_obsolete(&me), "a swap in progress elsewhere owns .prev");
+        assert!(my_prev.exists());
+        drop(held);
+        assert!(installer::remove_previous_if_obsolete(&me), "the running file may tidy up");
+        assert!(!my_prev.exists());
+        let _ = std::fs::remove_file(&lock_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_relaunch_puts_the_working_browser_back() {
+        let dir = scratch("rollback");
+        let current = dir.join("PATANYX");
+        let staging = dir.join("PATANYX.new");
+        std::fs::write(&current, b"old browser").unwrap();
+        std::fs::write(&staging, b"new browser").unwrap();
+        let err = installer::swap_keeping_previous(&current, &staging, |_| {
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("relaunch failure is reported");
+        assert_eq!(err.to_string(), "relaunch failed");
+        assert_eq!(std::fs::read(&current).unwrap(), b"old browser");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_good_swap_keeps_the_previous_file_until_the_new_one_starts() {
+        let dir = scratch("keep");
+        let current = dir.join("PATANYX");
+        let staging = dir.join("PATANYX.new");
+        std::fs::write(&current, b"old browser").unwrap();
+        std::fs::write(&staging, b"new browser").unwrap();
+        installer::swap_keeping_previous(&current, &staging, |_| Ok(())).expect("swaps");
+        assert_eq!(std::fs::read(&current).unwrap(), b"new browser");
+        assert_eq!(std::fs::read(dir.join("PATANYX.prev")).unwrap(), b"old browser");
+        assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod engine_gate_tests {
+    use super::tests::{dev_signing_key, dev_trusted_keys, payload_json, sign_with};
+    use super::{feed_for, manifest_url, run_check_engine, status_json, Phase, Updater, FLOOR};
+    use patanyx_update::{Platform, RunningEngine, Version};
+    use serde_json::json;
+
+    /// A signed linux-x86_64 offer of 2.11.0 to a 2.10.0 install, with
+    /// `engine_floor` spliced in (raw JSON object text) or none at all.
+    fn offer(floor: Option<&str>) -> Vec<u8> {
+        let base = payload_json("2.11.0", "linux-x86_64", 47);
+        let payload = match floor {
+            Some(floor) => base.replace(
+                ",\"published_at\"",
+                &format!(",\"engine_floor\":{floor},\"published_at\""),
+            ),
+            None => base,
+        };
+        sign_with(&payload, &dev_signing_key()).into_bytes()
+    }
+
+    fn check(engine: &RunningEngine<'_>, envelope: Vec<u8>) -> Phase {
+        run_check_engine(
+            &dev_trusted_keys(),
+            &FLOOR,
+            "2.10.0".parse::<Version>().unwrap(),
+            Platform::LinuxX86_64,
+            engine,
+            // These offers are signed with the test key under the original
+            // domain; the feed binding has its own test below.
+            patanyx_update::verify_manifest,
+            move || Ok(envelope),
+            |_| {},
+        )
+    }
+
+    /// Linux reads /v2 and verifies ONLY the /v2 domain; Windows verifies only
+    /// the original one. A /v1 manifest never reaches a 1.0.6+ Linux install.
+    #[test]
+    fn each_feed_verifies_only_its_own_domain() {
+        use ed25519_dalek::Signer;
+        let payload = payload_json("2.11.0", "linux-x86_64", 47);
+        let sign_in = |domain: &[u8]| {
+            let mut message = domain.to_vec();
+            message.extend_from_slice(payload.as_bytes());
+            let sig = dev_signing_key().sign(&message);
+            serde_json::json!({
+                "v": 1,
+                "payload": payload,
+                "sig": sig.to_bytes().iter().map(|b| format!("{b:02x}")).collect::<String>(),
+            })
+            .to_string()
+        };
+        let v1 = sign_in(patanyx_update::SIGNING_DOMAIN);
+        let v2 = sign_in(patanyx_update::SIGNING_DOMAIN_LINUX_V2);
+        let keys = dev_trusted_keys();
+        assert!(super::verify_for_feed(Platform::LinuxX86_64, v2.as_bytes(), &keys).is_ok());
+        assert!(super::verify_for_feed(Platform::LinuxX86_64, v1.as_bytes(), &keys).is_err());
+        assert!(patanyx_update::verify_manifest(v2.as_bytes(), &keys).is_err(), "old copies refuse /v2");
+    }
+
+    fn webkit(version: Option<&[u32]>) -> RunningEngine<'_> {
+        RunningEngine {
+            name: "WebKitGTK",
+            version,
+            gates_install: true,
+        }
+    }
+
+    #[test]
+    fn linux_reads_v2_and_windows_stays_on_v1() {
+        std::env::remove_var("PATANYX_UPDATE_MANIFEST_URL");
+        assert_eq!(feed_for(Platform::LinuxX86_64), "v2");
+        assert_eq!(feed_for(Platform::LinuxAarch64), "v2");
+        assert_eq!(feed_for(Platform::WindowsX86_64), "v1");
+        for channel in [
+            crate::prefs::UpdateChannel::Stable,
+            crate::prefs::UpdateChannel::Beta,
+        ] {
+            assert!(manifest_url(Platform::LinuxX86_64, channel).contains("/v2/linux-x86_64"));
+            assert!(manifest_url(Platform::WindowsX86_64, channel).contains("/v1/windows-x86_64"));
+        }
+    }
+
+    #[test]
+    fn an_offer_this_engine_cannot_run_is_held_not_offered() {
+        let phase = check(&webkit(Some(&[2, 52, 6])), offer(Some(r#"{"webkitgtk":"2.54.0"}"#)));
+        match &phase {
+            Phase::EngineHeld {
+                engine,
+                needed,
+                running,
+                offered,
+                ..
+            } => {
+                assert_eq!(engine, "WebKitGTK");
+                assert_eq!(needed, "2.54.0");
+                assert_eq!(running.as_deref(), Some("2.52.6"));
+                assert_eq!(offered.to_string(), "2.11.0");
+            }
+            other => panic!("expected EngineHeld, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_offer_this_engine_can_run_is_offered() {
+        let phase = check(&webkit(Some(&[2, 54, 0])), offer(Some(r#"{"webkitgtk":"2.54.0"}"#)));
+        assert!(matches!(phase, Phase::Offered { .. }), "got {phase:?}");
+    }
+
+    #[test]
+    fn an_offer_without_a_webkitgtk_floor_is_refused_on_linux() {
+        let phase = check(&webkit(Some(&[2, 60, 0])), offer(None));
+        assert!(matches!(phase, Phase::Refused { .. }), "got {phase:?}");
+    }
+
+    #[test]
+    fn an_unreadable_engine_is_held_with_the_unknown_kind() {
+        let phase = check(&webkit(None), offer(Some(r#"{"webkitgtk":"2.54.0"}"#)));
+        let u = Updater {
+            phase,
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        let snap = status_json(&u);
+        assert_eq!(snap["state"], json!("refused"));
+        assert_eq!(snap["refusal_kind"], json!("engine_unknown"));
+        assert!(snap.get("engine_running").is_none());
+        // "running" is still this build's PATANYX version, untouched.
+        assert_eq!(snap["running"], json!(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn the_held_status_carries_a_machine_readable_kind() {
+        let phase = check(&webkit(Some(&[2, 52, 6])), offer(Some(r#"{"webkitgtk":"2.54.0"}"#)));
+        let u = Updater {
+            phase,
+            last_check_started: None,
+            advisory: None,
+            envelope: None,
+        };
+        let snap = status_json(&u);
+        // Old readers still see a refusal with a sentence.
+        assert_eq!(snap["state"], json!("refused"));
+        assert!(snap["reason"].as_str().unwrap().contains("2.54.0"));
+        assert_eq!(snap["refusal_kind"], json!("engine_too_old"));
+        assert_eq!(snap["engine"], json!("WebKitGTK"));
+        assert_eq!(snap["engine_needed"], json!("2.54.0"));
+        assert_eq!(snap["engine_running"], json!("2.52.6"));
+        assert_eq!(snap["running"], json!(env!("CARGO_PKG_VERSION")));
+        assert_eq!(snap["offered"], json!("2.11.0"));
+    }
 }
 
 #[cfg(test)]

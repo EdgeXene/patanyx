@@ -62,6 +62,21 @@ fn script_of(c: char) -> Option<Script> {
     // Ranges are checked most-specific first where they would otherwise be
     // shadowed. Each bound is a Unicode block edge, cited so a reviewer can
     // check it against the standard rather than trust it.
+    //
+    // THIS TABLE IS 1.0.4's, AND STAYS 1.0.4's. The page tally and 1.0.4's
+    // per-node rule (NodeRules::RELEASE_1_0_4, which finds where 1.0.4
+    // refused a page) read it, so any change here changes what 1.0.4 would
+    // have done and silently moves the baseline everything is compared with
+    // (release review, tenth pass, R-001 and R-002).
+    // script_of_matches_1_0_4 pins it.
+    //
+    // AUDITED against Unicode Scripts.txt (15.1) on 2026-10-07, every letter
+    // these arms classify: inside these blocks the only letters of ANOTHER
+    // script are U+03E2..U+03EF (Coptic, counted here as Greek) and U+AB65 (a
+    // Greek letter, counted here as Latin). script_of_strict corrects both
+    // for the two rules that send text 1.0.4 never sent. The remaining letters
+    // Unicode calls Common or Inherited (U+0374, U+0640, U+064B..U+0655,
+    // U+0670, U+30FC, U+A788) belong to no other script.
     Some(match u {
         // Basic Latin letters + Latin-1 + Extended-A/B, IPA, Latin Extended
         // Additional/C/D/E, and fullwidth Latin. Broadened after a red-team
@@ -120,6 +135,21 @@ fn script_of(c: char) -> Option<Script> {
         | 0x30000..=0x3134F => Script::Han,
         _ => Script::Other,
     })
+}
+
+/// The script of a letter by Unicode's own assignment, for the two rules that
+/// send what 1.0.4 never sent (a short node trusted under a foreign tally,
+/// and source-only text past a refusal). They promise the node holds no
+/// foreign letter, so the two letters script_of misfiles must be right here:
+/// the Coptic letters of the Greek block are not Greek (seventh pass, R-001),
+/// and U+AB65 in Latin Extended-E is Greek, not Latin (eighth pass, R-001).
+/// Everything else is script_of.
+fn script_of_strict(c: char) -> Option<Script> {
+    match c as u32 {
+        0x03E2..=0x03EF if c.is_alphabetic() => Some(Script::Other),
+        0xAB65 => Some(Script::Greek),
+        _ => script_of(c),
+    }
 }
 
 /// The dominant script of a body of text, and what share of the letters it
@@ -300,6 +330,31 @@ pub struct ScriptCounts {
     han: usize,
 }
 
+/// What a run has learned about its page, applied per node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NodeRules {
+    /// The page has shown itself to be in the source language (enough text
+    /// in the source's own script was sent): a short node written entirely
+    /// in that script is kept even when the page tally has turned. Without
+    /// it, a lone source-language word on a foreign page would pass.
+    pub trust_source_short: bool,
+    /// The run has gone on past a batch where 1.0.4 would have refused the
+    /// page. From there only a node written WHOLLY in the source's writing
+    /// system, with letters of its own script, is sent: 1.0.4 sent nothing
+    /// at all, so anything with a foreign letter in it would be new foreign
+    /// text reaching the model.
+    pub source_only: bool,
+}
+
+impl NodeRules {
+    /// The per-node rule exactly as 1.0.4 applied it: a short node passes
+    /// while the page tally is not a mismatch, a long one on its share.
+    pub const RELEASE_1_0_4: NodeRules = NodeRules {
+        trust_source_short: false,
+        source_only: false,
+    };
+}
+
 impl ScriptCounts {
     /// A fresh accumulator for a given source language.
     pub fn new(source_code: &str) -> Self {
@@ -346,8 +401,40 @@ impl ScriptCounts {
     /// node ("2)", a date, a name) carries no signal, and dropping those would
     /// silently gap a page whose verdict already said translate.
     pub fn text_is_expected(&self, text: &str) -> bool {
+        self.text_is_expected_with(text, NodeRules::RELEASE_1_0_4)
+    }
+
+    /// Letters in `text`, those in the expected writing system, and those in
+    /// the expected script itself (kana alone for Japanese), by `classify`.
+    fn counts_by(&self, text: &str, classify: fn(char) -> Option<Script>) -> (usize, usize, usize) {
+        let (mut total, mut in_system, mut exact) = (0, 0, 0);
+        for c in text.chars() {
+            let Some(sc) = classify(c) else { continue };
+            total += 1;
+            let ok = match self.expected {
+                Some(Script::Kana) => sc == Script::Kana || sc == Script::Han,
+                Some(exp) => sc == exp,
+                None => true,
+            };
+            if ok {
+                in_system += 1;
+            }
+            if Some(sc) == self.expected {
+                exact += 1;
+            }
+        }
+        (total, in_system, exact)
+    }
+
+    /// `text_is_expected` with the two run-level relaxations and
+    /// tightenings set by the caller (see NodeRules).
+    pub fn text_is_expected_with(&self, text: &str, rules: NodeRules) -> bool {
         let mut total = 0usize;
         let mut in_system = 0usize;
+        // Letters in the expected script ITSELF. For Japanese that is kana
+        // alone, not kana + han: Han is shared with Chinese, so it is never
+        // proof on its own that a short node belongs to a Japanese source.
+        let mut exact = 0usize;
         for c in text.chars() {
             let Some(sc) = script_of(c) else { continue };
             total += 1;
@@ -359,10 +446,25 @@ impl ScriptCounts {
             if ok {
                 in_system += 1;
             }
+            if Some(sc) == self.expected {
+                exact += 1;
+            }
         }
         if self.expected.is_none() {
             return true;
         }
+        // The same three counts by Unicode's own script assignment, for the
+        // two rules below that go beyond 1.0.4 (see script_of_strict).
+        let (strict_total, strict_in_system, strict_exact) = self.counts_by(text, script_of_strict);
+        // PAST A POINT WHERE 1.0.4 REFUSED, ONLY THE SOURCE'S OWN TEXT. No
+        // foreign letter at all, and at least one in the source's own script:
+        // for Japanese, Han alone is shared with Chinese and proves nothing
+        // (release review of the mixed-page change, third pass R-002, sixth
+        // pass R-001 and R-002).
+        if rules.source_only {
+            return strict_exact > 0 && strict_in_system == strict_total;
+        }
+
         // A SHORT NODE IS ONLY GIVEN THE BENEFIT OF THE DOUBT WHILE THE PAGE
         // AS A WHOLE DESERVES IT.
         //
@@ -377,10 +479,38 @@ impl ScriptCounts {
         // The doubt is therefore extended only while the WHOLE page has not
         // already been judged incompatible. Once it has, short nodes are held
         // to the same standard as long ones.
+        //
+        // Except a short node written ENTIRELY in the source's own script.
+        // Chopping can only smuggle letters that are foreign; a node with none
+        // is exactly what the model is for. Without this, a Greek email inside
+        // an English webmail page lost every short Greek heading once the
+        // page's English chrome had tipped the whole-page tally.
         if total < MIN_LETTERS_PER_NODE {
+            if rules.trust_source_short && strict_total > 0 && strict_exact == strict_total {
+                return true;
+            }
             return verify(self) != Verdict::ScriptMismatch;
         }
         (in_system as f64 / total as f64) >= CLEAR_SHARE
+    }
+
+    /// Letters in `text` written in the source's own script (kana alone for
+    /// Japanese). What makes text evidence that the page is in the chosen
+    /// language: digits, punctuation and shared Han count for nothing. With
+    /// no expected script, every letter counts.
+    pub fn source_letters(&self, text: &str) -> usize {
+        text.chars()
+            .filter(|&c| match (self.expected, script_of_strict(c)) {
+                (_, None) => false,
+                (None, Some(_)) => true,
+                (Some(exp), Some(sc)) => sc == exp,
+            })
+            .count()
+    }
+
+    /// Whether `text` has any letter in the source's own script.
+    pub fn has_source_letters(&self, text: &str) -> bool {
+        self.source_letters(text) > 0
     }
 
     /// Letters counted so far (non-letters excluded).
@@ -885,6 +1015,129 @@ mod tests {
         assert_ne!(verify(&counts), Verdict::ScriptMismatch);
         assert!(counts.text_is_expected("2)"));
         assert!(counts.text_is_expected("1948"));
+    }
+
+    /// A Greek email inside an English webmail page. The page's English
+    /// chrome tips the whole-page tally into mismatch, and short Greek nodes
+    /// must still go to the Greek model: they hold no foreign letter, so
+    /// there is nothing for chopping to smuggle. Short nodes that DO carry
+    /// foreign letters are still refused, and Han alone is still not proof of
+    /// a Japanese node.
+    #[test]
+    fn on_a_refused_page_a_long_node_needs_the_sources_own_script() {
+        // Release review R-002: Chinese rejected, then a long all-Han node
+        // must not pass for Japanese.
+        let mut ja = ScriptCounts::new("ja");
+        ja.add_batch(&vec!["中文".to_string(); 200]);
+        assert_eq!(verify(&ja), Verdict::ScriptMismatch);
+        let strict = NodeRules { trust_source_short: true, source_only: true };
+        assert!(!ja.text_is_expected_with("这是一个很长的中文句子没有假名", strict));
+        assert!(ja.text_is_expected_with("これは日本語の文章です東京", strict));
+        assert!(!ja.has_source_letters("中文中文"));
+        assert!(ja.has_source_letters("東京です"));
+        let en = ScriptCounts::new("en");
+        assert!(!en.has_source_letters("2026 12:30"), "digits are no evidence");
+        assert!(en.has_source_letters("Inbox"));
+    }
+
+    #[test]
+    fn short_nodes_in_the_source_script_survive_a_refused_page_tally() {
+        let mut counts = ScriptCounts::new("el");
+        counts.add_batch(&[
+            "Κατεβάστε την εφαρμογή".to_string(),
+            "Unsubscribe from this newsletter".to_string(),
+            "Reply all Forward Move to folder".to_string(),
+        ]);
+        assert_eq!(verify(&counts), Verdict::ScriptMismatch);
+        let trusted = NodeRules { trust_source_short: true, source_only: false };
+        assert!(counts.text_is_expected_with("Άρθρο", trusted));
+        assert!(counts.text_is_expected_with("Νέα 2026", trusted));
+        assert!(!counts.text_is_expected_with("Inbox", trusted));
+        assert!(!counts.text_is_expected_with("Νέα ab", trusted));
+        assert!(!counts.text_is_expected_with("2)", trusted));
+        // 1.0.4 sent none of them.
+        assert!(!counts.text_is_expected("Άρθρο"));
+
+        let mut ja = ScriptCounts::new("ja");
+        ja.add_batch(&["这是中文文本这里现在今天请翻译更多的中文内容在这里非常好".to_string()]);
+        assert_eq!(verify(&ja), Verdict::ScriptMismatch);
+        assert!(
+            !ja.text_is_expected_with("中文", trusted),
+            "Han alone is not a Japanese node"
+        );
+        assert!(ja.text_is_expected_with("ですます", trusted));
+    }
+
+    /// Seventh review R-001: the Coptic letters in the Greek block are not
+    /// Greek, so they are no Greek source text.
+    #[test]
+    fn coptic_letters_are_not_greek() {
+        let counts = ScriptCounts::new("el");
+        let strict = NodeRules { trust_source_short: true, source_only: true };
+        assert!(!counts.text_is_expected_with("ϣϣϣϣϣϣϣϣ", strict));
+        assert!(!counts.text_is_expected_with("Καλημέρα ϣ", strict));
+        assert!(counts.text_is_expected_with("Καλημέρα ϐϑϕϰϱ", strict), "Greek symbol letters stay Greek");
+        assert_eq!(counts.source_letters("ϣϯ"), 0);
+        // Nor a short trusted node: under a foreign tally only text wholly
+        // in Greek is trusted, and Coptic is not Greek.
+        let mut tipped = ScriptCounts::new("el");
+        tipped.add_batch(&["Unsubscribe from this newsletter".to_string()]);
+        let trusted = NodeRules { trust_source_short: true, source_only: false };
+        assert!(!tipped.text_is_expected_with("ϣϣϣ", trusted));
+        assert!(tipped.text_is_expected_with("Νέα", trusted));
+    }
+
+    /// The page tally and 1.0.4's per-node rule must classify every letter
+    /// exactly as 1.0.4 did (tenth review, R-001 and R-002). A fingerprint of
+    /// script_of over every code point, taken from the 1.0.4 table: any edit
+    /// to the table fails here. Corrections belong in script_of_strict.
+    #[test]
+    fn script_of_matches_1_0_4() {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for u in 0..=0x10FFFFu32 {
+            let Some(c) = char::from_u32(u) else { continue };
+            let Some(sc) = script_of(c) else { continue };
+            for b in format!("{u:X}{sc:?};").bytes() {
+                hash ^= u64::from(b);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(hash, SCRIPT_OF_1_0_4, "script_of changed: {hash:#018x}");
+        // The two letters it misfiles, kept misfiled on purpose here.
+        assert_eq!(script_of('\u{03E3}'), Some(Script::Greek));
+        assert_eq!(script_of('\u{AB65}'), Some(Script::Latin));
+        assert_eq!(script_of_strict('\u{03E3}'), Some(Script::Other));
+        assert_eq!(script_of_strict('\u{AB65}'), Some(Script::Greek));
+    }
+    /// Computed from 25de544's detect.rs (1.0.4), compiled on its own.
+    const SCRIPT_OF_1_0_4: u64 = 0x8aa5_74a7_5459_76c3;
+
+    /// Eighth review R-001: U+AB65 sits in Latin Extended-E but is a Greek
+    /// letter, and is no English source text.
+    #[test]
+    fn a_greek_letter_in_a_latin_block_is_greek() {
+        let en = ScriptCounts::new("en");
+        let strict = NodeRules { trust_source_short: true, source_only: true };
+        assert!(!en.text_is_expected_with("\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}\u{AB65}", strict));
+        assert_eq!(en.source_letters("\u{AB65}"), 0);
+        assert_eq!(ScriptCounts::new("el").source_letters("\u{AB65}"), 1);
+        assert!(en.text_is_expected_with("Welcome \u{AB30}", strict), "the rest of the block stays Latin");
+    }
+
+    /// Sixth review R-002: past a refusal, a long node that is mostly the
+    /// source's script still carries foreign letters, and 1.0.4 sent none of
+    /// it. Only text wholly in the source's writing system goes on.
+    #[test]
+    fn past_a_refusal_only_text_wholly_in_the_source_is_sent() {
+        let counts = ScriptCounts::new("el");
+        let strict = NodeRules { trust_source_short: true, source_only: true };
+        assert!(!counts.text_is_expected_with("Καλημέρα κόσμε abcdef", strict));
+        assert!(counts.text_is_expected_with("Καλημέρα κόσμε, 2026!", strict));
+        assert!(!counts.text_is_expected_with("2026", strict), "no letter of its own");
+        let ja = ScriptCounts::new("ja");
+        assert!(ja.text_is_expected_with("東京都の天気です", strict));
+        assert!(!ja.text_is_expected_with("これはGoogleです", strict));
+        assert!(!ja.text_is_expected_with("東京都中央区日本橋", strict), "Han alone");
     }
 
 }

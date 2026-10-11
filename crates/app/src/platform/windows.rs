@@ -189,6 +189,26 @@ fn connect_focus_tracking(
     }
 }
 
+/// Side by Side: which tab's page took the keyboard, so the pane clicked
+/// into becomes the one every toolbar command and shortcut acts on.
+fn connect_pane_focus(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: u64) {
+    use webview2_com::FocusChangedEventHandler;
+    use wry::WebViewExtWindows;
+
+    let proxy = proxy.clone();
+    let controller = webview.controller();
+    let mut token = Default::default();
+    unsafe {
+        let _ = controller.add_GotFocus(
+            &FocusChangedEventHandler::create(Box::new(move |_sender, _args| {
+                let _ = proxy.send_event(UserEvent::PaneFocused(id));
+                Ok(())
+            })),
+            &mut token,
+        );
+    }
+}
+
 // `vk_key` moved to shortcuts.rs, beside `keypad_scan_code` and the resolver
 // it feeds. It is a pure u32 -> Key mapping with no Win32 types in it, and
 // living in a #[cfg(windows)] file meant NOTHING could test it from the Linux
@@ -223,6 +243,86 @@ pub fn connect_zoom_changed(webview: &WebView, proxy: &EventLoopProxy<UserEvent>
             &mut token,
         );
     }
+}
+
+/// A page's own fullscreen element (a video's full screen button).
+///
+/// WebView2 reports the change AFTER it happened and offers no veto, so the
+/// decision about the window is AppState's: an eligible page gets the screen,
+/// any other keeps the tab-sized fullscreen every earlier build gave it. The
+/// value is read from the engine, never from anything the page sent, and the
+/// tab id is the one recorded when the tab was built.
+pub fn connect_fullscreen(
+    _hosts: &Hosts,
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+) {
+    use webview2_com::ContainsFullScreenElementChangedEventHandler;
+    use wry::WebViewExtWindows;
+
+    let proxy = proxy.clone();
+    let core = webview.webview();
+    let mut token = Default::default();
+    let result = unsafe {
+        core.add_ContainsFullScreenElementChanged(
+            &ContainsFullScreenElementChangedEventHandler::create(Box::new(move |sender, _args| {
+                let Some(sender) = sender else {
+                    return Ok(());
+                };
+                let mut on = windows::core::BOOL::default();
+                sender.ContainsFullScreenElement(&mut on)?;
+                let _ = proxy.send_event(UserEvent::PageFullscreen(id, on.as_bool()));
+                Ok(())
+            })),
+            &mut token,
+        )
+    };
+    if let Err(error) = result {
+        diag(&format!(
+            "fullscreen: add_ContainsFullScreenElementChanged FAILED for tab {id} ({error}); its page keeps a tab-sized fullscreen"
+        ));
+    }
+}
+
+/// Windows needs no list: the engine cannot be told to refuse (see
+/// `connect_fullscreen`), so AppState applies the same rule after the fact.
+pub fn set_fullscreen_eligible(_hosts: &Hosts, _tabs: &[u64]) {}
+
+/// The window itself: borderless fullscreen on the monitor it is on, or back.
+pub fn set_page_fullscreen(hosts: &Hosts, on: bool) {
+    hosts
+        .window
+        .set_fullscreen(on.then_some(tao::window::Fullscreen::Borderless(None)));
+}
+
+/// The page takes the whole client area and the chrome gets nothing.
+///
+/// Zero-sized rather than covered for the reason `layout` gives for the
+/// legacy modal: siblings do not composite, so a zero-size chrome is the only
+/// arrangement that cannot fight the page for z-order on some machine.
+pub fn layout_fullscreen(hosts: &Hosts, chrome: &WebView, page: &WebView) {
+    let _ = set_chrome_z(hosts, false);
+    let _ = chrome.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(0.0, 0.0).into(),
+    });
+    let size = hosts
+        .window
+        .inner_size()
+        .to_logical::<f64>(hosts.window.scale_factor());
+    let _ = page.set_bounds(Rect {
+        position: LogicalPosition::new(0.0, 0.0).into(),
+        size: LogicalSize::new(size.width, size.height).into(),
+    });
+    let _ = page.set_visible(true);
+    READOUT_SCALE.store(hosts.window.scale_factor().to_bits(), Ordering::Relaxed);
+    READOUT_LEFT.store(0, Ordering::Relaxed);
+    READOUT_RIGHT.store(0, Ordering::Relaxed);
+    // Re-centre the notice for the new client size; a hover readout (not
+    // the notice) is hidden, as every layout hides it.
+    notice_reflow();
+    readout_apply(None);
 }
 
 /// Owns the window: it is the parent of every child webview and the source
@@ -1043,6 +1143,46 @@ thread_local! {
     static READOUT_TEXT: RefCell<String> = const { RefCell::new(String::new()) };
 }
 
+/// True while the fullscreen notice owns the readout window. Every hover
+/// write and every hide goes through `readout_apply`, which leaves the window
+/// alone while this is set: a background tab starting a load, or the pointer
+/// leaving the page, must not take the notice down before its time.
+static NOTICE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Shows the fullscreen notice (top centre) or takes it down.
+pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    READOUT_SCALE.store(hosts.window.scale_factor().to_bits(), Ordering::Relaxed);
+    match text {
+        // Only when the readout window exists: the flag silences every hover
+        // write, which must not happen for a notice that cannot be drawn.
+        Some(text) if READOUT_CHILD.load(Ordering::Relaxed) != 0 => {
+            NOTICE_ACTIVE.store(true, Ordering::Relaxed);
+            readout_draw(text, true);
+        }
+        Some(_) => diag("fullscreen notice: the readout window was never created; no notice shown"),
+        None => {
+            if NOTICE_ACTIVE.swap(false, Ordering::Relaxed) {
+                let raw = READOUT_CHILD.load(Ordering::Relaxed);
+                if raw != 0 {
+                    let _ = unsafe { ShowWindow(HWND(raw as _), SW_HIDE) };
+                }
+            }
+        }
+    }
+}
+
+/// Re-places a showing notice after the window changed size (entering
+/// fullscreen resizes the window AFTER the notice first drew).
+fn notice_reflow() {
+    if NOTICE_ACTIVE.load(Ordering::Relaxed) {
+        let text = READOUT_TEXT.with(|t| t.borrow().clone());
+        readout_draw(&text, true);
+    }
+}
+
 fn readout_scale() -> f64 {
     let bits = READOUT_SCALE.load(Ordering::Relaxed);
     let scale = f64::from_bits(bits);
@@ -1162,7 +1302,31 @@ pub fn hover_readout_state(_hosts: &Hosts) -> (bool, String) {
 }
 
 /// The `&Hosts`-free half, callable from the 'static status-bar callback.
+///
+/// A no-op while the fullscreen notice owns the window (`NOTICE_ACTIVE`).
 fn readout_apply(text: Option<&str>) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    if NOTICE_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    let raw = READOUT_CHILD.load(Ordering::Relaxed);
+    if raw == 0 {
+        return; // Never created: the feature is off.
+    }
+    let suppressed = READOUT_SUPPRESSED.load(Ordering::Relaxed);
+    match text.filter(|_| !suppressed) {
+        Some(text) => readout_draw(text, false),
+        None => {
+            let _ = unsafe { ShowWindow(HWND(raw as _), SW_HIDE) };
+        }
+    }
+}
+
+/// Measures and shows `text`: at the page's bottom-left (the hover readout)
+/// or top centre (`notice`, the fullscreen notice).
+fn readout_draw(text: &str, notice: bool) {
     use windows::Win32::Foundation::{HWND, RECT, SIZE};
     use windows::Win32::Graphics::Gdi::{
         GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, HFONT, HGDIOBJ,
@@ -1176,12 +1340,6 @@ fn readout_apply(text: Option<&str>) {
         return; // Never created: the feature is off.
     }
     let hwnd = HWND(raw as _);
-
-    let suppressed = READOUT_SUPPRESSED.load(Ordering::Relaxed);
-    let Some(text) = text.filter(|_| !suppressed) else {
-        let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-        return;
-    };
 
     READOUT_TEXT.with(|t| {
         let mut t = t.borrow_mut();
@@ -1232,8 +1390,11 @@ fn readout_apply(text: Option<&str>) {
     let left_px = (f64::from(READOUT_LEFT.load(Ordering::Relaxed)) * readout_scale()) as i32;
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let right_px = (f64::from(READOUT_RIGHT.load(Ordering::Relaxed)) * readout_scale()) as i32;
-    let (x, y, w, h) =
-        crate::hover_style::readout_rect(client.right, client.bottom, left_px, right_px, text_w, line_h);
+    let (x, y, w, h) = if notice {
+        crate::hover_style::notice_rect(client.right, client.bottom, text_w, line_h, readout_scale())
+    } else {
+        crate::hover_style::readout_rect(client.right, client.bottom, left_px, right_px, text_w, line_h)
+    };
 
     // HWND_TOP on every show: content webviews are created AFTER this window
     // (arm runs before the first tab), and siblings later in creation order
@@ -1680,6 +1841,7 @@ pub fn build_content(
     );
     connect_shortcuts(&webview, proxy);
     connect_focus_tracking(&webview, proxy, crate::state::FocusSurface::Content);
+    connect_pane_focus(&webview, proxy, id);
     // Tabs start hidden; AppState activates one via show_tab + layout. A
     // fresh WebView2 child defaults to visible, so hide it before it can
     // paint over the chrome strip or another tab.
@@ -1753,6 +1915,10 @@ pub fn build_content(
     // all-frames path, same place in the order so the first document
     // already has it.
     install_scrollbar_script(&webview, &state);
+    // YouTube's video ads: same registration path and place in the order, so
+    // the first YouTube document already has it. Toggled later by
+    // apply_policy.
+    sync_youtube_script(&webview, &state, Some((proxy.clone(), id)));
     // The first navigation happens HERE, not on the builder, and the
     // ordering is the whole point: wry issues `Navigate` inside
     // `build_as_child` when the builder carries a url, which is before any
@@ -4353,6 +4519,108 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
     } else {
         SettingState::Failed
     };
+    sync_youtube_script(webview, &view.state, None);
+}
+
+/// Brings this tab's YouTube ad script in line with
+/// `policy.block_youtube_ads` (`TabState::youtube_script_step`). Registration
+/// covers documents created AFTER it, so a change reaches YouTube pages
+/// opened or reloaded afterwards, which is what the switch's note says. The
+/// script checks the host itself: WebView2 cannot scope a registration.
+///
+/// `settled`: at tab build, the tab's first page waits for this answer
+/// (`TabState::initial_navigation_ready`), so the completion handler sends the
+/// same release event the local-network guard does; the guard's overdue timer
+/// also releases a registration that is never answered.
+fn sync_youtube_script(
+    webview: &WebView,
+    state: &Rc<RefCell<TabState>>,
+    settled: Option<(EventLoopProxy<UserEvent>, u64)>,
+) {
+    use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let step = state.borrow().youtube_script_step();
+    match step {
+        privacy::YoutubeScriptStep::Nothing => return,
+        privacy::YoutubeScriptStep::Remove => {
+            let id = state.borrow().youtube_script_id.clone();
+            if let Some(id) = id {
+                // The id is forgotten only once the engine confirms the
+                // removal; a refused removal keeps it, so the next change of
+                // the switch can try again (final review YT R-005).
+                if remove_document_script(&core, &id, "YouTube ads") {
+                    state.borrow_mut().youtube_script_id = None;
+                }
+            }
+            return;
+        }
+        privacy::YoutubeScriptStep::Add => {}
+    }
+    state.borrow_mut().youtube_script_adding = true;
+    let source: Vec<u16> = privacy::YOUTUBE_ADS_SCRIPT
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let remember = Rc::clone(state);
+    let core_for_handler = core.clone();
+    let settled_for_handler = settled.clone();
+    let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
+        move |hr, script_id| {
+            {
+                let mut st = remember.borrow_mut();
+                st.youtube_script_adding = false;
+                if hr.is_err() {
+                    diag("YouTube ads: registration REFUSED by the engine; YouTube shows its ads in this tab");
+                } else if !st.policy.block_youtube_ads || st.youtube_script_id.is_some() {
+                    // Switched off meanwhile, or a second copy after the
+                    // overdue timer let a re-add through: keep at most one.
+                    drop(st);
+                    if !remove_document_script(&core_for_handler, &script_id, "YouTube ads") {
+                        let mut st = remember.borrow_mut();
+                        if st.youtube_script_id.is_none() {
+                            st.youtube_script_id = Some(script_id);
+                        }
+                    }
+                } else {
+                    st.youtube_script_id = Some(script_id);
+                }
+            }
+            if let Some((proxy, id)) = &settled_for_handler {
+                let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(*id));
+            }
+            Ok(())
+        },
+    ));
+    let result = unsafe {
+        core.AddScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(source.as_ptr()), &handler)
+    };
+    if result.is_err() {
+        state.borrow_mut().youtube_script_adding = false;
+        diag("YouTube ads: AddScriptToExecuteOnDocumentCreated call failed; YouTube shows its ads in this tab");
+        if let Some((proxy, id)) = &settled {
+            let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(*id));
+        }
+    }
+}
+
+/// Removes one document-created script by the id the engine gave it, and
+/// says whether the engine accepted the removal.
+fn remove_document_script(
+    core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    id: &str,
+    what: &str,
+) -> bool {
+    let id_wide: Vec<u16> = id.encode_utf16().chain(std::iter::once(0)).collect();
+    let removed = unsafe {
+        core.RemoveScriptToExecuteOnDocumentCreated(windows::core::PCWSTR(id_wide.as_ptr()))
+    }
+    .is_ok();
+    if !removed {
+        diag(&format!("{what}: could not remove the registration; it is kept and retried at the next change"));
+    }
+    removed
 }
 
 // ---------------------------------------------------------------------------
@@ -5876,6 +6144,12 @@ pub fn blocked_total(view: &TabView) -> u64 {
 /// immediately before every app-issued content navigation, so the
 /// local-network boundary can tell the user's navigation from the page's
 /// (`TabState::note_app_navigation`).
+/// A navigation the browser is about to start. Nothing to do here: WebView2
+/// decides per request, and `on_load_started` (NavigationStarting) already
+/// lets an AUTO freeze yield before the document is requested. The Linux
+/// backend has to lift a compiled filter; see unix.rs.
+pub fn yield_auto_freeze(_webview: &WebView, _view: &TabView) {}
+
 pub fn note_app_navigation(view: &TabView, url: &str) {
     view.state.borrow_mut().note_app_navigation(url);
 }
@@ -5987,6 +6261,11 @@ pub fn freeze_phase(view: &TabView) -> FreezePhase {
     view.state.borrow().freeze.phase()
 }
 
+/// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
+pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
+    view.state.borrow().freeze.overrides()
+}
+
 /// Whether the block behind a freeze is actually in place. See
 /// `privacy::FreezeEnforcement`.
 pub fn freeze_enforcement(view: &TabView) -> privacy::FreezeEnforcement {
@@ -6014,6 +6293,9 @@ pub fn engine_settings(view: &TabView) -> EngineSettings {
         // here that is genuinely cross-platform, so both engines read the
         // one measured answer in tunnel_control.
         tunnel: crate::tunnel_control::report(),
+        // WebView2 brings its own process model; nothing here asks for the
+        // WebKitGTK sandbox, so the row stays honest at not_attempted.
+        sandbox: SettingState::NotAttempted.as_str(),
     }
 }
 
@@ -6933,6 +7215,8 @@ pub fn layout(
     hosts: &Hosts,
     chrome: &WebView,
     active: Option<&WebView>,
+    // Side by Side: two pages, left and right, in place of `active`.
+    pair: Option<(&WebView, &WebView)>,
     chrome_height: i32,
     chrome_strip: i32,
     chrome_left: i32,
@@ -6994,15 +7278,15 @@ pub fn layout(
                 chrome_right,
                 arrangement,
             ));
-            if let Some(webview) = active {
-                let _ = webview.set_bounds(content_rect(
-                    &hosts.window,
-                    crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
-                    chrome_left,
-                    chrome_right,
-                    0,
-                ));
-            }
+            place_pages(
+                hosts,
+                active,
+                pair,
+                crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
+                chrome_left,
+                chrome_right,
+                0,
+            );
         }
 
         // A modal. Two geometries, decided by what `arm_translucent_overlay`
@@ -7086,20 +7370,33 @@ pub fn layout(
                 // thing many people do -- maximise the window -- happens with
                 // a modal open. `content_rect` reads the window's current
                 // size, so that is covered here too.
-                if let Some(webview) = active {
-                    let _ = webview.set_bounds(content_rect(
-                        &hosts.window,
-                        crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
-                        chrome_left,
-                        chrome_right,
-                        0,
-                    ));
-                }
-            } else if let Some(webview) = active {
-                let _ = webview.set_bounds(Rect {
+                place_pages(
+                    hosts,
+                    active,
+                    pair,
+                    crate::platform::page_top_for(arrangement, chrome_height, chrome_strip),
+                    chrome_left,
+                    chrome_right,
+                    0,
+                );
+            } else {
+                // Zero-sized, both pages when there are two: the legacy modal
+                // hides the page area entirely.
+                let zero = || Rect {
                     position: LogicalPosition::new(0.0, 0.0).into(),
                     size: LogicalSize::new(0.0, 0.0).into(),
-                });
+                };
+                match pair {
+                    Some((l, r)) => {
+                        let _ = l.set_bounds(zero());
+                        let _ = r.set_bounds(zero());
+                    }
+                    None => {
+                        if let Some(webview) = active {
+                            let _ = webview.set_bounds(zero());
+                        }
+                    }
+                }
             }
         }
 
@@ -7125,19 +7422,12 @@ pub fn layout(
                 position: LogicalPosition::new(0.0, 0.0).into(),
                 size: LogicalSize::new(size.width, size.height).into(),
             });
-            if let Some(webview) = active {
-                // Side strips and the pane all coexist: page_rect subtracts
-                // left chrome from the left and both right-hand widths from
-                // the right.
-                #[allow(clippy::cast_possible_truncation)]
-                let _ = webview.set_bounds(content_rect(
-                    &hosts.window,
-                    chrome_height,
-                    chrome_left,
-                    chrome_right,
-                    pane as i32,
-                ));
-            }
+            // Side strips and the pane all coexist: page_rect subtracts
+            // left chrome from the left and both right-hand widths from
+            // the right. (Side by Side is ended before the chat pane docks,
+            // so `pair` is None here in practice; placed the same way if not.)
+            #[allow(clippy::cast_possible_truncation)]
+            place_pages(hosts, active, pair, chrome_height, chrome_left, chrome_right, pane as i32);
         }
     }
 }
@@ -7149,9 +7439,69 @@ pub fn layout(
 /// browser. The clamp lives here rather than in the UI so a bad width from any
 /// caller -- a dragged handle, a restored setting, a malformed IPC frame --
 /// lands somewhere survivable.
+/// Put the page, or the two Side by Side pages, where the arrangement says.
+fn place_pages(
+    hosts: &Hosts,
+    active: Option<&WebView>,
+    pair: Option<(&WebView, &WebView)>,
+    top: i32,
+    left: i32,
+    right: i32,
+    pane: i32,
+) {
+    match pair {
+        Some((l, r)) => {
+            let size = hosts
+                .window
+                .inner_size()
+                .to_logical::<f64>(hosts.window.scale_factor());
+            let rect = crate::platform::page_rect(
+                size.width,
+                size.height,
+                top,
+                left,
+                right,
+                pane,
+                crate::platform::PAGE_FRAME_PX,
+            );
+            let (a, b) = crate::platform::split_page_rect(rect, crate::platform::SIDE_BY_SIDE_GAP_PX);
+            for (webview, (x, y, w, h)) in [(l, a), (r, b)] {
+                let _ = webview.set_bounds(Rect {
+                    position: LogicalPosition::new(x, y).into(),
+                    size: LogicalSize::new(w, h).into(),
+                });
+            }
+        }
+        None => {
+            if let Some(webview) = active {
+                let _ = webview.set_bounds(content_rect(&hosts.window, top, left, right, pane));
+            }
+        }
+    }
+}
+
+/// Side by Side: each page is its own child window, placed by `layout`;
+/// this only makes both visible. It never focuses either (the keyboard
+/// stays where it is; see AppState::show_and_focus_tab).
+pub fn set_side_by_side(
+    _hosts: &Hosts,
+    pair: Option<((&TabView, &WebView), (&TabView, &WebView))>,
+) {
+    if let Some(((_, l), (_, r))) = pair {
+        let _ = l.set_visible(true);
+        let _ = r.set_visible(true);
+    }
+}
+
 const MAX_PANE_FRACTION: f64 = 0.5;
 
 /// Whether a docked pane can actually be laid out on this backend.
+/// WebView2 always composites; the Linux-only fault this guards against does
+/// not exist here (see unix.rs `compositing_disabled`).
+pub fn compositing_disabled() -> bool {
+    false
+}
+
 pub fn split_supported() -> bool {
     true
 }

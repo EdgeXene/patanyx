@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.3"
+version = "1.0.6"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -57,6 +57,12 @@ relay-client = ["chat", "patanyx-chat/relay-client"]
 # unconditional there and has no network code to gate — so this forwards
 # only to the HTTP client.
 updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-roots"]
+# The one-time 1.0.6 Linux BRIDGE build, published ONLY on the old /v1 Linux
+# feed: refuses to start below WebKitGTK 2.52.5 (the lowest floor any /v1 reader
+# enforced, 0.9.x) instead of
+# 2.54.0, and warns with the engine banner in between. See
+# platform::COMPILED_WEBKITGTK_FLOOR. Never on by default, never on Windows.
+linux-bridge = []
 
 [dependencies]
 # `mac-proxy` is OFF upstream by default; it is the ONLY wry arm that honours
@@ -79,6 +85,7 @@ fluent-bundle = "0.16"
 unic-langid = "0.9"
 patanyx-vault = { path = "../vault" }
 patanyx-integrity = { path = "../integrity" }
+patanyx-reader = { path = "../reader" }
 patanyx-corroborate = { path = "../corroborate" }
 patanyx-store = { path = "../store" }
 patanyx-update = { path = "../update" }
@@ -190,8 +197,13 @@ windows = { version = "0.61", features = [
   "Win32_System_Registry",
 ] }
 
-# GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
-# them. All uses live in src/platform/unix.rs.
+# libc is needed on every unix, macOS included: kill(2) on the update
+# preflight's process group (updater::installer::preflight).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+# GTK/WebKitGTK exist only on Linux; a macOS or Windows build must not try to
+# compile them. All uses live in src/platform/unix.rs.
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 gtk = "0.18"
 # Same crate+features wry itself uses; needed for the Response policy

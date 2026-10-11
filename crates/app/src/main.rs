@@ -87,7 +87,12 @@ mod langpack;
 mod languages;
 /// Page-language sanity checking by Unicode script (the corruption guard).
 mod detect;
+/// The "your system needs a newer web engine" window (Linux, strict builds).
+#[cfg(target_os = "linux")]
+mod engine_window;
 mod find;
+/// Page fullscreen (a video's "full screen" button): the decisions.
+mod fullscreen;
 mod hover;
 /// Colours, font metrics and geometry for the hover readout, kept apart from
 /// both backends so the Windows-only arithmetic is testable on any box.
@@ -108,13 +113,17 @@ mod platform;
 mod prefs;
 mod premium_purchase;
 mod psl;
+mod reader_view;
 mod resolver_probe;
 /// The browser's only self-initiated network activity, and its timing.
 mod schedule;
 mod shelf;
 mod shortcuts;
+mod side_by_side;
 mod sponsorship;
 mod state;
+mod tutorial;
+mod tab_groups;
 /// Cross-tab text search over each tab's visible text: pure matching,
 /// snippet shaping and refusal wording, identical on every platform.
 mod tab_search;
@@ -148,6 +157,12 @@ enum UserEvent {
     /// plainly which data were NOT cleared instead of turning an unavailable
     /// privacy primitive into a browser that never loads.
     SessionWipeFinished,
+    /// A tab's freeze changed without a navigation or an IPC call (Linux: the
+    /// GTK auto-freeze timer froze it, or its freeze filter failed to
+    /// install). Re-sends the toolbar status; without it the freeze chip read
+    /// "Live" on a frozen tab until something else happened to push one.
+    #[cfg_attr(windows, allow(dead_code))]
+    FreezeStatusChanged,
     /// The engine answered tab N's WebSocket guard registration (Windows):
     /// its first page may be released.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -187,6 +202,9 @@ enum UserEvent {
     // Sent only by the WebView2 backend; GTK restores focus by itself.
     #[cfg_attr(not(windows), allow(dead_code))]
     SurfaceFocused(state::FocusSurface),
+    /// Side by Side: this tab's page took the keyboard.
+    #[cfg_attr(not(any(windows, unix)), allow(dead_code))]
+    PaneFocused(u64),
     /// A key was pressed inside a PAGE. Carries nothing -- not the key, not a
     /// timestamp -- because the only thing it is used for is "a human is
     /// here", and a keystroke stream crossing this boundary would be a
@@ -214,6 +232,14 @@ enum UserEvent {
     QuitForRelaunch,
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
+    /// A tab's page entered (true) or left (false) element fullscreen, as
+    /// the ENGINE reported it. Tagged with the host-recorded tab id; nothing
+    /// a page sends can raise it.
+    PageFullscreen(u64, bool),
+    /// The "Press Esc to exit" notice's time is up. Carries the generation it
+    /// was shown under, so a timer from an earlier fullscreen cannot cut a
+    /// later notice short.
+    FullscreenNoticeEnd(u64),
     AutoLockTick,
     /// Drive one step of an in-flight translation.
     ///
@@ -312,6 +338,8 @@ enum UserEvent {
     /// Page bytes arriving from the engine's main-resource read, which is
     /// asynchronous. See page_integrity.rs.
     Integrity(page_integrity::IntegrityEvent),
+    /// A Reader View extraction finished on its worker thread.
+    Reader(reader_view::ReaderEvent),
     /// A navigation was refused because its host is on the malicious-host
     /// list. Carries the HOST and the matched rule, never the full URL: the
     /// path can hold a session token, and this event is rendered in the
@@ -390,8 +418,14 @@ enum UserEvent {
     Chat(patanyx_chat::TransportEvent),
 }
 
-/// Mirrors the CSP <meta> in chrome/index.html — keep the two in sync.
-const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'none'; form-action 'none'; base-uri 'none'";
+/// Mirrors the CSP <meta> in chrome/index.html — keep the two in sync
+/// (`the_chrome_policy_header_and_meta_tag_agree` checks it).
+///
+/// `media-src blob:` is for the feature videos (1.0.5): compiled in, handed
+/// to the chrome over IPC and played from a blob URL the chrome's own script
+/// made (tutorial.rs says why not a chrome-origin URL). Nothing else in the
+/// chrome plays media, and `connect-src` stays `'none'`.
+const CSP: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; media-src blob:; connect-src 'none'; form-action 'none'; base-uri 'none'";
 
 const INDEX_HTML: &str = include_str!("chrome/index.html");
 const CHROME_CSS: &str = include_str!("chrome/chrome.css");
@@ -752,6 +786,15 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
 /// has genuinely decided to accept it. It is deliberately an environment
 /// variable rather than a setting in the UI: this should be an explicit act,
 /// not a checkbox someone clicks past.
+/// What `--preflight` answers: would a RELEASE build of this file start?
+/// Release semantics even in a debug build, so a debug test binary refuses
+/// where the shipped one would: Windows never refuses (WebView2 updates
+/// itself); elsewhere only a runtime below the COMPILED floor refuses, unless
+/// the user set the documented override.
+fn preflight_starts(windows: bool, below_compiled_floor: bool, override_set: bool) -> bool {
+    windows || !below_compiled_floor || override_set
+}
+
 fn enforce_engine_floor() {
     let engine = platform::engine_info();
     if !engine.below_floor {
@@ -785,12 +828,21 @@ fn enforce_engine_floor() {
         // Only a floor raised by a signed manifest is unmet. A signed
         // document may make the browser warn; it may not turn it off.
         eprintln!("  Above the compiled floor; the banner in the window says so. Continuing.");
-    } else if cfg!(debug_assertions) {
+    } else if cfg!(debug_assertions)
+        && !std::env::var("PATANYX_DEBUG_ENFORCE_FLOOR").is_ok_and(|v| v == "1")
+    {
+        // PATANYX_DEBUG_ENFORCE_FLOOR=1 makes a debug build take the release
+        // path below, so the refusal window can be tested without a release.
         eprintln!("  Debug build: continuing anyway.");
     } else if override_set {
         eprintln!("  PATANYX_ALLOW_OLD_ENGINE=1 set: continuing at your own risk.");
     } else {
         eprintln!("  Release build: refusing to start. Set PATANYX_ALLOW_OLD_ENGINE=1 to override.");
+        // Say it where a double-click can see it, then exit as before.
+        #[cfg(target_os = "linux")]
+        if !engine_window::show(&engine) {
+            eprintln!("  (No display to show the explanation window on.)");
+        }
         std::process::exit(2);
     }
 }
@@ -988,6 +1040,22 @@ fn choose_start_url(positional: Option<String>, smoke_mode: bool) -> String {
 }
 
 #[cfg(test)]
+mod preflight_tests {
+    use super::preflight_starts;
+
+    #[test]
+    fn preflight_answers_with_release_semantics() {
+        // Windows never refuses: WebView2 updates itself.
+        assert!(preflight_starts(true, true, false));
+        // Elsewhere only a runtime below the COMPILED floor refuses...
+        assert!(preflight_starts(false, false, false));
+        assert!(!preflight_starts(false, true, false));
+        // ...unless the user set the documented override.
+        assert!(preflight_starts(false, true, true));
+    }
+}
+
+#[cfg(test)]
 mod start_url_tests {
     use super::{choose_start_url, HOME_URL};
 
@@ -1130,6 +1198,47 @@ fn main() {
                 std::process::exit(1);
             }
         }
+    }
+
+    // BUILD IDENTITY, for the publish gate: which variant this file is and
+    // the WebKitGTK floor it refuses to start below. Read-only, no window, no
+    // profile, safe in a release binary; it is how a published file is
+    // checked against the feed it is about to be served on.
+    if std::env::args().any(|arg| arg == "--build-identity") {
+        println!(
+            "{}",
+            serde_json::json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "variant": platform::BUILD_VARIANT,
+                "platform": format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH),
+                "compiled_webkitgtk_floor": platform::join_version(&platform::COMPILED_WEBKITGTK_FLOOR),
+            })
+        );
+        return;
+    }
+
+    // PREFLIGHT, for the updater: would a release build of THIS file start on
+    // THIS machine's engine? Asked by the RUNNING browser of a freshly verified
+    // update before it replaces itself (updater::installer), because only a
+    // new process loads the engine the new file will actually get. No window,
+    // no profile, no network. Exit 0 = it would start, 3 = it would refuse.
+    if std::env::args().any(|arg| arg == "--preflight") {
+        let engine = platform::engine_info();
+        let override_set = std::env::var("PATANYX_ALLOW_OLD_ENGINE").is_ok_and(|v| v == "1");
+        let starts = preflight_starts(cfg!(windows), engine.below_compiled_floor, override_set);
+        println!(
+            "{}",
+            serde_json::json!({
+                "preflight": 1,
+                "version": env!("CARGO_PKG_VERSION"),
+                "variant": platform::BUILD_VARIANT,
+                "engine": engine.name,
+                "engine_version": engine.version.as_deref().map(platform::join_version),
+                "compiled_floor": platform::join_version(engine.compiled_floor),
+                "starts": starts,
+            })
+        );
+        std::process::exit(if starts { 0 } else { 3 });
     }
 
     let smoke_mode = std::env::args().any(|arg| arg == "--smoke-test");
@@ -1465,6 +1574,7 @@ fn main() {
                 app.restore_focus();
             }
             Event::UserEvent(UserEvent::SurfaceFocused(surface)) => app.note_focus(surface),
+            Event::UserEvent(UserEvent::PaneFocused(id)) => app.on_pane_focused(id),
             // A key was pressed inside a page. The ONLY effect is to say a
             // human is here; see UserEvent::UserPresence.
             Event::UserEvent(UserEvent::UserPresence) => app.touch(),
@@ -1529,9 +1639,14 @@ fn main() {
             Event::UserEvent(UserEvent::ZoomFactorChanged(id, factor)) => {
                 app.on_zoom_factor_changed(id, factor)
             }
+            Event::UserEvent(UserEvent::PageFullscreen(id, on)) => app.on_page_fullscreen(id, on),
+            Event::UserEvent(UserEvent::FullscreenNoticeEnd(generation)) => {
+                app.on_fullscreen_notice_end(generation)
+            }
             Event::UserEvent(UserEvent::SessionWipeFinished) => {
                 app.finish_session_wipe()
             }
+            Event::UserEvent(UserEvent::FreezeStatusChanged) => app.emit_tab_status(),
             Event::UserEvent(UserEvent::LocalNetworkGuardSettled(id)) => {
                 app.on_local_network_guard_settled(id)
             }
@@ -1638,6 +1753,9 @@ fn main() {
             // over IPC and then never answered.
             Event::UserEvent(UserEvent::Integrity(event)) => {
                 page_integrity::handle_event(&mut app, event);
+            }
+            Event::UserEvent(UserEvent::Reader(event)) => {
+                reader_view::handle_event(&mut app, event);
             }
             Event::UserEvent(UserEvent::Ocr(event)) => {
                 ocr_support::handle_event(&mut app, event);
@@ -1766,6 +1884,12 @@ fn main() {
             Event::UserEvent(UserEvent::Shortcut(action)) => {
                 use shortcuts::Shortcut;
                 app.touch();
+                // A fullscreen page owns every pixel; a shortcut that needs the
+                // toolbar or another page ends fullscreen BEFORE it acts, so
+                // nothing focuses or opens UI the user cannot see.
+                if !fullscreen::shortcut_keeps_fullscreen(&action) {
+                    app.exit_page_fullscreen();
+                }
                 match action {
                     shortcuts::Shortcut::ZoomIn => app.zoom_active(1),
                     shortcuts::Shortcut::ZoomOut => app.zoom_active(-1),
@@ -1800,6 +1924,12 @@ fn main() {
                     }
                     Shortcut::LockVault => app.lock_vault(),
                     Shortcut::OpenCommandPalette => app.open_command_palette(),
+                    Shortcut::ToggleReaderView => app.emit("toggle_reader_view", serde_json::json!({})),
+                    Shortcut::ToggleSideBySide => {
+                        if let Err(code) = app.side_by_side_toggle() {
+                            app.emit("side_by_side_error", serde_json::json!({ "code": code }));
+                        }
+                    }
                     Shortcut::Print => app.print_active_tab(),
                     Shortcut::OpenDeveloperTools => {
                         // The accelerator has nowhere to report "no active tab";
@@ -2093,6 +2223,25 @@ mod translator_origin_tests {
             let res = serve_translator(&req);
             assert!(res.status() == 200 || res.status() == 404, "{path}");
         }
+    }
+
+    /// The chrome's policy is sent twice, as a header and as the page's meta
+    /// tag, and the stricter of the two wins in the engine: a directive added
+    /// to one copy only does nothing, silently (the plan review of the
+    /// feature videos, 2026-10-07).
+    #[test]
+    fn the_chrome_policy_header_and_meta_tag_agree() {
+        let at = INDEX_HTML.find("http-equiv=\"Content-Security-Policy\"").expect("meta CSP");
+        let rest = &INDEX_HTML[at..];
+        let start = rest.find("content=\"").expect("content") + "content=\"".len();
+        let meta = &rest[start..start + rest[start..].find('"').expect("end quote")];
+        let norm = |p: &str| {
+            let mut d: Vec<String> = p.split(';').map(|x| x.split_whitespace().collect::<Vec<_>>().join(" ")).filter(|x| !x.is_empty()).collect();
+            d.sort();
+            d
+        };
+        assert_eq!(norm(meta), norm(CSP), "index.html meta CSP and main.rs CSP differ");
+        assert!(CSP.contains("media-src blob:"));
     }
 
     /// Every response carries the policy, including the 404 -- the same rule

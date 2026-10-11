@@ -59,7 +59,9 @@ N=$(parse "$ALLOW" | wc -l)
 # evidence.
 # 77 as of 2026-09-09: line.me, PhishDestroy's report of the LINE apex, which
 # held publishing for a day until it was ruled ALLOW.
-check "shipped allowlist parses to 77 hosts" "77" "$N"
+# 78 as of 2026-09-16: dribbble.com, PhishDestroy's report of the Dribbble
+# apex, which held three hourly builds until it was ruled ALLOW.
+check "shipped allowlist parses to 78 hosts" "78" "$N"
 # googll.store was allowlisted for one draft on the strength of its Tranco rank
 # and then removed; see the note in the allowlist. Asserted explicitly because
 # the mistake is an easy one to make twice.
@@ -75,6 +77,11 @@ check "  the audit's headline FP is present" "yes" \
 # goes missing, pip breaks on every machine running PATANYX.
 check "  pypi.org is allowlisted" "yes" \
   "$(parse "$ALLOW" | grep -qx 'pypi.org' && echo yes || echo no)"
+# Pinned by name, not only by count: a count pin alone would let a future edit
+# swap one ruling for another and still pass. Same reasoning as the
+# confirm-file by-name pin in test-popularity-tripwire.sh.
+check "  dribbble.com is allowlisted" "yes" \
+  "$(parse "$ALLOW" | grep -qx 'dribbble.com' && echo yes || echo no)"
 
 # The parse in this test must be the one the script actually runs.
 check "test parse matches the shipped script" "yes" \

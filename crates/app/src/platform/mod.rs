@@ -937,6 +937,23 @@ pub fn page_rect(
     )
 }
 
+/// The gap between the two pages of Side by Side, in logical pixels.
+pub const SIDE_BY_SIDE_GAP_PX: i32 = 6;
+
+/// Side by Side: the page rectangle from `page_rect` split into a left and a
+/// right page with `gap` between them, each half as wide as the space allows.
+/// Pure, so the geometry both backends rely on is tested here.
+pub fn split_page_rect(
+    rect: (f64, f64, f64, f64),
+    gap: i32,
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let (x, y, w, h) = rect;
+    let gap = f64::from(gap.max(0)).min(w.max(0.0));
+    let half = ((w - gap) / 2.0).max(0.0).floor();
+    let right_w = (w - gap - half).max(0.0);
+    ((x, y, half, h), (x + half + gap, y, right_w, h))
+}
+
 /// Whether the chrome must be given the WHOLE window rather than a strip.
 ///
 /// The chrome is one webview and the layout it paints is not a rectangle:
@@ -1037,14 +1054,25 @@ pub const CHROME_ORIGIN_PREFIX: &str = "http://rbchrome.localhost/";
 
 /// Minimum WebKitGTK the browser will run unwarned.
 ///
-/// 2.52.6 is the fix version for WSA-2026-0005 (20 August 2026): nine CVEs,
-/// among them an iframe sandbox policy violation (CVE-2026-64728), a UI spoof
-/// through framed content (CVE-2026-64730), a visited-link history leak
-/// (CVE-2026-64713) and use-after-free crashes (CVE-2026-64783, -64787).
-/// It supersedes 2.52.5, the fix version for WSA-2026-0004 (10 July 2026,
-/// 23 CVEs, several "processing maliciously crafted web content may lead to
-/// memory corruption"). Every one of them is reachable by visiting a page,
-/// which is the entire job of this program.
+/// 2.54.0 is the fix version for WSA-2026-0006 (29 September 2026): 232 CVEs.
+/// Most name the ANGLE or Skia graphics code WebKit builds in, and most are
+/// reached by processing crafted web content; among them are sandbox escapes,
+/// memory corruption, cross-origin leaks and a Content Security Policy bypass
+/// from an AudioWorklet (CVE-2026-43670). None is marked exploited in the
+/// wild. A few need something other than a page (a webarchive file, an
+/// extension, local access). It supersedes 2.52.6, the fix version for
+/// WSA-2026-0005 (20 August 2026, nine CVEs, among them an iframe sandbox
+/// policy violation, CVE-2026-64728), and 2.52.5 before that (WSA-2026-0004,
+/// 10 July 2026, 23 CVEs). Visiting pages is the entire job of this program.
+///
+/// 2.54 also changed the engine underneath us: a Skia compositor in place of
+/// TextureMapper, no Cairo 2D rendering, hardware acceleration always on in
+/// the GTK3 API, WebRTC switched off. Before this floor moved, the Linux paths
+/// that lean on engine behavior were re-measured on 2.54.0 against 2.52.6
+/// (2026-10-02): page capture through a cairo ImageSurface, the
+/// content-blocker refusal code and the held page, the bundled filters
+/// compiling and blocking, nested workers, WebGL. Nothing differed. WebRTC
+/// was already absent with the settings this browser uses.
 ///
 /// This is a RUNTIME floor, not a build-time one. WebKitGTK is linked
 /// dynamically, so the version we compiled against says nothing about the
@@ -1053,31 +1081,68 @@ pub const CHROME_ORIGIN_PREFIX: &str = "http://rbchrome.localhost/";
 /// Debian 12 (bookworm) ships 2.50.6 and will never ship the fix: the Debian
 /// security tracker marks webkit2gtk in bookworm END-OF-LIFE (see DSA-6232-1),
 /// so waiting for it is not a plan. The fix is in trixie security as
-/// 2.52.6-1~deb13u1 (2.52.5-1~deb13u1 was DSA-6398-1). A native build on
+/// 2.54.0-1~deb13u1 (DSA-6534-1, 1 October 2026; 2.52.6-1~deb13u1 was
+/// DSA-6463-1 and 2.52.5-1~deb13u1 was DSA-6398-1). A native build on
 /// bookworm is therefore
 /// permanently below this floor, which is why `enforce_engine_floor` refuses
 /// to start a release build rather than merely printing a line.
 ///
 /// RAISING THIS STRANDS ANY RUNTIME BELOW IT, and on Linux that is a refusal
 /// to start, not a banner. Before raising, check what the shipping channels
-/// actually carry: Debian 13 security has 2.52.6, but the Flatpak's
+/// actually carry: Debian 13 security has 2.54.0, but the Flatpak's
 /// `org.gnome.Platform` runtime is pinned separately and may lag (see
 /// `packaging/flatpak/io.edgexene.Patanyx.yml`).
 ///
 /// Raise this whenever a new advisory lands. It is not a compatibility
 /// minimum and should never be lowered to silence the banner.
-pub const MIN_WEBKITGTK: [u32; 3] = [2, 52, 6];
+pub const MIN_WEBKITGTK: [u32; 3] = [2, 54, 0];
+
+/// The floor below which THIS build refuses to start, as opposed to
+/// `MIN_WEBKITGTK`, the security floor the engine banner warns below.
+///
+/// They are the same number in every build but one. The one-time 1.0.6
+/// BRIDGE build (feature `linux-bridge`) is published only on the old /v1
+/// Linux feed, which Linux builds before 1.0.6 read and install from without
+/// any engine check. It therefore has to start everywhere any of those builds
+/// started: every published /v1 reader is 0.9.0 or later, and the lowest floor
+/// any of them refused below was 2.52.5 (0.9.x), so the bridge refuses
+/// below 2.52.5 and only WARNS (the banner, through `MIN_WEBKITGTK`) between
+/// 2.52.5 and 2.54.0.
+/// Its job is to carry those installs onto the engine-aware /v2 feed without
+/// leaving any of them with a browser that will not open. Downloads and /v2
+/// carry the strict build.
+#[cfg(not(feature = "linux-bridge"))]
+pub const COMPILED_WEBKITGTK_FLOOR: [u32; 3] = MIN_WEBKITGTK;
+#[cfg(feature = "linux-bridge")]
+pub const COMPILED_WEBKITGTK_FLOOR: [u32; 3] = BRIDGE_WEBKITGTK_FLOOR;
+
+/// The lowest compiled floor any published /v1 reader enforced (0.9.x:
+/// 2.52.5; 1.0.0 to 1.0.3: 2.52.6, raised for Linux 1.0.0 in cb42324; the start refusal itself landed
+/// 2026-07-25, before 0.9.0). The bridge must not exceed it.
+#[cfg_attr(not(feature = "linux-bridge"), allow(dead_code))]
+pub const BRIDGE_WEBKITGTK_FLOOR: [u32; 3] = [2, 52, 5];
+
+/// "strict" or "bridge", for `--build-identity`, `--preflight` and the
+/// diagnostics, so a published file can be checked against the feed it is on.
+pub const BUILD_VARIANT: &str = if cfg!(feature = "linux-bridge") {
+    "bridge"
+} else {
+    "strict"
+};
+
+#[cfg(all(feature = "linux-bridge", not(target_os = "linux")))]
+compile_error!("`linux-bridge` is the one-time Linux bridge build; it has no meaning on this platform");
 
 /// Why the WebKitGTK floor is where it is, in the words printed when a
 /// runtime is below it. Beside the constant so the two move together: a
 /// floor raised for a new advisory with last year's explanation under it
 /// would send someone reading the log to the wrong fix.
-pub const WEBKITGTK_ADVISORY: &str = "WSA-2026-0005 fixes 9 CVEs in this engine, among them an iframe sandbox\n  \
-     violation and use-after-free crashes reachable by visiting a page (and\n  \
-     WSA-2026-0004 before it, 23 more). Debian marks webkit2gtk in bookworm\n  \
-     END-OF-LIFE, so no update is coming on that release: the fix is\n  \
-     Debian 13 security (2.52.6-1~deb13u1), or a Flatpak whose runtime\n  \
-     carries WebKitGTK 2.52.6 or newer.";
+pub const WEBKITGTK_ADVISORY: &str = "WSA-2026-0006 fixes 232 CVEs in this engine, among them sandbox escapes,\n  \
+     memory corruption and a Content Security Policy bypass that a web page\n  \
+     can trigger. Debian marks webkit2gtk in bookworm END-OF-LIFE, so no\n  \
+     update is coming on that release: the fix is Debian 13 security\n  \
+     (2.54.0-1~deb13u1), or a Flatpak whose runtime carries WebKitGTK 2.54.0\n  \
+     or newer.";
 
 /// Minimum WebView2 runtime the browser will run unwarned.
 ///
@@ -1974,6 +2039,33 @@ mod chrome_inset_tests {
 /// window smaller than its own chrome is what a user does with the mouse in
 /// half a second.
 #[cfg(test)]
+mod split_page_rect_tests {
+    use super::split_page_rect;
+
+    #[test]
+    fn two_pages_fill_the_width_with_the_gap_between() {
+        let (l, r) = split_page_rect((10.0, 100.0, 1006.0, 600.0), 6);
+        assert_eq!(l, (10.0, 100.0, 500.0, 600.0));
+        assert_eq!(r, (516.0, 100.0, 500.0, 600.0));
+        assert_eq!(l.2 + 6.0 + r.2, 1006.0);
+    }
+
+    #[test]
+    fn odd_widths_never_overlap_or_leave_a_seam() {
+        let (l, r) = split_page_rect((0.0, 0.0, 1001.0, 10.0), 6);
+        assert_eq!(l.0 + l.2 + 6.0, r.0);
+        assert_eq!(r.0 + r.2, 1001.0);
+    }
+
+    #[test]
+    fn a_window_too_narrow_gives_empty_pages_not_negative_ones() {
+        let (l, r) = split_page_rect((0.0, 0.0, 4.0, 10.0), 6);
+        assert!(l.2 >= 0.0 && r.2 >= 0.0);
+        assert!(r.0 >= l.0);
+    }
+}
+
+#[cfg(test)]
 mod page_rect_tests {
     use super::{
         chrome_covers_window, page_rect, ChromeLayout, CHROME_LEFT_RANGE, CHROME_RIGHT_RANGE,
@@ -2173,7 +2265,8 @@ mod engine_tests {
     use super::{
         below_floor, effective_floor_from, engine_floor_body, join_version, merge_running,
         parse_version_fields, resolve_engine_version, EngineInfo, EngineVersionSource,
-        RunningVersion, MIN_WEBKITGTK, MIN_WEBVIEW2, WEBKITGTK_ADVISORY, WEBVIEW2_ADVISORY,
+        RunningVersion, BRIDGE_WEBKITGTK_FLOOR, BUILD_VARIANT, COMPILED_WEBKITGTK_FLOOR, MIN_WEBKITGTK,
+        MIN_WEBVIEW2, WEBKITGTK_ADVISORY, WEBVIEW2_ADVISORY,
     };
 
     /// The parse that decides whether a fix is present. Four fields survive,
@@ -2192,27 +2285,60 @@ mod engine_tests {
         assert_eq!(parse_version_fields("unknown"), None);
     }
 
-    /// The floor exists because of WSA-2026-0005 (20 August 2026), which fixes
-    /// 9 CVEs in WebKitGTK before 2.52.6 (iframe sandbox violation, use-after-
-    /// free), on top of WSA-2026-0004 (23 CVEs before 2.52.5). 2.52.5 is now a
-    /// vulnerable version and must sit below the floor.
+    /// The floor exists because of WSA-2026-0006 (29 September 2026), which
+    /// fixes 232 CVEs in WebKitGTK before 2.54.0, on top of WSA-2026-0005
+    /// (9 CVEs before 2.52.6) and WSA-2026-0004 (23 CVEs before 2.52.5).
+    /// 2.52.6, the previous floor and what Debian 13 shipped until DSA-6534-1,
+    /// is now a vulnerable version and must sit below the floor.
     #[test]
     fn known_vulnerable_versions_are_below_the_floor() {
         // Debian 12 bookworm ships this one, so the banner is expected to
         // fire on a stock install. That is not a bug in the check.
         assert!(below_floor(&[2, 50, 6], &MIN_WEBKITGTK));
-        assert!(below_floor(&[2, 52, 4], &MIN_WEBKITGTK));
-        assert!(below_floor(&[2, 52, 5], &MIN_WEBKITGTK)); // WSA-2026-0005: affected
+        assert!(below_floor(&[2, 52, 5], &MIN_WEBKITGTK));
+        assert!(below_floor(&[2, 52, 6], &MIN_WEBKITGTK)); // WSA-2026-0006: affected
+        assert!(below_floor(&[2, 53, 92], &MIN_WEBKITGTK)); // the last 2.53 development release
         assert!(below_floor(&[2, 48, 0], &MIN_WEBKITGTK));
         assert!(below_floor(&[1, 99, 99], &MIN_WEBKITGTK));
     }
 
+    /// The bridge must start wherever any /v1 reader started: 0.9.x refused
+    /// only below 2.52.5 (git 37b4686; 1.0.0 shipped 2.52.6 after cb42324).
+    #[test]
+    fn the_bridge_floor_is_the_lowest_v1_readers_floor() {
+        assert_eq!(BRIDGE_WEBKITGTK_FLOOR, [2, 52, 5]);
+        assert!(below_floor(&BRIDGE_WEBKITGTK_FLOOR, &MIN_WEBKITGTK));
+    }
+
+    #[test]
+    fn the_compiled_floor_matches_the_variant() {
+        if cfg!(feature = "linux-bridge") {
+            assert_eq!(BUILD_VARIANT, "bridge");
+            assert_eq!(COMPILED_WEBKITGTK_FLOOR, BRIDGE_WEBKITGTK_FLOOR);
+        } else {
+            assert_eq!(BUILD_VARIANT, "strict");
+            assert_eq!(COMPILED_WEBKITGTK_FLOOR, MIN_WEBKITGTK);
+        }
+    }
+
     #[test]
     fn the_fix_version_and_later_are_not() {
-        assert!(!below_floor(&[2, 52, 6], &MIN_WEBKITGTK));
-        assert!(!below_floor(&[2, 52, 7], &MIN_WEBKITGTK));
-        assert!(!below_floor(&[2, 53, 4], &MIN_WEBKITGTK));
+        assert!(!below_floor(&[2, 54, 0], &MIN_WEBKITGTK));
+        assert!(!below_floor(&[2, 54, 1], &MIN_WEBKITGTK));
+        assert!(!below_floor(&[2, 55, 1], &MIN_WEBKITGTK));
         assert!(!below_floor(&[3, 0, 0], &MIN_WEBKITGTK));
+    }
+
+    /// Pinned to the advisory, as the WebView2 floor is pinned to its CVE: a
+    /// merge from a branch cut before 2 October 2026 would otherwise carry
+    /// 2.52.6 back in and every other test here would follow it. 2.54.0 is
+    /// the advisory's own fix version; 2.54.1 fixes no advisory and must not
+    /// be required, because Debian 13 security ships 2.54.0.
+    #[test]
+    fn the_compiled_webkitgtk_floor_is_the_fix_for_wsa_2026_0006() {
+        assert_eq!(MIN_WEBKITGTK, [2, 54, 0]);
+        assert!(WEBKITGTK_ADVISORY.contains("WSA-2026-0006"));
+        assert!(WEBKITGTK_ADVISORY.contains("2.54.0-1~deb13u1"));
     }
 
     /// Ordering is major, then minor, then micro. A naive numeric compare
@@ -2270,8 +2396,8 @@ mod engine_tests {
         assert!(!below_floor(&[152, 0, 4191], &MIN_WEBVIEW2));
         assert!(!below_floor(&[], &MIN_WEBVIEW2));
         // Extra fields beyond the floor's precision are ignored, not fatal.
-        assert!(!below_floor(&[2, 52, 6, 1], &MIN_WEBKITGTK));
-        assert!(below_floor(&[2, 52, 5, 99], &MIN_WEBKITGTK));
+        assert!(!below_floor(&[2, 54, 0, 1], &MIN_WEBKITGTK));
+        assert!(below_floor(&[2, 52, 6, 99], &MIN_WEBKITGTK));
     }
 
     #[test]
@@ -2379,7 +2505,7 @@ mod engine_tests {
             version_source: EngineVersionSource::Running,
         };
         let body = engine_floor_body(&i18n, &linux);
-        assert!(body.contains("2.50.6") && body.contains("2.52.6"), "{body}");
+        assert!(body.contains("2.50.6") && body.contains("2.54.0"), "{body}");
         assert!(
             !body.contains("on its own"),
             "WebKitGTK must not be promised a self-updating engine: {body}"

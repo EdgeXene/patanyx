@@ -92,6 +92,7 @@ use ed25519_dalek::{Signer, SigningKey};
 use patanyx_update::{
     hex, verify_advisory_manifest, verify_blocklist_manifest, verify_manifest,
     verify_model_manifest, TrustedKeys, SIGNING_DOMAIN, SIGNING_DOMAIN_ADVISORY,
+    SIGNING_DOMAIN_LINUX_V2,
     SIGNING_DOMAIN_BLOCKLIST, SIGNING_DOMAIN_MODELS,
 };
 
@@ -112,7 +113,9 @@ fn main() -> ExitCode {
         }
         ["sign", key, payload] => sign(Path::new(key), Path::new(payload)),
         ["sign-all", key, rest @ ..] => sign_all(Path::new(key), rest),
+        ["sign-all-linux-v2", key, rest @ ..] => sign_all_linux_v2(Path::new(key), rest),
         ["verify", envelope, key_hex] => verify(Path::new(envelope), key_hex),
+        ["verify-linux-v2", envelope, key_hex] => verify_linux_v2(Path::new(envelope), key_hex),
         ["sign-blocklist", key, payload] => sign_blocklist(Path::new(key), Path::new(payload)),
         ["sign-models", key, payload] => sign_models(Path::new(key), Path::new(payload)),
         ["verify-models", envelope, key_hex] => verify_models(Path::new(envelope), key_hex),
@@ -149,6 +152,12 @@ patanyx-sign -- publisher tooling for the signed update channel
                                    platform. All or nothing -- if any payload
                                    would be rejected, none are written.
   verify <envelope.json> <key-hex> check an update envelope as the browser does
+  sign-all-linux-v2 <key-file> <payload.json>...
+                                   the same, for the Linux /v2 feed (1.0.6 on):
+                                   signed so that no Linux build before 1.0.6
+                                   can verify it. Linux payloads only.
+  verify-linux-v2 <envelope.json> <key-hex>
+                                   check a /v2 envelope as a 1.0.6+ Linux copy does
 
   sign-blocklist   <key-file> <payload.json>  sign a BLOCKLIST payload
   sign-models      <key-file> <payload.json>  sign a LANGUAGE PACK payload
@@ -428,9 +437,42 @@ fn read_signing_key(path: &Path) -> Result<SigningKey, String> {
 ///
 /// Returns the envelope bytes and the manifest they parsed to, so a caller can
 /// report what it just signed without re-parsing.
+/// Which release feed a manifest is signed for. Two hard-wired entry points
+/// choose it (`sign-all` and `sign-all-linux-v2`), never a flag, for the same
+/// reason the blocklist has its own subcommand.
+#[derive(Clone, Copy)]
+enum ReleaseFeed {
+    /// Windows, and Linux /v1 (the 1.0.6 bridge, then frozen).
+    V1,
+    /// Linux /v2, from 1.0.6: `SIGNING_DOMAIN_LINUX_V2`, which no Linux build
+    /// before 1.0.6 can verify. See that constant.
+    LinuxV2,
+}
+
+impl ReleaseFeed {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            ReleaseFeed::V1 => SIGNING_DOMAIN,
+            ReleaseFeed::LinuxV2 => SIGNING_DOMAIN_LINUX_V2,
+        }
+    }
+
+    fn verify(
+        self,
+        bytes: &[u8],
+        keys: &TrustedKeys,
+    ) -> Result<patanyx_update::Manifest, patanyx_update::UpdateError> {
+        match self {
+            ReleaseFeed::V1 => verify_manifest(bytes, keys),
+            ReleaseFeed::LinuxV2 => patanyx_update::verify_manifest_linux_v2(bytes, keys),
+        }
+    }
+}
+
 fn sign_one(
     signing: &SigningKey,
     payload_path: &Path,
+    feed: ReleaseFeed,
 ) -> Result<(Vec<u8>, patanyx_update::Manifest), String> {
     let payload = fs::read_to_string(payload_path)
         .map_err(|e| format!("reading {}: {e}", payload_path.display()))?;
@@ -442,8 +484,8 @@ fn sign_one(
     // does not change the signature of an otherwise identical release.
     let payload = payload.trim().to_string();
 
-    let mut message = Vec::with_capacity(SIGNING_DOMAIN.len() + payload.len());
-    message.extend_from_slice(SIGNING_DOMAIN);
+    let mut message = Vec::with_capacity(feed.domain().len() + payload.len());
+    message.extend_from_slice(feed.domain());
     message.extend_from_slice(payload.as_bytes());
     let signature = signing.sign(&message);
 
@@ -466,7 +508,7 @@ fn sign_one(
     // to an update subcommand is refused rather than silently mis-signed.
     let keys = TrustedKeys::new(vec![signing.verifying_key()])
         .map_err(|e| format!("the key derived from this file is not usable: {e}"))?;
-    let manifest = verify_manifest(&bytes, &keys).map_err(|e| {
+    let manifest = feed.verify(&bytes, &keys).map_err(|e| {
         format!(
             "REFUSING TO EMIT: the browser would reject the manifest from {} -- {e}\n\
              Nothing was written. Fix it and sign again.",
@@ -478,7 +520,7 @@ fn sign_one(
 
 fn sign(key_path: &Path, payload_path: &Path) -> Result<(), String> {
     let signing = read_signing_key(key_path)?;
-    let (bytes, manifest) = sign_one(&signing, payload_path)?;
+    let (bytes, manifest) = sign_one(&signing, payload_path, ReleaseFeed::V1)?;
     eprintln!(
         "verified: {} {} ({} bytes) -> {}",
         manifest.platform(),
@@ -509,6 +551,16 @@ fn sign(key_path: &Path, payload_path: &Path) -> Result<(), String> {
 /// being replayed as the other, and a `--domain` flag would turn a type-system
 /// guarantee into a guarantee about what someone typed.
 fn sign_all(key_path: &Path, payload_paths: &[&str]) -> Result<(), String> {
+    sign_all_for(key_path, payload_paths, ReleaseFeed::V1)
+}
+
+/// `sign-all` for the Linux /v2 feed: same all-or-nothing batch, signed under
+/// `SIGNING_DOMAIN_LINUX_V2`, and every payload must be a Linux one.
+fn sign_all_linux_v2(key_path: &Path, payload_paths: &[&str]) -> Result<(), String> {
+    sign_all_for(key_path, payload_paths, ReleaseFeed::LinuxV2)
+}
+
+fn sign_all_for(key_path: &Path, payload_paths: &[&str], feed: ReleaseFeed) -> Result<(), String> {
     if payload_paths.is_empty() {
         return Err("sign-all needs at least one payload file".to_string());
     }
@@ -518,7 +570,7 @@ fn sign_all(key_path: &Path, payload_paths: &[&str]) -> Result<(), String> {
     let mut signed: Vec<(String, std::path::PathBuf, Vec<u8>)> = Vec::new();
     for raw in payload_paths {
         let path = Path::new(raw);
-        let (bytes, manifest) = sign_one(&signing, path)?;
+        let (bytes, manifest) = sign_one(&signing, path, feed)?;
         let platform = manifest.platform().to_string();
         // Two payloads for one platform would collapse into a single key in
         // the combined object below, publishing one and silently losing the
@@ -878,11 +930,20 @@ fn verify_blocklist(envelope_path: &Path, key_hex: &str) -> Result<(), String> {
 /// The point is to answer "is what I uploaded what the browser accepts?"
 /// against the file as served, not against what the signer remembers writing.
 fn verify(envelope_path: &Path, key_hex: &str) -> Result<(), String> {
+    verify_for(envelope_path, key_hex, ReleaseFeed::V1)
+}
+
+/// `verify` as a Linux 1.0.6+ copy checks a /v2 manifest.
+fn verify_linux_v2(envelope_path: &Path, key_hex: &str) -> Result<(), String> {
+    verify_for(envelope_path, key_hex, ReleaseFeed::LinuxV2)
+}
+
+fn verify_for(envelope_path: &Path, key_hex: &str, feed: ReleaseFeed) -> Result<(), String> {
     let bytes =
         fs::read(envelope_path).map_err(|e| format!("reading {}: {e}", envelope_path.display()))?;
     let keys = TrustedKeys::from_hex(&[key_hex])
         .map_err(|e| format!("the verifying key is not usable: {e}"))?;
-    let manifest = verify_manifest(&bytes, &keys)
+    let manifest = feed.verify(&bytes, &keys)
         .map_err(|e| format!("the browser would REJECT this manifest: {e}"))?;
     println!(
         "accepted: {} {} ({} bytes)\n  url:     {}\n  sha256:  {}\n  published_at: {}",
