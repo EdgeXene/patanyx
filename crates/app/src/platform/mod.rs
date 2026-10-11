@@ -299,10 +299,17 @@ pub fn presence_throttle_elapsed() -> bool {
     false
 }
 
-#[cfg(unix)]
+// darwin is unix, so "unix" must be spelled "unix minus macos" or a macOS
+// build would compile the GTK backend and fail. macOS gets its own backend.
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub use unix::*;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::*;
 
 #[cfg(windows)]
 mod windows;
@@ -987,7 +994,9 @@ pub fn sidebar_supported() -> bool {
 /// rewrites `rbchrome://...` to `http://rbchrome.localhost/...`, so the
 /// boot URL is platform-specific. The page's 'self'-based CSP is
 /// origin-relative and needs no change for either form.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const CHROME_URL: &str = "rbchrome://localhost/index.html";
+#[cfg(target_os = "macos")]
 pub const CHROME_URL: &str = "rbchrome://localhost/index.html";
 /// See the unix arm.
 #[cfg(windows)]
@@ -1009,7 +1018,9 @@ pub const CHROME_URL: &str = "http://rbchrome.localhost/index.html";
 /// Hostile page text goes into this view, so it gets its own origin, its own
 /// data store and its own protocol handler that is never wired to
 /// `serve_chrome`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const TRANSLATE_URL: &str = "rbtranslate://localhost/translator.html";
+#[cfg(target_os = "macos")]
 pub const TRANSLATE_URL: &str = "rbtranslate://localhost/translator.html";
 /// See the unix arm; wry rewrites custom schemes on WebView2.
 #[cfg(windows)]
@@ -1021,7 +1032,9 @@ pub const TRANSLATE_SCHEME: &str = "rbtranslate";
 /// Navigation allowlist prefix for the translator webview, same discipline as
 /// `CHROME_ORIGIN_PREFIX`: exact, and never loosened to "any http URL" to
 /// accommodate the WebView2 form.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const TRANSLATE_ORIGIN_PREFIX: &str = "rbtranslate://";
+#[cfg(target_os = "macos")]
 pub const TRANSLATE_ORIGIN_PREFIX: &str = "rbtranslate://";
 /// See the unix arm.
 #[cfg(windows)]
@@ -1031,7 +1044,9 @@ pub const TRANSLATE_ORIGIN_PREFIX: &str = "http://rbtranslate.localhost/";
 /// match the platform's origin form precisely — anything looser (e.g. "any
 /// http: URL", to accommodate the WebView2 form) would let the trusted
 /// chrome webview navigate onto the open web.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const CHROME_ORIGIN_PREFIX: &str = "rbchrome://";
+#[cfg(target_os = "macos")]
 pub const CHROME_ORIGIN_PREFIX: &str = "rbchrome://";
 /// See the unix arm.
 #[cfg(windows)]

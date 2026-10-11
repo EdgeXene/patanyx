@@ -26,7 +26,7 @@ PATANYX is a lightweight, Rust-based desktop browser built with privacy at its c
 
 EdgeXene designed PATANYX around transparency, local control, and verifiable protection while staying honest about what no browser can hide.
 
-PATANYX runs on Windows and Linux and is actively maintained.
+PATANYX runs on Windows, Linux, and macOS and is actively maintained. The macOS port (WKWebView backend) is maintained on this fork.
 
 ## Source policy
 
@@ -38,7 +38,7 @@ This repository contains the browser and its client-side crates: the ad and trac
 
 PATANYX is a Rust-based browser, and it is worth being precise about what that means. The browser's application logic and privacy and security policy are implemented in Rust. The ad and tracker blocker, encrypted vault and session store, signed update and blocklist clients, encrypted DNS and Private Tunnel, page capture, on-device OCR, permission policy, and license checks all live there.
 
-PATANYX does not implement its own rendering engine. Pages are rendered by WebView2 on Windows and WebKitGTK on Linux, using the platform's maintained web-engine runtime rather than bundling a separate browser engine with PATANYX.
+PATANYX does not implement its own rendering engine. Pages are rendered by WebView2 on Windows, WebKitGTK on Linux, and WKWebView on macOS, using the platform's maintained web-engine runtime rather than bundling a separate browser engine with PATANYX.
 
 That is deliberate. A rendering engine is one of the largest and most security-sensitive components of a browser. A small team maintaining its own engine would not make PATANYX safer; it would create another enormous attack surface to patch and maintain. PATANYX instead concentrates on what it can genuinely own: the privacy, security, storage, networking, permissions, and application behavior around the page.
 
@@ -62,7 +62,8 @@ PATANYX
 │
 └── Content webview
     ├── WebView2 (Windows)
-    └── WebKitGTK (Linux)
+    ├── WebKitGTK (Linux)
+    └── WKWebView (macOS)
 ```
 
 The browser's own interface, its toolbar, panels, vault prompt, settings, and other chrome, is drawn with HTML, CSS, and JavaScript inside a privileged UI webview. That layer carries no framework, no npm packages, and no bundler. It is a small set of hand-written files that ask Rust to perform operations and then render what Rust returns.
@@ -103,6 +104,20 @@ cargo build --release --bin patanyx
 ./target/release/patanyx
 ```
 
+### macOS (Apple Silicon)
+
+The macOS port renders with WKWebView through the vendored, patched copy of `wry` (see `vendor/wry/PATANYX-PATCH.md`). No extra system packages are needed; WKWebView ships with macOS.
+
+```bash
+git clone https://github.com/jergensturdley/patanyx.git
+cd patanyx
+git switch patanyx-macos
+
+cargo build --release --bin patanyx
+
+./target/release/patanyx
+```
+
 ### Windows (cross-build from Linux)
 
 Official Windows binaries are cross-compiled from Linux with `scripts/build-windows.sh`, which uses cargo-xwin to target `x86_64-pc-windows-msvc` and verifies the produced binary before accepting it. The resulting binary runs on Windows with the WebView2 runtime.
@@ -110,6 +125,8 @@ Official Windows binaries are cross-compiled from Linux with `scripts/build-wind
 ## Downloads
 
 Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/download/](https://patanyx.edgexene.io/download/).
+
+An unofficial Apple Silicon (aarch64-apple-darwin) build of the macOS port is attached to [this fork's releases](https://github.com/jergensturdley/patanyx/releases). It is ad-hoc signed and not notarized, so on first launch macOS may block it: right-click the binary and choose **Open**, or clear the quarantine attribute first (`xattr -d com.apple.quarantine patanyx`).
 
 Every published binary carries a [Sigstore](https://www.sigstore.dev/) bundle. Verify a download before running it:
 
