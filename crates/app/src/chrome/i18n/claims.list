@@ -40,6 +40,9 @@ chrome-onboarding-panel-p-n3
 chrome-onboarding-panel-p-n4
 chrome-pane-backup-p
 chrome-pane-backup-p-n2
+chrome-bk-import-older-p
+chrome-bk-import-warning-rest
+chrome-js-manager-delete-all-confirm
 chrome-pane-backup-p-n4
 chrome-pane-backup-p-n5
 chrome-permission-choice-p
@@ -167,3 +170,7 @@ chrome-engine-floor-title-span
 chrome-engine-floor-body
 chrome-engine-floor-evergreen
 chrome-engine-floor-body-restart
+
+# The Linux window shown when the web page sandbox cannot start: what the
+# sandbox does, and that PATANYX stopped instead of running without it.
+sandbox-window-body

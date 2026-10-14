@@ -27,6 +27,35 @@
            DOM order against screen rectangles; see startTabDrag. -->
       <div id="tabs" dir="ltr"></div>
       <button id="btn-newtab" type="button" title="New tab" data-msg-title="chrome.btn.newtab.title">+</button>
+      <!-- THE WINDOW FRAME ON WINDOWS (1.0.7). The window has no title bar
+           there (main.rs), so the strip is the title bar: its empty space and
+           #window-drag move the window, a double press maximizes, the band
+           along the top resizes, and these three buttons stand in for the
+           system's. Shown only when chrome_caps reports window_frame; Linux
+           keeps its desktop's title bar. #window-drag is never shared with a
+           tab, so a full strip still has somewhere to grab (plan review
+           2026-10-13, R-004). -->
+      <div id="window-drag" aria-hidden="true" hidden></div>
+      <div id="window-controls" hidden>
+        <button id="win-min" type="button" class="win-btn" title="Minimize" aria-label="Minimize"
+         data-msg-title="chrome.win.min.title" data-msg-aria-label="chrome.win.min.aria.label">
+          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5.5h10"/></svg>
+        </button>
+        <button id="win-max" type="button" class="win-btn" title="Maximize" aria-label="Maximize"
+         data-msg-title="chrome.win.max.title" data-msg-aria-label="chrome.win.max.aria.label">
+          <svg class="win-icon-max" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9"/></svg>
+          <svg class="win-icon-restore" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 2.5v-2h7v7h-2M0.5 2.5h7v7h-7z"/></svg>
+        </button>
+        <button id="win-close" type="button" class="win-btn" title="Close" aria-label="Close"
+         data-msg-title="chrome.win.close.title" data-msg-aria-label="chrome.win.close.aria.label">
+          <svg viewBox="0 0 10 10" aria-hidden="true"><path d="M0 0l10 10M10 0L0 10"/></svg>
+        </button>
+      </div>
+      <div id="window-resize" aria-hidden="true" hidden>
+        <div id="window-resize-nw"></div>
+        <div id="window-resize-n"></div>
+        <div id="window-resize-ne"></div>
+      </div>
     </nav>
 
     <!-- Toolbar. Navigation controls are glyph-only because back/forward/
@@ -202,7 +231,7 @@
            only, the same hard geometry as the rest of the set. -->
       <button
         id="btn-reader"
-        class="feature-btn"
+        class="feature-btn in-menu"
         type="button"
         aria-pressed="false"
         title="Reader View: this page's article as plain text (F9)"
@@ -253,7 +282,7 @@
       </button>
       <button
         id="btn-about"
-        class="feature-btn"
+        class="feature-btn in-menu"
         type="button"
         aria-pressed="false"
         title="Version, license, and the software this build is made of"
@@ -265,10 +294,38 @@
         </svg>
         <span class="feature-label" data-msg="chrome.btn.about.span">About</span>
       </button>
+      <!-- THE MENU (1.0.7). Reader View, About, Integrity and Updates keep
+           their buttons in this header (update.js appends its own, every
+           handler and every gate id is written against them) and wear
+           `in-menu`, which hides them; the menu below the strip holds a
+           proxy for each that clicks the real button, the way Ctrl+K does.
+           The menu is its own layer, not a panel: opening it leaves the open
+           panel open and never runs its onClose (chat wipes conversations
+           there). Escape closes the menu first, then the panel. -->
+      <button
+        id="btn-main-menu"
+        class="feature-btn"
+        type="button"
+        aria-haspopup="menu"
+        aria-expanded="false"
+        aria-controls="main-menu"
+        title="Menu: find, Reader View, page tools, updates, About PATANYX and toolbar settings"
+        aria-label="Menu"
+       data-msg-aria-label="chrome.btn.main.menu.aria.label" data-msg-title="chrome.btn.main.menu.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 4.5 H13.5" />
+          <path d="M2.5 8 H13.5" />
+          <path d="M2.5 11.5 H13.5" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.main.menu.span">Menu</span>
+      </button>
 
       <!-- ROW BREAK. Everything after this wraps onto a second line, so the
-           feature pills sit UNDER the address bar and every one of them is
-           visible without opening anything.
+           feature pills sit UNDER the address bar. Since 1.0.7 not every
+           control is visible without opening anything: Reader View, About,
+           Integrity and Updates live in the Menu, and the groups on this row
+           can fold into one button each (by choice, or on a narrow window).
+           The shield and the freeze chip never fold.
 
            A zero-height flex break rather than two container divs, and the
            reason is update.js and integrity.js: both append their button to
@@ -294,18 +351,6 @@
         <span id="privacy-count" class="badge" hidden></span>
       </button>
       <button
-        id="btn-theme"
-        class="feature-btn"
-        type="button"
-        aria-pressed="false"
-        title="Theme: how this browser looks"
-       data-msg-title="chrome.btn.theme.title">
-        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-          <path d="M8 2.5 A5.5 5.5 0 1 0 13.5 8 L8 8 Z" />
-        </svg>
-        <span class="feature-label" data-msg="chrome.btn.theme.span">Theme</span>
-      </button>
-      <button
         id="btn-freeze"
         class="feature-btn"
         type="button"
@@ -316,6 +361,42 @@
           <path d="M8 2 V14 M3.4 4.8 L12.6 11.2 M12.6 4.8 L3.4 11.2" />
         </svg>
         <span class="feature-label" id="freeze-label" data-msg="chrome.freeze.label.span">Live</span>
+      </button>
+
+      <!-- TOOLBAR GROUPS (1.0.7). Row two after the shield and the freeze chip
+           is four groups by subject. Each group's buttons carry data-group;
+           each group has a pill, written before its buttons, that chrome.css
+           shows only while html[data-folded] names the group, and that opens
+           the group's buttons as a menu (chrome.js TOOLBAR_GROUPS, the table
+           toolbar-groups-gate.js holds this markup to). Nothing is folded by
+           default. The shield and the freeze chip are in no group, on
+           purpose: they carry the standing protection state, and no fold,
+           chosen or automatic, may hide it. -->
+      <button
+        id="group-network"
+        class="feature-btn group-pill"
+        type="button"
+        data-group-pill="network"
+        aria-haspopup="menu"
+        aria-expanded="false"
+        aria-controls="group-menu"
+        aria-describedby="group-network-state"
+        title="Network: folded into one button. Click to open"
+        aria-label="Network"
+       data-msg-aria-label="chrome.group.network.aria.label" data-msg-title="chrome.group.network.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 13.5 H13.5" />
+          <path d="M4.5 13.5 V10.5" />
+          <path d="M8 13.5 V7.5" />
+          <path d="M11.5 13.5 V4.5" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.group.network.span">Network</span>
+        <!-- What a button inside wants said while it is folded away (an
+             interception on Tab Activity), filled by chrome.js. -->
+        <span class="sr-only" id="group-network-state"></span>
+        <svg class="ico chev" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 6.5 L8 9.5 L11 6.5" />
+        </svg>
       </button>
 
       <!-- Quarantine leads, because it is the only entry that is an ACTION
@@ -332,6 +413,7 @@
            unwound without contradicting it. -->
       <button
         id="btn-tab"
+        data-group="network"
         class="feature-btn"
         type="button"
         aria-pressed="false"
@@ -357,10 +439,81 @@
                anyone driving this by voice. -->
         <span class="feature-label" data-msg="chrome.btn.tab.span">TA</span>
       </button>
+
+      <!-- Globe = name lookup, coloured by the chrome's one rule: GREY IS NOT
+           ACTIVE, GREEN IS ACTIVE. Grey on System, because the browser is
+           doing nothing about DNS; green on Quad9, because it is.
+           Green says "the browser is choosing your resolver", not "you are
+           private" -- System stays the right answer for a VPN user, and the
+           panel's comparison says so in its first entry.
+
+           Hidden until the engine says it can honour the setting: WebKitGTK
+           has no encrypted-DNS support of any kind, so on Linux this never
+           appears rather than opening a panel full of controls that do
+           nothing. -->
+      <button
+        id="btn-dns"
+        data-group="network"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Who resolves the sites you visit"
+        hidden
+       data-msg-title="chrome.btn.dns.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <circle cx="8" cy="8" r="6" />
+          <path d="M2.3 6 H13.7 M2.3 10 H13.7" />
+          <path d="M8 2 C5.5 4.5 5.5 11.5 8 14 C10.5 11.5 10.5 4.5 8 2" />
+        </svg>
+        <span class="feature-label" id="dns-label" data-msg="chrome.dns.label.span">DNS</span>
+      </button>
+
+      <!-- No `hidden` here, unlike btn-dns: the tunnel runs on both
+           platforms, so there is no platform gate to reveal it through. -->
+      <button
+        id="btn-tunnel"
+        data-group="network"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Tunnel"
+       data-msg-title="chrome.btn.tunnel.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path
+            d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11.2 13.9 8 14.5 C4.8 13.9 2.5 11.5 2.5 8 V3.5 Z"
+          />
+        </svg>
+        <span class="feature-label" id="tunnel-label" data-msg="chrome.tunnel.label.span">Tunnel</span>
+      </button>
+      <button
+        id="group-tabs"
+        class="feature-btn group-pill"
+        type="button"
+        data-group-pill="tabs"
+        aria-haspopup="menu"
+        aria-expanded="false"
+        aria-controls="group-menu"
+        aria-describedby="group-tabs-state"
+        title="Tabs: folded into one button. Click to open"
+        aria-label="Tabs"
+       data-msg-aria-label="chrome.group.tabs.aria.label" data-msg-title="chrome.group.tabs.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3 5.5 H11 V13.5 H3 Z" />
+          <path d="M5 3.5 H13 V11.5" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.group.tabs.span">Tabs</span>
+        <!-- What a button inside wants said while it is folded away (an
+             interception on Tab Activity), filled by chrome.js. -->
+        <span class="sr-only" id="group-tabs-state"></span>
+        <svg class="ico chev" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 6.5 L8 9.5 L11 6.5" />
+        </svg>
+      </button>
       <!-- Tab Groups. Three stacked tabs, straight runs only, the same hard
            geometry as the rest of the set. -->
       <button
         id="btn-tab-group"
+        data-group="tabs"
         class="feature-btn"
         type="button"
         aria-pressed="false"
@@ -376,6 +529,7 @@
       <!-- Side by Side. Two panes with the split between them. -->
       <button
         id="btn-side-by-side"
+        data-group="tabs"
         class="feature-btn"
         type="button"
         aria-pressed="false"
@@ -388,11 +542,37 @@
         </svg>
         <span class="feature-label" data-msg="chrome.btn.side.span">Side by Side</span>
       </button>
+      <button
+        id="group-saved"
+        class="feature-btn group-pill"
+        type="button"
+        data-group-pill="saved"
+        aria-haspopup="menu"
+        aria-expanded="false"
+        aria-controls="group-menu"
+        aria-describedby="group-saved-state"
+        title="Saved: folded into one button. Click to open"
+        aria-label="Saved"
+       data-msg-aria-label="chrome.group.saved.aria.label" data-msg-title="chrome.group.saved.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 3 H13.5 V6 H2.5 Z" />
+          <path d="M3.5 6 V13 H12.5 V6" />
+          <path d="M6.5 8.5 H9.5" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.group.saved.span">Saved</span>
+        <!-- What a button inside wants said while it is folded away (an
+             interception on Tab Activity), filled by chrome.js. -->
+        <span class="sr-only" id="group-saved-state"></span>
+        <svg class="ico chev" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 6.5 L8 9.5 L11 6.5" />
+        </svg>
+      </button>
 
       <!-- Padlock = the vault, and the shackle opens when it is unlocked, so
            locked vs unlocked stays visible on the entry itself. -->
       <button
         id="btn-vault"
+        data-group="saved"
         class="feature-btn"
         type="button"
         aria-pressed="false"
@@ -429,6 +609,7 @@
            rather than a control that cannot work. -->
       <button
         id="btn-fill"
+        data-group="saved"
         class="feature-btn"
         type="button"
         title="Fill the saved password for this site"
@@ -448,82 +629,13 @@
         <span class="feature-label" data-msg="chrome.btn.fill.span">Fill password</span>
       </button>
 
-      <!-- Globe = name lookup, coloured by the chrome's one rule: GREY IS NOT
-           ACTIVE, GREEN IS ACTIVE. Grey on System, because the browser is
-           doing nothing about DNS; green on Quad9, because it is.
-           Green says "the browser is choosing your resolver", not "you are
-           private" -- System stays the right answer for a VPN user, and the
-           panel's comparison says so in its first entry.
-
-           Hidden until the engine says it can honour the setting: WebKitGTK
-           has no encrypted-DNS support of any kind, so on Linux this never
-           appears rather than opening a panel full of controls that do
-           nothing. -->
-      <button
-        id="btn-dns"
-        class="feature-btn"
-        type="button"
-        aria-pressed="false"
-        title="Who resolves the sites you visit"
-        hidden
-       data-msg-title="chrome.btn.dns.title">
-        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-          <circle cx="8" cy="8" r="6" />
-          <path d="M2.3 6 H13.7 M2.3 10 H13.7" />
-          <path d="M8 2 C5.5 4.5 5.5 11.5 8 14 C10.5 11.5 10.5 4.5 8 2" />
-        </svg>
-        <span class="feature-label" id="dns-label" data-msg="chrome.dns.label.span">DNS</span>
-      </button>
-
-      <!-- No `hidden` here, unlike btn-dns: the tunnel runs on both
-           platforms, so there is no platform gate to reveal it through. -->
-      <button
-        id="btn-tunnel"
-        class="feature-btn"
-        type="button"
-        aria-pressed="false"
-        title="Tunnel"
-       data-msg-title="chrome.btn.tunnel.title">
-        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-          <path
-            d="M8 1.5 L13.5 3.5 V8 C13.5 11.5 11.2 13.9 8 14.5 C4.8 13.9 2.5 11.5 2.5 8 V3.5 Z"
-          />
-        </svg>
-        <span class="feature-label" id="tunnel-label" data-msg="chrome.tunnel.label.span">Tunnel</span>
-      </button>
-
-      <!-- Hidden by default and revealed by chat.js, which is evaluated only
-           in chat builds. A default build never runs that script, so the
-           button must not be visible there or it would do nothing when
-           clicked. data-premium: private chat asks for a Premium license
-           (the panel still opens, so the lock can be explained in place;
-           every action inside asks the Rust gate). -->
-      <button
-        id="btn-chat"
-        class="feature-btn"
-        data-premium="1"
-        type="button"
-        aria-pressed="false"
-        title="Local-network chat"
-        hidden
-       data-msg-title="chrome.btn.chat.title">
-        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
-          <path d="M2.5 3.5 H13.5 V11 H7.5 L4.5 13.5 V11 H2.5 Z" />
-        </svg>
-        <span class="feature-label" data-msg="chrome.btn.chat.span">Chat</span>
-        <!-- Messages that arrived while you were not looking at them. It is
-               a COUNT, not a dot, because "three people wrote to you" and "one
-               did" are different situations. -->
-        <span id="chat-unread" class="badge" hidden></span>
-        <span id="chat-dot" class="dot" hidden></span>
-      </button>
-
       <!-- The star SAVES the page you are on; the library is where what you
            saved ends up, with downloads. Adjacent on purpose: the write and
            the read of the same thing. -->
 
       <button
         id="btn-library"
+        data-group="saved"
         class="feature-btn"
         type="button"
         aria-pressed="false"
@@ -537,6 +649,45 @@
         </svg>
         <span class="feature-label" data-msg="chrome.btn.library.span">Library</span>
       </button>
+      <button
+        id="group-tools"
+        class="feature-btn group-pill"
+        type="button"
+        data-group-pill="tools"
+        aria-haspopup="menu"
+        aria-expanded="false"
+        aria-controls="group-menu"
+        aria-describedby="group-tools-state"
+        title="Tools: folded into one button. Click to open"
+        aria-label="Tools"
+       data-msg-aria-label="chrome.group.tools.aria.label" data-msg-title="chrome.group.tools.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M3 3 H7 V7 H3 Z" />
+          <path d="M9 3 H13 V7 H9 Z" />
+          <path d="M3 9 H7 V13 H3 Z" />
+          <path d="M9 9 H13 V13 H9 Z" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.group.tools.span">Tools</span>
+        <!-- What a button inside wants said while it is folded away (an
+             interception on Tab Activity), filled by chrome.js. -->
+        <span class="sr-only" id="group-tools-state"></span>
+        <svg class="ico chev" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M5 6.5 L8 9.5 L11 6.5" />
+        </svg>
+      </button>
+      <button
+        id="btn-theme"
+        data-group="tools"
+        class="feature-btn"
+        type="button"
+        aria-pressed="false"
+        title="Theme: how this browser looks"
+       data-msg-title="chrome.btn.theme.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M8 2.5 A5.5 5.5 0 1 0 13.5 8 L8 8 Z" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.theme.span">Theme</span>
+      </button>
 
       <!-- Read text on this page: the Premium region-read mode. Opens a
            panel that captures the page and lets the user drag a rectangle
@@ -546,6 +697,7 @@
            control is covered by adding it here and nowhere else. -->
       <button
         id="btn-ocr-region"
+        data-group="tools"
         class="feature-btn"
         data-premium="1"
         type="button"
@@ -564,6 +716,33 @@
         <span class="feature-label" data-msg="chrome.btn.ocr.region.span">Read text</span>
       </button>
 
+      <!-- Hidden by default and revealed by chat.js, which is evaluated only
+           in chat builds. A default build never runs that script, so the
+           button must not be visible there or it would do nothing when
+           clicked. data-premium: private chat asks for a Premium license
+           (the panel still opens, so the lock can be explained in place;
+           every action inside asks the Rust gate). -->
+      <button
+        id="btn-chat"
+        data-group="tools"
+        class="feature-btn"
+        data-premium="1"
+        type="button"
+        aria-pressed="false"
+        title="Local-network chat"
+        hidden
+       data-msg-title="chrome.btn.chat.title">
+        <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+          <path d="M2.5 3.5 H13.5 V11 H7.5 L4.5 13.5 V11 H2.5 Z" />
+        </svg>
+        <span class="feature-label" data-msg="chrome.btn.chat.span">Chat</span>
+        <!-- Messages that arrived while you were not looking at them. It is
+               a COUNT, not a dot, because "three people wrote to you" and "one
+               did" are different situations. -->
+        <span id="chat-unread" class="badge" hidden></span>
+        <span id="chat-dot" class="dot" hidden></span>
+      </button>
+
       <!-- The tools modal's one door (was Deep Recall's own button; the
            the three content tools were collapsed into one modal and one
            toolbar slot, 2026-08-19). In MARKUP now rather than built by
@@ -573,7 +752,7 @@
            verbatim from the runtime button users already know. -->
       <button
         id="btn-integrity"
-        class="feature-btn"
+        class="feature-btn in-menu"
         type="button"
         aria-pressed="false"
         title="Page integrity: has this page changed since you saved it?"
@@ -622,6 +801,116 @@
          and a screen reader arriving at an unlabelled group of thirteen
          icon-only buttons has been told nothing. -->
     <nav id="sidebar" aria-label="Browser features" hidden data-msg-aria-label="chrome.sidebar.aria.label"></nav>
+
+    <!-- The main menu's layer: fixed under the strip at the right, drawn
+         over whatever panel is open (z-index 45, between the card at 40 and
+         the strip at 50). Each entry with data-proxy-for clicks that real
+         button; Print has no button of its own and asks Rust directly.
+         Needs the window covered to be visible below the strip, like a
+         panel; chrome.js counts an open menu in the coverage. -->
+    <!-- One layer for every folded group, filled at open from that group's
+         own buttons (chrome.js fillGroupMenu) and anchored at its pill. -->
+    <div id="group-menu" class="menu-layer" role="menu" hidden></div>
+
+    <div id="main-menu" class="menu-layer" role="menu" aria-labelledby="btn-main-menu" hidden>
+      <button
+        id="menu-reader"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-reader">
+        <span class="menu-entry-label" data-msg="chrome.menu.reader.span">Reader View</span>
+        <kbd class="menu-key" aria-hidden="true" data-msg="chrome.menu.reader.kbd">F9</kbd>
+      </button>
+      <button
+        id="menu-print"
+        type="button"
+        class="menu-entry"
+        role="menuitem">
+        <span class="menu-entry-label" data-msg="chrome.menu.print.span">Print this page</span>
+        <kbd class="menu-key" aria-hidden="true" data-msg="chrome.menu.print.kbd">Ctrl+P</kbd>
+      </button>
+      <button
+        id="menu-save-pdf"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-save-pdf">
+        <span class="menu-entry-label" data-msg="chrome.menu.save.pdf.span">Save page as PDF</span>
+      </button>
+      <!-- Find, Find across tabs and Image check (1.0.7). Actions of their
+           own, like Print. The last two are Premium: data-premium lets
+           applyPremiumState mark them locked, and while locked they show
+           the "Premium" tag in place of the shortcut and do nothing when
+           chosen: a locked feature says what it is and starts nothing. -->
+      <button
+        id="menu-find"
+        type="button"
+        class="menu-entry"
+        role="menuitem">
+        <span class="menu-entry-label" data-msg="chrome.menu.find.span">Find on this page</span>
+        <kbd class="menu-key" aria-hidden="true" data-msg="chrome.menu.find.kbd">Ctrl+F</kbd>
+      </button>
+      <button
+        id="menu-find-tabs"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-premium="1">
+        <span class="menu-entry-label" data-msg="chrome.menu.find.tabs.span">Find across tabs</span>
+        <kbd class="menu-key" aria-hidden="true" data-msg="chrome.menu.find.tabs.kbd">Ctrl+Shift+F</kbd>
+        <span class="menu-premium-tag" data-msg="chrome.menu.premium.tag">Premium</span>
+      </button>
+      <button
+        id="menu-image-check"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-premium="1">
+        <span class="menu-entry-label" data-msg="chrome.menu.image.check.span">Image check</span>
+        <span class="menu-premium-tag" data-msg="chrome.menu.premium.tag">Premium</span>
+      </button>
+      <button
+        id="menu-site-info"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-site-info">
+        <span class="menu-entry-label" data-msg="chrome.menu.site.info.span">About this site</span>
+      </button>
+      <button
+        id="menu-integrity"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-integrity">
+        <span class="menu-entry-label" data-msg="chrome.menu.integrity.span">Page integrity</span>
+      </button>
+      <button
+        id="menu-update"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-update">
+        <span class="menu-entry-label" data-msg="chrome.menu.update.span">Updates</span>
+      </button>
+      <button
+        id="menu-about"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-about">
+        <span class="menu-entry-label" data-msg="chrome.menu.about.span">About PATANYX</span>
+      </button>
+      <button
+        id="menu-customize"
+        type="button"
+        class="menu-entry"
+        role="menuitem"
+        data-proxy-for="btn-theme">
+        <span class="menu-entry-label" data-msg="chrome.menu.customize.span">Customize toolbar</span>
+      </button>
+    </div>
 
     <!-- BOOKMARKS BAR. Off by default and shown only when asked for: it is a
          third chrome row, and vertical space on a laptop is the thing this
@@ -679,15 +968,17 @@
          which is the one time the state can have changed. -->
     <!-- THE FEATURE VIDEOS (1.0.5). Raised once at boot, after the first-run
          tour when that is showing, until Watch or Not now answers it; both
-         write a marker (prefs.rs). The videos stay one click away in About. -->
+         write a marker (prefs.rs). The videos stay one click away in About.
+         On Windows the same banner announces Kept Sites (1.0.7) once, also
+         to people who answered it for 1.0.5: chrome.js swaps its text. -->
     <div id="tutorial-banner" role="status" hidden>
       <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
         <path d="M2.5 3.5 H13.5 V12.5 H2.5 Z" />
         <path d="M6.8 6 L10.2 8 L6.8 10 Z" />
       </svg>
       <div class="banner-text">
-        <span class="banner-title" data-msg="chrome.tutorial.banner.title.span">New in 1.0.5: Reader View, Tab Groups and Side by Side</span>
-        <span data-msg="chrome.tutorial.banner.body.span">Three short, silent videos show how each one works. They are built into PATANYX, so watching them downloads nothing. They stay in About for later.</span>
+        <span id="tutorial-banner-title" class="banner-title" data-msg="chrome.tutorial.banner.title.span">New in 1.0.5: Reader View, Tab Groups and Side by Side</span>
+        <span id="tutorial-banner-body" data-msg="chrome.tutorial.banner.body.span">Three short, silent videos show how each one works. They are built into PATANYX, so watching them downloads nothing. They stay in About for later.</span>
       </div>
       <div class="banner-actions">
         <button id="tutorial-banner-watch" type="button" class="small" data-msg="chrome.tutorial.banner.watch.button">Watch</button>
@@ -1211,12 +1502,28 @@
       <div class="form-buttons">
         <button id="btn-tabfreeze" type="button" data-msg="chrome.btn.tabfreeze.button">Freeze this tab</button>
         <button id="btn-allow-site" type="button" class="small" data-msg="chrome.btn.allow.site.button">
-          Allow this site while frozen
+          Allow this host while frozen
         </button>
       </div>
       <p class="panel-note" data-msg="chrome.tab.panel.p">
-        Stops this tab from sending data. Chat, maps, and other live pages stop. Allowed sites stay live until the tab closes.
+        Blocks new network requests from this tab. Connections already open are not closed. Chat, maps, and other live pages may stop working. Hosts you allow can still be contacted until the tab closes.
       </p>
+
+      <!-- Per TAB and per SITE, memory only. Rust ends it when this tab's
+           page goes to another site or the tab closes, and the box follows
+           tab_status, never the click (renderAdsAllow; held by
+           scripts/tab-ads-allow-gate.js). Where it cannot be turned on it is
+           disabled with the reason in #tab-ads-allow-reason. -->
+      <label class="toggle-row" for="tab-ads-allow">
+        <input id="tab-ads-allow" type="checkbox" />
+        <span class="toggle-text">
+          <span class="toggle-title" data-msg="chrome.tab.ads.allow.span">Allow ads and trackers on this tab</span>
+          <span class="toggle-note" data-msg="chrome.tab.ads.allow.note.span">
+            Lasts until this tab goes to another site or closes. PATANYX's ad and tracker list and YouTube ad blocking are off for this tab only. PATANYX still refuses sites reported for phishing or malware.
+          </span>
+        </span>
+      </label>
+      <p class="panel-note" id="tab-ads-allow-reason" hidden></p>
 
       <span class="section-label" data-msg="chrome.tab.panel.span.n2">Storage</span>
       <p class="panel-intro" id="tab-profile-desc"></p>
@@ -1292,6 +1599,7 @@
       <p class="panel-intro" id="receipt-session"></p>
       <p class="panel-note" id="receipt-session-caption"></p>
       <p class="panel-intro" id="receipt-page"></p>
+      <p class="panel-note" id="receipt-ads-allowed" hidden data-msg="chrome.receipt.ads.allowed.p">PATANYX's ad and tracker list is off for this tab.</p>
 
       <!-- A separate reading, intentionally outside the privacy receipt.
            The receipt is engine-owned; these are untrusted claims pushed by
@@ -1596,6 +1904,108 @@
     <section id="theme-panel" hidden>
       <h1 data-msg="chrome.theme.panel.h1">Theme</h1>
 
+      <!-- PRESETS (1.0.7). A pack is a preset of the three choices below it
+           (chrome colors, accent, texture), defined in chrome.js THEME_PACKS
+           and applied through the same three commands the individual pickers
+           send; Rust stores no pack. The marked card is the one whose three
+           values match the chrome right now, so changing any single choice
+           below un-marks it and the Custom line appears. Pack names are
+           labels only; nothing keys on them. -->
+      <section id="presets-choice">
+        <h3 class="section-head" data-msg="chrome.presets.choice.h3">Presets</h3>
+        <div id="pack-cards">
+          <button
+            id="pack-original"
+            type="button"
+            class="small pack-card"
+            data-pack="original"
+            title="Original: Dark colors, blue accent, no texture"
+            aria-label="Original, Dark colors, blue accent, no texture"
+           data-msg-aria-label="chrome.pack.original.aria.label" data-msg-title="chrome.pack.original.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.original.span">Original</span>
+          </button>
+          <button
+            id="pack-ion-storm"
+            type="button"
+            class="small pack-card"
+            data-pack="ion-storm"
+            title="Ion Storm: Black colors, violet accent, Glow"
+            aria-label="Ion Storm, Black colors, violet accent, Glow"
+           data-msg-aria-label="chrome.pack.ion.storm.aria.label" data-msg-title="chrome.pack.ion.storm.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.ion.storm.span">Ion Storm</span>
+          </button>
+          <button
+            id="pack-sardonyx-night"
+            type="button"
+            class="small pack-card"
+            data-pack="sardonyx-night"
+            title="Sardonyx Night: Midnight colors, deep red accent, Grain"
+            aria-label="Sardonyx Night, Midnight colors, deep red accent, Grain"
+           data-msg-aria-label="chrome.pack.sardonyx.night.aria.label" data-msg-title="chrome.pack.sardonyx.night.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.sardonyx.night.span">Sardonyx Night</span>
+          </button>
+          <button
+            id="pack-aether-paper"
+            type="button"
+            class="small pack-card"
+            data-pack="aether-paper"
+            title="Aether Paper: Paper colors, sky blue accent, no texture"
+            aria-label="Aether Paper, Paper colors, sky blue accent, no texture"
+           data-msg-aria-label="chrome.pack.aether.paper.aria.label" data-msg-title="chrome.pack.aether.paper.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.aether.paper.span">Aether Paper</span>
+          </button>
+          <button
+            id="pack-chloris-graphite"
+            type="button"
+            class="small pack-card"
+            data-pack="chloris-graphite"
+            title="Chloris Graphite: Graphite colors, green accent, Stripes"
+            aria-label="Chloris Graphite, Graphite colors, green accent, Stripes"
+           data-msg-aria-label="chrome.pack.chloris.graphite.aria.label" data-msg-title="chrome.pack.chloris.graphite.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.chloris.graphite.span">Chloris Graphite</span>
+          </button>
+          <button
+            id="pack-chrysos-black"
+            type="button"
+            class="small pack-card"
+            data-pack="chrysos-black"
+            title="Chrysos Black: Black colors, gold accent, Glow"
+            aria-label="Chrysos Black, Black colors, gold accent, Glow"
+           data-msg-aria-label="chrome.pack.chrysos.black.aria.label" data-msg-title="chrome.pack.chrysos.black.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.chrysos.black.span">Chrysos Black</span>
+          </button>
+          <button
+            id="pack-thalassa-mist"
+            type="button"
+            class="small pack-card"
+            data-pack="thalassa-mist"
+            title="Thalassa Mist: Graphite colors, teal accent, Grain"
+            aria-label="Thalassa Mist, Graphite colors, teal accent, Grain"
+           data-msg-aria-label="chrome.pack.thalassa.mist.aria.label" data-msg-title="chrome.pack.thalassa.mist.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.thalassa.mist.span">Thalassa Mist</span>
+          </button>
+          <button
+            id="pack-iris-midnight"
+            type="button"
+            class="small pack-card"
+            data-pack="iris-midnight"
+            title="Iris Midnight: Midnight colors, lavender accent, Glow"
+            aria-label="Iris Midnight, Midnight colors, lavender accent, Glow"
+           data-msg-aria-label="chrome.pack.iris.midnight.aria.label" data-msg-title="chrome.pack.iris.midnight.title">
+            <span class="pack-preview"><span class="pack-dot"></span></span>
+            <span data-msg="chrome.pack.iris.midnight.span">Iris Midnight</span>
+          </button>
+        </div>
+        <p class="panel-foot" id="pack-custom" hidden title="Your own mix of the choices below" data-msg="chrome.pack.custom.p" data-msg-title="chrome.pack.custom.title">Custom</p>
+      </section>
+
       <section id="theme-choice">
         <h3 class="section-head" data-msg="chrome.theme.choice.h3">Page colors</h3>
         <div class="form-buttons">
@@ -1614,6 +2024,9 @@
           <button id="scheme-dark" type="button" class="small" data-msg="chrome.scheme.dark.button">Dark</button>
           <button id="scheme-white" type="button" class="small" data-msg="chrome.scheme.white.button">White</button>
           <button id="scheme-black" type="button" class="small" data-msg="chrome.scheme.black.button">Black</button>
+          <button id="scheme-graphite" type="button" class="small" data-msg="chrome.scheme.graphite.button">Graphite</button>
+          <button id="scheme-midnight" type="button" class="small" data-msg="chrome.scheme.midnight.button">Midnight</button>
+          <button id="scheme-paper" type="button" class="small" data-msg="chrome.scheme.paper.button">Paper</button>
         </div>
       </section>
 
@@ -1771,6 +2184,69 @@
            data-msg-aria-label="chrome.accent.purple.aria.label" data-msg-title="chrome.accent.purple.title">
             <span class="swatch"></span>Porphyra
           </button>
+          <button
+            id="accent-tangerine"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="tangerine"
+            title="Pyrrhos: orange"
+            aria-label="Pyrrhos, orange"
+           data-msg-aria-label="chrome.accent.tangerine.aria.label" data-msg-title="chrome.accent.tangerine.title">
+            <span class="swatch"></span>Pyrrhos
+          </button>
+          <button
+            id="accent-mint"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="mint"
+            title="Minthe: mint green"
+            aria-label="Minthe, mint green"
+           data-msg-aria-label="chrome.accent.mint.aria.label" data-msg-title="chrome.accent.mint.title">
+            <span class="swatch"></span>Minthe
+          </button>
+          <button
+            id="accent-gold"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="gold"
+            title="Chrysos: gold"
+            aria-label="Chrysos, gold"
+           data-msg-aria-label="chrome.accent.gold.aria.label" data-msg-title="chrome.accent.gold.title">
+            <span class="swatch"></span>Chrysos
+          </button>
+          <button
+            id="accent-lavender"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="lavender"
+            title="Iris: lavender"
+            aria-label="Iris, lavender"
+           data-msg-aria-label="chrome.accent.lavender.aria.label" data-msg-title="chrome.accent.lavender.title">
+            <span class="swatch"></span>Iris
+          </button>
+          <button
+            id="accent-copper"
+            type="button"
+            class="small theme-swatch"
+            data-theme-choice="copper"
+            title="Chalkos: copper"
+            aria-label="Chalkos, copper"
+           data-msg-aria-label="chrome.accent.copper.aria.label" data-msg-title="chrome.accent.copper.title">
+            <span class="swatch"></span>Chalkos
+          </button>
+        </div>
+      </section>
+
+      <!-- TEXTURE (1.0.7). A faint gradient over the strips and panel cards,
+           chrome-only: pages cannot see it. Stored as prefs.rs chrome_texture,
+           worn as html[data-texture]. -->
+      <section id="texture-choice">
+        <h3 class="section-head" data-msg="chrome.texture.choice.h3">Texture</h3>
+        <div id="texture-buttons">
+          <button id="texture-none" type="button" class="small" data-msg="chrome.texture.none.button">None</button>
+          <button id="texture-glow" type="button" class="small" data-msg="chrome.texture.glow.button">Glow</button>
+          <button id="texture-grain" type="button" class="small" data-msg="chrome.texture.grain.button">Grain</button>
+          <button id="texture-stripes" type="button" class="small" data-msg="chrome.texture.stripes.button">Stripes</button>
         </div>
       </section>
 
@@ -1843,6 +2319,66 @@
             Icons only
           </button>
         </div>
+        <!-- Folds (1.0.7): stored as prefs.rs toolbar_folded, worn as
+             html[data-folded]. A narrow window folds more on its own, from
+             the right end, and never changes these boxes. -->
+        <div id="fold-choices" role="group" aria-labelledby="fold-head">
+          <span
+            class="fold-head"
+            id="fold-head"
+            title="A narrow window can fold more of the top strip on its own. These boxes stay as you set them."
+           data-msg="chrome.fold.head.span" data-msg-title="chrome.fold.head.title">Fold each into one button:</span>
+          <label class="fold-choice" for="fold-network" title="Show as one button that opens its tools" data-msg-title="chrome.fold.network.title">
+            <input id="fold-network" type="checkbox" />
+            <span data-msg="chrome.fold.network.span">Network</span>
+          </label>
+          <label class="fold-choice" for="fold-tabs" title="Show as one button that opens its tools" data-msg-title="chrome.fold.tabs.title">
+            <input id="fold-tabs" type="checkbox" />
+            <span data-msg="chrome.fold.tabs.span">Tabs</span>
+          </label>
+          <label class="fold-choice" for="fold-saved" title="Show as one button that opens its tools" data-msg-title="chrome.fold.saved.title">
+            <input id="fold-saved" type="checkbox" />
+            <span data-msg="chrome.fold.saved.span">Saved</span>
+          </label>
+          <label class="fold-choice" for="fold-tools" title="Show as one button that opens its tools" data-msg-title="chrome.fold.tools.title">
+            <input id="fold-tools" type="checkbox" />
+            <span data-msg="chrome.fold.tools.span">Tools</span>
+          </label>
+        </div>
+      </section>
+
+      <!-- The duplicate-site notice. On by default. Only this switch is
+           stored; the sites a user dismisses are kept in memory for the
+           session and never written (duplicate_site.rs). -->
+      <section id="duplicate-choice">
+        <h3 class="section-head" data-msg="chrome.duplicate.choice.h3">Tabs</h3>
+        <label class="toggle-row" for="duplicate-notice">
+          <input id="duplicate-notice" type="checkbox" />
+          <span class="toggle-text">
+            <span class="toggle-title" data-msg="chrome.duplicate.notice.span">Show when a site is already open in another tab</span>
+            <span class="toggle-note" data-msg="chrome.duplicate.notice.span.n2">
+              When you open a site that another tab already has open, PATANYX offers to switch to that tab or close this one. Dismiss stops these notices for that site until PATANYX closes.
+            </span>
+          </span>
+        </label>
+      </section>
+
+      <!-- The chrome's own motion: panel fades, tab slides, notice slides.
+           The stylesheet already follows the system's reduce-motion setting;
+           this switch is for a user whose system does not offer one, or who
+           wants it quiet in this browser alone. Stored as one bool
+           (prefs.rs reduce_motion), worn as html[data-motion]. -->
+      <section id="motion-choice">
+        <h3 class="section-head" data-msg="chrome.motion.choice.h3">Motion</h3>
+        <label class="toggle-row" for="reduce-motion">
+          <input id="reduce-motion" type="checkbox" />
+          <span class="toggle-text">
+            <span class="toggle-title" data-msg="chrome.motion.reduce.span">Reduce motion</span>
+            <span class="toggle-note" data-msg="chrome.motion.reduce.span.n2">
+              Panels, tabs and notices change without sliding or fading. Your system's reduce-motion setting is followed either way.
+            </span>
+          </span>
+        </label>
       </section>
 
       <!-- The bookmark folder bar. Off by default: it is a third chrome row
@@ -2134,6 +2670,9 @@
           <span class="toggle-note" data-msg="chrome.pv.youtube.ads.note.span">
             Removes most video ads and sponsored listings on YouTube. Applies to YouTube pages you open or reload after changing it.
           </span>
+          <span class="toggle-note error" id="pv-youtube-ads-refused" data-msg="chrome.pv.youtube.ads.refused.span" hidden>
+            Not working in this tab: the engine did not accept the ad script, so YouTube shows its ads here.
+          </span>
         </span>
       </label>
 
@@ -2212,9 +2751,8 @@
       <section id="keep-sites" hidden>
         <h3 class="section-head" data-msg="chrome.keep.sites.h3">Sites to keep when PATANYX starts</h3>
         <p class="panel-foot" id="keep-sites-caption" data-msg="chrome.keep.sites.caption.p">
-          PATANYX clears cookies and site data every time it starts. A site
-          listed here is left alone, so it still knows you next time. Useful
-          for a site that signs you out or re-verifies you on every launch.
+          PATANYX clears site data every time it starts. A site you keep gets
+          its own storage, which stays between sessions.
         </p>
         <div class="form-buttons">
           <input id="keep-site-host" type="text" placeholder="example.com" autocomplete="off" spellcheck="false"
@@ -2225,11 +2763,11 @@
         </div>
         <ul id="keep-sites-list" class="plain-list"></ul>
         <p class="panel-foot" id="keep-sites-limit" data-msg="chrome.keep.sites.limit.p">
-          Keeping any site changes how the clear works. Instead of wiping the
-          whole profile at once, PATANYX clears each site it can find in the
-          cookie jar. A site that stored data but set no cookie is not found
-          that way, so its data can survive. With no sites kept, the whole
-          profile is cleared as before.
+          Kept storage also holds what other sites store inside a kept site's
+          pages. Each start deletes only its cache and other sites' cookies.
+          Adding a site signs you out of it once; removing one clears all kept
+          sites at the next start. A second PATANYX running at the same time
+          does not use kept storage.
         </p>
         <p class="panel-foot" id="keep-sites-result"></p>
       </section>
@@ -2643,7 +3181,16 @@
             autocomplete="new-password"
            data-msg-placeholder="chrome.import.pass2.placeholder"/>
           <div class="form-buttons">
-            <button type="submit" data-msg="chrome.import.form.button">Import vault</button>
+            <button id="import-submit" type="submit" data-msg="chrome.import.form.button">Import vault</button>
+          </div>
+          <!-- A running export or import (backup_job.rs). The bar moves only
+               as work is reported and has no animation of its own. -->
+          <div class="backup-progress" id="import-progress" hidden>
+            <progress id="import-bar" max="1" value="0"></progress>
+            <p class="panel-note" id="import-status" role="status" aria-live="polite"></p>
+            <div class="form-buttons">
+              <button id="import-stop" type="button" data-msg="chrome.bk.job.stop.button">Stop</button>
+            </div>
           </div>
           <p class="error" id="import-error"></p>
         </form>
@@ -2659,10 +3206,12 @@
           see it once. Nobody can make you another one, including us.
         </p>
         <pre id="recovery-key" class="recovery-key"></pre>
+        <!-- What an import brought back: a result, so it is drawn as one,
+             apart from the warnings in the note below it. -->
+        <p id="recovery-import-result" class="ok" hidden></p>
         <p id="recovery-import-note" class="error" hidden></p>
         <p class="error" data-msg="chrome.vault.recovery.p.n2">
-          A backup will not help without this key or your passphrase. Backups
-          cover a broken disk, not a forgotten passphrase.
+          This key does not open an encrypted export. An export opens only with the passphrase chosen for it.
         </p>
         <div class="form-buttons">
           <button id="recovery-ack" type="button" data-msg="chrome.recovery.ack.button">
@@ -3102,7 +3651,7 @@
 
           <h2 data-msg="chrome.pane.backup.h2.n2">Encrypted export</h2>
           <p class="panel-intro" data-msg="chrome.pane.backup.p.n2">
-            Move or back up the vault in one encrypted file protected by a new passphrase. This covers a lost machine, not a forgotten passphrase. Only the recovery key does.
+            Back up or move your vault and your Library in one encrypted file, protected by a passphrase of its own. It includes everything in your vault, such as your passwords, notes, Private Tunnel configuration and Premium token. While your Library is open, it also includes your bookmarks, Tab Shelf, Deep Recall pages and page snapshots with their pictures, and your Divergence Exceptions. Download records stay on this computer. Earlier versions of PATANYX cannot open the file. There is no recovery key for the file, so without its passphrase it cannot be opened. If you forget your vault passphrase, use your recovery key.
           </p>
           <form id="bk-export-form" class="entry-form">
             <div class="form-buttons">
@@ -3131,7 +3680,16 @@
               autocomplete="new-password"
              data-msg-placeholder="chrome.bk.exp.pass2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" data-msg="chrome.bk.export.form.button">Write encrypted export</button>
+              <button id="bk-exp-submit" type="submit" data-msg="chrome.bk.export.form.button">Write encrypted export</button>
+            </div>
+            <!-- A running export or import (backup_job.rs). The bar moves only
+                 as work is reported and has no animation of its own. -->
+            <div class="backup-progress" id="bk-exp-progress" hidden>
+              <progress id="bk-exp-bar" max="1" value="0"></progress>
+              <p class="panel-note" id="bk-exp-status" role="status" aria-live="polite"></p>
+              <div class="form-buttons">
+                <button id="bk-exp-stop" type="button" data-msg="chrome.bk.job.stop.button">Stop</button>
+              </div>
             </div>
             <p class="error" id="bk-exp-error"></p>
             <p class="ok" id="bk-exp-ok"></p>
@@ -3146,7 +3704,7 @@
                it. -->
           <p class="destructive-warning" role="note">
             <span data-msg="chrome.bk.import.warning.lead">Importing</span>
-            <strong data-msg="chrome.autolock.choices.open.strong">replaces the vault on this machine</strong><span data-msg="chrome.bk.import.warning.rest">. Every password, note, and bookmark here is replaced by the backup. There is no undo. Export anything the backup does not contain first.</span>
+            <strong data-msg="chrome.autolock.choices.open.strong">replaces the vault on this machine</strong><span data-msg="chrome.bk.import.warning.rest">. Your vault and Library here are replaced by the backup's, including every password, note, bookmark, shelved window and Deep Recall page, your Private Tunnel configuration and your Premium token. There is no undo. If you may want any of it back, make an encrypted export first.</span>
           </p>
           <p class="panel-intro" data-msg="chrome.autolock.choices.open.p">
             Choose a new vault passphrase and recovery key. The export
@@ -3159,6 +3717,13 @@
               </button>
             </div>
             <p id="bk-import-chosen" class="item-sub"></p>
+            <!-- Shown once an OLDER backup file is chosen (versions 1 and 2:
+                 vault and bookmarks only). The import still replaces the
+                 whole Library, so what it cannot bring back is said here,
+                 before the person confirms. -->
+            <p class="destructive-warning" id="bk-import-older" role="note" hidden data-msg="chrome.bk.import.older.p">
+              This backup was made by an earlier version of PATANYX and holds only your vault and, at most, your bookmarks. Importing it still replaces your whole Library, so your Tab Shelf, Deep Recall pages, page snapshots, empty bookmark folders, Divergence Exceptions and download records on this computer will be gone.
+            </p>
             <input
               id="bk-import-src"
               type="text"
@@ -3185,7 +3750,16 @@
               autocomplete="new-password"
              data-msg-placeholder="chrome.bk.import.pass2.placeholder"/>
             <div class="form-buttons">
-              <button type="submit" data-msg="chrome.bk.import.form.button">Replace this vault with the backup</button>
+              <button id="bk-import-submit" type="submit" data-msg="chrome.bk.import.form.button">Replace this vault with the backup</button>
+            </div>
+            <!-- A running export or import (backup_job.rs). The bar moves only
+                 as work is reported and has no animation of its own. -->
+            <div class="backup-progress" id="bk-import-progress" hidden>
+              <progress id="bk-import-bar" max="1" value="0"></progress>
+              <p class="panel-note" id="bk-import-status" role="status" aria-live="polite"></p>
+              <div class="form-buttons">
+                <button id="bk-import-stop" type="button" data-msg="chrome.bk.job.stop.button">Stop</button>
+              </div>
             </div>
             <p class="error" id="bk-import-error"></p>
           </form>
@@ -3444,6 +4018,9 @@
     <section id="tutorial-panel" class="panel-wide" hidden>
       <h1 data-msg="chrome.tutorial.panel.h1">Feature videos</h1>
       <div id="tutorial-topics" class="reader-controls" role="group" aria-label="Choose a video" data-msg-aria-label="chrome.tutorial.topics.aria.label">
+        <!-- Windows only (Kept Sites exists only there): shown when Rust says
+             the build has its video. -->
+        <button id="tutorial-topic-keep" type="button" class="small" aria-pressed="false" hidden data-msg="chrome.tutorial.topic.keep.button">Kept Sites</button>
         <button id="tutorial-topic-reader" type="button" class="small" aria-pressed="true" data-msg="chrome.tutorial.topic.reader.button">Reader View</button>
         <button id="tutorial-topic-groups" type="button" class="small" aria-pressed="false" data-msg="chrome.tutorial.topic.groups.button">Tab Groups</button>
         <button id="tutorial-topic-side" type="button" class="small" aria-pressed="false" data-msg="chrome.tutorial.topic.side.button">Side by Side</button>
@@ -3522,6 +4099,12 @@
           Show the tour again
         </button>
         <button id="about-videos" type="button" class="small" data-msg="chrome.about.videos.button">Watch the feature videos</button>
+        <!-- These two leave the chrome: each opens its page on patanyx.net in a
+             new tab, and About closes first (chrome.js openSitePage). -->
+        <button id="about-guide" type="button" class="small" title="Opens patanyx.net/guide in a new tab"
+         data-msg="chrome.about.guide.button" data-msg-title="chrome.about.guide.title">Read the guide</button>
+        <button id="about-premium-guide" type="button" class="small" hidden title="Opens the Premium guide on patanyx.net in a new tab"
+         data-msg="chrome.about.premium.guide.button" data-msg-title="chrome.about.premium.guide.title">Read the Premium guide</button>
       </div>
       <div id="about-description"></div>
 

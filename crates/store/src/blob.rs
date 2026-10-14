@@ -51,6 +51,20 @@ use crate::error::StoreError;
 const MAGIC: &[u8; 8] = b"RBBLOB\x00\x01";
 const BLOB_VERSION: u8 = 1;
 const HEADER_LEN: usize = MAGIC.len() + 1 + NONCE_LEN;
+/// The AEAD tag the ciphertext carries after the encrypted bytes.
+const TAG_LEN: usize = 16;
+
+/// Everything `reader` holds, if that is at most `limit` bytes: never asks it
+/// for more than `limit + 1`, however much it could give.
+pub(crate) fn read_bounded(reader: impl std::io::Read, limit: u64) -> Result<Vec<u8>, StoreError> {
+    use std::io::Read as _;
+    let mut raw = Vec::new();
+    reader.take(limit + 1).read_to_end(&mut raw)?;
+    if raw.len() as u64 > limit {
+        return Err(StoreError::BadFormat("a blob larger than its limit".to_string()));
+    }
+    Ok(raw)
+}
 
 /// Domain separator for the blob subkey. The store already applies this
 /// trick to its passphrase pre-hash: keys for different jobs must be
@@ -92,6 +106,14 @@ fn validate_id(id: &str) -> Result<(), StoreError> {
         return Err(StoreError::NotFound(format!("unusable blob id: {id:?}")));
     }
     Ok(())
+}
+
+/// The same check as `validate_id`, as a yes or no, for code that must refuse
+/// an id BEFORE it gets anywhere near a write: a backup is validated whole
+/// before anything is restored, and it must judge ids exactly as this module
+/// will, or an id could pass that check and then fail part-way through.
+pub(crate) fn is_valid_id(id: &str) -> bool {
+    validate_id(id).is_ok()
 }
 
 /// `SHA-256(domain || 0x00 || store_key)`, so the blob key and the store key
@@ -156,6 +178,13 @@ impl BlobStore {
         self.dir.join(id)
     }
 
+    /// Bytes on disk for a picture of `plaintext_len` bytes, before it is
+    /// written: what every limit is judged against, so a limit checked
+    /// before a write and one checked after it agree.
+    pub(crate) fn stored_len(plaintext_len: usize) -> u64 {
+        (HEADER_LEN + plaintext_len + TAG_LEN) as u64
+    }
+
     /// Encrypts and writes, replacing any previous blob for `id`. Returns
     /// the number of bytes on disk.
     pub fn put(&self, id: &str, plaintext: &[u8]) -> Result<u64, StoreError> {
@@ -214,6 +243,50 @@ impl BlobStore {
     pub fn get(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         validate_id(id)?;
         let raw = fs::read(self.path_for(id))?;
+        self.open_raw(&raw)
+    }
+
+    /// [`Self::get`], reading at most the bytes a picture of `max_plaintext`
+    /// bytes is stored as, from the file actually opened: a damaged or
+    /// substituted file cannot make the reader hold more than that.
+    pub fn get_bounded(
+        &self,
+        id: &str,
+        max_plaintext: usize,
+    ) -> Result<Zeroizing<Vec<u8>>, StoreError> {
+        validate_id(id)?;
+        let path = self.path_for(id);
+        // A picture is a regular file IN this folder, never a link: a link's
+        // target can sit anywhere, including somewhere about to be deleted.
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(StoreError::BadFormat("a picture that is not a regular file".to_string()));
+        }
+        let mut options = fs::OpenOptions::new();
+        options.read(true);
+        // And opened without following one, so a link swapped in after that
+        // check is refused too: on unix the open itself fails; on Windows the
+        // link is opened as itself (FILE_FLAG_OPEN_REPARSE_POINT) and the
+        // handle's own type, checked below, is not a regular file.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW);
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let file = options.open(&path)?;
+        if !file.metadata()?.file_type().is_file() {
+            return Err(StoreError::BadFormat("a picture that is not a regular file".to_string()));
+        }
+        let raw = read_bounded(file, Self::stored_len(max_plaintext))?;
+        self.open_raw(&raw)
+    }
+
+    fn open_raw(&self, raw: &[u8]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
         if raw.len() < HEADER_LEN || &raw[..MAGIC.len()] != MAGIC {
             return Err(StoreError::BadFormat("not a blob file".to_string()));
         }

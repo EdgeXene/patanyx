@@ -660,6 +660,118 @@ function readNoise(sandbox) {
   );
 }
 
+// ---- (h2) no global marker: idempotence without touching window ------------
+// Idempotence used to rest on a product-named window property. Hidden from
+// Object.keys, it was still in Object.getOwnPropertyNames(window), so any page
+// could tell PATANYX in particular was running. The script must add nothing
+// to the global, and must STILL not stack; the plant proves the stacking
+// assert above can fail once the second-run check is gone.
+// Every own key, symbols included: a symbol-keyed marker is just as readable
+// (Object.getOwnPropertySymbols) as a named one.
+// Read from INSIDE the context, as a page would: a symbol set on window there
+// is not mirrored onto the outer sandbox object.
+function addedGlobals(source) {
+  const sb = mkSandbox({ hostname: "example.com" });
+  const keys = () => vm.runInContext("Reflect.ownKeys(window)", sb);
+  const had = new Set(keys());
+  vm.runInContext(
+    source.replace(PLACEHOLDER, TOKEN_A).replace(OVERRIDES_PLACEHOLDER, "{}"),
+    sb,
+  );
+  return keys().filter((k) => !had.has(k)).map(String);
+}
+{
+  const added = addedGlobals(template);
+  assert(!added.length, "the script added a global: " + added.join(","));
+  const anchor = "    var hookSource = Function.prototype.toString;";
+  assert(template.includes(anchor), "cannot plant: the idempotence block changed");
+  for (const marker of [
+    'window.__marker = true;',
+    'window[Symbol("marker")] = true;',
+  ]) {
+    assert(
+      addedGlobals(template.replace(anchor, "    " + marker + "\n" + anchor)).length > 0,
+      "planted global not caught: " + marker,
+    );
+  }
+
+  const guard = `    if (alreadyHooked()) {
+      return;
+    }`;
+  assert(template.includes(guard), "cannot plant: the second-run check changed");
+  const planted = template
+    .replace(guard, "    alreadyHooked(); /* planted: no early return */")
+    .replace(PLACEHOLDER, TOKEN_A)
+    .replace(OVERRIDES_PLACEHOLDER, "{}");
+  const st = mkSandbox({ hostname: "example.com" });
+  vm.runInContext(planted, st);
+  const first = st.CanvasRenderingContext2D.prototype.getImageData;
+  vm.runInContext(planted, st);
+  assert(
+    st.CanvasRenderingContext2D.prototype.getImageData !== first,
+    "planted defect not caught: without the second-run check the hooks should stack",
+  );
+}
+
+// ---- (h3) the second-run check knows EVERY hooked method -------------------
+// The check recognises the first run by the wrappers it left, so it must list
+// every method the script replaces: a realm that lacks some APIs is still
+// recognised by whichever hooks it did get. Measured, not assumed: this reads
+// the list out of the script, observes what a run actually replaces, and then
+// double-registers each hooked family ALONE (every other family deleted) --
+// the case that stacked when the list held only five methods.
+{
+  const listText = (template.match(/var HOOKED = (\[[\s\S]*?\]);/) || [])[1];
+  assert(listText, "cannot find the HOOKED list in the script");
+  const hooked = JSON.parse(listText.replace(/,(\s*\])/g, "$1"));
+  const listed = new Set(hooked.map(([o, m]) => o + "." + m));
+  const owners = [...new Set(hooked.map(([o]) => o))];
+
+  const methodsOf = (sb) => {
+    const out = new Map();
+    for (const name of Object.getOwnPropertyNames(sb)) {
+      const proto = sb[name] && sb[name].prototype;
+      if (!proto || typeof proto !== "object") continue;
+      for (const key of Object.getOwnPropertyNames(proto)) {
+        const d = Object.getOwnPropertyDescriptor(proto, key);
+        if (d && typeof d.value === "function") out.set(name + "." + key, d.value);
+      }
+    }
+    return out;
+  };
+  const sb = mkSandbox({ hostname: "example.com" });
+  const before = methodsOf(sb);
+  runDivergence(sb, TOKEN_A);
+  const replaced = [...methodsOf(sb)].filter(([k, fn]) => before.get(k) !== fn);
+  assert(replaced.length > 0, "the run replaced nothing; the sandbox is wrong");
+  for (const [key, fn] of replaced) {
+    assert(listed.has(key), "hooked but missing from HOOKED: " + key);
+    const text = Function.prototype.toString.call(fn);
+    assert(
+      text.includes("noteProbe(") || text.includes('note("'),
+      "wrapper carries no marker the second-run check can see: " + key,
+    );
+  }
+
+  let families = 0;
+  for (const owner of owners) {
+    if (!sb[owner]) continue; // not modelled by this sandbox
+    families += 1;
+    const alone = mkSandbox({ hostname: "example.com" });
+    for (const other of owners) if (other !== owner) delete alone[other];
+    runDivergence(alone, TOKEN_A);
+    const once = methodsOf(alone);
+    runDivergence(alone, TOKEN_A);
+    for (const [key, fn] of methodsOf(alone)) {
+      assert(
+        once.get(key) === fn,
+        "second registration re-hooked " + key + " when " + owner + " was the only hooked family",
+      );
+    }
+  }
+  assert(families >= 4, "too few hooked families modelled to mean anything: " + families);
+}
+
 // ---- (i) element measurement: sub-pixel, bounded, round-safe, keyed -------
 //
 // Every assertion runs the REAL installed hook against the stub's KNOWN

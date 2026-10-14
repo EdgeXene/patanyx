@@ -174,10 +174,11 @@
       button.title = text;
       label.textContent = text;
     });
-    // Feature controls live in the menu sheet now; the toolbar keeps only the
-    // shield, the freeze chip and the menu button itself. `menu-item` supplies
-    // the row geometry, `feature-btn` keeps the state classes -- is-active,
-    // is-warning and aria-pressed are all written against that selector.
+    // Appended to the toolbar like every feature pill, and hidden there by
+    // chrome.js under `in-menu` since 1.0.7: the main menu's Updates entry
+    // proxies a click to this button and mirrors its state classes
+    // (is-warning, aria-pressed), so this element stays the one that owns
+    // the behaviour.
     var host = document.getElementById("toolbar");
     button.className = "feature-btn";
     (host || document.body).appendChild(button);

@@ -84,6 +84,29 @@ dmxleo.com           # The same CDN's own apex, from the Tracking list.
 # Absent from the upstream lists today; this entry keeps it that way.
 dmads.dailymotion.com
 
+# ---- Dailymotion's consent dialog, added 2026-10-12 ----
+# consent.dailymotion.com is Dailymotion's own name for its consent platform
+# (DNS: an alias of cdn-1945.privacy-mgmt.com, Sourcepoint, account 1945).
+# Where the GDPR applies, the page loads the "Data privacy at Dailymotion"
+# dialog from it (its consent setup names it as the endpoint), and the player
+# stays black until the visitor answers. Upstream files it under Tracking.
+# Reproduced through a French exit in a PATANYX development build on WebKitGTK
+# 2.54 (Linux; WebView2 not reproduced), twice each way: with it refused, a
+# video page shows no dialog and a black player that never starts; with it
+# allowed, the dialog appears, a choice dismisses it ("Accept" once,
+# "Continue without accepting" once), and the next video in the tab does not
+# ask again and plays. Requests logged to it before a choice was made: the
+# dialog's script, configuration and messages, its vendor list, and a
+# page-view report (wrapper/v2/pv-data). The request that records the
+# visitor's choice was not logged. Linux (WebKitGTK) only; not run on Windows,
+# where the same list change applies. Exact host only.
+consent.dailymotion.com
+# NOT allowed, deliberately: privacymanager.io (launchpad, launchpad-wrapper,
+# ats-wrapper, geo). Dailymotion loads it on every page, but its configuration
+# there holds one rule, of type "ATS": LiveRamp's identity envelope, which is
+# tracking, not consent. In the US the page's consent setup uses
+# cdn.privacy-mgmt.com instead, which neither shipped list carries.
+
 # ---- Instagram's own API, added 2026-10-10 ----
 # gateway.instagram.com, graphql.instagram.com and graph-fallback.instagram.com
 # are instagram.com's own API endpoints (its page scripts call them for the

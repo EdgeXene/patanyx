@@ -185,6 +185,110 @@ pub fn matched_rule(host: &str) -> Option<String> {
     set().matched_rule(host).map(str::to_owned)
 }
 
+/// The hosts on PATANYX's ad and tracker lists that the list IN FORCE also
+/// refuses, each host and every parent domain checked
+/// (`privacy::malicious_overlap`, which also states what this cannot find).
+///
+/// One snapshot of the set, taken once, so a refresh that lands halfway
+/// through cannot produce an overlap that is half one list and half another.
+/// ~144k hosts, several lookups each: run it on a worker
+/// (`ad_overlap_in_background`), never on the event loop.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn ad_overlap() -> Vec<String> {
+    ad_overlap_for(&set())
+}
+
+/// `ad_overlap` against a given list in force (tests pass their own, since
+/// other tests swap the shared one).
+#[cfg_attr(windows, allow(dead_code))]
+fn ad_overlap_for(active: &HostSet) -> Vec<String> {
+    use crate::platform::privacy::{bundled_ads, bundled_tracking};
+    let mut hosts = ad_overlap_with(
+        active,
+        bundled_ads()
+            .blocked_hosts
+            .iter()
+            .chain(bundled_tracking().blocked_hosts.iter()),
+    );
+    // Plus every malicious entry that sits BENEATH an ad-list host in the
+    // bundled list, found at build time from the plaintext (the runtime list
+    // is hashed and cannot be searched for descendants). So `ad.example.com`
+    // stays blocked in an allowed tab when only `example.com` is on the ad
+    // list, and `example.com` itself is allowed as the user asked (review
+    // 2026-10-12, R-001; compliance audit). RESIDUAL: an entry of that shape
+    // added by a refresh after this build is not found.
+    // Each still checked against the list IN FORCE: a refresh that retracts
+    // one (a false positive) unblocks it here too, instead of it staying
+    // blocked until the next binary (release review 2026-10-12, R-006).
+    #[cfg(not(windows))]
+    hosts.extend(
+        MALICIOUS_BENEATH_AD_HOSTS
+            .lines()
+            .filter(|l| !l.is_empty() && active.matched_rule(l).is_some())
+            .map(str::to_string),
+    );
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts
+}
+
+/// See build.rs `emit_malicious_beneath_ad_hosts`. Linux only: WebView2 checks
+/// every request against the malicious list itself.
+#[cfg(not(windows))]
+const MALICIOUS_BENEATH_AD_HOSTS: &str =
+    include_str!(concat!(env!("OUT_DIR"), "/malicious-beneath-ad-hosts.txt"));
+
+#[cfg_attr(windows, allow(dead_code))]
+fn ad_overlap_with<'a>(set: &HostSet, hosts: impl Iterator<Item = &'a String>) -> Vec<String> {
+    crate::platform::privacy::malicious_overlap(hosts.map(String::as_str), |host| {
+        set.matched_rule(host).is_some()
+    })
+}
+
+/// Computes `ad_overlap` off the event loop and hands it back as
+/// `UserEvent::AdOverlapComputed`. Called at startup and after every refresh
+/// that reported success, on a backend that needs it
+/// (`platform::ad_overlap_wanted`): the overlap must follow the list in force,
+/// or a host that became malicious would stay reachable in a tab with ads
+/// allowed.
+///
+/// Each computation carries a request number, and only the newest request's
+/// answer is used (`is_latest_overlap_request`): a slow worker for an older
+/// list must not land after a newer one and replace it (review 2026-10-12 of
+/// the per-tab switch, R-004). A worker that cannot be started is reported as
+/// a failure, which ends every allowance and keeps the switch unavailable,
+/// rather than leaving the old overlap in force with nothing coming to replace
+/// it (R-003).
+#[cfg_attr(windows, allow(dead_code))]
+pub fn ad_overlap_in_background(proxy: &tao::event_loop::EventLoopProxy<crate::UserEvent>) {
+    let request = next_overlap_request();
+    let worker = proxy.clone();
+    let spawned = std::thread::Builder::new()
+        .name("ad-overlap".into())
+        .spawn(move || {
+            let _ = worker.send_event(crate::UserEvent::AdOverlapComputed {
+                request,
+                hosts: Some(ad_overlap()),
+            });
+        });
+    if spawned.is_err() {
+        let _ = proxy.send_event(crate::UserEvent::AdOverlapComputed { request, hosts: None });
+    }
+}
+
+static OVERLAP_REQUESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg_attr(windows, allow(dead_code))]
+fn next_overlap_request() -> u64 {
+    OVERLAP_REQUESTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+/// Whether `request` is the newest overlap computation asked for.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn is_latest_overlap_request(request: u64) -> bool {
+    request == OVERLAP_REQUESTS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 // ---------------------------------------------------------------------------
 // The signed hourly refresh.
 // ---------------------------------------------------------------------------
@@ -380,6 +484,95 @@ mod tests {
         );
         assert!(s.matched_rule("login.fruitfulshortlinux.opreaopoi.repl.co").is_some());
         assert!(s.matched_rule("example.invalid").is_none());
+    }
+
+    /// The overlap the Linux allowance keeps blocked is real and is found
+    /// from the shipped lists: an exact-host count found 35 hosts on both
+    /// (code map, 2026-10-11). If this ever reads zero against the bundled
+    /// floor, the overlap filter would compile to nothing and an allowed tab
+    /// would reach every one of them. Also times it, because it runs on a
+    /// worker at startup and after every refresh.
+    #[test]
+    fn the_ad_overlap_with_the_bundled_floor_is_found() {
+        use crate::platform::privacy::{bundled_ads, bundled_rules, bundled_tracking};
+        let set = bundled_set();
+        let started = std::time::Instant::now();
+        let overlap = ad_overlap_with(
+            &set,
+            bundled_ads()
+                .blocked_hosts
+                .iter()
+                .chain(bundled_tracking().blocked_hosts.iter()),
+        );
+        let took = started.elapsed();
+        println!("ad overlap: {} hosts in {took:?}", overlap.len());
+        assert!(
+            overlap.len() >= 30,
+            "only {} hosts are on both lists; the code map counted 35 exact matches",
+            overlap.len()
+        );
+        for host in &overlap {
+            assert!(set.matched_rule(host).is_some(), "{host} is not malicious");
+            assert!(bundled_rules().blocks_host(host), "{host} is not on the ad list");
+        }
+    }
+
+    /// The build-time half: malicious entries beneath an ad-list host are in
+    /// the overlap, so an allowed Linux tab keeps blocking
+    /// `ad.broadstreetads.com` (malicious) while `broadstreetads.com`, an
+    /// ordinary ad host, is allowed as the user asked (review 2026-10-12,
+    /// R-001; compliance audit). Every entry really is malicious and really
+    /// sits under an ad-list host.
+    #[test]
+    #[cfg(not(windows))] // the build-time list is Linux only
+    fn malicious_entries_beneath_ad_hosts_are_in_the_overlap_and_their_parents_are_not() {
+        use crate::platform::privacy::bundled_rules;
+        let set = bundled_set();
+        let beneath: Vec<&str> = MALICIOUS_BENEATH_AD_HOSTS.lines().filter(|l| !l.is_empty()).collect();
+        // 181 at this list version.
+        assert!(beneath.len() >= 100, "only {} entries found", beneath.len());
+        assert!(beneath.contains(&"ad.broadstreetads.com"), "the review's example is missing");
+        for host in &beneath {
+            assert!(set.matched_rule(host).is_some(), "{host} is not malicious");
+            assert!(bundled_rules().blocks_host(host), "{host} is not under an ad-list host");
+        }
+        let overlap = ad_overlap_for(&set);
+        for host in &beneath {
+            assert!(overlap.binary_search(&host.to_string()).is_ok(), "{host} is not in the overlap");
+        }
+        // The parents are NOT blocked whole: the switch still allows them.
+        for parent in ["broadstreetads.com", "doubleclick.net"] {
+            assert!(overlap.binary_search(&parent.to_string()).is_err(), "{parent} is blocked whole again");
+        }
+        let (json, _) = crate::platform::privacy::overlap_filter(&overlap).expect("a filter");
+        assert!(json.contains("ad\\\\.broadstreetads") || json.contains("ad\\.broadstreetads") || json.contains("ad.broadstreetads"));
+    }
+
+    /// A build-time entry that the list in force no longer names is not in
+    /// the overlap (release review 2026-10-12, R-006).
+    #[test]
+    #[cfg(not(windows))] // the build-time list is Linux only
+    fn a_build_time_entry_follows_the_list_in_force() {
+        let beneath: Vec<&str> = MALICIOUS_BENEATH_AD_HOSTS.lines().filter(|l| !l.is_empty()).collect();
+        // A refreshed list that still names one entry and retracted the rest.
+        let named = "ad.broadstreetads.com";
+        let active = HostSet::from_lines(&format!("{named}\n"));
+        let overlap = ad_overlap_for(&active);
+        assert!(overlap.binary_search(&named.to_string()).is_ok(), "the entry still listed was dropped");
+        let retracted: Vec<&&str> = beneath.iter().filter(|h| active.matched_rule(h).is_none()).collect();
+        assert!(retracted.len() >= 100, "the test lost its retracted entries");
+        for host in retracted {
+            assert!(overlap.binary_search(&host.to_string()).is_err(), "{host} was retracted and is still blocked");
+        }
+    }
+
+    /// Only the newest overlap request's answer counts (R-004).
+    #[test]
+    fn only_the_newest_overlap_request_counts() {
+        let older = next_overlap_request();
+        let newer = next_overlap_request();
+        assert!(!is_latest_overlap_request(older), "an older worker's answer would replace a newer one");
+        assert!(is_latest_overlap_request(newer));
     }
 
     #[test]

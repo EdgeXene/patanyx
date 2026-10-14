@@ -1067,19 +1067,14 @@ pub struct Tab {
     /// browser-wide switch), then whatever set_privacy last applied to every
     /// tab. Read where a held-page event is consumed: the browser-wide value
     /// was wrong for a private tab opened while blocking was off, and the
-    /// hold was silently dropped (review R-002, round 6).
+    /// hold was silently dropped (review R-002, round 6). False while ads and
+    /// trackers are allowed on this tab; taken from the engine glue whenever
+    /// that changes (`sync_policy_from_engine`).
     pub block_ads: bool,
-    /// Whether a Fingerprint Divergence script was actually built for this
-    /// tab, recorded at construction.
-    ///
-    /// OBSERVED, not configured, and the difference is the whole point of
-    /// the proof panel: this is false when the pref was off, when the
-    /// randomness source failed (which yields no script rather than a fixed
-    /// token), and when the site is set to Off. Reading the pref at display
-    /// time would answer a different question and would be wrong for every
-    /// tab opened before the pref last changed, since neither engine can
-    /// re-register a live view's scripts.
-    pub divergence_registered: bool,
+    /// The policy this tab runs under now: the preset it was built with, then
+    /// rebased (`TabPolicy::rebased_on`) each time the browser-wide policy
+    /// changes. A Strict Tab keeps its preset; see `set_privacy`.
+    pub policy: platform::TabPolicy,
     /// The tab's translation session, if the user started one.
     ///
     /// Per TAB and not per browser: two tabs can be mid-translation in
@@ -1123,6 +1118,13 @@ pub struct Tab {
     /// callback if the WebView is closed, which would otherwise strand every
     /// other pending tab behind the process-wide gate forever.
     close_after_session_wipe: bool,
+    /// Which WebView2 profile this tab's pages live in (kept_profile.rs).
+    /// Fixed when the tab is built: a page that belongs in the other
+    /// profile opens in another tab.
+    pub profile: crate::kept_profile::ProfileKind,
+    /// When this tab was opened by a page moving between profiles; such a
+    /// tab cannot move another page for a while (plan review R-019).
+    opened_by_crossing_at: Option<Instant>,
     /// Counts claimed by the document-start divergence wrappers in this tab.
     /// These are deliberately kept apart from the engine-owned request
     /// ledger: page code can reach the same message channel and forge them.
@@ -1132,6 +1134,20 @@ pub struct Tab {
     /// Set when `load_url` originates from back/forward/reload so the
     /// resulting UrlChanged event is not recorded as a new history entry.
     suppress_history: bool,
+    /// Ad and tracker blocking came back for this tab while the user had it
+    /// frozen, so the reload that brings the page on screen in line could not
+    /// run. Paid by the next reload (without the cache) or by unfreezing
+    /// (release review 2026-10-12, round 2, R-003).
+    blocking_reload_owed: bool,
+    /// The document on screen when the reload became owed
+    /// (`platform::current_document`). Paid automatically only while that
+    /// document is still the one shown; another page drops the debt (release
+    /// review 2026-10-12, round 7, R-001).
+    owed_document: Option<u64>,
+    /// The tab's address when the reload became owed: Linux names no
+    /// documents, so a different address is how a different page is told
+    /// apart there (round 8, R-001).
+    owed_url: String,
     /// Page zoom, as a scale factor. Per TAB, like every mainstream browser:
     /// a global level would resize a page the user never asked about, and a
     /// per-site one needs storage this browser deliberately does not keep for
@@ -1174,19 +1190,25 @@ impl Tab {
     /// the original value and this opens the address they most recently
     /// asked for; it never starts an early navigation merely because the UI
     /// was already responsive.
-    fn finish_initial_navigation(&mut self) {
+    ///
+    /// Returns true when the first page was due and could NOT be issued: no
+    /// navigation started, so nothing the user asked for will commit and
+    /// the caller drops the tab's duplicate-site mark (code review
+    /// 2026-10-07, R-019). Every other outcome returns false.
+    #[must_use]
+    fn finish_initial_navigation(&mut self) -> bool {
         if !self.initial_navigation_pending {
-            return;
+            return false;
         }
         // On Windows the first page also waits for the WebSocket guard's
         // registration (`platform::initial_navigation_ready`); this runs again
         // when that settles.
         if !platform::initial_navigation_ready(&self.view) {
-            return;
+            return false;
         }
         self.initial_navigation_pending = false;
         if self.close_after_session_wipe {
-            return;
+            return false;
         }
         platform::note_app_navigation(&self.view, &self.url);
         if let Err(error) = platform::load_initial_url(&self.webview, self.id, &self.url) {
@@ -1194,7 +1216,9 @@ impl Tab {
             // (final review 6, R-004).
             platform::forget_app_navigation(&self.view);
             platform::report_initial_navigation_failure(&self.url, &error);
+            return true;
         }
+        false
     }
 
     /// Every navigation the BROWSER issues on this tab's content goes through
@@ -1208,6 +1232,14 @@ impl Tab {
         // freeze-after-load) yields before the request, as it would to a
         // link. A manual freeze is not touched.
         platform::yield_auto_freeze(&self.webview, &self.view);
+        // "Allow ads and trackers on this tab" ends here, before the request,
+        // when the browser itself takes the tab to another site (typed
+        // address, back, forward, a bookmark). On WebKitGTK this is the one
+        // point that comes before the document request is sent; the engine's
+        // own main-frame signals come after it. Windows ends it in
+        // NavigationStarting instead, where it can see whether the navigation
+        // really goes ahead, so there this does nothing.
+        platform::end_ads_allowance_before_navigation(&self.webview, &self.view, url);
         platform::note_app_navigation(&self.view, url);
         let loaded = self.webview.load_url(url);
         if loaded.is_err() {
@@ -1215,6 +1247,24 @@ impl Tab {
             platform::forget_app_navigation(&self.view);
         }
         loaded
+    }
+
+    /// The site ads and trackers are allowed on in this tab, if they are.
+    ///
+    /// Read from the engine glue every time rather than kept here as a second
+    /// copy: the allowance ends inside engine handlers (NavigationStarting,
+    /// WebKit's main-frame load), and a copy here would be stale until the
+    /// `AdsAllowanceEnded` event arrived. A browser-wide Privacy switch moved
+    /// in that window would have re-allowed the NEXT site.
+    pub fn ads_allowed_site(&self) -> Option<String> {
+        platform::ads_allowed_site(&self.view)
+    }
+
+    /// Takes the policy in force from the engine glue after something there
+    /// changed it (an allowance granted or ended).
+    fn sync_policy_from_engine(&mut self) {
+        self.policy = platform::tab_policy(&self.view);
+        self.block_ads = self.policy.block_ads;
     }
 
     fn queue_or_navigate(&mut self, url: &str) -> Result<(), &'static str> {
@@ -1244,32 +1294,83 @@ impl Tab {
     // forbidden by the security rules, so navigation history is kept here
     // and replayed with `load_url()`. "reload" is a re-fetch of the current
     // URL.
-    pub fn history_back(&mut self) -> Result<(), &'static str> {
+    //
+    // Back and Forward answer `Ok(true)` only when a navigation was actually
+    // issued. Nothing to go back to is `Ok(false)`, the same no-op it always
+    // was, and it must stay distinguishable: AppState marks the tab for the
+    // duplicate-site notice on `Ok(true)` alone, and a mark with no
+    // navigation behind it would be spent by the page's next one (R-019).
+    pub fn history_back(&mut self) -> Result<bool, &'static str> {
         let index = match self.history_index {
             Some(i) if i > 0 => i,
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         let url = self.history[index - 1].clone();
         self.history_index = Some(index - 1);
         self.suppress_history = true;
-        self.load_url(&url).map_err(|_| "io")
+        self.load_url(&url).map_err(|_| "io")?;
+        Ok(true)
     }
 
-    pub fn history_forward(&mut self) -> Result<(), &'static str> {
+    pub fn history_forward(&mut self) -> Result<bool, &'static str> {
         let index = match self.history_index {
             Some(i) if i + 1 < self.history.len() => i,
-            _ => return Ok(()),
+            _ => return Ok(false),
         };
         let url = self.history[index + 1].clone();
         self.history_index = Some(index + 1);
         self.suppress_history = true;
-        self.load_url(&url).map_err(|_| "io")
+        self.load_url(&url).map_err(|_| "io")?;
+        Ok(true)
     }
 
     pub fn history_reload(&mut self) -> Result<(), &'static str> {
+        self.reload_page(false)
+    }
+
+    /// `history_reload` without the cache, for where ad and tracker blocking
+    /// has just come back for this tab: a plain reload can run scripts the
+    /// page fetched while it was off (platform::reload_bypassing_cache).
+    pub fn reload_bypassing_cache(&mut self) -> Result<(), &'static str> {
+        self.reload_page(true)
+    }
+
+    /// Brings the page on screen in line with blocking that just came back
+    /// for this tab: a reload without the cache, or, while the user has the
+    /// tab frozen (that reload would be held), owed until it is unfrozen or
+    /// reloaded (`blocking_reload_owed`).
+    pub fn reload_to_restore_blocking(&mut self) -> Result<(), &'static str> {
+        match restore_blocking_plan(platform::manually_frozen(&self.view)) {
+            RestoreBlocking::ReloadNow => self.reload_bypassing_cache(),
+            RestoreBlocking::Owe => {
+                self.owe_blocking_reload();
+                Ok(())
+            }
+        }
+    }
+
+    /// Owes a reload without the cache for the document on screen now.
+    fn owe_blocking_reload(&mut self) {
+        self.blocking_reload_owed = true;
+        self.owed_document = platform::current_document(&self.view);
+        self.owed_url = self.url.clone();
+    }
+
+    fn reload_page(&mut self, bypass_cache: bool) -> Result<(), &'static str> {
         if self.url.is_empty() {
             return Ok(());
         }
+        // A reload without the cache the engine failed later is owed too.
+        if platform::take_bypass_reload_failed(&self.view) {
+            self.owe_blocking_reload();
+        }
+        // An owed reload is paid by whichever reload comes next, but not by
+        // one the user's freeze will hold (`reload_plan`).
+        let plan = reload_plan(
+            bypass_cache,
+            self.blocking_reload_owed,
+            platform::manually_frozen(&self.view),
+        );
         self.suppress_history = true;
         // A real reload, not a re-navigation. `load_url` to the current
         // address is a fresh navigation, and a navigation is allowed to be
@@ -1286,11 +1387,106 @@ impl Tab {
         // asking (TabState::on_top_level_navigation_starting).
         platform::yield_auto_freeze(&self.webview, &self.view);
         platform::note_app_navigation(&self.view, &self.url);
-        let reloaded = self.webview.reload();
+        let reloaded = if plan.bypass_cache {
+            platform::reload_bypassing_cache(&self.webview, &self.view)
+        } else {
+            self.webview.reload().map_err(|_| ())
+        };
         if reloaded.is_err() {
             platform::forget_app_navigation(&self.view);
+            // A reload without the cache that never started leaves it owed
+            // (release review 2026-10-12, round 4, R-002).
+            if plan.bypass_cache {
+                self.owe_blocking_reload();
+            }
+        } else {
+            self.blocking_reload_owed = plan.still_owed;
         }
         reloaded.map_err(|_| "io")
+    }
+}
+
+/// How blocking that just came back for a tab reaches the page on screen.
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreBlocking {
+    /// Reload now, without the cache.
+    ReloadNow,
+    /// The user has the tab frozen, which would hold the reload: owed until
+    /// it is unfrozen or reloaded.
+    Owe,
+}
+
+fn restore_blocking_plan(manually_frozen: bool) -> RestoreBlocking {
+    if manually_frozen {
+        RestoreBlocking::Owe
+    } else {
+        RestoreBlocking::ReloadNow
+    }
+}
+
+/// A page an allowance-ending navigation left on screen (a download, a
+/// cancel): reloaded at once, unless something is about to replace it or is
+/// waiting on the user there -- PATANYX's own cancel-and-replace flows (the
+/// tracking-parameter strip's clean re-issue, the HTTP warning, the blocked
+/// site notice, the ad-list hold), which a reload would undo -- or the user
+/// froze the tab. Then it is owed (release review 2026-10-12, rounds 3 and 4).
+fn kept_page_plan(replacement_or_prompt: bool, manually_frozen: bool) -> RestoreBlocking {
+    restore_blocking_plan(replacement_or_prompt || manually_frozen)
+}
+
+/// What one reload does about an owed blocking reload.
+#[derive(Debug, PartialEq, Eq)]
+struct ReloadPlan {
+    /// Skip the cache: asked for, or owed.
+    bypass_cache: bool,
+    /// Still owed once this reload has been dispatched: a reload the user's
+    /// freeze holds pays nothing (release review 2026-10-12, round 3, R-001).
+    still_owed: bool,
+}
+
+/// The tab is now at `url`: an owed reload for another address is dropped.
+fn retire_owed_reload_on_leaving(tab: &mut Tab, url: &str) {
+    if owed_reload_survives(tab.blocking_reload_owed, &tab.owed_url, url) {
+        return;
+    }
+    tab.blocking_reload_owed = false;
+}
+
+/// Whether an owed reload survives the tab arriving at `url`.
+fn owed_reload_survives(owed: bool, owed_url: &str, url: &str) -> bool {
+    !owed || owed_url == url
+}
+
+/// What unfreezing does with an owed reload.
+#[derive(Debug, PartialEq, Eq)]
+enum OwedOnUnfreeze {
+    Nothing,
+    /// Pay it now, without the cache.
+    Reload,
+    /// A prompt or a replacement is pending there: keep it for the next reload.
+    Wait,
+    /// Another document is on screen: the page it was owed for is gone, and
+    /// reloading this one could lose what the user is doing there (round 7,
+    /// R-001).
+    Forget,
+}
+
+fn unfreeze_plan(owed: bool, must_wait: bool, same_document: bool) -> OwedOnUnfreeze {
+    if !owed {
+        OwedOnUnfreeze::Nothing
+    } else if !same_document {
+        OwedOnUnfreeze::Forget
+    } else if must_wait {
+        OwedOnUnfreeze::Wait
+    } else {
+        OwedOnUnfreeze::Reload
+    }
+}
+
+fn reload_plan(bypass_requested: bool, owed: bool, manually_frozen: bool) -> ReloadPlan {
+    ReloadPlan {
+        bypass_cache: bypass_requested || owed,
+        still_owed: owed && manually_frozen,
     }
 }
 
@@ -1631,10 +1827,38 @@ fn build_tab(
     id: u64,
     url: &str,
     policy: &platform::TabPolicy,
+    permissions: crate::state::PermissionBook,
+) -> Result<Tab, wry::Error> {
+    // A kept tab whose request interception did not register has no
+    // boundary at all, so it is never used: it is dropped before its first
+    // page is issued and the tab is built in the ordinary profile instead
+    // (code review round 2, R-035).
+    let tab = build_tab_as(hosts, proxy, id, url, policy, permissions.clone(), true)?;
+    if tab.profile == crate::kept_profile::ProfileKind::Kept && !platform::kept_boundary_ready(&tab.view) {
+        // Not dropped: its controller may be running the kept profile's
+        // start-up cleanup, whose completion releases every other kept
+        // tab (code review round 3). It stays hidden and never navigates.
+        Box::leak(Box::new(tab));
+        // Kept storage is off for the rest of the session, as when its
+        // ledger cannot be written: otherwise the ordinary tab built
+        // instead would send its page straight back (code review round 5).
+        platform::set_kept_enabled(false);
+        return build_tab_as(hosts, proxy, id, url, policy, permissions, false);
+    }
+    Ok(tab)
+}
+
+fn build_tab_as(
+    hosts: &platform::Hosts,
+    proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
+    url: &str,
+    policy: &platform::TabPolicy,
     // The session permission table, cloned into this tab's engine callback.
     // Passed rather than reached for: build_tab is a free function precisely
     // so it cannot touch AppState while AppState is mutably borrowed.
     permissions: crate::state::PermissionBook,
+    allow_kept: bool,
 ) -> Result<Tab, wry::Error> {
     let nav_proxy = proxy.clone();
     // Hosts this tab may visit despite the blocklist, because the user chose
@@ -1669,7 +1893,15 @@ fn build_tab(
     // Windows that is where the WebView2 user-data directory is attached, and
     // it has to be attached at CONSTRUCTION (wry 0.55.1 has no
     // `with_web_context` setter). See platform::new_webview_builder.
-    let builder = platform::new_webview_builder()
+    // KEPT SITES (kept_profile.rs): the profile is decided by the page the
+    // tab opens on, and only a tab that keeps data can be in the kept one.
+    let profile = crate::kept_profile::kind_for_url(
+        url,
+        &crate::kept_profile::kept_hosts(),
+        policy.ephemeral,
+        allow_kept && platform::kept_profile_supported(),
+    );
+    let builder = platform::new_webview_builder_for(profile)
         // Developer tools, and ONLY on content. Set here rather than in the
         // shared factory so it can never depend on which builder call comes
         // last: the privileged chrome is built from the same factory and sets
@@ -1829,6 +2061,7 @@ fn build_tab(
             malicious_override.clone(),
             id,
             permissions.clone(),
+            profile,
         )?;
     *new_tab_gate.borrow_mut() = Some(platform::new_tab_gate(&view));
     // The engine zooms on keys this process never sees; this is how the
@@ -1841,9 +2074,6 @@ fn build_tab(
     // Response-policy workaround on unix, a no-op on Windows where wry's
     // download handlers are implemented natively.
     platform::fix_downloads(&webview);
-    // What the platform layer just did, captured from the same inputs it
-    // used rather than re-derived later.
-    let divergence_built = platform::privacy::divergence_script(policy.ephemeral).is_some();
 
     Ok(Tab {
         id,
@@ -1854,7 +2084,7 @@ fn build_tab(
         ephemeral: policy.ephemeral,
         blocked_pending: std::cell::RefCell::new(None),
         block_ads: policy.block_ads,
-        divergence_registered: divergence_built,
+        policy: policy.clone(),
         translation: None,
         translation_extracted: 0,
         translation_patched: 0,
@@ -1862,10 +2092,15 @@ fn build_tab(
         translate_continue: None,
         initial_navigation_pending,
         close_after_session_wipe: false,
+        profile,
+        opened_by_crossing_at: None,
         fingerprint_probes: FingerprintProbeCounts::default(),
         history: Vec::new(),
         history_index: None,
         suppress_history: false,
+        blocking_reload_owed: false,
+        owed_document: None,
+        owed_url: String::new(),
         zoom: 1.0,
         malicious_override,
         insecure_override,
@@ -2187,6 +2422,9 @@ pub struct AppState {
     /// which is itself activity -- re-arms it for next time.
     lock_warning_sent: bool,
     pub tabs: Vec<Tab>,
+    /// Ledger entries (kept_profile.rs) that could not be written; tried
+    /// again at exit.
+    kept_unrecorded: Vec<String>,
     pub active: usize,
     /// Find session of the ACTIVE tab, per-tab by construction: the
     /// tab-switch path stops it and tab teardown unwires it, so one slot
@@ -2217,6 +2455,9 @@ pub struct AppState {
     pub hosts: platform::Hosts,
     /// Cloned into every tab's webview handlers.
     proxy: EventLoopProxy<UserEvent>,
+    /// Whether the window was maximized when the chrome was last told,
+    /// so a resize drag does not send the same answer every frame.
+    window_maximized: bool,
     /// Chrome webview — the ONLY webview we may call `evaluate_script` on.
     chrome: WebView,
     /// Current chrome strip height in logical pixels. Stored here (not only
@@ -2292,6 +2533,10 @@ pub struct AppState {
     /// chrome (the address bar, the find bar, a panel field) or the active
     /// tab's page. See `restore_focus`.
     pub focus_intent: std::cell::Cell<FocusSurface>,
+    /// Where a click found the keyboard before it moved it (note_focus).
+    /// A press on the window controls takes the keyboard into the chrome,
+    /// which a real title bar never does; this is where it goes back.
+    pub focus_before: std::cell::Cell<FocusSurface>,
     pub smoke_mode: bool,
     /// Set once the behavioural blocking probe has navigated, so the smoke
     /// exit does not fire before the page has had a chance to make requests.
@@ -2323,6 +2568,18 @@ pub struct AppState {
     /// Replayed by `activation::replay_pending` right after the next unlock
     /// evaluation. In memory only: a process exit in between still loses it.
     pub pending_activation_event: Option<crate::activation::ActivationEvent>,
+    /// An encrypted export or a whole-Library import running on a worker
+    /// (`backup_job`). One at a time.
+    pub backup_job: Option<crate::backup_job::BackupJob>,
+    pub backup_job_seq: u64,
+    /// Moves every time an import may replace the vault (it begins its
+    /// commit). A Premium activation call remembers the epoch it started in,
+    /// and an answer from an earlier epoch is dropped: it belongs to a vault
+    /// that may no longer be the one open, even when the licence is the same.
+    pub vault_epoch: u64,
+    /// The epoch the activation call in flight started in (one at a time).
+    /// A Cell: the calls that start one only read the rest of the state.
+    pub activation_epoch: std::cell::Cell<Option<u64>>,
     /// What the capture currently in flight is FOR. Written by the IPC arm
     /// that set `CAPTURE_IN_FLIGHT`, read once by `on_capture_done`. A single
     /// value is enough because the in-flight flag admits one capture at a
@@ -2371,6 +2628,16 @@ pub struct AppState {
     /// remembered (tab, origin) pair cannot enforce "once per pair" anyway
     /// once submissions from two tabs interleave.
     last_locked_save_notice: Option<Instant>,
+    /// "This site is already open in another tab": every rule lives in
+    /// `duplicate_site`, where a test can reach it; this struct only feeds it
+    /// navigations, activations and closes, and emits what comes back.
+    /// Memory only, including the sites the user dismissed this session.
+    duplicate_sites: crate::duplicate_site::DuplicateSites,
+    /// Sites already offered for the keep-list this session (keep_offer.rs).
+    keep_offers: crate::keep_offer::KeepOffers,
+    /// The `duplicate_site_notice` pref, read once at startup and updated by
+    /// its setter, so a navigation never has to read prefs.json.
+    duplicate_notice_enabled: bool,
     /// PDF renders in flight, keyed by destination path, valued by the URL
     /// they were started from. The engine answers asynchronously and the tab
     /// may have navigated by then, so the source URL cannot be re-read at
@@ -2688,6 +2955,7 @@ impl AppState {
             autolock_secs: crate::prefs::load().vault_autolock_secs,
             lock_warning_sent: false,
             tabs: Vec::new(),
+            kept_unrecorded: Vec::new(),
             active: 0,
             find: crate::find::FindSession::default(),
             find_gen: crate::find::GenSeq::default(),
@@ -2697,6 +2965,7 @@ impl AppState {
             blocked_pending_seq: 0,
             hosts,
             proxy,
+            window_maximized: false,
             chrome,
             chrome_height: platform::CHROME_HEIGHT_PX,
             closed_chrome_height: platform::CHROME_HEIGHT_PX,
@@ -2716,11 +2985,16 @@ impl AppState {
             // The address bar, until something says otherwise: a launch on its
             // own is someone about to type where to go.
             focus_intent: std::cell::Cell::new(FocusSurface::Chrome),
+            focus_before: std::cell::Cell::new(FocusSurface::Chrome),
             smoke_mode,
             probe_started: false,
             ping_count: 0,
             picked_paths: std::collections::VecDeque::new(),
             pending_activation_event: None,
+            backup_job: None,
+            backup_job_seq: 0,
+            vault_epoch: 0,
+            activation_epoch: std::cell::Cell::new(None),
             next_pick_token: 1,
             capture_intent: crate::capture::CaptureIntent::SaveFile,
             smoke_second_ping_requested: false,
@@ -2736,6 +3010,9 @@ impl AppState {
             download_compare: crate::download_compare::DownloadCompareState::default(),
             pending_save: None,
             last_locked_save_notice: None,
+            duplicate_sites: crate::duplicate_site::DuplicateSites::default(),
+            keep_offers: crate::keep_offer::KeepOffers::default(),
+            duplicate_notice_enabled: crate::prefs::load().duplicate_site_notice,
             pending_pdf: std::collections::HashMap::new(),
             #[cfg(feature = "chat")]
             chat: crate::chat_panel::ChatState::default(),
@@ -2849,12 +3126,86 @@ impl AppState {
         self.proxy.clone()
     }
 
+    /// A title-bar action from the chrome's own controls (window_frame.rs).
+    /// Close ends the event loop the way the system close does, so AppState
+    /// drops normally; the rest act on the window.
+    pub fn window_control(
+        &mut self,
+        action: crate::window_frame::WindowAction,
+    ) -> Result<(), &'static str> {
+        if !platform::custom_window_frame() {
+            return Err("unsupported");
+        }
+        if action == crate::window_frame::WindowAction::Close {
+            let _ = self.proxy.send_event(UserEvent::CloseWindow);
+            return Ok(());
+        }
+        // The press that sent this put the keyboard in the chrome. A real
+        // title bar never takes it, so it goes back to the page when the
+        // page had it, unless a panel covers the window (code review
+        // 2026-10-13, R-001). Minimize only records it, for the activation
+        // that restores the window (restore_focus).
+        let page_had_it = match self.focus_intent.get() {
+            FocusSurface::Content => true,
+            FocusSurface::Chrome => self.focus_before.get() == FocusSurface::Content,
+        };
+        platform::window_control(&self.hosts, action)?;
+        if page_had_it && !self.modal_covers_window() {
+            if action == crate::window_frame::WindowAction::Minimize {
+                self.focus_intent.set(FocusSurface::Content);
+            } else {
+                self.focus_active_content();
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether the window is maximized now, for the chrome's Maximize or
+    /// Restore control. False where the chrome draws no controls.
+    pub fn window_maximized_now(&self) -> bool {
+        platform::custom_window_frame() && platform::window_is_maximized(&self.hosts)
+    }
+
+    /// Tells the chrome when the window is maximized or restored, so its
+    /// control shows the right glyph and the top resize band steps aside
+    /// while maximized. Called on every resize; sends only a change.
+    pub fn note_window_state(&mut self) {
+        let maximized = self.window_maximized_now();
+        if maximized != self.window_maximized {
+            self.window_maximized = maximized;
+            self.emit("window_state", json!({ "maximized": maximized }));
+        }
+    }
+
     pub fn touch(&mut self) {
         self.last_activity = Instant::now();
         // A fresh idle stretch gets a fresh warning. Without this the notice
         // would fire once per session and every later approach to the deadline
         // would be silent.
         self.lock_warning_sent = false;
+    }
+
+    /// Whether the idle lock is due: the person chose a timeout and has been
+    /// away longer than it. An import's commit runs with no idle deadline, so
+    /// its end asks this before the imported vault's session begins.
+    pub fn idle_lock_due(&self) -> bool {
+        self.autolock_after()
+            .is_some_and(|after| self.last_activity.elapsed() >= after)
+    }
+
+    /// Starts the idle lock's one-minute countdown now, as if the person had
+    /// been away exactly long enough for the warning. For an import whose
+    /// commit outlasted the idle timeout: the countdown and "I'm still here"
+    /// come before the lock, as they always do, rather than a lock with no
+    /// warning that would also cost the one-time recovery key.
+    pub fn arm_idle_warning_now(&mut self) {
+        let Some(after) = self.autolock_after() else {
+            return;
+        };
+        if let Some(at) = Instant::now().checked_sub(after.saturating_sub(AUTO_LOCK_WARN_BEFORE)) {
+            self.last_activity = at;
+            self.lock_warning_sent = false;
+        }
     }
 
     /// The configured idle timeout, or `None` when the user chose never.
@@ -2869,6 +3220,13 @@ impl AppState {
     /// disabled -- so the loop can go back to waiting indefinitely instead of
     /// spinning on a deadline that will never do anything.
     pub fn autolock_deadline(&self) -> Option<Instant> {
+        // During an import's commit the vault is closed and the lock waits
+        // for the result (`backup_job`): a deadline in the past would only
+        // spin the event loop. The commit is bounded; the idle lock comes
+        // back with the imported vault's session.
+        if crate::backup_job::committing(self) {
+            return None;
+        }
         let after = self.autolock_after()?;
         self.vault.as_ref()?;
         Some(if self.lock_warning_sent {
@@ -3423,7 +3781,26 @@ impl AppState {
     /// rest). A tab already gone has nothing to release.
     pub fn on_local_network_guard_settled(&mut self, id: u64) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-            tab.finish_initial_navigation();
+            let failed = tab.finish_initial_navigation();
+            if failed {
+                self.duplicate_sites.forget_user_navigation(id);
+            }
+        }
+    }
+
+    /// A tab's bundled ad and tracker filters finished loading (WebKitGTK).
+    /// Every tab still holding its first page is looked at again;
+    /// `Tab::finish_initial_navigation` leaves alone a tab that is not
+    /// pending and one whose own filters or start-up clear are not done yet.
+    pub fn on_bundled_filters_settled(&mut self) {
+        let mut failed_ids = Vec::new();
+        for tab in self.tabs.iter_mut() {
+            if tab.finish_initial_navigation() {
+                failed_ids.push(tab.id);
+            }
+        }
+        for id in failed_ids {
+            self.duplicate_sites.forget_user_navigation(id);
         }
     }
 
@@ -3433,7 +3810,10 @@ impl AppState {
     pub fn on_local_network_guard_overdue(&mut self, id: u64) {
         if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
             platform::note_local_network_guard_overdue(&tab.view);
-            tab.finish_initial_navigation();
+            let failed = tab.finish_initial_navigation();
+            if failed {
+                self.duplicate_sites.forget_user_navigation(id);
+            }
         }
     }
 
@@ -3459,6 +3839,20 @@ impl AppState {
         self.next_tab_id += 1;
         let was_empty = self.tabs.is_empty();
         self.tabs.push(tab);
+        // `switch` is true only on the browser's own paths (a new tab from the
+        // chrome, a partner, sponsorship or purchase button, the first tab of
+        // a restored shelf, Ctrl+T, the startup tab); a page's window.open
+        // arrives with false (main.rs, OpenInNewTab). So this tab's first
+        // load is the user's, which is the only kind the duplicate-site
+        // notice answers to (see duplicate_site.rs). The reverse does NOT
+        // hold: the user also opens BACKGROUND tabs (the rest of a restored
+        // shelf, an accepted shared link), and those callers mark through
+        // `note_user_navigation` themselves (code review 2026-10-07, R-020).
+        // The bookmark-check tab (page_integrity) is the browser's own
+        // errand, not a site the user opened, and is not marked.
+        if switch {
+            self.duplicate_sites.note_user_navigation(id);
+        }
         if was_empty {
             self.active = 0;
             self.show_and_focus_tab(0);
@@ -3473,6 +3867,19 @@ impl AppState {
     }
 
     pub fn close_tab(&mut self, id: u64) -> Result<(), &'static str> {
+        // The last kept tab closing: the kept profile's stored permission
+        // decisions go back to default, through the hidden kept view that
+        // outlives the tab (code review rounds 2 and 3).
+        if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+            if tab.profile == crate::kept_profile::ProfileKind::Kept
+                && !self
+                    .tabs
+                    .iter()
+                    .any(|t| t.id != id && t.profile == crate::kept_profile::ProfileKind::Kept)
+            {
+                platform::sweep_kept_permissions(&self.hosts, true);
+            }
+        }
         // Before anything is removed, so Side by Side's hidden pane is
         // restored while both panes still exist.
         if self.page_fullscreen == Some(id) {
@@ -3490,6 +3897,12 @@ impl AppState {
             .ok_or("not_found")?;
         crate::page_integrity::on_tab_closed(self, id);
         crate::reader_view::on_tab_closed(self, id);
+        // A duplicate-site notice naming this tab, on either side, is over.
+        // And when the last Strict tab goes, so does every dismissal made
+        // in one: a Strict visit must leave nothing behind it.
+        let strict_tabs_remain = self.tabs.iter().any(|t| t.id != id && t.policy.strict);
+        let retired = self.duplicate_sites.on_tab_closed(id, strict_tabs_remain);
+        self.retire_duplicate_notice(retired);
         // Closing either pane ends Side by Side; the other pane stays open
         // and is shown if it is the tab that becomes active.
         let pair_ended = crate::side_by_side::close_ends_pair(self.pair, id);
@@ -3595,9 +4008,17 @@ impl AppState {
         self.emit_tabs_changed();
         if was_active {
             let tab = &self.tabs[self.active];
+            let new_active_id = tab.id;
             self.emit("url_changed", json!({ "url": tab.url, "tab": tab.id }));
             self.emit_tab_status();
             self.focus_url_bar_if_active_is_blank();
+            // The neighbour became active here WITHOUT `set_active`, so the
+            // duplicate-site check that every activation gets has to run here
+            // too, or a duplicate that loaded in the background behind the
+            // closed tab is never shown (code review 2026-10-06, R-001).
+            let retired = self.duplicate_sites.on_active_changed(new_active_id);
+            self.retire_duplicate_notice(retired);
+            self.present_duplicate_notice();
         }
         Ok(())
     }
@@ -3809,6 +4230,7 @@ impl AppState {
     /// (a click into the page or into the chrome). Our own focus calls set the
     /// intent directly; this is how a CLICK is heard.
     pub fn note_focus(&self, surface: FocusSurface) {
+        self.focus_before.set(self.focus_intent.get());
         self.focus_intent.set(surface);
     }
 
@@ -3956,10 +4378,233 @@ impl AppState {
             }
         }
         self.privacy = policy;
+        // Each OPEN tab is rebased, not overwritten: a Strict Tab keeps every
+        // protection it was opened with, and every tab keeps its storage mode
+        // (`TabPolicy::rebased_on`). Copying the browser-wide policy onto
+        // every tab turned JavaScript on in an open Strict Tab whenever any
+        // Privacy switch moved.
+        //
+        // And a tab with ads and trackers allowed KEEPS them allowed: the
+        // engine glue lays the allowance over the rebased policy
+        // (`TabState::apply_base_policy`) and returns what is now in force, so
+        // no browser-wide switch can quietly turn blocking back on there. When
+        // the allowance ends, the tab returns to the rebased policy.
         for tab in &mut self.tabs {
-            tab.block_ads = self.privacy.block_ads;
-            platform::apply_policy(&tab.webview, &tab.view, &self.privacy);
+            let rebased = tab.policy.rebased_on(&self.privacy);
+            let effective = platform::apply_policy(&tab.webview, &tab.view, &rebased);
+            tab.block_ads = effective.block_ads;
+            tab.policy = effective;
         }
+    }
+
+    // ---- "Allow ads and trackers on this tab" ------------------------------
+    //
+    // Lasts for this tab on this site: it ends when the tab's top-level
+    // document goes to another site, or when the tab closes. Never saved. The
+    // allowance itself lives with the engine handlers (`TabState`); this is
+    // the IPC surface, and what keeps the open page matching the switch.
+
+    /// Why the switch cannot be changed for `tab` now, or None.
+    fn ads_allow_unavailable(&self, tab: &Tab) -> Option<&'static str> {
+        // A tab the user froze cannot reload, and the switch's reload is what
+        // makes the open page match it, both ways: turning it off without the
+        // reload left an open YouTube page running without its ad script once
+        // the tab was unfrozen. So it cannot be changed until the tab is
+        // unfrozen (release review 2026-10-12, R-003). The reasons below come
+        // first (a Strict Tab freezes itself, and never has the allowance).
+        let manually_frozen = platform::manually_frozen(&tab.view);
+        platform::ads_allow_unavailable(
+            tab.ads_allowed_site().is_some(),
+            tab.policy.strict,
+            // What THIS tab blocks without the allowance: a private tab opened
+            // while the browser-wide switch was off still blocks (its preset),
+            // and must be offered the switch (review 2026-10-12, R-006).
+            platform::ads_base_blocking(&tab.view),
+            platform::ads_site_of(&tab.url).is_some(),
+            platform::ads_allow_ready(),
+        )
+        .or(manually_frozen.then_some("ads_tab_frozen"))
+    }
+
+    /// The switch, for tab `tab_id`.
+    ///
+    /// ON: refused for a Strict Tab, with blocking already off for every tab,
+    /// for a page with no site, and on WebKitGTK until the filters it must put
+    /// back and keep are in memory. Otherwise the tab's current site is
+    /// recorded, any held page and ad-list exception on it are cleared (the
+    /// allowance covers both), the engine stops blocking, and the tab is
+    /// RELOADED: the page on screen loaded under the old setting, and the
+    /// open page must always match the switch.
+    ///
+    /// OFF: blocking goes back and the tab is reloaded for the same reason.
+    ///
+    /// Both ways refused while the user has the tab frozen, since its reload
+    /// cannot run (`ads_tab_frozen`).
+    pub fn set_tab_ads_allowed(&mut self, tab_id: u64, allowed: bool) -> Result<Value, &'static str> {
+        let idx = self
+            .tabs
+            .iter()
+            .position(|t| t.id == tab_id)
+            .ok_or("no_tab")?;
+        if allowed {
+            if let Some(reason) = self.ads_allow_unavailable(&self.tabs[idx]) {
+                return Err(reason);
+            }
+            let site = platform::ads_site_of(&self.tabs[idx].url).ok_or("ads_no_site")?;
+            if self.tabs[idx].ads_allowed_site().as_deref() == Some(site.as_str()) {
+                // Already on for this site: nothing to change, nothing to reload.
+                return Ok(self.active_tab_status());
+            }
+            let tab = &mut self.tabs[idx];
+            // A held page is resumed rather than reloaded: what is on screen is
+            // the placeholder, and its address is the page the user wanted.
+            // Without the fragment, so it is a real navigation and never a
+            // fragment step inside the placeholder, and as a GET: a held form
+            // was not sent, and allowing ads does not send it either.
+            let held = tab.adlist.pending().cloned();
+            // The engine first: if it refuses, nothing here has changed.
+            platform::allow_ads_on_tab(&tab.webview, &tab.view, site)?;
+            tab.adlist.clear_pending();
+            tab.adlist.end_override();
+            platform::set_adlist_override(&tab.view, None);
+            tab.sync_policy_from_engine();
+            let resumed = match &held {
+                Some(record) => {
+                    let bare = record.url.split('#').next().unwrap_or(&record.url).to_string();
+                    tab.queue_or_navigate(&bare)
+                }
+                None => tab.history_reload(),
+            };
+            if let Err(reason) = resumed {
+                // The page on screen could not be brought in line with the
+                // switch, so the switch goes back to match the page.
+                platform::end_ads_allowance(&tab.webview, &tab.view);
+                tab.sync_policy_from_engine();
+                if let Some(record) = held {
+                    tab.adlist.restore(record);
+                }
+                return Err(reason);
+            }
+        } else {
+            if self.tabs[idx].ads_allowed_site().is_some() && platform::manually_frozen(&self.tabs[idx].view) {
+                return Err("ads_tab_frozen");
+            }
+            let tab = &mut self.tabs[idx];
+            if platform::end_ads_allowance(&tab.webview, &tab.view) {
+                tab.sync_policy_from_engine();
+                // Blocking is already back in the engine whether or not the
+                // reload starts. A reload that fails leaves the page that
+                // loaded with ads allowed on screen, and the caller is told.
+                // Without the cache, or scripts fetched while ads were allowed
+                // run again from it (platform::reload_bypassing_cache).
+                if let Err(reason) = tab.reload_bypassing_cache() {
+                    self.emit_tab_status();
+                    return Err(reason);
+                }
+            }
+        }
+        self.emit_tab_status();
+        Ok(self.active_tab_status())
+    }
+
+    /// Windows: the navigation that ended tab `tab_id`'s allowance never
+    /// replaced the page (a download, or a cancel), so the page loaded with
+    /// ads allowed is still on screen (round 2, R-002). Reloaded at once
+    /// without the cache, or owed while PATANYX's own replacement or prompt
+    /// is pending there or the user froze the tab (`kept_page_plan`).
+    pub fn on_ads_allowance_page_kept(&mut self, tab_id: u64, replacing: bool, document: Option<u64>) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return; // a late event from a closed tab
+        };
+        // A different document on screen by now: the page this was for is
+        // gone, and so is the reason to reload (round 6, R-002).
+        if platform::current_document(&self.tabs[idx].view) != document {
+            return;
+        }
+        // Asked again now: a navigation announced or started since the event
+        // was sent counts as much as one pending then (round 5, R-002).
+        let busy = replacing || self.blocking_reload_must_wait(idx);
+        let tab = &mut self.tabs[idx];
+        match kept_page_plan(busy, platform::manually_frozen(&tab.view)) {
+            RestoreBlocking::ReloadNow => {
+                let _ = tab.reload_bypassing_cache();
+            }
+            RestoreBlocking::Owe => tab.owe_blocking_reload(),
+        }
+    }
+
+    /// Whether an automatic reload of tab `idx` would undo something: a
+    /// navigation about to replace the page, or a prompt waiting on the user
+    /// there (the save-password offer, the HTTP warning, the blocked-site
+    /// notice, the ad-list hold). Rounds 3 to 6 of the release review.
+    fn blocking_reload_must_wait(&self, idx: usize) -> bool {
+        let tab = &self.tabs[idx];
+        platform::replacement_pending(&tab.view)
+            || self.pending_save.as_ref().map(|p| p.tab_id) == Some(tab.id)
+            || tab.insecure_pending.is_some()
+            || tab.blocked_pending.borrow().is_some()
+            || tab.adlist.pending().is_some()
+    }
+
+    /// An engine handler ended tab `tab_id`'s allowance because its top-level
+    /// document went to another site. Blocking is already back in the engine;
+    /// this brings AppState's copy of the policy and the chrome in line.
+    pub fn on_ads_allowance_ended(&mut self, tab_id: u64) {
+        let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
+            return; // a late event from a closed tab
+        };
+        self.tabs[idx].sync_policy_from_engine();
+        if idx == self.active {
+            self.emit_tab_status();
+        }
+    }
+
+    /// Ends every tab's allowance, reloading each tab that had one so the
+    /// page matches the switch. For when the engine can no longer keep the
+    /// promise the switch makes (WebKitGTK: the filter for hosts on both the
+    /// ad list and the malicious-site list is being replaced or failed).
+    fn end_every_ads_allowance(&mut self) {
+        for tab in &mut self.tabs {
+            if platform::end_ads_allowance(&tab.webview, &tab.view) {
+                tab.sync_policy_from_engine();
+                // Owed, not lost, on a tab the user froze (round 2, R-003).
+                let _ = tab.reload_to_restore_blocking();
+            }
+        }
+    }
+
+    /// The hosts on both the ad lists and the malicious-site list in force,
+    /// from the worker. If the filter allowed tabs rely on is being replaced,
+    /// their allowances end now rather than run without it.
+    ///
+    /// Only the newest computation's answer is used (an older worker can
+    /// finish last), and one that could not run fails closed: every allowance
+    /// ends and the switch stays unavailable until a later list computes.
+    pub fn on_ad_overlap_computed(&mut self, request: u64, hosts: Option<Vec<String>>) {
+        if !crate::blocklist::is_latest_overlap_request(request) {
+            return;
+        }
+        let replaced = match hosts {
+            Some(hosts) => platform::on_ad_overlap_computed(hosts, &self.proxy()),
+            None => {
+                platform::on_ad_overlap_failed();
+                true
+            }
+        };
+        if replaced {
+            self.end_every_ads_allowance();
+        }
+        self.emit_tab_status();
+    }
+
+    /// The overlap filter finished compiling, or failed to. A failure ends
+    /// every allowance (fail closed) and keeps the switch unavailable; either
+    /// way the chrome is told the switch's availability.
+    pub fn on_ad_overlap_settled(&mut self) {
+        if !platform::ads_allow_ready() {
+            self.end_every_ads_allowance();
+        }
+        self.emit_tab_status();
     }
 
     /// Applies WebView2's profile-level tracking-prevention choice to every
@@ -4006,7 +4651,7 @@ impl AppState {
         // and the sentence that keeps this feature honest ("cookies, not your
         // saved passwords") is then pinned by cookie_control's own tests
         // instead of by nobody. Assembled, not phrased -- see that module.
-        let copy = crate::cookie_control::forget_all_copy();
+        let copy = crate::cookie_control::forget_all_copy(cfg!(windows) && crate::kept_profile::holds_kept_data());
         json!({
             // Whether the cookie-clearing controls can do anything on this
             // backend. False on WebKitGTK in 1.0.0, where the platform calls
@@ -4019,6 +4664,15 @@ impl AppState {
             "javascript": self.privacy.javascript,
             "ephemeral": self.privacy.ephemeral,
             "block_youtube_ads": self.privacy.block_youtube_ads,
+            // The switch above is what the user asked for; this is what the
+            // ACTIVE tab's engine did about it (review R-007), so the switch's
+            // note can say when YouTube shows its ads here regardless.
+            "youtube_ads_script": self
+                .tabs
+                .get(self.active)
+                .map(|tab| platform::youtube_ads_install(&tab.view))
+                .unwrap_or_default()
+                .as_str(),
             "network_blocking_supported": platform::network_blocking_supported(),
             "freeze_enforced": platform::freeze_enforced(),
             "forget_all": {
@@ -4072,11 +4726,20 @@ impl AppState {
                 // unreachable arm; the measured value lives in the tab arm.
                 "tunnel": "not_attempted",
                 "content_script_registered": "not_attempted",
+                // No tab, no script: null leaves both rows out.
+                "divergence_script": Value::Null,
+                "youtube_ads_script": Value::Null,
                 "pending_save": Value::Null,
                 "insecure_pending": Value::Null,
+                // The ads switch, in the same shape as the tab arm below: with
+                // no tab there is no page and so no site to allow it on.
+                "ads_allowed": false,
+                "ads_allow_available": false,
+                "ads_allow_reason": "ads_no_site",
             });
         };
         let engine_settings = platform::engine_settings(&tab.view);
+        let ads_unavailable = self.ads_allow_unavailable(tab);
         json!({
             "freeze_phase": platform::freeze_phase(&tab.view),
             // What the user ASKED for is `freeze_phase`; what the ENGINE did
@@ -4182,6 +4845,11 @@ impl AppState {
             // of an unconfirmed capability -- same discipline as every other
             // field above.
             "content_script_registered": engine_settings.content_script_registered,
+            // The two document-start scripts a setting asks for, reported as
+            // the engine answered (reviews R-003 and R-007). Null, and so no
+            // row, while nothing was asked or the answer is still on its way.
+            "divergence_script": platform::divergence_install(&tab.view).engine_row(),
+            "youtube_ads_script": platform::youtube_ads_install(&tab.view).engine_row(),
             // Set only if the ACTIVE tab is the one that submitted it -- see
             // `note_login_submitted` and `PendingSave`'s own doc. Never the
             // password: chrome.js gets enough to render "Save password for
@@ -4242,6 +4910,15 @@ impl AppState {
                 .and_then(host_of)
                 .map(Value::from)
                 .unwrap_or(Value::Null),
+            // "Allow ads and trackers on this tab". `ads_allowed` is read from
+            // the engine glue, which is where the allowance ends mid-
+            // navigation, so the switch and the shield never show an
+            // allowance that is already over. When the switch cannot be
+            // turned on, `ads_allow_reason` says why (`ads_allow_unavailable`)
+            // and the chrome words it.
+            "ads_allowed": tab.ads_allowed_site().is_some(),
+            "ads_allow_available": ads_unavailable.is_none(),
+            "ads_allow_reason": ads_unavailable,
         })
     }
 
@@ -4321,10 +4998,13 @@ impl AppState {
 
     /// The engine says a tab's page entered or left its fullscreen element.
     ///
-    /// Entering is honoured only for a page in `fullscreen::eligible_tabs`.
-    /// On Linux the engine already refused anything else; on Windows the
-    /// report comes after the fact and an ineligible page simply keeps a
-    /// tab-sized fullscreen, which is what every earlier build did.
+    /// Entering is decided by `fullscreen::entry`: only a page in
+    /// `fullscreen::eligible_tabs`, and only while the "Press Esc to exit"
+    /// notice can be drawn. On Linux the engine already refused anything
+    /// else; on Windows the report comes after the fact and a refused page
+    /// simply keeps a tab-sized fullscreen, which is what every earlier build
+    /// did. The notice is then drawn BEFORE the window is made fullscreen, and
+    /// a notice that fails to draw ends it there (release review R-004).
     pub fn on_page_fullscreen(&mut self, id: u64, on: bool) {
         if !on {
             if self.page_fullscreen == Some(id) {
@@ -4339,8 +5019,15 @@ impl AppState {
             return;
         };
         let active = self.tabs.get(self.active).map(|t| t.id);
-        if !crate::fullscreen::eligible_tabs(active, self.pair, self.modal_covers_window()).contains(&id) {
-            return;
+        let eligible = crate::fullscreen::eligible_tabs(active, self.pair, self.modal_covers_window())
+            .contains(&id);
+        match crate::fullscreen::entry(eligible, platform::fullscreen_notice_can_draw(&self.hosts)) {
+            crate::fullscreen::Entry::Grant => {}
+            crate::fullscreen::Entry::Ineligible => return,
+            crate::fullscreen::Entry::NoNotice => {
+                self.refuse_page_fullscreen();
+                return;
+            }
         }
         // The other Side by Side pane already holds the screen: one at a time.
         self.exit_page_fullscreen();
@@ -4354,6 +5041,14 @@ impl AppState {
         // the fullscreen one: on Linux the engine has already fullscreened the
         // window, and a normal layout in between would flash the toolbar.
         self.page_fullscreen = Some(id);
+        // The notice BEFORE the window. If it cannot draw, the page does not
+        // get the screen: on Windows the window was never made fullscreen,
+        // and on Linux leaving gives back the window the engine took. Either
+        // way the page is treated as every browser-side exit treats it.
+        if !self.show_fullscreen_notice() {
+            self.leave_page_fullscreen();
+            return;
+        }
         platform::set_page_fullscreen(&self.hosts, true);
         // A pane the user clicked in may not be the active one yet (the focus
         // report and the fullscreen report race). The same path as that focus
@@ -4364,7 +5059,18 @@ impl AppState {
             self.on_pane_focused(id);
         }
         self.relayout();
-        self.show_fullscreen_notice();
+    }
+
+    /// No page gets the screen: the notice cannot be drawn.
+    ///
+    /// Ends any page fullscreen there is, then gives the window back. On
+    /// Linux this request only gets here if the notice broke after the engine
+    /// asked (the engine handler refuses it otherwise), and by then WebKit has
+    /// made the window fullscreen. On Windows the window is not fullscreen and
+    /// asking again changes nothing.
+    fn refuse_page_fullscreen(&mut self) {
+        self.exit_page_fullscreen();
+        platform::set_page_fullscreen(&self.hosts, false);
     }
 
     /// Ends page fullscreen from the browser's side (a shortcut, a modal, a
@@ -4385,7 +5091,7 @@ impl AppState {
         // Any notice timer still running belongs to the fullscreen that just
         // ended.
         self.fullscreen_notice_gen += 1;
-        platform::set_fullscreen_notice(&self.hosts, None);
+        let _ = platform::set_fullscreen_notice(&self.hosts, None);
         platform::set_page_fullscreen(&self.hosts, false);
         // Side by Side: the other pane was hidden for the duration.
         if let Some((l, r)) = self.pair {
@@ -4403,21 +5109,28 @@ impl AppState {
     /// The one defence against a page that draws a fake browser once it owns
     /// the screen: the user is told, by the browser, that a page has the
     /// screen and how to take it back.
-    fn show_fullscreen_notice(&mut self) {
+    ///
+    /// False when the notice could not be shown. The caller must not give
+    /// the page the screen then.
+    #[must_use]
+    fn show_fullscreen_notice(&mut self) -> bool {
         self.fullscreen_notice_gen += 1;
         let generation = self.fullscreen_notice_gen;
         let text = self.i18n.text(crate::i18n::keys::CHROME_FULLSCREEN_NOTICE);
-        platform::set_fullscreen_notice(&self.hosts, Some(&text));
+        if !platform::set_fullscreen_notice(&self.hosts, Some(&text)) {
+            return false;
+        }
         let proxy = self.proxy.clone();
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_secs(crate::fullscreen::NOTICE_SECS));
             let _ = proxy.send_event(UserEvent::FullscreenNoticeEnd(generation));
         });
+        true
     }
 
     pub fn on_fullscreen_notice_end(&mut self, generation: u64) {
         if generation == self.fullscreen_notice_gen {
-            platform::set_fullscreen_notice(&self.hosts, None);
+            let _ = platform::set_fullscreen_notice(&self.hosts, None);
         }
     }
 
@@ -4436,18 +5149,37 @@ impl AppState {
         Ok(self.active_tab_status())
     }
 
-    /// One-call unfreeze of the active tab.
-    pub fn unfreeze_active_tab(&self) -> Result<Value, &'static str> {
-        let tab = self.tabs.get(self.active).ok_or("not_found")?;
+    /// One-call unfreeze of the active tab. A reload owed while it was
+    /// frozen (`Tab::blocking_reload_owed`) runs now.
+    ///
+    /// Not while a prompt or a replacement is pending there: it stays owed
+    /// for the next reload (round 6, R-001).
+    pub fn unfreeze_active_tab(&mut self) -> Result<Value, &'static str> {
+        let active = self.active;
+        let tab = self.tabs.get(active).ok_or("not_found")?;
         platform::unfreeze(&tab.webview, &tab.view);
+        let must_wait = self.blocking_reload_must_wait(active);
+        let tab = &mut self.tabs[active];
+        let same_document =
+            platform::current_document(&tab.view) == tab.owed_document && tab.url == tab.owed_url;
+        match unfreeze_plan(tab.blocking_reload_owed, must_wait, same_document) {
+            OwedOnUnfreeze::Reload => {
+                let _ = tab.reload_bypassing_cache();
+            }
+            OwedOnUnfreeze::Forget => tab.blocking_reload_owed = false,
+            OwedOnUnfreeze::Nothing | OwedOnUnfreeze::Wait => {}
+        }
         Ok(self.active_tab_status())
     }
 
     /// Per-site override on the active tab: `host` keeps working even while
     /// the tab is frozen. Survives navigation, dies with the tab (the
     /// override is the user's exception, not the page's).
-    pub fn allow_site_active_tab(&self, host: &str) -> Result<Value, &'static str> {
+    pub fn allow_site_active_tab(&self, host: &str, tab_id: u64) -> Result<Value, &'static str> {
         let tab = self.tabs.get(self.active).ok_or("not_found")?;
+        if !allow_targets_active_tab(tab_id, tab.id) {
+            return Err("not_found");
+        }
         platform::allow_site(&tab.webview, &tab.view, host);
         Ok(self.active_tab_status())
     }
@@ -6018,13 +6750,22 @@ impl AppState {
         if !crate::cookie_control::available() {
             return Err("cookie_clear_unavailable");
         }
-        let tab = self
+        // The ordinary profile's tabs only: sites the person chose to keep
+        // live in their own profile and are kept by that choice (the
+        // confirmation says so).
+        // With no ordinary tab open, the chrome itself lives in the
+        // ordinary profile (code review round 4).
+        let webview = self
             .tabs
             .iter()
-            .find(|tab| !tab.ephemeral)
-            .ok_or("no_persistent_tab")?;
-        if platform::forget_all_cookies(&tab.webview) {
-            Ok(json!({ "message": crate::cookie_control::cleared_line() }))
+            .find(|tab| !tab.ephemeral && tab.profile == crate::kept_profile::ProfileKind::Main)
+            .map_or(&self.chrome, |tab| &tab.webview);
+        if platform::forget_all_cookies(webview) {
+            Ok(json!({
+                "message": crate::cookie_control::cleared_line(
+                    cfg!(windows) && crate::kept_profile::holds_kept_data(),
+                )
+            }))
         } else {
             // Its OWN code, not the per-site `cookie_delete_failed`. The two
             // failures need different sentences ("for this site" is false
@@ -6180,6 +6921,9 @@ impl AppState {
     pub fn active_ledger(&self) -> Result<Value, &'static str> {
         let tab = self.tabs.get(self.active).ok_or("not_found")?;
         Ok(json!({
+            // Which tab these rows belong to: the panel draws and acts on a
+            // ledger only while that tab is the active one.
+            "tab_id": tab.id,
             "items": platform::ledger(&tab.view),
             "counts_blocked": LEDGER_COUNTS_BLOCKED,
         }))
@@ -6367,8 +7111,31 @@ impl AppState {
     /// second copy is what let the auto-lock and the explicit lock drift
     /// apart once already.
     pub fn lock_vault(&mut self) {
-        crate::page_integrity::on_vault_locked(self);
+        // A running backup is asked first: an export, or an import that has
+        // not committed, is stopped and the lock goes ahead now. An import's
+        // commit cannot be stopped; the lock then waits for its result
+        // (`backup_job::on_lock`).
+        if !crate::backup_job::on_lock(self) {
+            return;
+        }
         self.vault = None; // dropping Vault zeroizes key material
+        self.end_vault_session();
+        self.emit("vault_locked", json!({}));
+    }
+
+    /// Everything a lock ends besides the vault itself: pending integrity
+    /// checks and snapshot drafts, the chat transport, Premium output, the
+    /// licence session, the staged Deep Recall picture, the divergence table.
+    /// `lock_vault` runs it, and so does an import that replaced a live vault,
+    /// which must not carry the OLD vault's session into the new one and does
+    /// not emit `vault_locked`, because the chrome is showing the new recovery
+    /// key at that moment.
+    pub fn end_vault_session(&mut self) {
+        // FIRST: pending comparisons and snapshot drafts carry text read out
+        // of the ending vault's Library, and a late answer must not land in a
+        // different profile. (Reads no vault state, so it is safe after the
+        // vault field is cleared.)
+        crate::page_integrity::on_vault_locked(self);
         // The store deliberately stays resident for internal download
         // provenance. It is NOT publicly open: `store_status` reports closed
         // and every Library command routes through `ipc::store_open`, which
@@ -6407,10 +7174,68 @@ impl AppState {
         // read. Cleared BEFORE the event, so nothing can observe the lock
         // and still be handed the old table.
         set_divergence_overrides_snapshot(String::new());
-        self.emit("vault_locked", json!({}));
     }
 
     // ---- bookmark/provenance store -------------------------------------------
+
+    /// THE way to write to the vault. While an import is replacing it, every
+    /// write is refused (`backup_in_progress`): the reply would say it was
+    /// saved, and the import would then put the backup's vault in its place.
+    /// A source pin keeps raw `vault.as_mut()` out of the rest of the app.
+    pub fn vault_for_write(&mut self) -> Result<&mut Vault, &'static str> {
+        if crate::backup_job::importing(self) {
+            return Err("backup_in_progress");
+        }
+        self.vault.as_mut().ok_or("not_unlocked")
+    }
+
+    /// THE way to write to the Library, for the same reason as
+    /// [`AppState::vault_for_write`].
+    pub fn store_for_write(&mut self) -> Result<&mut Store, &'static str> {
+        if crate::backup_job::importing(self) {
+            return Err("backup_in_progress");
+        }
+        self.store.as_mut().ok_or("not_unlocked")
+    }
+
+    /// Attaches the Library an import's commit opened on its worker, with the
+    /// checks `open_store` makes after its recovery, so this thread never
+    /// reads, decrypts or checks the Library itself.
+    pub fn attach_imported_library(&mut self, library: crate::vault_backup::ImportedLibrary) {
+        use crate::vault_backup::ImportedLibrary;
+        match library {
+            ImportedLibrary::Unfinished => {
+                self.store = None;
+                self.store_error = Some("library_import_unfinished");
+                return;
+            }
+            ImportedLibrary::Opened { store, .. } => {
+                let marker = self.library_replace_marker();
+                if marker.exists() {
+                    if Store::exists(&self.store_path) {
+                        self.detach_store_unreplaced();
+                        return;
+                    }
+                    let _ = std::fs::remove_file(&marker);
+                }
+                if let Err(code) = self.hold_library_lock("library_in_use") {
+                    self.store = None;
+                    self.store_error = Some(code);
+                    return;
+                }
+                self.store = Some(store);
+                self.store_error = None;
+            }
+            ImportedLibrary::NotOpened(err) => {
+                self.store = None;
+                self.store_error = Some(match err {
+                    patanyx_store::StoreError::AuthFailed => "store_passphrase_mismatch",
+                    other => crate::ipc::store_code(other),
+                });
+            }
+        }
+        self.after_store_opened();
+    }
 
     /// Opens the store with the vault's passphrase, creating it on first use
     /// (existing vaults from before the store was wired get one silently, at
@@ -6441,6 +7266,26 @@ impl AppState {
     /// Failure is recorded rather than propagated: a damaged bookmark file
     /// must not make the vault unusable, and the next unlock retries.
     pub fn open_store(&mut self, passphrase: Option<&str>) {
+        // A whole-Library import that has not finished comes first: it is
+        // finished or undone here, before any Library is opened or created,
+        // and decided by the vault that is actually open (`vault_backup`).
+        // Under the Library lock, since it renames files another PATANYX
+        // window could otherwise have open.
+        if crate::vault_backup::journal_exists(&self.store_path) {
+            let Some(Ok(library_key)) = self.vault.as_ref().map(Vault::library_key) else {
+                return;
+            };
+            if let Err(code) = self.hold_library_lock("library_in_use") {
+                self.store = None;
+                self.store_error = Some(code);
+                return;
+            }
+            if crate::vault_backup::recover(&self.store_path, &library_key).is_err() {
+                self.store = None;
+                self.store_error = Some("library_import_unfinished");
+                return;
+            }
+        }
         let marker = self.library_replace_marker();
         if marker.exists() {
             if Store::exists(&self.store_path) {
@@ -6563,6 +7408,15 @@ impl AppState {
             // is closed whenever the vault is closed.
             "open": self.vault.is_some() && self.store.is_some(),
             "error": self.store_error,
+            // The backup file an unfinished import came from, so the message
+            // can say which file to import again. Only with that error, and
+            // only while the vault is open.
+            "import_source": match (self.store_error, self.vault.is_some()) {
+                (Some("library_import_unfinished"), true) => {
+                    crate::vault_backup::unfinished_source(&self.store_path)
+                }
+                _ => None,
+            },
             // Whether this build can digest a page is one question with one
             // answer, and it lives with the code that does the digesting:
             // `integrity_status` reports `platform::page_bytes_supported()`.
@@ -6624,16 +7478,26 @@ impl AppState {
             // hashing; there is nothing truthful left to record.
             Err(_) => return,
         };
-        if self.store.is_none() {
-            self.emit(
-                "download_record_failed",
-                json!({ "reason": "store_unavailable" }),
-            );
+        // An import is replacing the Library: the record waits for whichever
+        // Library is open when it ends (`backup_job`).
+        if crate::backup_job::park_download(self, url, &filename, byte_len, sha256) {
             return;
         }
-        let result = match self.store.as_mut() {
-            Some(store) => store.record_download(url, &filename, byte_len, sha256),
-            None => return, // unreachable: checked above
+        self.record_parked_download(url, &filename, byte_len, sha256);
+    }
+
+    /// Writes a download record into the open Library, saying so either way.
+    /// Also where records parked during an import land.
+    pub fn record_parked_download(&mut self, url: &str, filename: &str, byte_len: u64, sha256: [u8; 32]) {
+        let result = match self.store_for_write() {
+            Ok(store) => store.record_download(url, filename, byte_len, sha256),
+            Err(_) => {
+                self.emit(
+                    "download_record_failed",
+                    json!({ "reason": "store_unavailable" }),
+                );
+                return;
+            }
         };
         match result {
             Ok(_) => self.emit("downloads_changed", json!({})),
@@ -6764,23 +7628,45 @@ impl AppState {
         let arriving = self.tabs[index].id;
         let pane_switch = crate::side_by_side::on_select(self.pair, leaving, arriving)
             == crate::side_by_side::Selection::PaneSwitch;
-        if !pane_switch {
-            self.end_side_by_side_hiding_all_but(arriving);
-            platform::hide_tab(
-                &self.tabs[self.active].view,
-                &self.tabs[self.active].webview,
-            );
+        let leaving_index = self.active;
+        // Leaving a pair: its STATE ends here, so the layout below is the
+        // single-page one; its panes are hidden only after the incoming page
+        // is shown, like the outgoing page (review 2026-10-12, R-003).
+        let ended_pair = if pane_switch { None } else { self.pair.take() };
+        if ended_pair.is_some() {
+            platform::set_side_by_side(&self.hosts, None);
         }
         self.active = index;
+        // GEOMETRY FIRST, THEN SHOW, THEN HIDE. A Windows page hidden during a
+        // resize (or created hidden) has stale bounds, so showing it and
+        // re-placing it afterwards painted one frame at the old rectangle;
+        // and hiding the outgoing page before the incoming one was shown
+        // painted one frame of nothing. Both were a visible blink on every
+        // switch (UI pass 2026-10-12). place_pages lays out the ACTIVE page,
+        // which is the incoming one from here, hidden or not.
+        self.relayout();
         // The page gets the keyboard, and a later window activation brings it
         // back there -- unless a modal still covers the window (the strip
         // stays clickable under one): see show_and_focus_tab.
         if focus || !pane_switch {
             self.show_and_focus_tab(index);
         }
-        // A freshly shown Windows tab may have stale bounds (created hidden,
-        // or hidden during a resize); re-apply geometry for it and chrome.
-        self.relayout();
+        if !pane_switch {
+            platform::hide_tab(
+                &self.tabs[leaving_index].view,
+                &self.tabs[leaving_index].webview,
+            );
+            if let Some((l, r)) = ended_pair {
+                for id in [l, r] {
+                    if id == arriving {
+                        continue;
+                    }
+                    if let Some(t) = self.tabs.iter().find(|t| t.id == id) {
+                        platform::hide_tab(&t.view, &t.webview);
+                    }
+                }
+            }
+        }
         let (url, tab_id) = (self.tabs[index].url.clone(), self.tabs[index].id);
         // The tab id lets the address bar tell a switch (always shows the new
         // tab's address) from the SAME tab redirecting under someone typing
@@ -6795,6 +7681,13 @@ impl AppState {
         // already continued.
         self.emit_tab_status();
         crate::reader_view::on_active_changed(self);
+        // A duplicate-site notice belongs to the tab it was shown on, so it
+        // goes when that tab leaves the front; and a duplicate that loaded in
+        // the background is shown now that its tab is the one in front. A
+        // Side by Side pane switch is an activation like any other.
+        let retired = self.duplicate_sites.on_active_changed(tab_id);
+        self.retire_duplicate_notice(retired);
+        self.present_duplicate_notice();
     }
 
     pub fn tab_list(&self) -> Value {
@@ -6989,16 +7882,12 @@ impl AppState {
     pub fn fingerprint_probe_activity(&self) -> serde_json::Value {
         const LABEL: &str = "Page-reported fingerprint probes";
         const CAVEAT: &str = "Page-reported, not browser-observed. These counts describe probe calls reported by this page's main-world scripts; the page can omit or forge them, and worker probes are not included.";
-        const DISABLED: &str = "Fingerprint Divergence is not active in this tab.";
-        const CHANNEL_FAILED: &str =
-            "Probe reports are unavailable because the page-reporting channel did not register.";
-
         let Some(tab) = self.tabs.get(self.active) else {
             return json!({
                 "label": LABEL,
                 "caveat": CAVEAT,
                 "status": "unavailable",
-                "status_text": CHANNEL_FAILED,
+                "status_text": PROBE_CHANNEL_FAILED,
                 "surface_labels": {
                     "audio": "Audio",
                     "canvas": "Canvas",
@@ -7013,14 +7902,10 @@ impl AppState {
                 },
             });
         };
-        let channel = platform::fingerprint_probe_reporting(&tab.view);
-        let (status, status_text) = if !tab.divergence_registered {
-            ("disabled", DISABLED)
-        } else if channel != "applied" {
-            ("unavailable", CHANNEL_FAILED)
-        } else {
-            ("active", "")
-        };
+        let (status, status_text) = probe_activity_status(
+            platform::divergence_install(&tab.view),
+            platform::fingerprint_probe_reporting(&tab.view),
+        );
         let counts = tab.fingerprint_probes;
         json!({
             "label": LABEL,
@@ -7066,6 +7951,13 @@ impl AppState {
         self.next_tab_id += 1;
         let was_empty = self.tabs.is_empty();
         self.tabs.push(tab);
+        // Every caller is the user, foreground or background: the
+        // right-click menu's open-link and open-image entries (new tab,
+        // background, ephemeral, Strict/quarantine), `tab_open_with_profile`,
+        // and the Strict Tab button. No page reaches this, so the first load
+        // always counts for the duplicate-site notice (code review
+        // 2026-10-07, R-020).
+        self.duplicate_sites.note_user_navigation(id);
         if was_empty {
             self.active = 0;
             self.show_and_focus_tab(0);
@@ -7127,12 +8019,12 @@ impl AppState {
         scope: &'static str,
         text: String,
     ) {
-        let Some(store) = self.store.as_mut() else {
-            self.emit(
-                "archive_saved",
-                json!({ "ok": false, "error": "not_unlocked" }),
-            );
-            return;
+        let store = match self.store_for_write() {
+            Ok(store) => store,
+            Err(code) => {
+                self.emit("archive_saved", json!({ "ok": false, "error": code }));
+                return;
+            }
         };
         match store.add_archive(&url, &title, scope, &text, Some(&png)) {
             Ok(id) => {
@@ -7166,25 +8058,359 @@ impl AppState {
     // ---- navigation (always the active tab) ----------------------------------
 
     pub fn navigate(&mut self, url: &str) -> Result<(), &'static str> {
-        match self.tabs.get_mut(self.active) {
-            Some(tab) => tab.queue_or_navigate(url),
-            None => Err("not_found"),
+        // KEPT SITES (kept_profile.rs): a page that belongs in the other
+        // profile opens in a tab of that profile, next to this one, instead
+        // of loading here; a blank tab is replaced.
+        if let Some(tab) = self.tabs.get(self.active) {
+            if self.belongs_in_other_profile(tab, url) {
+                let id = tab.id;
+                return self.open_in_other_profile(id, url, false, false).map(|_| ());
+            }
         }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Err("not_found");
+        };
+        let id = tab.id;
+        tab.queue_or_navigate(url)?;
+        // The address bar and bookmarks both come through here: the user
+        // asked for this page, so its load counts for the duplicate-site
+        // notice. Marked only once the navigation was accepted, so a refused
+        // one cannot lend its mark to whatever the page does next. An
+        // address the navigation handler will refuse outright (a scheme or
+        // origin content may not load) is refused silently, with no event
+        // to drop the mark on, so it is never marked at all (R-019).
+        if is_allowed_content_url(url) {
+            self.duplicate_sites.note_user_navigation(id);
+        }
+        Ok(())
+    }
+
+    /// Back (-1), Forward (1) or Reload (0) of the active tab, checked
+    /// against the kept profile before anything is issued: a page that
+    /// belongs in the other profile opens in a tab of that profile next to
+    /// this one, and for Back and Forward this tab and its history stay as
+    /// they are (code review 2026-10-13, R-028). A Reload replaces the tab
+    /// instead: the document it reloads has to end, which is how revoking
+    /// a permission stops a camera already running (code review round 6).
+    /// True when it did that.
+    fn history_crosses_profile(&mut self, step: i64) -> Result<bool, &'static str> {
+        let Some(tab) = self.tabs.get(self.active) else {
+            return Ok(false);
+        };
+        let target = if step == 0 {
+            Some(tab.url.clone())
+        } else {
+            tab.history_index
+                .and_then(|i| usize::try_from(i as i64 + step).ok())
+                .and_then(|i| tab.history.get(i).cloned())
+        };
+        let Some(target) = target else {
+            return Ok(false);
+        };
+        if !self.belongs_in_other_profile(tab, &target) {
+            return Ok(false);
+        }
+        let id = tab.id;
+        match self.open_in_other_profile(id, &target, step == 0, false) {
+            Ok(_) => Ok(true),
+            // A Reload whose replacement cannot be built (the tab limit,
+            // the engine) still reloads here, so the old document ends;
+            // a kept tab's boundary answers the page itself (code review
+            // round 7).
+            Err(_) if step == 0 => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Whether `url` belongs in the other profile than `tab`'s
+    /// (kept_profile.rs). Private tabs never move.
+    fn belongs_in_other_profile(&self, tab: &Tab, url: &str) -> bool {
+        !tab.ephemeral
+            && (tab.profile == crate::kept_profile::ProfileKind::Kept || platform::kept_profile_supported())
+            && crate::kept_profile::kind_for_url(url, &crate::kept_profile::kept_hosts(), false, true)
+                != tab.profile
+    }
+
+    /// Opens `url` in a new tab (built in the profile its page belongs in),
+    /// right after `source_id` and in its group, and makes it active. The
+    /// source is closed when `replace` is set or when it was blank.
+    fn open_in_other_profile(
+        &mut self,
+        source_id: u64,
+        url: &str,
+        replace: bool,
+        from_crossing: bool,
+    ) -> Result<u64, &'static str> {
+        if self.tabs.len() >= MAX_TABS {
+            return Err("bad_args");
+        }
+        let source_blank = self
+            .tabs
+            .iter()
+            .find(|t| t.id == source_id)
+            .is_some_and(|t| t.url.is_empty() || t.url == "about:blank");
+        let id = self.new_tab(url, true)?;
+        if from_crossing {
+            if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
+                tab.opened_by_crossing_at = Some(Instant::now());
+            }
+        }
+        let mut order: Vec<u64> = self.tabs.iter().map(|t| t.id).collect();
+        order.retain(|t| *t != id);
+        let at = order.iter().position(|t| *t == source_id).map_or(order.len(), |p| p + 1);
+        order.insert(at, id);
+        if let Some(group) = self.groups.group_of(source_id) {
+            let _ = self.groups.add(group, id, &mut order);
+        }
+        let _ = self.reorder_tabs(&order);
+        if replace || source_blank {
+            let _ = self.close_tab(source_id);
+        }
+        self.emit_tabs_changed();
+        Ok(id)
+    }
+
+    /// A page was refused in its tab because it belongs in the other
+    /// profile (windows.rs, `ProfileVerdict::Move`). The refusal already
+    /// happened; this decides whether the page opens elsewhere. Only an
+    /// ALLOWED request reaches here (R-018); a form is never re-sent; a tab
+    /// that was itself opened this way moments ago cannot move another page
+    /// (R-019); the tab cap and the content allowlist hold as for any tab.
+    pub fn on_profile_crossing(&mut self, tab_id: u64, url: String, method: String) {
+        let Some(source) = self.tabs.iter().find(|t| t.id == tab_id) else {
+            return;
+        };
+        let opened_at = source.opened_by_crossing_at;
+        let site = crate::kept_profile::host_of_page(&url).unwrap_or_default();
+        // The navigation left this tab, moved or refused, so a plain-HTTP
+        // warning it raised here for the same site on the way is not this
+        // tab's any more: the tab it moves to raises its own, and the notice
+        // below says why it was refused. Left in place, Continue on it would
+        // only send the page across again.
+        let moved_host = host_of(&url);
+        let is_active = self.tabs.get(self.active).map(|t| t.id) == Some(tab_id);
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            if moved_host.is_some() && tab.insecure_pending.as_deref().and_then(host_of) == moved_host {
+                tab.insecure_pending = None;
+                tab.insecure_pending_at = None;
+                if is_active {
+                    self.emit_tab_status();
+                }
+            }
+        }
+        if !method.eq_ignore_ascii_case("GET") {
+            self.emit_keep_notice(crate::i18n::keys::CHROME_KEEP_FORM_NOT_MOVED, &site, true);
+            return;
+        }
+        if !crate::kept_profile::crossing_allowed(opened_at, Instant::now()) {
+            self.emit_keep_notice(crate::i18n::keys::CHROME_KEEP_LOOP_STOPPED, &site, true);
+            return;
+        }
+        if !is_allowed_content_url(&url) {
+            return;
+        }
+        if self.open_in_other_profile(tab_id, &url, false, true).is_ok() {
+            self.emit_keep_notice(crate::i18n::keys::CHROME_KEEP_MOVED, &site, false);
+        }
+    }
+
+    fn emit_keep_notice(&self, key: &str, site: &str, error: bool) {
+        let mut args = crate::i18n::Args::default();
+        args.set("site", site);
+        let text = self.i18n.resolve(key, &args);
+        self.emit("toast", json!({ "text": text, "error": error }));
+    }
+
+    /// The keep-list changed (Privacy, or the Messenger offer). The request
+    /// handlers read the new list at once. A site just kept that the active
+    /// tab is showing reopens in the kept profile, replacing the tab; other
+    /// open tabs on it move at their next navigation.
+    ///
+    /// Returns whether the active tab was reopened there, so the chrome never
+    /// says it was when it was not (code review 2026-10-13, R-033).
+    pub fn keep_list_changed(&mut self, hosts: &[String], added: Option<&str>) -> bool {
+        // Only hosts recorded in the ledger are ever treated as kept
+        // (code review round 3, R-046); another process may have added
+        // to the list.
+        // While kept storage is off (not the sole PATANYX, or a ledger
+        // write failed), a site can be dropped from the list but never
+        // added: a surviving kept tab must not start keeping a site the
+        // ledger does not know (code review round 4).
+        let hosts = if platform::kept_enabled() {
+            crate::kept_profile::admit(hosts)
+        } else {
+            let current = crate::kept_profile::kept_hosts();
+            hosts.iter().filter(|h| current.contains(h)).cloned().collect()
+        };
+        let hosts = hosts.as_slice();
+        crate::kept_profile::set_kept_hosts(hosts);
+        if added.is_none() || !platform::kept_profile_supported() {
+            return false;
+        }
+        let Some(tab) = self.tabs.get(self.active) else {
+            return false;
+        };
+        if tab.ephemeral || tab.profile == crate::kept_profile::ProfileKind::Kept {
+            return false;
+        }
+        let (id, url) = (tab.id, tab.url.clone());
+        // Only the site just added (code review round 10): a tab on a site
+        // kept earlier moves at its own next navigation.
+        let added_here = added.is_some_and(|host| crate::kept_profile::added_covers(&url, host));
+        if !added_here || crate::kept_profile::kind_for_url(&url, hosts, false, true) != crate::kept_profile::ProfileKind::Kept {
+            return false;
+        }
+        // The new tab can fall back to the ordinary profile (a kept tab
+        // whose boundary did not come up), so its profile is checked.
+        match self.open_in_other_profile(id, &url, true, false) {
+            Ok(new_id) => self
+                .tabs
+                .iter()
+                .any(|t| t.id == new_id && t.profile == crate::kept_profile::ProfileKind::Kept),
+            Err(_) => false,
+        }
+    }
+
+    /// Something in the kept profile could not be enforced or cleared: the
+    /// next start clears it in full. Recorded as a marker no keep-list holds.
+    ///
+    /// If even that cannot be written, the kept profile is done for this
+    /// session: no new tab goes there, the open kept tabs close so nothing
+    /// more accumulates, and the entry is tried again at exit (code review
+    /// round 2, R-039).
+    pub fn on_kept_clear_owed(&mut self, why: &str) {
+        let marker = if why.starts_with('!') { why.to_string() } else { format!("!{why}") };
+        if crate::kept_profile::entries_of(&crate::kept_profile::read_ledger()).contains(&marker) {
+            return;
+        }
+        if crate::kept_profile::record(&marker).is_err() {
+            // Durable anyway: with the ledger gone the next start owes the
+            // full clear. The marker is also kept here, for this start's
+            // clear to write and for exit (code review round 5).
+            crate::kept_profile::forfeit_ledger();
+            self.kept_unrecorded.push(marker);
+            platform::set_kept_enabled(false);
+            self.close_kept_tabs();
+        }
+    }
+
+    /// A kept tab's boundary could not answer a request: the next start
+    /// clears the kept profile in full, and the tab closes now, which also
+    /// cancels a request that was held back (R-035).
+    pub fn on_kept_enforcement_failed(&mut self, tab_id: u64, held: bool) {
+        self.on_kept_clear_owed(if held { "!held" } else { "!enforcement" });
+        self.close_or_blank(tab_id);
+    }
+
+    /// Closes a kept tab whose document must not stay. Closing the last tab
+    /// builds its replacement first, which can fail; the document then
+    /// ends anyway, by going to about:blank, which needs no new web view
+    /// (code review round 7).
+    fn close_or_blank(&mut self, id: u64) {
+        if self.tabs.iter().any(|t| t.id == id) && self.close_tab(id).is_err() {
+            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
+                let _ = tab.load_url("about:blank");
+            }
+        }
+    }
+
+    fn close_kept_tabs(&mut self) {
+        let ids: Vec<u64> = self
+            .tabs
+            .iter()
+            .filter(|t| t.profile == crate::kept_profile::ProfileKind::Kept)
+            .map(|t| t.id)
+            .collect();
+        for id in ids {
+            self.close_or_blank(id);
+        }
+    }
+
+    /// At exit: one more try for ledger entries that could not be written,
+    /// and failing that, for removing the ledger, which the next start
+    /// also treats as owed the full clear (code review round 7).
+    pub fn retry_unrecorded_kept_entries(&mut self) {
+        self.kept_unrecorded.retain(|entry| crate::kept_profile::record(entry).is_err());
+        if !self.kept_unrecorded.is_empty() {
+            crate::kept_profile::forfeit_ledger();
+        }
+    }
+
+    /// The saved page colors, applied to a tab of each profile that has one
+    /// open (code review 2026-10-13, R-032). True when every one applied.
+    ///
+    /// The active tab first, exactly as before (on Linux that is the whole
+    /// of it: the setting is GTK-wide), then a tab of each other profile
+    /// that has one open; a kept profile with no tab open gets it when its
+    /// next tab is built (code review round 2, R-043).
+    pub fn apply_page_theme_everywhere(&self, theme: crate::prefs::PageTheme) -> bool {
+        let Some(active) = self.tabs.get(self.active) else {
+            return false;
+        };
+        let mut all = platform::apply_page_theme(&active.webview, theme);
+        for kind in [crate::kept_profile::ProfileKind::Main, crate::kept_profile::ProfileKind::Kept] {
+            if active.profile == kind && !active.ephemeral {
+                continue;
+            }
+            if let Some(tab) = self.tabs.iter().find(|t| t.profile == kind && !t.ephemeral) {
+                all &= platform::apply_page_theme(&tab.webview, theme);
+            }
+        }
+        all
+    }
+
+    /// The kept profile was cleared in full: nothing kept before is owed a
+    /// clear any more (R-016).
+    ///
+    /// Retires only the markers that were there at this start; one raised
+    /// since stays owed (code review round 2, R-038). A ledger that cannot
+    /// be rewritten keeps its old entries, which only costs another full
+    /// clear at the next start.
+    pub fn on_kept_profile_cleared(&mut self) {
+        platform::set_kept_full_clear_due(false);
+        let entries = crate::kept_profile::ledger_after_clear(
+            &crate::kept_profile::kept_hosts(),
+            &crate::kept_profile::read_ledger(),
+            crate::kept_profile::kept_folder_exists(),
+            &crate::kept_profile::markers_at_start(),
+            &self.kept_unrecorded,
+        );
+        if crate::kept_profile::write_ledger(&entries).is_ok() {
+            crate::kept_profile::set_markers_at_start(Vec::new());
+            self.kept_unrecorded.clear();
+        }
+    }
+
+    /// A tab the USER just opened or sent somewhere through a path that does
+    /// not come through `navigate`, `new_tab(.., true)` or
+    /// `new_tab_with_policy`: the background tabs of a restored shelf, an
+    /// accepted shared link, Open anyway on the malicious-site banner. Call
+    /// it only once the navigation has really started; see
+    /// `duplicate_site` for what the mark means.
+    pub fn note_user_navigation(&mut self, tab_id: u64) {
+        self.duplicate_sites.note_user_navigation(tab_id);
     }
 
     /// Releases every tab built while the asynchronous once-per-process wipe
     /// was running. Tabs built after the platform gate reaches Ready navigate
     /// immediately and have `initial_navigation_pending == false`, so this is
     /// idempotent and can never reload a live tab.
-    pub fn finish_session_wipe(&mut self) {
-        for tab in &mut self.tabs {
+    pub fn finish_session_wipe(&mut self, kind: crate::kept_profile::ProfileKind) {
+        // A first page that cannot be issued once the wipe is over (the wipe
+        // itself failing still ends here, with the page released) never
+        // commits, so its tab's duplicate-site mark goes with it (R-019).
+        // Only THIS profile's tabs: each waits for its own clear (R-017).
+        for tab in self.tabs.iter_mut().filter(|t| t.profile == kind) {
             platform::note_session_wipe_finished(&tab.view);
-            tab.finish_initial_navigation();
+            let failed = tab.finish_initial_navigation();
+            if failed {
+                self.duplicate_sites.forget_user_navigation(tab.id);
+            }
         }
         let delayed_closes = self
             .tabs
             .iter()
-            .filter(|tab| tab.close_after_session_wipe)
+            .filter(|tab| tab.close_after_session_wipe && tab.profile == kind)
             .map(|tab| tab.id)
             .collect::<Vec<_>>();
         for id in delayed_closes {
@@ -7200,32 +8426,67 @@ impl AppState {
                     // 3, R-005). Not ready yet on Windows: the guard's
                     // settle event finishes it, as for any pending tab.
                     tab.initial_navigation_pending = true;
-                    tab.finish_initial_navigation();
+                    let failed = tab.finish_initial_navigation();
+                    if failed {
+                        self.duplicate_sites.forget_user_navigation(id);
+                    }
                 }
                 self.emit_tabs_changed();
             }
         }
     }
 
+    /// Back and Forward are the user's choice of page wherever they come
+    /// from (the toolbar, the shortcut, the right-click menu), so a page
+    /// they lead to counts for the duplicate-site notice (code review
+    /// 2026-10-07, R-021). Marked only when a navigation was really issued:
+    /// at the start or end of the history there is nothing to commit, and a
+    /// mark would wait for the page's own next navigation (R-019).
     pub fn history_back(&mut self) -> Result<(), &'static str> {
-        match self.tabs.get_mut(self.active) {
-            Some(tab) => tab.history_back(),
-            None => Ok(()),
+        if self.history_crosses_profile(-1)? {
+            return Ok(());
         }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Ok(());
+        };
+        let id = tab.id;
+        if tab.history_back()? {
+            self.duplicate_sites.note_user_navigation(id);
+        }
+        Ok(())
     }
 
     pub fn history_forward(&mut self) -> Result<(), &'static str> {
-        match self.tabs.get_mut(self.active) {
-            Some(tab) => tab.history_forward(),
-            None => Ok(()),
+        if self.history_crosses_profile(1)? {
+            return Ok(());
         }
+        let Some(tab) = self.tabs.get_mut(self.active) else {
+            return Ok(());
+        };
+        let id = tab.id;
+        if tab.history_forward()? {
+            self.duplicate_sites.note_user_navigation(id);
+        }
+        Ok(())
     }
 
     pub fn history_reload(&mut self) -> Result<(), &'static str> {
+        if self.history_crosses_profile(0)? {
+            return Ok(());
+        }
         match self.tabs.get_mut(self.active) {
             Some(tab) => tab.history_reload(),
             None => Ok(()),
         }
+    }
+
+    /// Ends the active tab's document without building anything: the
+    /// tab goes to about:blank. For a permission revocation whose reload
+    /// could not run, since only ending the page stops a running stream
+    /// (code review round 7).
+    pub fn end_active_document(&mut self) -> Result<(), &'static str> {
+        let tab = self.tabs.get(self.active).ok_or("no_tab")?;
+        tab.load_url("about:blank").map_err(|_| "engine")
     }
 
     // ---- tab events (routed by tab id) ----------------------------------------
@@ -7237,7 +8498,28 @@ impl AppState {
             None => return, // late event from a closed tab
         };
         self.tabs[index].url = url.clone();
+        // The backstop for "Allow ads and trackers on this tab". The engine
+        // handlers end it before the next site's requests go out; a committed
+        // top-level address on another site that somehow got past them ends
+        // it here, late but not never.
+        // Synced either way: an engine handler may already have ended it, with
+        // its event still queued behind this one.
+        {
+            let tab = &mut self.tabs[index];
+            platform::end_ads_allowance_if_leaving(&tab.webview, &tab.view, &url);
+            tab.sync_policy_from_engine();
+        }
+        // An owed reload is for the page it was owed on. Once the tab is at
+        // another address that page is gone, and coming back to the same
+        // address later is a new page the user may be working in (release
+        // review 2026-10-12, round 9, R-001).
+        retire_owed_reload_on_leaving(&mut self.tabs[index], &url);
         self.tabs[index].record_history(url.clone());
+        // A duplicate-site notice naming this tab ends if the tab just left
+        // that site; entering a site records a candidate, shown at the end of
+        // this handler once everything else about the load is settled.
+        let retired = self.duplicate_sites.on_navigation(id, &url);
+        self.retire_duplicate_notice(retired);
         // The declared-language badge is a fact about the page that just left,
         // so it clears on navigation. The new page re-declares (or does not),
         // and a stale badge from the previous page must not linger.
@@ -7309,6 +8591,125 @@ impl AppState {
         if is_active {
             self.emit_tab_status();
         }
+        self.present_duplicate_notice();
+        if is_active {
+            self.present_keep_offer(index, &url);
+        }
+    }
+
+    /// Offers to keep Messenger's site when the active tab lands on a
+    /// Messenger page whose site the keep-list does not keep yet; once per
+    /// site per session (keep_offer.rs says why). The sentence is composed
+    /// here from the catalog, with the site as its only argument.
+    fn present_keep_offer(&mut self, index: usize, url: &str) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        let (strict, ephemeral) = (tab.policy.strict, tab.ephemeral);
+        let kept = crate::prefs::load().wipe_exempt_hosts;
+        let Some(site) = self
+            .keep_offers
+            .offer(url, &kept, strict, ephemeral, platform::kept_profile_supported())
+        else {
+            return;
+        };
+        let mut args = crate::i18n::Args::default();
+        args.set("site", site);
+        let body = self
+            .i18n
+            .resolve(crate::i18n::keys::CHROME_KEEP_OFFER_BODY, &args);
+        self.emit("keep_site_offer", json!({ "site": site, "body": body }));
+    }
+
+    /// Shows the duplicate-site notice for the ACTIVE tab if it has one due.
+    /// Called after every navigation and every activation; whether one is due
+    /// is decided entirely in `duplicate_site`.
+    fn present_duplicate_notice(&mut self) {
+        let Some(active_id) = self.tabs.get(self.active).map(|t| t.id) else {
+            return;
+        };
+        let views: Vec<crate::duplicate_site::TabView<'_>> = self
+            .tabs
+            .iter()
+            .map(|t| crate::duplicate_site::TabView {
+                id: t.id,
+                url: &t.url,
+                // Strict, not merely private: a Strict tab pairs only with
+                // Strict tabs (release review 2026-10-12, R-002).
+                strict: t.policy.strict,
+            })
+            .collect();
+        let shown = self.duplicate_sites.present(
+            active_id,
+            &views,
+            self.duplicate_notice_enabled,
+        );
+        drop(views);
+        let Some(notice) = shown else { return };
+        // The text is composed HERE from the catalog, with the site as an
+        // argument, so the chrome renders words it did not write and a page
+        // has no say in them.
+        let mut args = crate::i18n::Args::default();
+        args.set("site", notice.site.as_str());
+        let body = self
+            .i18n
+            .resolve(crate::i18n::keys::CHROME_DUPLICATE_SITE_BODY, &args);
+        self.emit(
+            "duplicate_site",
+            json!({
+                "notice_id": notice.id,
+                "tab_id": notice.tab_id,
+                "other_id": notice.other_id,
+                "site": notice.site,
+                "body": body,
+            }),
+        );
+    }
+
+    fn retire_duplicate_notice(&self, notice_id: Option<u64>) {
+        if let Some(id) = notice_id {
+            self.emit("duplicate_site_retired", json!({ "notice_id": id }));
+        }
+    }
+
+    /// A button on the duplicate-site notice. `duplicate_site::act` decides
+    /// whether the click may still act; a stale one switches, closes and
+    /// silences nothing. Either way the notice it came from is over.
+    pub fn duplicate_site_action(
+        &mut self,
+        notice_id: u64,
+        choice: crate::duplicate_site::Choice,
+    ) -> Result<Value, &'static str> {
+        let views: Vec<crate::duplicate_site::TabView<'_>> = self
+            .tabs
+            .iter()
+            .map(|t| crate::duplicate_site::TabView {
+                id: t.id,
+                url: &t.url,
+                // Strict, not merely private: a Strict tab pairs only with
+                // Strict tabs (release review 2026-10-12, R-002).
+                strict: t.policy.strict,
+            })
+            .collect();
+        let outcome = self.duplicate_sites.act(notice_id, choice, &views);
+        drop(views);
+        self.retire_duplicate_notice(Some(notice_id));
+        match outcome? {
+            crate::duplicate_site::Outcome::SwitchTo(id) => self.switch_tab(id)?,
+            crate::duplicate_site::Outcome::Close(id) => self.close_tab(id)?,
+            crate::duplicate_site::Outcome::Dismissed => {}
+        }
+        Ok(json!({}))
+    }
+
+    /// The notice's setting. Turning it off also takes down a notice already
+    /// on screen and drops every candidate waiting to be shown.
+    pub fn set_duplicate_notice_enabled(&mut self, enabled: bool) {
+        self.duplicate_notice_enabled = enabled;
+        if !enabled {
+            let retired = self.duplicate_sites.disable();
+            self.retire_duplicate_notice(retired);
+        }
     }
 
     /// The navigation handler held back a plain-HTTP load on tab `id`.
@@ -7322,6 +8723,11 @@ impl AppState {
     /// The clock is a parameter so the stability rule is testable without
     /// sleeping.
     pub fn note_insecure_navigation_at(&mut self, id: u64, url: String, now: Instant) {
+        // Held, so it will not commit: a duplicate-site mark the user's
+        // navigation left must not wait for the page's own next one (R-019).
+        // Before every early return below, because the hold happened whether
+        // or not the banner's subject changes.
+        self.duplicate_sites.forget_user_navigation(id);
         let is_active = self.tabs.get(self.active).map(|t| t.id) == Some(id);
         let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
             return; // late event from a closed tab
@@ -7373,7 +8779,12 @@ impl AppState {
         tab.insecure_pending = None;
         tab.insecure_pending_at = None;
         tab.allow_insecure_host(&host);
-        tab.load_url(&url).ok();
+        let id = tab.id;
+        // Continue is the user choosing this page, so it counts for the
+        // duplicate-site notice (R-021) -- once the load has started.
+        if tab.load_url(&url).is_ok() {
+            self.duplicate_sites.note_user_navigation(id);
+        }
         let status = self.active_tab_status();
         Ok(json!({ "allowed": host, "status": status }))
     }
@@ -7460,6 +8871,9 @@ impl AppState {
             }
             return Err(reason);
         }
+        // Open anyway is the user choosing this page, like Continue on the
+        // plain-HTTP warning (R-021); marked only now that it has started.
+        self.duplicate_sites.note_user_navigation(tab_id);
         // The SAME shape insecure_allow returns, because the chrome reads
         // `res.status` and treats anything else as "hide the banner". A bare
         // status here made every successful allow take the hide branch, and a
@@ -7497,6 +8911,9 @@ impl AppState {
     /// banner from an earlier attempt, even to the same host in the same
     /// tab, spends nothing (design review of pentest F-006).
     pub fn note_navigation_blocked(&mut self, tab_id: u64, host: &str) -> Option<u64> {
+        // Refused, so it will not commit: the user's duplicate-site mark goes
+        // with it (R-019). Open anyway marks afresh (ipc.rs, blocklist_allow).
+        self.duplicate_sites.forget_user_navigation(tab_id);
         let tab = self.tabs.iter().find(|t| t.id == tab_id)?;
         self.blocked_pending_seq = self.blocked_pending_seq.wrapping_add(1);
         let id = self.blocked_pending_seq;
@@ -7513,7 +8930,22 @@ impl AppState {
         // hold anything. THIS TAB's policy, not the browser-wide one: a
         // private tab blocks under its own preset while the switch is off,
         // and its hold is real (review R-002, round 6).
+        //
+        // The engine already refused the page either way, so the user's
+        // duplicate-site mark is dropped before the policy check (R-019).
+        // The placeholder that follows commits on the held site without a
+        // mark. Open anyway (`adlist_allow`) marks afresh, as the user's
+        // choice, though the placeholder has normally put the tab on the
+        // held site already, so the real page arriving there is not an
+        // entry and rarely raises anything.
+        self.duplicate_sites.forget_user_navigation(tab_id);
         let tab = self.tabs.iter_mut().find(|t| t.id == tab_id)?;
+        // From the engine glue, not from this copy: an engine handler may
+        // have just ended the tab's ads allowance (the navigation being held
+        // here is usually the one that ended it), and a copy still saying
+        // "not blocking" would drop a real hold and leave the placeholder on
+        // screen with no banner to explain it.
+        tab.sync_policy_from_engine();
         if !tab.block_ads {
             return None;
         }
@@ -7566,7 +8998,447 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::{check_download_file_in, hash_file, sanitize_filename, FileVerdict};
+    use super::{
+        kept_page_plan, owed_reload_survives, reload_plan, restore_blocking_plan, unfreeze_plan, OwedOnUnfreeze,
+        ReloadPlan, RestoreBlocking,
+    };
     use std::path::{Path, PathBuf};
+
+    /// `lock_vault` is still the one place the vault locks, and everything it
+    /// ends now lives in `end_vault_session`, which an import over a live vault
+    /// reuses without announcing a lock. Checked in the source because an
+    /// AppState cannot be built in a unit test.
+    #[test]
+    fn lock_vault_ends_the_session_through_end_vault_session() {
+        let source = include_str!("state.rs");
+        let body_of = |anchor: &str| {
+            let start = source.find(anchor).unwrap_or_else(|| panic!("{anchor} moved"));
+            let end = start
+                + source[start..]
+                    .find("\n    }\n")
+                    .unwrap_or_else(|| panic!("{anchor} has no terminator"));
+            &source[start..end]
+        };
+        let lock = body_of("pub fn lock_vault(&mut self) {");
+        let cleared = lock.find("self.vault = None;").expect("lock_vault no longer drops the vault");
+        let ended = lock.find("self.end_vault_session();").expect("lock_vault no longer ends the session");
+        let emitted = lock
+            .find("self.emit(\"vault_locked\", json!({}));")
+            .expect("lock_vault no longer tells the chrome");
+        assert!(cleared < ended && ended < emitted, "lock_vault's order changed");
+
+        let session = body_of("pub fn end_vault_session(&mut self) {");
+        for step in [
+            "crate::page_integrity::on_vault_locked(self);",
+            "crate::chat_panel::on_vault_locked(self);",
+            "self.tab_scan = None;",
+            "self.emit_tab_scan_state();",
+            "crate::licence_control::on_vault_locked();",
+            "crate::archive::clear_staged();",
+            "set_divergence_overrides_snapshot(String::new());",
+        ] {
+            assert!(session.contains(step), "end_vault_session no longer runs {step}");
+        }
+        assert!(
+            !session.contains("\"vault_locked\""),
+            "end_vault_session must not announce a lock: an import shows the new recovery key then"
+        );
+    }
+
+    /// A browser-wide Privacy change reaches each open tab through
+    /// `TabPolicy::rebased_on`, never as the browser-wide policy itself:
+    /// copying it onto every tab is what turned script on in an open Strict
+    /// Tab. Checked in the source because an AppState cannot be built in a
+    /// unit test; the smoke run measures the engine's own setting.
+    #[test]
+    fn set_privacy_rebases_each_open_tab_instead_of_copying_the_browser_policy() {
+        let source = include_str!("state.rs");
+        let start = source
+            .find("pub fn set_privacy(&mut self, policy: platform::TabPolicy) {")
+            .expect("set_privacy moved");
+        let end = start + source[start..].find("\n    }\n").expect("set_privacy has no terminator");
+        let body = &source[start..end];
+        assert!(body.contains("let rebased = tab.policy.rebased_on(&self.privacy);"));
+        // The engine glue lays the tab's ads allowance over the rebased
+        // policy and hands back what is in force; that is what the tab keeps.
+        assert!(body.contains("let effective = platform::apply_policy(&tab.webview, &tab.view, &rebased);"));
+        assert!(body.contains("tab.policy = effective;"));
+        assert!(
+            !body.contains("apply_policy(&tab.webview, &tab.view, &self.privacy)"),
+            "the browser-wide policy is applied to tabs directly again"
+        );
+    }
+
+    // ---- "Allow ads and trackers on this tab", pinned in the source ------
+    //
+    // AppState and the engine handlers cannot be built in a unit test, so the
+    // rules that live in that glue are pinned where they are written. The
+    // pure halves (`with_ads_allowed`, the site rule, `TabState`'s allowance)
+    // are tested exhaustively in privacy.rs.
+
+    /// The body of the first function whose header is `header`, through the
+    /// first line that closes at the header's own indent.
+    fn body_of<'a>(source: &'a str, header: &str) -> &'a str {
+        let start = source.find(header).unwrap_or_else(|| panic!("{header} moved"));
+        let indent = source[..start]
+            .rsplit('\n')
+            .next()
+            .map(str::len)
+            .unwrap_or(0);
+        let close = format!("\n{}}}\n", " ".repeat(indent));
+        let end = start
+            + source[start..]
+                .find(&close)
+                .unwrap_or_else(|| panic!("{header} has no end"));
+        &source[start..end]
+    }
+
+    fn before(body: &str, first: &str, then: &str) -> bool {
+        match (body.find(first), body.find(then)) {
+            (Some(a), Some(b)) => a < b,
+            _ => false,
+        }
+    }
+
+    const UNIX: &str = include_str!("platform/unix.rs");
+    const WINDOWS: &str = include_str!("platform/windows.rs");
+    const STATE: &str = include_str!("state.rs");
+    const MAIN: &str = include_str!("main.rs");
+    const IPC: &str = include_str!("ipc.rs");
+
+    /// Both engines put the allowance over whatever policy they are given.
+    /// A backend that wrote the given policy straight into the tab would let
+    /// any browser-wide Privacy switch turn blocking back on in an allowed
+    /// tab, which is what `set_privacy` relies on not happening.
+    #[test]
+    fn every_engine_applies_the_allowance_over_the_policy_it_is_given() {
+        for (name, source) in [("unix", UNIX), ("windows", WINDOWS)] {
+            let body = body_of(source, "pub fn apply_policy(");
+            assert!(
+                body.contains("let effective = st.apply_base_policy(policy);"),
+                "{name}: apply_policy no longer goes through apply_base_policy"
+            );
+            assert!(
+                !body.contains("st.policy = policy.clone();"),
+                "{name}: apply_policy writes the given policy straight into the tab"
+            );
+        }
+    }
+
+    /// WebView2: the allowance ends in NavigationStarting, top frame, every
+    /// hop, before the request handler sees the hop's document. And the
+    /// malicious-site check stays FIRST in the request handler, ahead of the
+    /// policy the allowance changes.
+    #[test]
+    fn windows_ends_the_allowance_in_navigation_starting_and_keeps_the_malicious_check_first() {
+        let nav = body_of(WINDOWS, "fn connect_navigation_events(");
+        assert!(
+            before(nav, "core.add_NavigationStarting(", ".end_ads_allowance_unless_same_site("),
+            "NavigationStarting no longer ends the allowance"
+        );
+        assert!(
+            before(nav, ".end_ads_allowance_unless_same_site(", "core.add_FrameNavigationStarting("),
+            "the allowance is ended in a FRAME handler, which would end it on every ad iframe"
+        );
+        assert!(nav.contains("UserEvent::AdsAllowanceEnded { tab_id: id }"));
+        let requests = body_of(WINDOWS, "fn connect_request_interception(");
+        assert!(
+            before(requests, "crate::blocklist::matched_rule", "decide_intercepted("),
+            "the malicious-site check is no longer ahead of the ad decision"
+        );
+    }
+
+    /// WebKitGTK: the allowance ends on the MAIN frame's load start and
+    /// redirect, first thing in that handler, and a navigation whose blocking
+    /// could not be put back is stopped. The response decision is the
+    /// main-frame backstop. The browser's own navigations end it before the
+    /// request, back and forward included.
+    #[test]
+    fn linux_ends_the_allowance_on_the_main_frame_before_the_next_site_loads() {
+        let load = body_of(UNIX, "fn connect_load_events(");
+        assert!(load.contains("LoadEvent::Started | LoadEvent::Redirected"));
+        assert!(
+            before(load, "end_allowance_for_main_frame(", "translate_outbox.borrow_mut().clear();"),
+            "the allowance must end before anything else the load start does"
+        );
+        assert!(before(load, "== privacy::AfterAllowanceEnded::Refuse", "web_view.stop_loading();"));
+        let guard = body_of(UNIX, "fn connect_ads_allowance_guard(");
+        assert!(guard.contains("response.is_main_frame_main_resource()"));
+        assert!(guard.contains("decision.ignore();"));
+        let build = body_of(UNIX, "pub fn build_content(");
+        assert!(build.contains("connect_ads_allowance_guard(&webview, state.clone(), ads.clone());"));
+        let ending = body_of(UNIX, "fn end_allowance_for_main_frame(");
+        assert!(
+            before(ending, "put_blocking_back(", "wake(UserEvent::AdsAllowanceEnded"),
+            "blocking must be back before anything is told the allowance ended"
+        );
+        let load_url = body_of(STATE, "pub(crate) fn load_url(&self, url: &str)");
+        assert!(before(
+            load_url,
+            "platform::end_ads_allowance_before_navigation(",
+            "self.webview.load_url(url)"
+        ));
+        for header in ["pub fn history_back(", "pub fn history_forward("] {
+            assert!(body_of(STATE, header).contains("self.load_url(&url)"), "{header}");
+        }
+    }
+
+    /// Containment that must not depend on building a web view (code
+    /// review round 7): a Reload whose replacement fails reloads in place,
+    /// a revocation whose reload fails blanks the page, and a kept tab
+    /// whose close is refused goes to about:blank.
+    #[test]
+    fn kept_containment_has_a_fallback_that_builds_nothing() {
+        let crosses = body_of(STATE, "fn history_crosses_profile(");
+        assert!(crosses.contains("Err(_) if step == 0 => Ok(false),"));
+        let revoke = &IPC[IPC.find("\"permission_grant\" | \"permission_revoke\" =>").unwrap()..];
+        let revoke = &revoke[..revoke.find("\"tracking_prevention_get\"").unwrap_or(revoke.len())];
+        assert!(revoke.contains("\n            let reloaded = state.history_reload();\n"));
+        assert!(revoke.contains(
+            "\n            if reloaded.is_err() && cmd == \"permission_revoke\" {\n                let _ = state.end_active_document();\n            }\n"
+        ));
+        let blank = body_of(STATE, "fn close_or_blank(");
+        assert!(blank.contains(
+            "\n        if self.tabs.iter().any(|t| t.id == id) && self.close_tab(id).is_err() {\n            if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {\n                let _ = tab.load_url(\"about:blank\");\n"
+        ));
+        let blank_page = body_of(STATE, "pub fn end_active_document(");
+        assert!(blank_page.contains("tab.load_url(\"about:blank\").map_err(|_| \"engine\")"));
+        assert!(body_of(STATE, "pub fn on_kept_enforcement_failed(").contains("self.close_or_blank(tab_id);"));
+        assert!(body_of(STATE, "fn close_kept_tabs(").contains("self.close_or_blank(id);"));
+    }
+
+    /// The race guard and the overlap filter. A filter load that lands after
+    /// the user allowed ads must not put blocking back, and an allowed tab
+    /// keeps the hosts that are on both lists blocked; without that filter in
+    /// memory the switch cannot go on and the tab keeps its ad filters.
+    #[test]
+    fn linux_filter_landings_follow_the_tab_and_the_overlap_fails_closed() {
+        for header in ["unsafe extern \"C\" fn on_bundled_filter_loaded(", "unsafe extern \"C\" fn on_filter_saved("] {
+            let body = body_of(UNIX, header);
+            assert!(
+                before(body, "tab_wants_bundled(", "webkit_user_content_manager_add_filter(data.ucm, filter)"),
+                "{header} adds a bundled filter without asking whether the tab still wants it"
+            );
+        }
+        let wants = body_of(UNIX, "fn tab_wants_bundled(");
+        assert!(wants.contains("st.wants_overlap_filter() && !overlap_ready()"));
+        let sync = body_of(UNIX, "fn sync_ad_filters(");
+        assert!(sync.contains("install_overlap_filter(&ucm, ads);"));
+        assert!(
+            before(sync, "install_overlap_filter(&ucm, ads);", "remove_filter_by_id(&ucm, BundledFilter::Ads.id());"),
+            "the overlap filter must be in before the ad filters come out"
+        );
+        assert!(body_of(UNIX, "pub fn ads_allow_ready(").contains("bundled && overlap_ready()"));
+        assert!(body_of(UNIX, "pub fn allow_ads_on_tab(").contains("if !ads_allow_ready() {"));
+        let hold = body_of(UNIX, "fn connect_adlist_hold(");
+        assert!(hold.contains("let block_ads = !ads_allowed;"));
+    }
+
+    /// The overlap follows the malicious list in force: computed at startup
+    /// and after every successful refresh, and a change ends the allowances
+    /// that relied on the old filter.
+    #[test]
+    fn the_overlap_is_rebuilt_from_the_list_in_force() {
+        let refreshed = body_of(MAIN, "Event::UserEvent(UserEvent::BlocklistRefreshed(outcome)) => {");
+        assert!(refreshed.contains("blocklist::ad_overlap_in_background(&app.proxy());"));
+        assert!(MAIN.contains("Event::UserEvent(UserEvent::AdsAllowanceEnded { tab_id }) => {"));
+        let computed = body_of(STATE, "pub fn on_ad_overlap_computed(");
+        assert!(before(computed, "platform::on_ad_overlap_computed(", "self.end_every_ads_allowance();"));
+        assert!(body_of(STATE, "pub fn on_ad_overlap_settled(").contains("self.end_every_ads_allowance();"));
+    }
+
+    /// The switch itself: refused by the shared rules, the open page reloaded
+    /// both ways, the status pushed, and both arms of `tab_status` carrying
+    /// its fields. The IPC arm takes the tab id and the direction only.
+    #[test]
+    fn the_switch_reloads_the_tab_and_tab_status_carries_it_in_both_arms() {
+        let set = body_of(STATE, "pub fn set_tab_ads_allowed(");
+        assert!(set.contains("self.ads_allow_unavailable(&self.tabs[idx])"));
+        // Each branch reloads on its own: ON resumes a held page or reloads,
+        // OFF reloads. Checked per branch, so one branch's reload cannot
+        // stand in for the other's (a planted defect showed it could).
+        let split = set.find("        } else {\n").expect("no OFF branch");
+        let (on, off) = (&set[..split], &set[split..]);
+        assert!(before(on, "platform::allow_ads_on_tab(", "None => tab.history_reload(),"));
+        assert!(before(on, "platform::allow_ads_on_tab(", "tab.queue_or_navigate(&bare)"));
+        // OFF skips the cache: a plain reload ran a tracker script cached
+        // while ads were allowed (measured on WebView2, 2026-10-12).
+        assert!(before(off, "platform::end_ads_allowance(&tab.webview, &tab.view)", "tab.reload_bypassing_cache()"));
+        let every = body_of(STATE, "fn end_every_ads_allowance(");
+        assert!(every.contains("let _ = tab.reload_to_restore_blocking();"));
+        // Round 2, R-003 and R-002: a tab the user froze is owed the reload
+        // rather than losing it, and the owed reload is paid by unfreezing
+        // or by the next reload; a page an ending navigation left on screen
+        // gets the same reload.
+        let restore = body_of(STATE, "pub fn reload_to_restore_blocking(");
+        assert!(restore.contains("restore_blocking_plan(platform::manually_frozen(&self.view))"));
+        let reload = body_of(STATE, "fn reload_page(");
+        assert!(reload.contains("platform::manually_frozen(&self.view),"));
+        assert!(reload.contains("self.blocking_reload_owed = plan.still_owed;"));
+        let unfreeze = body_of(STATE, "pub fn unfreeze_active_tab(");
+        assert!(before(unfreeze, "platform::unfreeze(&tab.webview, &tab.view);", "match unfreeze_plan(tab.blocking_reload_owed, must_wait, same_document) {"));
+        assert!(unfreeze.contains("platform::current_document(&tab.view) == tab.owed_document && tab.url == tab.owed_url;"));
+        assert!(unfreeze.contains("let must_wait = self.blocking_reload_must_wait(active);"));
+        assert!(reload.contains("if platform::take_bypass_reload_failed(&self.view) {"));
+        // A kept page: reloaded at once unless a replacement or a prompt is
+        // pending or the tab is frozen (rounds 3 and 4).
+        let kept = body_of(STATE, "pub fn on_ads_allowance_page_kept(");
+        let wait = body_of(STATE, "fn blocking_reload_must_wait(");
+        for prompt in [
+            "platform::replacement_pending(&tab.view)",
+            "self.pending_save.as_ref().map(|p| p.tab_id) == Some(tab.id)",
+            "tab.insecure_pending.is_some()",
+            "tab.blocked_pending.borrow().is_some()",
+            "tab.adlist.pending().is_some()",
+        ] {
+            assert!(wait.contains(prompt), "{prompt} is not checked");
+        }
+        assert!(kept.contains("if platform::current_document(&self.tabs[idx].view) != document {"));
+        assert!(kept.contains("let busy = replacing || self.blocking_reload_must_wait(idx);"));
+        assert!(kept.contains("kept_page_plan(busy, platform::manually_frozen(&tab.view))"));
+        let windows_reload = &WINDOWS[WINDOWS.find("pub fn reload_bypassing_cache(").unwrap()..];
+        let windows_reload = &windows_reload[..windows_reload.find("\n}\n").unwrap()];
+        assert!(windows_reload.contains("state.borrow_mut().note_bypass_reload_failed();"));
+        assert!(!windows_reload.contains(".Reload()"), "the engine's failure reloads on its own again");
+        assert!(reload.contains("if plan.bypass_cache {\n                self.owe_blocking_reload();"));
+        let owe = body_of(STATE, "fn owe_blocking_reload(");
+        assert!(owe.contains("self.owed_document = platform::current_document(&self.view);"));
+        assert!(owe.contains("self.owed_url = self.url.clone();"));
+        // History suppression is not touched on a page change: it is shared
+        // with Back and Forward (round 8, R-002 and R-003).
+        let changed = body_of(STATE, "pub fn on_url_changed(");
+        assert!(!changed.contains("take_bypass_reload_failed"));
+        assert!(before(changed, "retire_owed_reload_on_leaving(&mut self.tabs[index], &url);", "self.tabs[index].record_history(url.clone());"));
+        let windows = include_str!("platform/windows.rs");
+        assert!(windows.contains("starting_state.borrow_mut().note_allowance_ended_by(ending);"));
+        assert!(windows.contains("(st.replacement_pending(), st.current_document())"));
+        assert!(windows.contains("UserEvent::AdsAllowancePageKept { tab_id: id, replacing, document }"));
+        assert!(set.contains("tab.adlist.clear_pending();"));
+        assert!(set.contains("platform::set_adlist_override(&tab.view, None);"));
+        assert!(set.contains("self.emit_tab_status();"));
+        let status = body_of(STATE, "pub fn active_tab_status(&self) -> Value {");
+        for key in ["\"ads_allowed\":", "\"ads_allow_available\":", "\"ads_allow_reason\":"] {
+            assert_eq!(status.matches(key).count(), 2, "{key} must be in both arms of tab_status");
+        }
+        let arm = body_of(IPC, "\"tab_ads_allow\" => {");
+        assert!(arm.contains("state.set_tab_ads_allowed(tab_id, allowed)"));
+        assert!(!arm.contains("\"site\""), "the site must come from the tab, never from the chrome");
+    }
+
+    /// Availability follows what THIS tab blocks without the allowance, not
+    /// the browser-wide switch: a private tab opened while blocking was off
+    /// for every tab still blocks (review 2026-10-12, R-006). And an overlap
+    /// answer is used only if it is the newest asked for (R-004).
+    #[test]
+    fn availability_follows_the_tab_and_only_the_newest_overlap_counts() {
+        let check = body_of(STATE, "fn ads_allow_unavailable(&self, tab: &Tab)");
+        assert!(check.contains("platform::ads_base_blocking(&tab.view),"));
+        assert!(!check.contains("self.privacy.block_ads"), "availability reads the browser-wide switch again");
+        let computed = body_of(STATE, "pub fn on_ad_overlap_computed(");
+        assert!(before(computed, "is_latest_overlap_request(request)", "platform::on_ad_overlap_computed("));
+        assert!(before(computed, "platform::on_ad_overlap_failed();", "self.end_every_ads_allowance();"));
+    }
+
+    /// Every refusal the switch can give has words in the chrome, in the one
+    /// table both a refused click and the disabled box read
+    /// (ipc.rs's error-code scan does not reach state.rs or privacy.rs).
+    /// A tab switch places the incoming page, shows it, and only then hides
+    /// the outgoing one: hide-then-show painted a blank frame, and
+    /// show-then-place painted a frame at stale bounds (UI pass 2026-10-12).
+    #[test]
+    fn a_tab_switch_places_and_shows_the_incoming_page_before_hiding_the_outgoing() {
+        let body = body_of(STATE, "fn set_active_inner(");
+        assert!(before(body, "self.active = index;", "self.relayout();"), "geometry is applied before the switch is recorded");
+        // Leaving a pair: the pair's state ends before the layout, and no
+        // page is hidden before the incoming one is shown (R-003).
+        assert!(before(body, "self.pair.take()", "self.relayout();"), "the pair outlives the layout");
+        assert!(!body.contains("end_side_by_side_hiding_all_but"), "a pair's panes are hidden before the incoming page is shown");
+        assert!(before(body, "self.show_and_focus_tab(index);", "if let Some((l, r)) = ended_pair {"), "a pair's panes are hidden before the incoming page is shown");
+        assert!(before(body, "self.relayout();", "self.show_and_focus_tab(index);"), "the incoming page is shown before it is placed");
+        assert!(
+            before(body, "self.show_and_focus_tab(index);", "platform::hide_tab(\n                &self.tabs[leaving_index].view,"),
+            "the outgoing page is hidden before the incoming one is shown"
+        );
+    }
+
+    /// Blocking coming back reloads at once, unless the user froze the tab:
+    /// then it is owed, and a reload the freeze holds does not pay it; the
+    /// first reload after unfreezing does (release review 2026-10-12,
+    /// rounds 2 and 3).
+    #[test]
+    fn an_owed_blocking_reload_survives_the_freeze_and_is_paid_after_it() {
+        assert_eq!(restore_blocking_plan(false), RestoreBlocking::ReloadNow);
+        assert_eq!(restore_blocking_plan(true), RestoreBlocking::Owe);
+        // Owed, then the toolbar reload while still frozen: it skips the
+        // cache, and the debt stays.
+        let held = reload_plan(false, true, true);
+        assert!(held.bypass_cache);
+        assert!(held.still_owed, "a reload the freeze holds paid the debt");
+        // Unfrozen (unfreeze_active_tab asks for the bypass): paid.
+        let paid = reload_plan(true, true, false);
+        assert!(paid.bypass_cache && !paid.still_owed);
+        // An ordinary reload with nothing owed keeps the cache.
+        assert_eq!(reload_plan(false, false, false), ReloadPlan { bypass_cache: false, still_owed: false });
+        assert_eq!(reload_plan(false, false, true), ReloadPlan { bypass_cache: false, still_owed: false });
+        // A page an ending navigation left on screen and was owed: the next
+        // reload pays it.
+        let kept = reload_plan(false, true, false);
+        assert!(kept.bypass_cache && !kept.still_owed);
+        // Unfreezing: paid only for the page it was owed for, and not over a
+        // prompt (rounds 6 and 7).
+        assert_eq!(unfreeze_plan(false, false, true), OwedOnUnfreeze::Nothing);
+        assert_eq!(unfreeze_plan(true, false, true), OwedOnUnfreeze::Reload);
+        assert_eq!(unfreeze_plan(true, true, true), OwedOnUnfreeze::Wait);
+        assert_eq!(unfreeze_plan(true, false, false), OwedOnUnfreeze::Forget);
+        assert_eq!(unfreeze_plan(true, true, false), OwedOnUnfreeze::Forget);
+        // Round 9: leaving the owed page's address retires the debt, so a
+        // return to that address (a new page) cannot revive it.
+        assert!(owed_reload_survives(true, "https://a.example/", "https://a.example/"));
+        assert!(!owed_reload_survives(true, "https://a.example/", "https://b.example/"));
+        assert!(owed_reload_survives(false, "https://a.example/", "https://b.example/"));
+        // The kept page itself: reloaded unless something is pending there.
+        assert_eq!(kept_page_plan(false, false), RestoreBlocking::ReloadNow);
+        assert_eq!(kept_page_plan(true, false), RestoreBlocking::Owe);
+        assert_eq!(kept_page_plan(false, true), RestoreBlocking::Owe);
+    }
+
+    #[test]
+    fn every_refusal_the_switch_can_give_has_words_in_the_chrome() {
+        let chrome = include_str!("chrome/chrome.js");
+        let start = chrome.find("ERROR_TEXT = {").expect("ERROR_TEXT moved");
+        let end = start + chrome[start..].find("\n    };").expect("ERROR_TEXT has no end");
+        let table = &chrome[start..end];
+        let mut codes = std::collections::BTreeSet::new();
+        for bits in 0u8..32 {
+            if let Some(code) = crate::platform::ads_allow_unavailable(
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+            ) {
+                codes.insert(code);
+            }
+        }
+        assert_eq!(codes.len(), 4, "{codes:?}");
+        codes.insert("no_tab");
+        codes.insert("ads_tab_frozen");
+        for code in &codes {
+            assert!(table.contains(&format!("{code}:")), "{code} has no words in ERROR_TEXT");
+        }
+        // The same codes are what the refusing code paths return.
+        let privacy = include_str!("platform/privacy.rs");
+        assert!(privacy.contains("return Err(\"ads_strict_tab\");"));
+        assert!(privacy.contains("return Err(\"ads_blocking_off\");"));
+        assert!(UNIX.contains("return Err(\"ads_not_ready\");"));
+        assert!(STATE.contains(".ok_or(\"ads_no_site\")"));
+        assert!(STATE.contains(".or(manually_frozen.then_some(\"ads_tab_frozen\"))"));
+        // Both directions (R-003): the OFF arm refuses on a frozen tab too.
+        let set = body_of(STATE, "pub fn set_tab_ads_allowed(");
+        let off = &set[set.find("} else {").expect("the OFF arm")..];
+        assert!(off.find("return Err(\"ads_tab_frozen\");").expect("OFF is not refused while frozen")
+            < off.find("platform::end_ads_allowance(").expect("OFF ends the allowance"));
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8127,12 +9999,82 @@ fn set_divergence_overrides_snapshot(json: String) {
 }
 
 impl AppState {
-    /// Whether the active tab actually got a divergence script.
-    pub fn active_divergence_registered(&self) -> bool {
+    /// What the engine did with the active tab's Divergence script (review
+    /// R-003). OBSERVED, not configured: it answers for the tab as built,
+    /// which can disagree with the pref (neither engine can re-register a
+    /// live view's scripts), and it is Refused when the engine did not take
+    /// a script that was built.
+    pub fn active_divergence_install(&self) -> platform::ScriptInstall {
         self.tabs
             .get(self.active)
-            .map(|tab| tab.divergence_registered)
-            .unwrap_or(false)
+            .map(|tab| platform::divergence_install(&tab.view))
+            .unwrap_or_default()
+    }
+}
+
+const PROBE_DISABLED: &str = "Fingerprint Divergence is not active in this tab.";
+const PROBE_REFUSED: &str =
+    "Fingerprint Divergence is not active in this tab: the engine did not accept its script.";
+const PROBE_PENDING: &str = "Fingerprint Divergence is waiting for the engine in this tab.";
+const PROBE_CHANNEL_FAILED: &str =
+    "Probe reports are unavailable because the page-reporting channel did not register.";
+
+/// The Tab Activity probe reading's status and line, from what the engine
+/// did with the tab's Divergence script and whether its page-reporting
+/// channel registered. It used to follow whether a script was BUILT, so a
+/// script the engine refused still read as active (review R-003).
+fn probe_activity_status(
+    install: platform::ScriptInstall,
+    channel: &str,
+) -> (&'static str, &'static str) {
+    match install {
+        platform::ScriptInstall::NotWanted => ("disabled", PROBE_DISABLED),
+        platform::ScriptInstall::Refused => ("disabled", PROBE_REFUSED),
+        platform::ScriptInstall::Pending => ("pending", PROBE_PENDING),
+        platform::ScriptInstall::Installed if channel != "applied" => {
+            ("unavailable", PROBE_CHANNEL_FAILED)
+        }
+        platform::ScriptInstall::Installed => ("active", ""),
+    }
+}
+
+#[cfg(test)]
+mod probe_activity_status_tests {
+    use super::*;
+    use crate::platform::ScriptInstall;
+
+    /// Only a script the engine confirmed can read as active, and only with
+    /// its reporting channel up. A built script the engine refused used to
+    /// read as active (review R-003).
+    #[test]
+    fn only_a_confirmed_install_reads_as_active() {
+        for channel in ["applied", "failed", "not_attempted"] {
+            assert_eq!(probe_activity_status(ScriptInstall::NotWanted, channel), ("disabled", PROBE_DISABLED));
+            assert_eq!(probe_activity_status(ScriptInstall::Refused, channel), ("disabled", PROBE_REFUSED));
+            assert_eq!(probe_activity_status(ScriptInstall::Pending, channel), ("pending", PROBE_PENDING));
+        }
+        assert_eq!(probe_activity_status(ScriptInstall::Installed, "applied"), ("active", ""));
+        assert_eq!(
+            probe_activity_status(ScriptInstall::Installed, "failed"),
+            ("unavailable", PROBE_CHANNEL_FAILED)
+        );
+        assert_eq!(
+            probe_activity_status(ScriptInstall::Installed, "not_attempted"),
+            ("unavailable", PROBE_CHANNEL_FAILED)
+        );
+        assert!(PROBE_REFUSED.contains("not active"), "a refusal must not read as protection");
+    }
+
+    /// Both tab_status arms carry the two script rows, and the proof reply
+    /// carries the engine's answer rather than whether a script was built.
+    #[test]
+    fn the_status_replies_carry_the_engine_answer() {
+        let src = include_str!("state.rs");
+        assert_eq!(src.matches("\"divergence_script\": ").count(), 2, "both tab_status arms");
+        assert_eq!(src.matches("\"youtube_ads_script\": ").count(), 3, "both arms and privacy_status");
+        assert!(!src.contains(concat!("divergence_", "registered")), "the built-not-installed flag is back");
+        let ipc = include_str!("ipc.rs");
+        assert!(ipc.contains("\"install\": state.active_divergence_install().as_str()"));
     }
 }
 
@@ -9810,5 +11752,24 @@ mod library_lock_tests {
         assert!(!again);
         release_unused_library_lock(&mut held, again, false);
         assert!(held.is_some(), "a lock held before the operation was given back");
+    }
+}
+
+/// The Tab panel names the tab whose ledger or status it showed. If the
+/// active tab has changed since, the host came from another tab's requests
+/// and is not applied to this one.
+fn allow_targets_active_tab(requested: u64, active: u64) -> bool {
+    requested == active
+}
+
+#[cfg(test)]
+mod allow_site_tests {
+    use super::allow_targets_active_tab;
+
+    #[test]
+    fn an_allow_applies_only_to_the_tab_the_panel_showed() {
+        assert!(allow_targets_active_tab(7, 7));
+        // The user switched tabs after the panel drew tab 7's rows.
+        assert!(!allow_targets_active_tab(7, 9));
     }
 }

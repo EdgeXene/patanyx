@@ -205,6 +205,90 @@ check("a tab with nothing registered says so plainly", async () => {
   await closePrivacy();
 });
 
+check("a script the engine refused is never described as installed", async () => {
+  // Review R-003: the proof followed whether a script was BUILT, so a script
+  // the engine refused read "Installed for ...". It follows the engine now.
+  state({
+    host: "example.com",
+    enabled_globally: true,
+    off_for_this_site: false,
+    install: "refused",
+    registered: false,
+    surfaces: ["canvas", "audio"],
+  });
+  await openPrivacy();
+  const proof = $("dv-proof").textContent.toLowerCase();
+  await closePrivacy();
+  assert(!proof.includes("installed for"), "a refused script read as installed: " + proof);
+  assert(proof.includes("not installed") && proof.includes("engine"), "the refusal must say the engine did not take it: " + proof);
+});
+
+check("an answer still on its way is described as waiting", async () => {
+  state({
+    host: "example.com",
+    enabled_globally: true,
+    off_for_this_site: false,
+    install: "pending",
+    registered: false,
+    surfaces: ["canvas"],
+  });
+  await openPrivacy();
+  const proof = $("dv-proof").textContent.toLowerCase();
+  await closePrivacy();
+  assert(!proof.includes("installed for"), "an unanswered script read as installed: " + proof);
+  assert(proof.includes("waiting"), "a pending install must say it is waiting: " + proof);
+});
+
+check("a tab built before the pref went off still reports what it has", async () => {
+  // Observed, never inferred from the pref: the engine's answer for this tab
+  // wins over a pref that changed after the tab was built.
+  state({
+    host: "example.com",
+    enabled_globally: false,
+    off_for_this_site: false,
+    install: "installed",
+    registered: true,
+    surfaces: ["canvas"],
+  });
+  await openPrivacy();
+  const proof = $("dv-proof").textContent.toLowerCase();
+  await closePrivacy();
+  assert(proof.includes("installed for"), "a tab that has the script was described from the pref: " + proof);
+});
+
+check("the proof follows the tab when tabs switch with the panel open", async () => {
+  // Review 2026-10-12 R-003: a switch with the panel open left the proof
+  // describing the tab before it ("Installed for ..." about a tab whose
+  // engine refused the script).
+  state({
+    host: "a.example",
+    enabled_globally: true,
+    off_for_this_site: false,
+    install: "installed",
+    registered: true,
+    surfaces: ["canvas"],
+  });
+  await openPrivacy();
+  global.window.__rb_event({ event: "tab_status", data: { id: 1, origin: "a.example", divergence_script: "applied" } });
+  await flush();
+  assert($("dv-proof").textContent.toLowerCase().includes("installed for"), "(control) tab A's proof");
+  state({
+    host: "b.example",
+    enabled_globally: true,
+    off_for_this_site: false,
+    install: "refused",
+    registered: false,
+    surfaces: ["canvas"],
+  });
+  global.window.__rb_event({ event: "tab_status", data: { id: 2, origin: "b.example", divergence_script: "failed" } });
+  await flush();
+  const proof = $("dv-proof").textContent.toLowerCase();
+  const host = $("dv-host").textContent;
+  await closePrivacy();
+  assert(!proof.includes("installed for"), "the proof still describes the previous tab: " + proof);
+  assert(host.includes("b.example"), "the proof still names the previous tab's site: " + host);
+});
+
 check("the switch is described as reaching the next tab", async () => {
   const html = fs.readFileSync(process.env.HTML_PATH, "utf8");
   const note = html.match(/id="dv-off"[\s\S]{0,600}?<\/label>/);

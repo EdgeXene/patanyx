@@ -116,15 +116,14 @@ pub struct TabView {
     /// Shared with the engine callbacks below; GTK is single-threaded (the
     /// main loop), so Rc/RefCell is sufficient and correct.
     state: Rc<RefCell<TabState>>,
-    /// Kept because removing a user stylesheet requires the same instance
-    /// that was added (GTK objects are refcounted pointers).
-    cosmetic_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
+    /// The parts of this tab's ad blocking the engine holds (`AdSurfaces`).
+    /// Shared, like `state`, with the main-frame handlers that put them back
+    /// when an ads allowance ends in the middle of a navigation.
+    ads: Rc<AdSurfaces>,
     /// The page-scrollbar sheet (`set_page_scrollbar`), kept for the same
-    /// reason: swapping it out needs the instance that went in.
+    /// reason as the cosmetic sheet: swapping it out needs the instance that
+    /// went in.
     scrollbar_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
-    /// The YouTube ad script while `block_youtube_ads` is on
-    /// (`set_youtube_ads`); removing a user script needs the same instance.
-    youtube_script: RefCell<Option<webkit2gtk::UserScript>>,
     /// Host-to-page translation messages for this tab. Shared with the reply
     /// signal handler, which is why it is an Rc rather than owned outright:
     /// GTK is single-threaded, so Rc/RefCell is sufficient and correct here
@@ -371,6 +370,31 @@ pub fn show_all(hosts: &Hosts) {
 /// that was never leaving anything beside the exe.
 pub fn new_webview_builder() -> WebViewBuilder<'static> {
     WebViewBuilder::new()
+}
+
+/// One profile on this backend: kept sites are a Windows feature for now
+/// (kept_profile.rs), so every kind builds the ordinary way.
+pub fn new_webview_builder_for(_kind: crate::kept_profile::ProfileKind) -> WebViewBuilder<'static> {
+    new_webview_builder()
+}
+
+/// No second profile here; every tab is MAIN.
+pub fn kept_profile_supported() -> bool {
+    false
+}
+
+/// The MAIN clear starts with the first content tab on this backend.
+pub fn begin_main_profile_wipe(_webview: &WebView, _proxy: &EventLoopProxy<UserEvent>) {}
+
+/// No kept profile on this backend.
+pub fn begin_kept_profile_start(_hosts: &Hosts, _proxy: &EventLoopProxy<UserEvent>) {}
+
+/// No kept profile on this backend.
+pub fn sweep_kept_permissions(_hosts: &Hosts, _create: bool) {}
+
+/// Nothing to remove on this backend.
+pub fn remove_kept_profile_folder() -> bool {
+    true
 }
 
 /// Builder for the translator webview: its own `WebContext`, and therefore its
@@ -797,6 +821,8 @@ pub fn build_content(
     // and state.rs needs no `#[cfg]`; see clear_persisted_permissions above
     // for why WebKitGTK cannot honour the frame-isolation rule.
     _permissions: crate::state::PermissionBook,
+    // One profile on this backend (kept_profile.rs).
+    _profile: crate::kept_profile::ProfileKind,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
     // Build blank and navigate only after the per-tab UserContentManager has
     // both the divergence UserScript and its message handler. Applying the
@@ -901,17 +927,24 @@ pub fn build_content(
         } else {
             SettingState::Failed
         };
-    connect_load_events(&webview, state.clone(), translate_outbox.clone(), translate_script.clone());
+    let ads = Rc::new(AdSurfaces::new(id));
+    connect_load_events(
+        &webview,
+        state.clone(),
+        ads.clone(),
+        translate_outbox.clone(),
+        translate_script.clone(),
+    );
     connect_adlist_hold(&webview, state.clone(), proxy.clone(), id);
+    connect_ads_allowance_guard(&webview, state.clone(), ads.clone());
     connect_ledger(&webview, state.clone());
     connect_tls_errors(&webview, state.clone());
 
     let view = TabView {
         container,
         state,
-        cosmetic_sheet: RefCell::new(None),
+        ads,
         scrollbar_sheet: RefCell::new(None),
-        youtube_script: RefCell::new(None),
         translate_outbox,
     };
     apply_policy(&webview, &view, policy);
@@ -924,7 +957,8 @@ pub fn build_content(
     // at build time: the toggle affects the NEXT tab, never this one --
     // neither engine can re-register a live view's scripts, and the panel
     // copy says so.
-    install_divergence_script(&webview, policy.ephemeral);
+    let divergence = install_divergence_script(&webview, policy.ephemeral);
+    view.state.borrow_mut().divergence_install = divergence;
     // The page-scrollbar courtesy, as a User-level stylesheet: author rules
     // beat it by definition, which is the "the page's own choice wins"
     // contract stated in privacy.rs. Colour is what the chrome last reported.
@@ -937,11 +971,16 @@ pub fn build_content(
     // website data at all. Make the saved-profile promise explicit and match
     // Windows: construction returns while the async manager clear runs, and
     // this tab (plus any fast followers) stays blank until its callback.
-    let initial_navigation_pending = if policy.ephemeral {
+    let waiting_for_wipe = if policy.ephemeral {
         false
     } else {
         begin_new_session_wipe(&webview, proxy)
     };
+    // The first page also waits for the ad and tracker filters `apply_policy`
+    // just asked for. On a fresh profile they compile for about two seconds,
+    // and a page issued meanwhile sends its tracker requests; their landing
+    // posts `BundledFiltersSettled`, which issues it.
+    let initial_navigation_pending = waiting_for_wipe || !initial_navigation_ready(&view);
     if !initial_navigation_pending {
         super::load_initial_url(&webview, id, url)?;
     }
@@ -971,15 +1010,15 @@ fn begin_new_session_wipe(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) 
     use webkit2gtk::{WebContextExt, WebViewExt, WebsiteDataManagerExtManual, WebsiteDataTypes};
     use wry::WebViewExtUnix;
 
-    match super::enter_session_wipe() {
+    match super::enter_session_wipe(crate::kept_profile::ProfileKind::Main) {
         super::SessionWipeEntry::Ready => return false,
         super::SessionWipeEntry::Waiting => return true,
         super::SessionWipeEntry::Start => {}
     }
 
     let finish = |proxy: &EventLoopProxy<UserEvent>| {
-        super::finish_session_wipe();
-        let _ = proxy.send_event(UserEvent::SessionWipeFinished);
+        super::finish_session_wipe(crate::kept_profile::ProfileKind::Main);
+        let _ = proxy.send_event(UserEvent::SessionWipeFinished(crate::kept_profile::ProfileKind::Main));
     };
     let native = webview.webview();
     let Some(context) = native.context() else {
@@ -1016,8 +1055,8 @@ fn begin_new_session_wipe(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) 
             } else {
                 eprintln!("patanyx session: cleared cookies, DOM storage, service workers, Cache Storage, and HTTP cache from the previous session");
             }
-            super::finish_session_wipe();
-            let _ = done_proxy.send_event(UserEvent::SessionWipeFinished);
+            super::finish_session_wipe(crate::kept_profile::ProfileKind::Main);
+            let _ = done_proxy.send_event(UserEvent::SessionWipeFinished(crate::kept_profile::ProfileKind::Main));
         },
     );
     true
@@ -1099,17 +1138,23 @@ fn install_gpc_script(webview: &WebView) {
 /// register nothing, which is the honest posture (no script, no claim).
 /// Ephemeral tabs get their own token so a site cannot link an ephemeral
 /// visit to a normal one by matching noise.
-fn install_divergence_script(webview: &WebView, ephemeral: bool) {
+///
+/// Returns what the engine took, for the tab's status (review R-003): the
+/// panels used to say "Installed" whenever a script was BUILT, including on a
+/// tab with no content manager to install it into.
+fn install_divergence_script(webview: &WebView, ephemeral: bool) -> super::privacy::ScriptInstall {
+    use super::privacy::ScriptInstall;
     use webkit2gtk::{
         UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime,
     };
     use wry::WebViewExtUnix;
     let Some(source) = super::privacy::divergence_script(ephemeral) else {
-        return;
+        return ScriptInstall::NotWanted;
     };
     let Some(ucm) = user_content_manager(&webview.webview()) else {
-        // Same degrade-never-crash rule as install_gpc_script above.
-        return;
+        // Same degrade-never-crash rule as install_gpc_script above, and now
+        // reported: the tab runs without the noise it was built to have.
+        return ScriptInstall::Refused;
     };
     let script = UserScript::new(
         &source,
@@ -1119,6 +1164,7 @@ fn install_divergence_script(webview: &WebView, ephemeral: bool) {
         &[],
     );
     ucm.add_script(&script);
+    ScriptInstall::Installed
 }
 
 /// Wires the count-only push channel used by Fingerprint Divergence.
@@ -1156,6 +1202,27 @@ fn connect_fingerprint_probe_messages(
         };
         let _ = proxy.send_event(UserEvent::FingerprintProbes { tab_id: id, counts });
     });
+    // WRY ALREADY HOLDS THIS NAME. Its attach_ipc_handler runs for every view
+    // it builds, content tabs included (vendor/wry/src/webkitgtk/mod.rs:311,
+    // :658), so on this manager a second registration of "ipc" always returned
+    // false. Every Linux tab stored Failed and Tab Activity said the channel
+    // did not register, directly under counts that had arrived through it:
+    // WebKit emits the signal on the manager with the handler name as its
+    // detail, so wry's registration was delivering to the closure above.
+    //
+    // Replacing it, rather than reading false as "someone else registered it",
+    // is what keeps the bool honest. False then only means the engine refused
+    // a registration THIS function made after connecting its closure, and a
+    // registration of another kind (with-reply emits a different signal and
+    // would never reach the closure) cannot pass for this one. Unregistering
+    // does not disconnect signal handlers, per WebKit's documentation of
+    // unregister_script_message_handler, so wry's own closure keeps receiving
+    // as before. There is no page to observe the gap: build_content builds
+    // blank and navigates only after this returns.
+    // Measured on WebKitGTK 2.50.6: wry's register true, a plain second
+    // register false; unregister-then-register true, a third register false,
+    // and a page's postMessage reached both closures either way.
+    ucm.unregister_script_message_handler(HANDLER);
     ucm.register_script_message_handler(HANDLER)
 }
 
@@ -1226,7 +1293,7 @@ thread_local! {
 fn wake_freeze_status() {
     FREEZE_STATUS_WAKE.with(|w| {
         if let Some(proxy) = w.borrow().as_ref() {
-            let _ = proxy.send_event(UserEvent::FreezeStatusChanged);
+            let _ = proxy.send_event(UserEvent::TabStatusChanged);
         }
     });
 }
@@ -1273,13 +1340,14 @@ fn connect_adlist_hold(
         let Some(host) = privacy::host_of(failing_uri) else {
             return false;
         };
-        let (frozen, overridden) = {
+        let (frozen, overridden, ads_allowed) = {
             let st = state.borrow();
             (
                 // A document refused before the auto freeze was lifted at the
                 // start of this load is still the freeze's refusal.
                 st.freeze.phase() == privacy::FreezePhase::Frozen || st.freeze_lifted_this_load,
                 st.adlist_override_host().as_deref() == Some(host.as_str()),
+                st.ads_allowed_site().is_some(),
             )
         };
         // "Is ad blocking on for this tab" is answered by the ENGINE here,
@@ -1293,7 +1361,14 @@ fn connect_adlist_hold(
         // turning blocking off removes the filters synchronously, so a 104
         // cannot arrive from a tab whose blocking is off. So: a
         // content-blocker refusal that is not the freeze IS the ad filter.
-        let block_ads = true;
+        //
+        // With ONE exception, the ads allowance. A tab with ads allowed has
+        // no ad filters (they come off synchronously too), but it carries the
+        // overlap filter that keeps hosts on both the ad list and the
+        // malicious-site list blocked. A 104 there is that filter refusing a
+        // malicious host, not the ad list holding a page: no placeholder, no
+        // "on the ad list" banner, and WebKit's own refusal stands.
+        let block_ads = !ads_allowed;
         let listed = privacy::bundled_rules().blocks_host(&host);
         match crate::adlist_consent::classify_load_failure(
             error.domain().as_str(),
@@ -1351,6 +1426,7 @@ fn connect_adlist_hold(
 fn connect_load_events(
     webview: &WebView,
     state: Rc<RefCell<TabState>>,
+    ads: Rc<AdSurfaces>,
     translate_outbox: Rc<RefCell<TranslateOutbox>>,
     translate_script: Rc<RefCell<Option<webkit2gtk::UserScript>>>,
 ) {
@@ -1358,6 +1434,24 @@ fn connect_load_events(
     use wry::WebViewExtUnix;
     let native = webview.webview();
     native.connect_load_changed(move |web_view, event| {
+        // "ALLOW ADS AND TRACKERS ON THIS TAB" ends here when the MAIN FRAME
+        // starts loading another site, or is redirected to one. load-changed
+        // is main-frame only (measured; see connect_adlist_hold), which is
+        // what makes it usable at all: WebKitGTK's navigation-policy decision
+        // fires for frames too and cannot tell them apart, and ending the
+        // allowance on every cross-site iframe would end it on the first ad.
+        // First thing in the handler, so blocking is back before anything
+        // else here runs. If it cannot be put back synchronously the load is
+        // stopped: refused, not let through with the filters still off.
+        if matches!(event, LoadEvent::Started | LoadEvent::Redirected) {
+            let url = web_view.uri().map(|u| u.to_string()).unwrap_or_default();
+            if end_allowance_for_main_frame(web_view, &ads, &state, &url)
+                == privacy::AfterAllowanceEnded::Refuse
+            {
+                web_view.stop_loading();
+                return;
+            }
+        }
         match event {
             LoadEvent::Started => {
                 // TRANSLATION CONSENT DIES WITH THE PAGE, and this is where it
@@ -1569,6 +1663,10 @@ fn issuer_name(certificate: &gtk::gio::TlsCertificate) -> Option<String> {
 /// exceptions. Freezing is enforced by the same compiled-content-filter path
 /// as ad blocking.
 fn install_freeze_filter(native: &webkit2gtk::WebView, state: &Rc<RefCell<TabState>>) {
+    // Also here, not only with the bundled lists: with ad blocking off those
+    // are never installed, and a crash could leave a freeze filter naming
+    // allowed hosts behind (compliance review, A4). Once per run either way.
+    remove_stale_freeze_filters();
     let Some(ucm) = user_content_manager(native) else {
         return;
     };
@@ -1582,11 +1680,12 @@ fn install_freeze_filter(native: &webkit2gtk::WebView, state: &Rc<RefCell<TabSta
     // place until this one is installed: removing it first left a frozen tab
     // with no freeze while the replacement compiled. FreezeFilterBook swaps
     // them in on_filter_saved.
+    let holds_hosts = !exceptions.is_empty();
     let generation = state
         .borrow_mut()
         .freeze_filters
         .request_with_hosts(id, exceptions);
-    compile_and_add_filter(&ucm, &json, Some((state.clone(), generation)));
+    compile_and_add_filter(&ucm, &json, Some((state.clone(), generation)), holds_hosts);
 }
 
 /// Whether freezing actually blocks requests on this platform.
@@ -1629,6 +1728,25 @@ fn filter_store_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(".patanyx").join("contentfilters")
 }
 
+/// Where a freeze filter that names allowed hosts is compiled: a per-run
+/// directory on the user's runtime tmpfs, kept out of the persistent filter
+/// cache, so the hosts a user allowed on a frozen tab are not left in the
+/// profile (Strict Tabs promise to keep nothing). The compiled copy is also
+/// removed from the store as soon as the filter is installed. Without a
+/// runtime dir, the persistent cache is used, the removal still applies, and
+/// remove_stale_freeze_filters clears anything a crash left behind.
+fn private_filter_store_dir() -> Option<std::path::PathBuf> {
+    let rt = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty())?;
+    let dir = std::path::PathBuf::from(rt).join(format!("patanyx-{}-freeze", std::process::id()));
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .ok()?;
+    Some(dir)
+}
+
 /// Everything the async callback owns. Boxed and leaked into `user_data`, then
 /// reclaimed exactly once when the callback fires.
 struct FilterSaveData {
@@ -1650,6 +1768,13 @@ struct FilterSaveData {
     /// tell whether it is still the one the tab wants when it finishes.
     id: String,
     generation: u64,
+    /// The filter names hosts a user allowed: its compiled copy is removed
+    /// from the store once installed (or discarded).
+    remove_after_install: bool,
+    /// Present only for a BUNDLED ad or tracker filter compiled on a cache
+    /// miss: which one, so it is kept in memory, and the tab's state, so it
+    /// goes in only if the tab still wants it when the compile lands.
+    bundled: Option<(BundledFilter, Rc<RefCell<TabState>>)>,
 }
 
 /// Compiles `json` into a content filter and adds it to `ucm`.
@@ -1674,6 +1799,14 @@ enum BundledFilter {
 }
 
 impl BundledFilter {
+    /// Its place in `BUNDLED_COMPILED`.
+    fn slot(self) -> usize {
+        match self {
+            BundledFilter::Ads => 0,
+            BundledFilter::Tracking => 1,
+        }
+    }
+
     fn id(self) -> &'static str {
         match self {
             BundledFilter::Ads => privacy::bundled_ads_filter_id(),
@@ -1687,6 +1820,136 @@ impl BundledFilter {
         match self {
             BundledFilter::Ads => privacy::content_blocker_json(privacy::bundled_ads()),
             BundledFilter::Tracking => privacy::content_blocker_json(privacy::bundled_tracking()),
+        }
+    }
+}
+
+/// WebKit's compile scratch file: "ContentRuleList-" and exactly the six
+/// characters mkostemp fills in.
+fn is_compile_temp_file(name: &str) -> bool {
+    name.strip_prefix("ContentRuleList-")
+        .is_some_and(|rest| rest.len() == 6 && rest.bytes().all(|b| b.is_ascii_alphanumeric()))
+}
+
+/// Whether a file in the persistent filter store is a compiled FREEZE
+/// filter: WebKit names it "ContentRuleList-" + the identifier, and a freeze
+/// filter's identifier is filter_id_for's "patanyx-" + 16 hex digits with
+/// no suffix. The bundled ad and tracking lists carry "-ads" and
+/// "-tracking" and are kept.
+fn is_freeze_filter_file(name: &str) -> bool {
+    name.strip_prefix("ContentRuleList-patanyx-")
+        .is_some_and(|hex| hex.len() == 16 && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+
+/// Once per run, before any freeze: a freeze filter is compiled for a
+/// session and means nothing to the next one, so any left in the persistent
+/// store (by a crash between compile and removal, or by an older build that
+/// kept them) is deleted, along with the per-run private stores of runs that
+/// are no longer alive. One that names allowed hosts would otherwise outlive
+/// the tab it was allowed in (compliance review of Allow while frozen).
+fn remove_stale_freeze_filters() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        if let Ok(entries) = std::fs::read_dir(filter_store_dir()) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_str().is_some_and(is_freeze_filter_file) {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        // WebKit writes a filter's rules to a temporary file
+        // ("ContentRuleList-" + six mkostemp characters, in GLib's tmp dir)
+        // while compiling, and removes it when the compile ends. A crash in
+        // that window leaves it, allowed hosts included (Allow while frozen
+        // review, third pass, R-001). Only that exact name, only this user's,
+        // and only if older than ten minutes: a compile takes milliseconds,
+        // and another WebKit program of the same user may be mid-compile.
+        if let Ok(entries) = std::fs::read_dir(webkit2gtk::glib::tmp_dir()) {
+            use std::os::unix::fs::MetadataExt;
+            // This process's uid, read from its own /proc entry.
+            let Ok(uid) = std::fs::metadata("/proc/self").map(|m| m.uid()) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let is_temp = entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_compile_temp_file);
+                let stale = entry.metadata().is_ok_and(|m| {
+                    m.is_file()
+                        && m.uid() == uid
+                        && m.modified().is_ok_and(|t| {
+                            t.elapsed().is_ok_and(|age| age > std::time::Duration::from_secs(600))
+                        })
+                });
+                if is_temp && stale {
+                    let _ = std::fs::remove_file(entry.path());
+                }
+            }
+        }
+        let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) else {
+            return;
+        };
+        let Ok(entries) = std::fs::read_dir(&rt) else {
+            return;
+        };
+        let me = std::process::id();
+        for entry in entries.flatten() {
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|n| n.strip_prefix("patanyx-")?.strip_suffix("-freeze")?.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid != me && !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    });
+}
+
+/// One bundled filter load started for a tab has ended, however it ended
+/// (in place, compiled, refused, or the tab gone): the tab's count goes down
+/// and, at zero, first pages held for it are looked at again. A drop guard,
+/// so no return path in the two callbacks can forget it; a load that hands
+/// its work to a compile passes the guard on (`handed_on`) and the compile's
+/// callback ends it. A failed load still releases the page: a compile the
+/// engine refuses is recorded in the diagnostics log, and a tab that never
+/// loads is worse.
+struct BundledLoadEnds {
+    state: Option<Rc<RefCell<TabState>>>,
+}
+
+impl BundledLoadEnds {
+    fn new(state: &Rc<RefCell<TabState>>) -> Self {
+        Self {
+            state: Some(state.clone()),
+        }
+    }
+
+    fn handed_on(mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for BundledLoadEnds {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        let settled = {
+            let mut st = state.borrow_mut();
+            st.bundled_filters_loading = st.bundled_filters_loading.saturating_sub(1);
+            st.bundled_filters_loading == 0
+        };
+        if settled {
+            // The same proxy the freeze status uses: it is the event loop's.
+            FREEZE_STATUS_WAKE.with(|w| {
+                if let Some(proxy) = w.borrow().as_ref() {
+                    let _ = proxy.send_event(UserEvent::BundledFiltersSettled);
+                }
+            });
         }
     }
 }
@@ -1707,16 +1970,44 @@ impl BundledFilter {
 /// TWO filters, not one merged set, because WebKit refuses a compiled list
 /// over 150,000 rules and the merged set already brushes it. Each is well
 /// under; the pipeline that generates the lists asserts the ceiling per list.
-fn install_bundled_filters(ucm: &webkit2gtk::UserContentManager) {
-    ensure_bundled_filter(ucm, BundledFilter::Ads);
-    ensure_bundled_filter(ucm, BundledFilter::Tracking);
+///
+/// Once either has been loaded in this process it is kept in memory
+/// (`BUNDLED_COMPILED`) and added straight from there, synchronously. Returns
+/// whether both went in synchronously; false means one is loading and lands
+/// later, IF the tab still wants it then (`tab_wants_bundled`).
+fn install_bundled_filters(ucm: &webkit2gtk::UserContentManager, state: &Rc<RefCell<TabState>>) -> bool {
+    remove_stale_freeze_filters();
+    let mut in_place = true;
+    for which in [BundledFilter::Ads, BundledFilter::Tracking] {
+        let added = BUNDLED_COMPILED.with(|cache| match &cache.borrow()[which.slot()] {
+            Some(filter) => {
+                filter.add_to(ucm);
+                true
+            }
+            None => false,
+        });
+        if !added {
+            ensure_bundled_filter(ucm, which, state.clone());
+            in_place = false;
+        }
+    }
+    in_place
 }
 
 /// One filter: store_load, with `on_bundled_filter_loaded` finishing the job
 /// either way. Ref discipline matches `compile_and_add_filter` exactly: the
 /// ucm and store refs taken here are owned by the payload and released by
 /// whichever callback ends the chain.
-fn ensure_bundled_filter(ucm: &webkit2gtk::UserContentManager, which: BundledFilter) {
+///
+/// `state` is the tab's, read when the load lands. THE RACE GUARD: a load
+/// asked for while the tab blocked can land after the user allowed ads there,
+/// and must not put the filters back; one asked for when an allowance ended
+/// must not be dropped. What the tab wants at that moment decides both.
+fn ensure_bundled_filter(
+    ucm: &webkit2gtk::UserContentManager,
+    which: BundledFilter,
+    state: Rc<RefCell<TabState>>,
+) {
     use webkit2gtk::glib::translate::ToGlibPtr;
 
     let dir = filter_store_dir();
@@ -1745,10 +2036,14 @@ fn ensure_bundled_filter(ucm: &webkit2gtk::UserContentManager, which: BundledFil
     // for the callback, however long WebKit takes.
     unsafe { gobject_sys::g_object_ref(raw_ucm as *mut gobject_sys::GObject) };
 
+    // Counted only now, with nothing left that can return before the load is
+    // asked for: its callback (or the compile it hands on to) ends it.
+    state.borrow_mut().bundled_filters_loading += 1;
     let payload = Box::into_raw(Box::new(BundledLoadData {
         ucm: raw_ucm,
         store,
         which,
+        state,
     }));
 
     // SAFETY: every pointer is non-NULL and valid; the id string is copied by
@@ -1769,6 +2064,10 @@ struct BundledLoadData {
     ucm: *mut webkit2gtk_sys::WebKitUserContentManager,
     store: *mut webkit2gtk_sys::WebKitUserContentFilterStore,
     which: BundledFilter,
+    /// The tab's, so the landing can ask what the tab wants NOW. Holding it
+    /// keeps the state alive if the tab closes mid-load, the same way
+    /// `FilterSaveData::freeze_state` does; GLib calls back on this thread.
+    state: Rc<RefCell<TabState>>,
 }
 
 /// Async completion for `ensure_bundled_filter`'s load attempt.
@@ -1791,6 +2090,9 @@ unsafe extern "C" fn on_bundled_filter_loaded(
         return;
     }
     let data = Box::from_raw(user_data as *mut BundledLoadData);
+    // Ends this tab's count on every return below, unless the work is
+    // handed on to a compile (`handed_on` at the save call).
+    let ends = BundledLoadEnds::new(&data.state);
 
     let mut error: *mut glib_sys::GError = std::ptr::null_mut();
     let filter = webkit2gtk_sys::webkit_user_content_filter_store_load_finish(
@@ -1798,8 +2100,15 @@ unsafe extern "C" fn on_bundled_filter_loaded(
     );
 
     if error.is_null() && !filter.is_null() {
-        webkit2gtk_sys::webkit_user_content_manager_add_filter(data.ucm, filter);
-        // `add_filter` takes its own ref; release the one load_finish gave us.
+        // Kept in memory for every later add, then into THIS tab only if it
+        // still wants it: a tab whose user allowed ads while this loaded must
+        // not have it put back.
+        remember_bundled(data.which, filter);
+        if tab_wants_bundled(&data.state.borrow()) {
+            webkit2gtk_sys::webkit_user_content_manager_add_filter(data.ucm, filter);
+        }
+        // `add_filter` and the cache take their own refs; release the one
+        // load_finish gave us.
         webkit2gtk_sys::webkit_user_content_filter_unref(filter);
         gobject_sys::g_object_unref(data.ucm as *mut gobject_sys::GObject);
         gobject_sys::g_object_unref(data.store as *mut gobject_sys::GObject);
@@ -1846,7 +2155,11 @@ unsafe extern "C" fn on_bundled_filter_loaded(
         freeze_state: None,
         id: data.which.id().to_string(),
         generation: 0,
+        remove_after_install: false,
+        bundled: Some((data.which, data.state.clone())),
     }));
+    // `on_filter_saved` ends the count from here (it always runs).
+    ends.handed_on();
     webkit2gtk_sys::webkit_user_content_filter_store_save(
         data.store,
         c_id.as_ptr(),
@@ -1862,6 +2175,7 @@ fn compile_and_add_filter(
     ucm: &webkit2gtk::UserContentManager,
     json: &str,
     freeze: Option<(Rc<RefCell<TabState>>, u64)>,
+    holds_hosts: bool,
 ) {
     let (freeze_state, generation) = match freeze {
         Some((state, generation)) => (Some(state), generation),
@@ -1887,7 +2201,11 @@ fn compile_and_add_filter(
     }
     use webkit2gtk::glib::translate::ToGlibPtr;
 
-    let dir = filter_store_dir();
+    let dir = if holds_hosts {
+        private_filter_store_dir().unwrap_or_else(filter_store_dir)
+    } else {
+        filter_store_dir()
+    };
     // WebKit will not create the directory itself and silently fails without it.
     if std::fs::create_dir_all(&dir).is_err() {
         give_up!(format!(
@@ -1938,6 +2256,8 @@ fn compile_and_add_filter(
         freeze_state,
         id: privacy::filter_id_for(json),
         generation,
+        remove_after_install: holds_hosts,
+        bundled: None,
     }));
 
     // SAFETY: every pointer is non-NULL and valid; `store` and `ucm` are kept
@@ -1959,6 +2279,35 @@ fn compile_and_add_filter(
     }
 }
 
+/// Completion for the removal of a compiled freeze filter that named allowed
+/// hosts. A failure is logged; remove_stale_freeze_filters is the backstop
+/// for the persistent store on the next run.
+///
+/// SAFETY: invoked by GLib with the store as `source` and the task's result.
+unsafe extern "C" fn on_filter_removed(
+    source: *mut gobject_sys::GObject,
+    result: *mut gio_sys::GAsyncResult,
+    _user_data: glib_sys::gpointer,
+) {
+    let mut error: *mut glib_sys::GError = std::ptr::null_mut();
+    let ok = webkit2gtk_sys::webkit_user_content_filter_store_remove_finish(
+        source as *mut webkit2gtk_sys::WebKitUserContentFilterStore,
+        result,
+        &mut error,
+    );
+    if ok == glib_sys::GFALSE {
+        let why = if error.is_null() || (*error).message.is_null() {
+            "unknown error".to_string()
+        } else {
+            std::ffi::CStr::from_ptr((*error).message).to_string_lossy().into_owned()
+        };
+        diag(&format!("freeze filter with allowed hosts not removed from its store: {why}"));
+    }
+    if !error.is_null() {
+        glib_sys::g_error_free(error);
+    }
+}
+
 /// Async completion for `compile_and_add_filter`. Runs on the main loop once
 /// WebKit has compiled the rules.
 ///
@@ -1974,6 +2323,9 @@ unsafe extern "C" fn on_filter_saved(
     }
     // Reclaimed here and nowhere else; every path below drops it.
     let data = Box::from_raw(user_data as *mut FilterSaveData);
+    // A bundled filter's compile ends that tab's count on every return below,
+    // after the filter (if any) went in.
+    let _ends = data.bundled.as_ref().map(|(_, state)| BundledLoadEnds::new(state));
 
     let mut error: *mut glib_sys::GError = std::ptr::null_mut();
     let filter = webkit2gtk_sys::webkit_user_content_filter_store_save_finish(
@@ -2024,14 +2376,44 @@ unsafe extern "C" fn on_filter_saved(
                 }
             }
         };
+        // A filter naming allowed hosts leaves no compiled copy behind,
+        // whether it was installed or discarded as stale. The removal runs
+        // asynchronously; its task holds its own ref on the store. WebKit
+        // refuses the call outright without a callback (g_return_if_fail),
+        // so one is always passed (Allow while frozen review, second pass,
+        // R-001).
+        if data.remove_after_install {
+            if let Ok(c_id) = std::ffi::CString::new(data.id.as_str()) {
+                webkit2gtk_sys::webkit_user_content_filter_store_remove(
+                    data.store,
+                    c_id.as_ptr(),
+                    std::ptr::null_mut(),
+                    Some(on_filter_removed),
+                    std::ptr::null_mut(),
+                );
+            }
+        }
         let Some(superseded) = superseded else {
             webkit2gtk_sys::webkit_user_content_filter_unref(filter);
             gobject_sys::g_object_unref(data.ucm as *mut gobject_sys::GObject);
             gobject_sys::g_object_unref(data.store as *mut gobject_sys::GObject);
             return;
         };
-        webkit2gtk_sys::webkit_user_content_manager_add_filter(data.ucm, filter);
-        // `add_filter` takes its own ref; release the one `save_finish` gave us.
+        // A bundled filter compiled on a cache miss is kept in memory like a
+        // loaded one, and goes into this tab only if the tab still wants it
+        // (the same race guard as `on_bundled_filter_loaded`).
+        let lands = match &data.bundled {
+            Some((which, state)) => {
+                remember_bundled(*which, filter);
+                tab_wants_bundled(&state.borrow())
+            }
+            None => true,
+        };
+        if lands {
+            webkit2gtk_sys::webkit_user_content_manager_add_filter(data.ucm, filter);
+        }
+        // `add_filter` and the cache take their own refs; release the one
+        // `save_finish` gave us.
         webkit2gtk_sys::webkit_user_content_filter_unref(filter);
         // The freeze this one replaces comes off only now that it is in.
         for old in superseded {
@@ -2261,7 +2643,13 @@ fn user_content_manager(native: &webkit2gtk::WebView) -> Option<webkit2gtk::User
 ///
 /// Distinct from anything the chrome uses. A content webview has no
 /// `window.ipc` by design, and this deliberately does not resemble one.
-pub const TRANSLATE_CHANNEL: &str = "patanyxTranslate";
+///
+/// NOT NAMED AFTER THE PRODUCT, and every page can read it. Handlers do not
+/// enumerate, but `typeof window.webkit.messageHandlers.<name>` answers for
+/// any name a page guesses, so a product-named handler told every site which
+/// browser this is (it was `patanyxTranslate` until 2026-09-23). The test
+/// below pins both names to the extractor's and keeps the product out.
+pub const TRANSLATE_CHANNEL: &str = "translate";
 
 /// The extractor that posts through `TRANSLATE_CHANNEL`.
 const CONTENT_TRANSLATE_SCRIPT: &str = include_str!("../content_scripts/translate_extract.js");
@@ -2401,7 +2789,7 @@ fn remove_translate_script(native: &webkit2gtk::WebView, script: &webkit2gtk::Us
 
 /// The name the page ASKS on. Unlike `TRANSLATE_CHANNEL`, a `postMessage`
 /// here returns a Promise that the HOST resolves.
-pub const TRANSLATE_ASK_CHANNEL: &str = "patanyxTranslateAsk";
+pub const TRANSLATE_ASK_CHANNEL: &str = "translateAsk";
 
 /// Gives a CONTENT webview a page-initiated REQUEST/REPLY channel, which is
 /// how translated text gets back INTO the page.
@@ -2942,18 +3330,195 @@ unsafe fn reply_error(reply: *mut webkit2gtk_sys::WebKitScriptMessageReply, toke
 /// approaching this is a page misbehaving rather than a document being long.
 const MAX_CONTENT_TRANSLATE_BYTES: usize = 1024 * 1024;
 
-fn set_ad_blocking(native: &webkit2gtk::WebView, view: &TabView, enable: bool) {
+// ---------------------------------------------------------------------------
+// Ad blocking per tab, and "Allow ads and trackers on this tab"
+//
+// A tab's ad blocking on this backend is four engine objects: the two bundled
+// content filters, the cosmetic stylesheet and the YouTube user script. An
+// ads allowance takes them out of ONE tab's own content manager (each webview
+// has its own, so no other tab is touched) and puts a fifth in: the overlap
+// filter, which keeps hosts on both the ad list and the malicious-site list
+// blocked (`privacy::malicious_overlap`), because the malicious list is
+// enforced only on navigations here and the ad filter was what stopped their
+// subresources.
+//
+// Everything that must come back when the allowance ends is held in memory,
+// so the end is a synchronous add inside the main-frame handler, before the
+// next site's requests: the bundled filters process-wide once loaded
+// (`BUNDLED_COMPILED`), the sheet and script per tab (`AdSurfaces`). The
+// switch is unavailable until both bundled filters and the overlap filter are
+// in memory (`ads_allow_ready`), so it can never be on in a tab whose
+// blocking could not be put back at once.
+// ---------------------------------------------------------------------------
+
+/// The parts of one tab's ad blocking that the engine holds and that only the
+/// instance that went in can take out. Shared (Rc) between the TabView and the
+/// main-frame handlers, because an allowance can end inside a load-changed or
+/// decide-policy callback and those must put every one of these back.
+struct AdSurfaces {
+    /// For `UserEvent::AdsAllowanceEnded`.
+    tab_id: u64,
+    /// The cosmetic stylesheet, while blocking is on.
+    cosmetic_sheet: RefCell<Option<webkit2gtk::UserStyleSheet>>,
+    /// The YouTube ad script, while `block_youtube_ads` is on.
+    youtube_script: RefCell<Option<webkit2gtk::UserScript>>,
+    /// The id of the overlap filter in this tab, if one is: removed by that
+    /// id when the allowance ends.
+    overlap_installed: RefCell<Option<String>>,
+}
+
+impl AdSurfaces {
+    fn new(tab_id: u64) -> Self {
+        Self {
+            tab_id,
+            cosmetic_sheet: RefCell::new(None),
+            youtube_script: RefCell::new(None),
+            overlap_installed: RefCell::new(None),
+        }
+    }
+}
+
+/// A compiled content filter this process holds a reference to.
+///
+/// NO `Drop`, on purpose. These live in thread-locals, and glibc runs a
+/// thread's TLS destructors inside `exit()`; an unref there would reach into
+/// WebKit while the process is coming down. A filter that is replaced is
+/// released explicitly (`release`); the ones still held at exit are left to
+/// the process ending, which frees them anyway.
+struct CompiledFilter(*mut webkit2gtk_sys::WebKitUserContentFilter);
+
+impl CompiledFilter {
+    /// Keeps `raw` with a reference of its own; the caller's is untouched.
+    ///
+    /// SAFETY: `raw` must be a live filter.
+    unsafe fn retain(raw: *mut webkit2gtk_sys::WebKitUserContentFilter) -> Self {
+        webkit2gtk_sys::webkit_user_content_filter_ref(raw);
+        Self(raw)
+    }
+
+    /// Synchronous: the manager takes its own reference.
+    fn add_to(&self, ucm: &webkit2gtk::UserContentManager) {
+        use webkit2gtk::glib::translate::ToGlibPtr;
+        let raw: *mut webkit2gtk_sys::WebKitUserContentManager = ucm.to_glib_none().0;
+        // SAFETY: both pointers are live for the call.
+        unsafe { webkit2gtk_sys::webkit_user_content_manager_add_filter(raw, self.0) };
+    }
+
+    /// Gives back the reference `retain` took.
+    fn release(self) {
+        // SAFETY: exactly the one reference this value owns, released once:
+        // `self` is consumed.
+        unsafe { webkit2gtk_sys::webkit_user_content_filter_unref(self.0) };
+    }
+}
+
+/// Where the overlap filter stands, process-wide.
+enum OverlapFilter {
+    /// Not worked out yet: the worker has not reported since startup.
+    NotBuilt,
+    /// Compiling the rules that carry this id.
+    Compiling(String),
+    /// In memory, with its id. `None`: no host is on both lists, so there
+    /// is nothing to install.
+    Ready(Option<(String, CompiledFilter)>),
+    /// The engine refused it. The switch stays unavailable (fail closed)
+    /// until a later list compiles.
+    Failed,
+}
+
+thread_local! {
+    /// The two bundled filters once the store has handed them over, kept by
+    /// this process. The engine keeps a compiled filter only while some
+    /// manager holds it; this keeps it while no tab does, so putting blocking
+    /// back is an add, never a store load (~70 ms) or a compile (~3 s) with
+    /// the next site's requests already going out. Indexed by
+    /// `BundledFilter::slot`.
+    static BUNDLED_COMPILED: RefCell<[Option<CompiledFilter>; 2]> =
+        const { RefCell::new([None, None]) };
+    static AD_OVERLAP: RefCell<OverlapFilter> = const { RefCell::new(OverlapFilter::NotBuilt) };
+    /// Only the newest overlap compile may become the one in force: a slow
+    /// compile for an older list landing after a newer one must be dropped,
+    /// or an allowed tab would keep the older list's hosts and miss the new.
+    static AD_OVERLAP_GENERATION: RefCell<crate::adlist_consent::FilterGeneration> =
+        RefCell::new(crate::adlist_consent::FilterGeneration::new());
+}
+
+/// Keeps a bundled filter that just loaded or compiled, unless one is kept
+/// already: the id is derived from the shipped list, so every load in this
+/// process hands back the same rules.
+///
+/// SAFETY: `raw` must be a live filter; the caller keeps its own reference.
+unsafe fn remember_bundled(which: BundledFilter, raw: *mut webkit2gtk_sys::WebKitUserContentFilter) {
+    BUNDLED_COMPILED.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if cache[which.slot()].is_none() {
+            cache[which.slot()] = Some(CompiledFilter::retain(raw));
+        }
+    });
+}
+
+/// Moves the overlap filter to `next`, releasing the compiled filter it held.
+fn set_overlap(next: OverlapFilter) {
+    let previous = AD_OVERLAP.with(|overlap| std::mem::replace(&mut *overlap.borrow_mut(), next));
+    if let OverlapFilter::Ready(Some((_, filter))) = previous {
+        filter.release();
+    }
+}
+
+fn overlap_ready() -> bool {
+    AD_OVERLAP.with(|overlap| matches!(*overlap.borrow(), OverlapFilter::Ready(_)))
+}
+
+/// Whether the switch may be turned on: everything an allowed tab needs put
+/// back, and the filter it must keep, are in memory.
+pub fn ads_allow_ready() -> bool {
+    let bundled = BUNDLED_COMPILED.with(|cache| cache.borrow().iter().all(Option::is_some));
+    bundled && overlap_ready()
+}
+
+/// The overlap filter is this backend's: the malicious list covers
+/// navigations only (blocklist.rs).
+pub fn ad_overlap_wanted() -> bool {
+    true
+}
+
+/// Whether this tab's bundled filters belong in its content manager now:
+/// whenever its policy blocks, and -- failing closed -- also while it is
+/// allowed but the overlap filter it relies on is not in memory.
+fn tab_wants_bundled(st: &TabState) -> bool {
+    st.wants_ad_filters() || (st.wants_overlap_filter() && !overlap_ready())
+}
+
+/// Brings one tab's content manager in line with what its `TabState` wants:
+/// the bundled filters and the cosmetic sheet while blocking, the overlap
+/// filter while ads are allowed. Adds before removes, so there is no moment
+/// with neither. Returns whether the bundled filters the tab wants are in
+/// place NOW, rather than still loading from the store.
+fn sync_ad_filters(
+    native: &webkit2gtk::WebView,
+    ads: &AdSurfaces,
+    state: &Rc<RefCell<TabState>>,
+) -> bool {
     let Some(ucm) = user_content_manager(native) else {
         // An engine without a content manager leaves the feature off
-        // (constraint: degrade, never crash).
-        return;
+        // (constraint: degrade, never crash), and nothing is in place.
+        return false;
     };
-    set_cosmetic(&ucm, view, enable);
+    let (wants_bundled, wants_overlap) = {
+        let st = state.borrow();
+        (tab_wants_bundled(&st), st.wants_overlap_filter())
+    };
+    let mut in_place = true;
     // Cosmetic hiding alone would still let every ad request leave the
     // machine, so the network filter is the half that makes the claim true.
-    if enable {
-        install_bundled_filters(&ucm);
-    } else {
+    if wants_bundled {
+        in_place = install_bundled_filters(&ucm, state);
+    }
+    if wants_overlap {
+        install_overlap_filter(&ucm, ads);
+    }
+    set_cosmetic(&ucm, ads, wants_bundled);
+    if !wants_bundled {
         // Only the ad and tracker filters, by id. Removing EVERY filter here
         // also took a frozen tab's freeze filter, and the tab could send
         // requests while the replacement compiled with the toolbar still
@@ -2961,13 +3526,343 @@ fn set_ad_blocking(native: &webkit2gtk::WebView, view: &TabView, enable: bool) {
         remove_filter_by_id(&ucm, BundledFilter::Ads.id());
         remove_filter_by_id(&ucm, BundledFilter::Tracking.id());
     }
+    if !wants_overlap {
+        if let Some(old) = ads.overlap_installed.borrow_mut().take() {
+            remove_filter_by_id(&ucm, &old);
+        }
+    }
+    in_place
+}
+
+/// Puts the overlap filter in force into this tab, replacing an older one.
+/// Nothing while it is not in memory: `tab_wants_bundled` keeps the bundled
+/// filters in the tab meanwhile.
+fn install_overlap_filter(ucm: &webkit2gtk::UserContentManager, ads: &AdSurfaces) {
+    AD_OVERLAP.with(|overlap| {
+        let overlap = overlap.borrow();
+        let OverlapFilter::Ready(ready) = &*overlap else {
+            return;
+        };
+        let want = ready.as_ref().map(|(id, _)| id.clone());
+        let mut installed = ads.overlap_installed.borrow_mut();
+        if *installed == want {
+            return;
+        }
+        if let Some((_, filter)) = ready {
+            filter.add_to(ucm);
+        }
+        if let Some(old) = installed.take() {
+            remove_filter_by_id(ucm, &old);
+        }
+        *installed = want;
+    });
+}
+
+/// After an allowance ended: the filters, the sheet and the YouTube script,
+/// as the tab's policy now wants them. Returns whether the filters are in
+/// place synchronously.
+fn put_blocking_back(native: &webkit2gtk::WebView, ads: &AdSurfaces, state: &Rc<RefCell<TabState>>) -> bool {
+    let restored = sync_ad_filters(native, ads, state);
+    let youtube = state.borrow().policy.block_youtube_ads;
+    set_youtube_ads(native, ads, youtube);
+    restored
+}
+
+/// The main frame is about to load `url`. Ends this tab's ads allowance if
+/// `url` is another site, putting blocking back FIRST, and says whether the
+/// load may go on (`privacy::after_allowance_ended`).
+fn end_allowance_for_main_frame(
+    native: &webkit2gtk::WebView,
+    ads: &AdSurfaces,
+    state: &Rc<RefCell<TabState>>,
+    url: &str,
+) -> privacy::AfterAllowanceEnded {
+    let ended = state.borrow_mut().end_ads_allowance_unless_same_site(url);
+    if !ended {
+        return privacy::after_allowance_ended(false, true);
+    }
+    let restored = put_blocking_back(native, ads, state);
+    // No host and no URL: the diagnostics export promises no browsing history.
+    diag(if restored {
+        "ads: allowance ended by a main-frame navigation to another site"
+    } else {
+        "ads: allowance ended and blocking could not be put back at once; the navigation was refused"
+    });
+    wake(UserEvent::AdsAllowanceEnded { tab_id: ads.tab_id });
+    privacy::after_allowance_ended(true, restored)
+}
+
+/// The main frame's RESPONSE policy decision, the backstop behind
+/// load-changed. It is the one decide-policy signal that names the main frame
+/// (`is_main_frame_main_resource`), and it comes after the document request
+/// and every redirect but before the response is committed, so before the new
+/// page can ask for anything. load-changed has normally ended the allowance
+/// already; this catches a final address it did not see. Returns false
+/// (undecided) in every other case, so wry's handler and `fix_downloads` keep
+/// deciding what they decide.
+fn connect_ads_allowance_guard(webview: &WebView, state: Rc<RefCell<TabState>>, ads: Rc<AdSurfaces>) {
+    use webkit2gtk::{PolicyDecisionExt, ResponsePolicyDecisionExt, URIRequestExt, URIResponseExt, WebViewExt};
+    use wry::WebViewExtUnix;
+    let native = webview.webview();
+    native.connect_decide_policy(move |web_view, decision, decision_type| {
+        if decision_type != webkit2gtk::PolicyDecisionType::Response {
+            return false;
+        }
+        if state.borrow().ads_allowed_site().is_none() {
+            return false;
+        }
+        let Some(response) = decision.dynamic_cast_ref::<webkit2gtk::ResponsePolicyDecision>() else {
+            return false;
+        };
+        if !response.is_main_frame_main_resource() {
+            return false;
+        }
+        // An address that cannot be read has no site, which ends it.
+        let url = response
+            .response()
+            .and_then(|r| r.uri())
+            .or_else(|| response.request().and_then(|r| r.uri()))
+            .map(|u| u.to_string())
+            .unwrap_or_default();
+        match end_allowance_for_main_frame(web_view, &ads, &state, &url) {
+            privacy::AfterAllowanceEnded::Proceed => false,
+            privacy::AfterAllowanceEnded::Refuse => {
+                decision.ignore();
+                true
+            }
+        }
+    });
+}
+
+/// Sends `event` through the proxy every content build records.
+fn wake(event: UserEvent) {
+    FREEZE_STATUS_WAKE.with(|w| {
+        if let Some(proxy) = w.borrow().as_ref() {
+            let _ = proxy.send_event(event);
+        }
+    });
+}
+
+/// Turns the allowance on for `site`. Refused until everything it needs is in
+/// memory, for a Strict Tab, and where the tab blocks nothing. The ad-list
+/// state is cleared with it: the allowance covers that host anyway.
+pub fn allow_ads_on_tab(webview: &WebView, view: &TabView, site: String) -> Result<TabPolicy, &'static str> {
+    use wry::WebViewExtUnix;
+    if !ads_allow_ready() {
+        return Err("ads_not_ready");
+    }
+    let policy = {
+        let mut st = view.state.borrow_mut();
+        let policy = st.grant_ads_allowance(site)?;
+        st.set_adlist_override(None);
+        policy
+    };
+    let native = webview.webview();
+    sync_ad_filters(&native, &view.ads, &view.state);
+    set_youtube_ads(&native, &view.ads, policy.block_youtube_ads);
+    Ok(policy)
+}
+
+/// Ends the allowance, if there is one, and puts blocking back. Returns
+/// whether there was one.
+pub fn end_ads_allowance(webview: &WebView, view: &TabView) -> bool {
+    use wry::WebViewExtUnix;
+    let ended = view.state.borrow_mut().end_ads_allowance();
+    if ended {
+        put_blocking_back(&webview.webview(), &view.ads, &view.state);
+    }
+    ended
+}
+
+/// Ends the allowance if `url` is on another site. Returns whether it ended.
+pub fn end_ads_allowance_if_leaving(webview: &WebView, view: &TabView, url: &str) -> bool {
+    use wry::WebViewExtUnix;
+    let ended = view.state.borrow_mut().end_ads_allowance_unless_same_site(url);
+    if ended {
+        put_blocking_back(&webview.webview(), &view.ads, &view.state);
+    }
+    ended
+}
+
+/// The browser is about to take this tab to `url` itself. The one point on
+/// this backend that comes BEFORE the document request; load-changed and the
+/// response decision come after it. AppState hears through the same event
+/// the engine handlers send.
+pub fn end_ads_allowance_before_navigation(webview: &WebView, view: &TabView, url: &str) {
+    if end_ads_allowance_if_leaving(webview, view, url) {
+        wake(UserEvent::AdsAllowanceEnded { tab_id: view.ads.tab_id });
+    }
+}
+
+pub fn ads_allowed_site(view: &TabView) -> Option<String> {
+    view.state.borrow().ads_allowed_site().map(str::to_string)
+}
+
+/// The policy in force in this tab, the allowance included.
+pub fn tab_policy(view: &TabView) -> TabPolicy {
+    view.state.borrow().policy.clone()
+}
+
+/// The hosts on both lists, from the worker (`blocklist::ad_overlap`).
+/// Compiles them unless the filter in force (or compiling) already carries
+/// exactly these. Returns true when a filter that allowed tabs may rely on is
+/// being replaced, so the caller ends their allowances rather than leave them
+/// running on the old one.
+/// The overlap could not be computed (its worker did not start). Fail
+/// closed: nothing compiling may land, and the switch stays unavailable.
+pub fn on_ad_overlap_failed() {
+    AD_OVERLAP_GENERATION.with(|g| g.borrow_mut().invalidate());
+    set_overlap(OverlapFilter::Failed);
+    diag("overlap filter not computed: the worker did not start");
+}
+
+/// What this tab blocks without its allowance (the allowance's base policy).
+pub fn ads_base_blocking(view: &TabView) -> bool {
+    view.state.borrow().ads_base_policy().block_ads
+}
+
+pub fn on_ad_overlap_computed(hosts: Vec<String>, proxy: &EventLoopProxy<UserEvent>) -> bool {
+    let next = privacy::overlap_filter(&hosts);
+    let next_id = next.as_ref().map(|(_, id)| id.clone());
+    let (unchanged, had_one) = AD_OVERLAP.with(|overlap| match &*overlap.borrow() {
+        OverlapFilter::Ready(ready) => (ready.as_ref().map(|(id, _)| id) == next_id.as_ref(), true),
+        OverlapFilter::Compiling(id) => (Some(id) == next_id.as_ref(), true),
+        OverlapFilter::NotBuilt | OverlapFilter::Failed => (false, false),
+    });
+    if unchanged {
+        return false;
+    }
+    match next {
+        None => {
+            AD_OVERLAP_GENERATION.with(|g| g.borrow_mut().invalidate());
+            set_overlap(OverlapFilter::Ready(None));
+            let _ = proxy.send_event(UserEvent::AdOverlapSettled);
+        }
+        Some((json, id)) => {
+            let token = AD_OVERLAP_GENERATION.with(|g| g.borrow_mut().begin());
+            set_overlap(OverlapFilter::Compiling(id.clone()));
+            compile_overlap_filter(&json, &id, token, proxy);
+        }
+    }
+    had_one
+}
+
+struct OverlapSaveData {
+    store: *mut webkit2gtk_sys::WebKitUserContentFilterStore,
+    id: String,
+    token: u64,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+/// The overlap filter's compile. Not added to any tab here: it is kept in
+/// memory and installed by `sync_ad_filters` where an allowance wants it.
+fn compile_overlap_filter(json: &str, id: &str, token: u64, proxy: &EventLoopProxy<UserEvent>) {
+    let fail = |why: &str| {
+        let current = AD_OVERLAP_GENERATION.with(|g| g.borrow().may_apply(token));
+        if current {
+            set_overlap(OverlapFilter::Failed);
+            diag(&format!("overlap filter not compiled: {why}"));
+            let _ = proxy.send_event(UserEvent::AdOverlapSettled);
+        }
+    };
+    let dir = filter_store_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return fail("cannot create the filter cache");
+    }
+    let Some(dir_str) = dir.to_str() else {
+        return fail("the filter cache path is not UTF-8");
+    };
+    let (Ok(c_dir), Ok(c_id)) = (std::ffi::CString::new(dir_str), std::ffi::CString::new(id)) else {
+        return fail("the cache path or filter id contains an interior NUL");
+    };
+    // SAFETY: the path is copied; the store is a strong ref the callback
+    // releases.
+    let store = unsafe { webkit2gtk_sys::webkit_user_content_filter_store_new(c_dir.as_ptr()) };
+    if store.is_null() {
+        return fail("the engine would not open a filter store");
+    }
+    // SAFETY: g_bytes_new COPIES the buffer.
+    let bytes = unsafe { glib_sys::g_bytes_new(json.as_ptr() as *const std::ffi::c_void, json.len()) };
+    if bytes.is_null() {
+        // SAFETY: the only reference to `store`.
+        unsafe { gobject_sys::g_object_unref(store as *mut gobject_sys::GObject) };
+        return fail("could not allocate the rule buffer");
+    }
+    let payload = Box::into_raw(Box::new(OverlapSaveData {
+        store,
+        id: id.to_string(),
+        token,
+        proxy: proxy.clone(),
+    }));
+    // SAFETY: every pointer is valid; the payload is reclaimed exactly once in
+    // `on_overlap_saved`.
+    unsafe {
+        webkit2gtk_sys::webkit_user_content_filter_store_save(
+            store,
+            c_id.as_ptr(),
+            bytes,
+            std::ptr::null_mut(),
+            Some(on_overlap_saved),
+            payload as glib_sys::gpointer,
+        );
+        glib_sys::g_bytes_unref(bytes);
+    }
+}
+
+/// SAFETY: invoked by GLib with the payload passed to `..._store_save`,
+/// exactly once. Reclaims the box and releases the store.
+unsafe extern "C" fn on_overlap_saved(
+    _source: *mut gobject_sys::GObject,
+    result: *mut gio_sys::GAsyncResult,
+    user_data: glib_sys::gpointer,
+) {
+    if user_data.is_null() {
+        return;
+    }
+    let data = Box::from_raw(user_data as *mut OverlapSaveData);
+    let mut error: *mut glib_sys::GError = std::ptr::null_mut();
+    let filter = webkit2gtk_sys::webkit_user_content_filter_store_save_finish(
+        data.store, result, &mut error,
+    );
+    let why = if !error.is_null() {
+        let why = if (*error).message.is_null() {
+            "the engine refused the rules".to_string()
+        } else {
+            std::ffi::CStr::from_ptr((*error).message)
+                .to_string_lossy()
+                .into_owned()
+        };
+        glib_sys::g_error_free(error);
+        Some(why)
+    } else if filter.is_null() {
+        Some("no filter and no error".to_string())
+    } else {
+        None
+    };
+    if AD_OVERLAP_GENERATION.with(|g| g.borrow().may_apply(data.token)) {
+        match why {
+            None => {
+                let kept = CompiledFilter::retain(filter);
+                set_overlap(OverlapFilter::Ready(Some((data.id.clone(), kept))));
+            }
+            Some(why) => {
+                set_overlap(OverlapFilter::Failed);
+                diag(&format!("overlap filter not compiled: {why}"));
+            }
+        }
+        let _ = data.proxy.send_event(UserEvent::AdOverlapSettled);
+    }
+    if !filter.is_null() {
+        webkit2gtk_sys::webkit_user_content_filter_unref(filter);
+    }
+    gobject_sys::g_object_unref(data.store as *mut gobject_sys::GObject);
 }
 
 /// Cosmetic filtering as a user STYLESHEET, not injected script. This is
 /// the crate's central security invariant applied to ad blocking: content
 /// webviews get no IPC and are never script-evaluated, and
 /// UserStyleLevel::User sheets need no script context in the page.
-fn set_cosmetic(ucm: &webkit2gtk::UserContentManager, view: &TabView, enable: bool) {
+fn set_cosmetic(ucm: &webkit2gtk::UserContentManager, view: &AdSurfaces, enable: bool) {
     use webkit2gtk::UserContentManagerExt;
     if enable {
         if view.cosmetic_sheet.borrow().is_some() {
@@ -2993,7 +3888,13 @@ fn set_cosmetic(ucm: &webkit2gtk::UserContentManager, view: &TabView, enable: bo
 /// runtime-changeable; `ephemeral` is NOT (the WebContext is fixed once the
 /// view exists) — changing it requires recreating the tab, and this
 /// function deliberately does not fake it.
-pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
+///
+/// `policy` is the BASE: the preset at build, the browser-wide policy rebased
+/// onto this tab afterwards. What is put in force is that base with this
+/// tab's ads allowance laid over it (`TabState::apply_base_policy`), and that
+/// is what is returned, so no caller can apply a policy that forgot the
+/// allowance.
+pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) -> TabPolicy {
     // No `use webkit2gtk::SettingsExt;` at this level: the only call that
     // needs it brings it in itself, inside the `Some(settings)` arm below,
     // next to the comment explaining why the trait has to be named at all.
@@ -3001,11 +3902,13 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
     // outer one was load-bearing; it was not, and the compiler said so.
     use wry::WebViewExtUnix;
     let native = webview.webview();
-    {
+    let policy = {
         let mut st = view.state.borrow_mut();
-        st.policy = policy.clone();
-        st.freeze.set_auto(policy.freeze_after_load);
-    }
+        let effective = st.apply_base_policy(policy);
+        st.freeze.set_auto(effective.freeze_after_load);
+        effective
+    };
+    let policy = &policy;
     // Note: WebViewExt::settings() nullability in 2.0.2 (Option
     // assumed). Applied post-construction but before the caller navigates;
     // a quarantine caller must not navigate between build_content and this
@@ -3029,8 +3932,9 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
     } else {
         SettingState::Failed
     };
-    set_ad_blocking(&native, view, policy.block_ads);
-    set_youtube_ads(&native, view, policy.block_youtube_ads);
+    sync_ad_filters(&native, &view.ads, &view.state);
+    set_youtube_ads(&native, &view.ads, policy.block_youtube_ads);
+    policy.clone()
 }
 
 /// Adds or removes the YouTube ad script on a live view. A user script runs
@@ -3038,7 +3942,7 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
 /// page load in this tab -- the page already showing keeps what it loaded
 /// with, and the switch's note says so. Scoped to YouTube's hosts twice: the
 /// URL patterns here, and the script's own host check.
-fn set_youtube_ads(native: &webkit2gtk::WebView, view: &TabView, on: bool) {
+fn set_youtube_ads(native: &webkit2gtk::WebView, view: &AdSurfaces, on: bool) {
     use webkit2gtk::{
         UserContentInjectedFrames, UserContentManagerExt, UserScript, UserScriptInjectionTime,
     };
@@ -3099,9 +4003,6 @@ pub fn unfreeze(webview: &WebView, view: &TabView) {
     lift_freeze_filter(&webview.webview(), &view.state);
 }
 
-/// Per-site override: `host` keeps working even while the tab is frozen.
-/// When the freeze filter is installed it is recompiled with the new
-/// unless-domain list (freeze semantics documented in privacy.rs).
 /// Set or clear this tab's ad-list override. Same call in both directions so
 /// the revocation cannot be the path nobody wrote. Read by `decide_request` on
 /// Windows; on WebKitGTK there is no per-host exception (see
@@ -3110,6 +4011,9 @@ pub fn set_adlist_override(view: &TabView, host: Option<String>) {
     view.state.borrow_mut().set_adlist_override(host);
 }
 
+/// Per-host exception: `host` keeps working while the tab is frozen. While
+/// frozen, the freeze filter is recompiled with the host as an
+/// ignore-previous-rules entry (freeze semantics documented in privacy.rs).
 pub fn allow_site(webview: &WebView, view: &TabView, host: &str) {
     use wry::WebViewExtUnix;
     let frozen = {
@@ -3261,13 +4165,47 @@ pub fn blocked_total(view: &TabView) -> u64 {
 /// handler only, and WebKitGTK has no per-request veto to enforce it with.
 pub fn note_app_navigation(_view: &TabView, _url: &str) {}
 
+/// Never asked here: a page left on screen by an allowance-ending navigation
+/// is detected on Windows only (`AdsAllowancePageKept`).
+#[allow(dead_code)]
+pub fn replacement_pending(_view: &TabView) -> bool {
+    false
+}
+
+/// As `replacement_pending`: Windows only.
+#[allow(dead_code)]
+pub fn current_document(_view: &TabView) -> Option<u64> {
+    None
+}
+
+/// Never set here: WebKitGTK's reload without the cache has no later answer.
+pub fn take_bypass_reload_failed(_view: &TabView) -> bool {
+    false
+}
+
+/// Reload without the cache, for where ad and tracker blocking has just come
+/// back for the tab (see the Windows twin for what a plain reload let through
+/// there; here it costs one uncached load and keeps the two engines alike).
+pub fn reload_bypassing_cache(webview: &WebView, _view: &TabView) -> Result<(), ()> {
+    use webkit2gtk::WebViewExt;
+    use wry::WebViewExtUnix;
+    webview.webview().reload_bypass_cache();
+    Ok(())
+}
+
 /// No-op, as `note_app_navigation`.
 pub fn forget_app_navigation(_view: &TabView) {}
 
-/// Always: nothing but the session wipe holds a first page on WebKitGTK, and
-/// AppState already waits for that.
-pub fn initial_navigation_ready(_view: &TabView) -> bool {
-    true
+/// Whether this tab's first page may be issued: its bundled ad and tracker
+/// filters are in (or their loads ended), and the start-up clear its profile
+/// waits on is done. The clear used to be the only hold, and AppState's
+/// SessionWipeFinished was the only release; a tab can now also be released
+/// by `BundledFiltersSettled`, so the clear is asked here too (an ephemeral
+/// tab never waits for it: `build_content`).
+pub fn initial_navigation_ready(view: &TabView) -> bool {
+    let st = view.state.borrow();
+    st.bundled_filters_loading == 0
+        && (st.policy.ephemeral || super::session_wipe_finished(crate::kept_profile::ProfileKind::Main))
 }
 
 /// No-op: the WebSocket guard is Windows-only, so nothing here is overdue.
@@ -3282,9 +4220,17 @@ pub fn report_initial_navigation_failure(url: &str, error: &wry::Error) {
 /// No-op: the tab's pending flag is the whole wipe state here.
 pub fn note_session_wipe_finished(_view: &TabView) {}
 
-/// A pending first page here means the tab waits for the session wipe.
-pub fn holds_session_wipe(_view: &TabView, first_page_pending: bool) -> bool {
+/// Whether closing this tab must wait for the start-up clear: only while
+/// the clear it waits on is still running, because the clear's web view must
+/// outlive its callback. A first page that waits only for its ad and tracker
+/// filters, or an ephemeral tab (which never waits for the clear), holds
+/// nothing, and the tab closes at once. Otherwise its close would be deferred
+/// to a SessionWipeFinished that has already happened, and the tab would
+/// stay open and blank.
+pub fn holds_session_wipe(view: &TabView, first_page_pending: bool) -> bool {
     first_page_pending
+        && !view.state.borrow().policy.ephemeral
+        && !super::session_wipe_finished(crate::kept_profile::ProfileKind::Main)
 }
 
 /// No standing to hand over: the local-network boundary is not enforced on
@@ -3364,9 +4310,23 @@ pub fn freeze_phase(view: &TabView) -> FreezePhase {
     view.state.borrow().freeze.phase()
 }
 
+/// Frozen by the user's click, which a reload does not lift.
+pub fn manually_frozen(view: &TabView) -> bool {
+    view.state.borrow().freeze.is_manually_frozen()
+}
+
 /// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
+/// While frozen, only the hosts in the INSTALLED filter: a host just allowed
+/// is still blocked until its replacement filter compiles, and the panel
+/// must not say Allowed before the engine does. While live, the exceptions
+/// the next freeze will carry.
 pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
-    view.state.borrow().freeze.overrides()
+    let st = view.state.borrow();
+    if st.freeze.phase() == FreezePhase::Frozen {
+        st.freeze_filters.installed_hosts().unwrap_or_default()
+    } else {
+        st.freeze.overrides()
+    }
 }
 
 /// Whether the block behind a freeze is actually in place.
@@ -3587,6 +4547,36 @@ pub fn script_setting(view: &TabView) -> &'static str {
     view.state.borrow().script_setting.as_str()
 }
 
+/// What the engine did with this tab's Fingerprint Divergence script,
+/// recorded at build. See the Windows counterpart.
+pub fn divergence_install(view: &TabView) -> privacy::ScriptInstall {
+    view.state.borrow().divergence_install
+}
+
+/// What the engine did with this tab's YouTube ad script. The evidence here
+/// is the script object `set_youtube_ads` keeps only after handing it to the
+/// content manager; a tab that wants the script and holds none has none.
+pub fn youtube_ads_install(view: &TabView) -> privacy::ScriptInstall {
+    privacy::youtube_script_install(
+        view.state.borrow().policy.block_youtube_ads,
+        view.ads.youtube_script.borrow().is_some(),
+        false,
+    )
+}
+
+/// Whether the ENGINE runs script in this tab right now, read back from
+/// WebKit's own settings object rather than from the policy the tab was
+/// given. `None` when the settings object cannot be had. For checks (the
+/// smoke run) that must not trust our own record of what was asked.
+pub fn engine_script_enabled(webview: &WebView) -> Option<bool> {
+    use wry::WebViewExtUnix;
+    let native = webview.webview();
+    webkit2gtk::WebViewExt::settings(&native).map(|settings| {
+        use webkit2gtk::SettingsExt as _;
+        settings.enables_javascript()
+    })
+}
+
 pub fn fingerprint_probe_reporting(view: &TabView) -> &'static str {
     view.state.borrow().fingerprint_probe_reporting.as_str()
 }
@@ -3597,6 +4587,11 @@ pub fn fingerprint_probe_reporting(view: &TabView) -> &'static str {
 /// failure is already reported through `freeze_enforcement`. Naming the
 /// mechanism is the honest answer; reusing Windows' "registered" would
 /// describe machinery that does not exist here.
+/// No kept profile on this backend.
+pub fn kept_boundary_ready(_view: &TabView) -> bool {
+    true
+}
+
 pub fn interception_state(_view: &TabView) -> &'static str {
     privacy::UNIX_INTERCEPTION_NAME
 }
@@ -4368,6 +5363,21 @@ pub fn window_is_maximized(hosts: &Hosts) -> bool {
     hosts._window.is_maximized()
 }
 
+/// Linux keeps the desktop's title bar; the chrome draws no window controls
+/// (window_frame.rs is the Windows half).
+pub fn custom_window_frame() -> bool {
+    false
+}
+
+/// Never reached: AppState::window_control refuses first where
+/// `custom_window_frame` is false. Kept so both backends expose one API.
+pub fn window_control(
+    _hosts: &Hosts,
+    _action: crate::window_frame::WindowAction,
+) -> Result<(), &'static str> {
+    Err("unsupported")
+}
+
 /// See `set_chrome_height`: same mechanism, the left edge.
 pub fn set_chrome_left(hosts: &Hosts, px: i32) {
     let (top, _, right) = hosts.insets.get();
@@ -4460,9 +5470,13 @@ pub fn layout(
 /// enter-fullscreen is asked BEFORE the engine fullscreens the toplevel
 /// window, and returning true stops it, so an ineligible page (a background
 /// tab, or any page while a modal is open) is refused here and the window
-/// never changes. An eligible one proceeds: WebKit fullscreens the window and
-/// AppState moves the toolbar aside. leave-fullscreen (Esc, or the page
-/// itself) is reported and allowed to proceed, so WebKit restores the window.
+/// never changes. So is every page while the "Press Esc to exit" notice cannot
+/// be drawn (`fullscreen::entry`): its style is read here, at the moment of
+/// the request, not copied into the eligibility list, because a scheme change
+/// can break it without a relayout. An allowed page proceeds: WebKit
+/// fullscreens the window and AppState moves the toolbar aside.
+/// leave-fullscreen (Esc, or the page itself) is reported and allowed to
+/// proceed, so WebKit restores the window.
 pub fn connect_fullscreen(
     hosts: &Hosts,
     webview: &WebView,
@@ -4474,10 +5488,19 @@ pub fn connect_fullscreen(
 
     let native = webview.webview();
     let eligible = Rc::clone(&hosts.fullscreen_eligible);
+    let styled = Rc::clone(&hosts.readout_styled);
+    let readout = hosts.readout.clone();
     let enter_proxy = proxy.clone();
     native.connect_enter_fullscreen(move |_view| {
-        if !eligible.borrow().contains(&id) {
-            return true; // refused: the engine leaves the window alone
+        let allowed = eligible.borrow().contains(&id);
+        match crate::fullscreen::entry(allowed, notice_can_draw(&styled, &readout)) {
+            crate::fullscreen::Entry::Grant => {}
+            // Refused: the engine leaves the window alone.
+            crate::fullscreen::Entry::Ineligible => return true,
+            crate::fullscreen::Entry::NoNotice => {
+                diag("fullscreen: refused, the notice that says how to leave cannot be drawn");
+                return true;
+            }
         }
         let _ = enter_proxy.send_event(UserEvent::PageFullscreen(id, true));
         false
@@ -4518,12 +5541,30 @@ pub fn layout_fullscreen(hosts: &Hosts, _chrome: &WebView, _page: &WebView) {
     }
 }
 
+/// Whether the fullscreen notice can be drawn: the readout label is still in
+/// the widget tree and its style loaded. An unstyled label over page pixels
+/// is indistinguishable from page content, so it does not count.
+fn notice_can_draw(styled: &Cell<bool>, readout: &gtk::Label) -> bool {
+    styled.get() && readout.parent().is_some()
+}
+
+/// See `notice_can_draw`. AppState asks before giving a page the screen.
+pub fn fullscreen_notice_can_draw(hosts: &Hosts) -> bool {
+    notice_can_draw(&hosts.readout_styled, &hosts.readout)
+}
+
 /// Shows the fullscreen notice, top centre, or takes it down. Uses the hover
 /// readout's label and style; like the readout it stays off when its style
 /// failed to load, rather than drawing unstyled text over a page.
-pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) {
+///
+/// Returns whether the notice is showing: false for `None`, and false when it
+/// could not be shown, which AppState takes as "no page gets the screen".
+/// True means GTK accepted the styled label as shown with the notice's text;
+/// what the compositor then does with it is not visible from here.
+#[must_use]
+pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) -> bool {
     match text {
-        Some(text) if hosts.readout_styled.get() => {
+        Some(text) if fullscreen_notice_can_draw(hosts) => {
             hosts.notice_active.set(true);
             hosts.readout.set_halign(gtk::Align::Center);
             hosts.readout.set_valign(gtk::Align::Start);
@@ -4533,16 +5574,29 @@ pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) {
                 .set_margin_top(crate::hover_style::NOTICE_TOP_MARGIN as i32);
             hosts.readout.set_text(text);
             hosts.readout.show();
-        }
-        Some(_) => {}
-        None => {
-            if hosts.notice_active.replace(false) {
-                hosts.readout.hide();
-                hosts.readout.set_halign(gtk::Align::Start);
-                hosts.readout.set_valign(gtk::Align::End);
-                hosts.readout.set_margin_top(0);
+            if hosts.readout.is_visible() && hosts.readout.text() == text {
+                return true;
             }
+            // Never leave the flag set for a notice that is not up: it
+            // silences every hover write.
+            take_down_notice(hosts);
+            false
         }
+        Some(_) => false,
+        None => {
+            take_down_notice(hosts);
+            false
+        }
+    }
+}
+
+/// Hides the notice and gives the label back to the hover readout.
+fn take_down_notice(hosts: &Hosts) {
+    if hosts.notice_active.replace(false) {
+        hosts.readout.hide();
+        hosts.readout.set_halign(gtk::Align::Start);
+        hosts.readout.set_valign(gtk::Align::End);
+        hosts.readout.set_margin_top(0);
     }
 }
 
@@ -4969,6 +6023,22 @@ mod translate_outbox_tests {
         // name for both would silently merge them.
         assert_ne!(TRANSLATE_CHANNEL, TRANSLATE_ASK_CHANNEL);
     }
+
+    #[test]
+    fn the_page_visible_channel_names_match_the_extractor_and_skip_the_product() {
+        // Nothing else ties these constants to the names the extractor posts
+        // to, and a mismatch fails silently: the extractor finds no handler
+        // and translation is simply never offered. And every page can look a
+        // handler up by name, so neither may name the product.
+        assert!(CONTENT_TRANSLATE_SCRIPT.contains(&format!("var OUT = \"{TRANSLATE_CHANNEL}\";")));
+        assert!(CONTENT_TRANSLATE_SCRIPT.contains(&format!("var ASK = \"{TRANSLATE_ASK_CHANNEL}\";")));
+        for name in [TRANSLATE_CHANNEL, TRANSLATE_ASK_CHANNEL] {
+            assert!(
+                !name.to_ascii_lowercase().contains("patanyx"),
+                "page-visible handler name {name} identifies the product"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -5016,5 +6086,31 @@ mod translate_channel_token_tests {
         assert!(strip_channel_token("poll:bb {}", outbox.expected_request()).is_some());
         outbox.set_token("");
         assert_eq!(outbox.expected_request(), "");
+    }
+}
+
+#[cfg(test)]
+mod freeze_store_tests {
+    use super::is_freeze_filter_file;
+
+    #[test]
+    fn only_compiled_freeze_filters_are_cleared_at_startup() {
+        let id = crate::platform::privacy::filter_id_for("[]");
+        assert!(is_freeze_filter_file(&format!("ContentRuleList-{id}")));
+        let ads = crate::platform::privacy::bundled_ads_filter_id();
+        let tracking = crate::platform::privacy::bundled_tracking_filter_id();
+        assert!(!is_freeze_filter_file(&format!("ContentRuleList-{ads}")));
+        assert!(!is_freeze_filter_file(&format!("ContentRuleList-{tracking}")));
+        assert!(!is_freeze_filter_file("ContentRuleList-patanyx-0f9ad3db94374790x"));
+        assert!(!is_freeze_filter_file("notes.txt"));
+    }
+
+    #[test]
+    fn only_webkits_compile_scratch_name_is_swept_from_tmp() {
+        use super::is_compile_temp_file;
+        assert!(is_compile_temp_file("ContentRuleList-a1B2c3"));
+        assert!(!is_compile_temp_file("ContentRuleList-patanyx-0f9ad3db94374790"));
+        assert!(!is_compile_temp_file("ContentRuleList-abc"));
+        assert!(!is_compile_temp_file("other-a1B2c3"));
     }
 }

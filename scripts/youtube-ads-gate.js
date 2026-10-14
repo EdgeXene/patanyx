@@ -63,7 +63,12 @@ const PLANTS = {
   // JSON XHR replies re-parsed on each read.
   "reparse-json": ["if (t === \"json\") return cleanedJson(this);", "if (t === \"json\") return JSON.parse(JSON.stringify(cleanedJson(this)));"],
   // Body-length header kept on the rebuilt reply.
-  "keep-length": ['call.call(headersDelete, copy, "content-length");', ""],
+  "keep-length": ['apply(headersDelete, copy, ["content-length"]);', ""],
+  // A wrapper goes back to looking `call` up on Function.prototype, which the
+  // page can replace (1.0.6 release review R-006).
+  "page-fetch-call": ["apply(nativeFetch, Win, [input, init])", "nativeFetch.call(Win, input, init)"],
+  // The same for the player-data cleaner.
+  "page-hasown-call": ["apply(hasOwn, node, [key])", "hasOwn.call(node, key)"],
 };
 if (process.env.PATANYX_YT_LIST_PLANTS) {
   console.log(Object.keys(PLANTS).join("\n"));
@@ -82,7 +87,7 @@ if (plant) {
 }
 
 // ---- a fresh realm per check ----
-function realm(host, { preset } = {}) {
+function realm(host, { preset, prelude } = {}) {
   const calls = [];
   class XMLHttpRequest {
     constructor() {
@@ -167,6 +172,9 @@ function realm(host, { preset } = {}) {
   };
   if (preset) Object.assign(win, preset);
   vm.createContext(win);
+  // Code that runs in the page's realm before the script, as a page's own
+  // natives would exist there before it.
+  if (prelude) vm.runInContext(prelude, win);
   const before = new Set(Object.getOwnPropertyNames(win));
   vm.runInContext(SRC, win);
   win.__added = Object.getOwnPropertyNames(win).filter((k) => !before.has(k));
@@ -550,6 +558,24 @@ check("fail open: an unexpected value leaves the data exactly as it was", () => 
   const frozen = { contents: Object.freeze([{ adSlotRenderer: {} }, VIDEO("a")]), adSlots: [] };
   w.ytInitialData = frozen;
   assert("adSlots" in frozen && frozen.contents.length === 2, "a frozen list caused a partial clean");
+  // Neither frozen nor sealed, but the rebuild cannot complete: a fixed
+  // length, or a fixed slot (review 2026-10-12, R-004). Nothing may change.
+  const fixedLength = [{ adSlotRenderer: {} }, VIDEO("b")];
+  Object.defineProperty(fixedLength, "length", { writable: false });
+  const lengthData = { contents: fixedLength, adPlacements: [1] };
+  w.ytInitialData = lengthData;
+  assert(
+    "adPlacements" in lengthData && fixedLength.length === 2 && "adSlotRenderer" in fixedLength[0],
+    "a list with a fixed length was half cleaned",
+  );
+  const fixedSlot = [{ adSlotRenderer: {} }, VIDEO("c")];
+  Object.defineProperty(fixedSlot, 1, { writable: false, configurable: false });
+  const slotData = { contents: fixedSlot, adPlacements: [1] };
+  w.ytInitialData = slotData;
+  assert(
+    "adPlacements" in slotData && fixedSlot.length === 2 && "adSlotRenderer" in fixedSlot[0],
+    "a list with a fixed slot was half cleaned",
+  );
 });
 
 check("hosts: on any other site nothing is installed", () => {
@@ -596,6 +622,45 @@ check(
     assert(w.__styles === 1, "the fallback style sheet was not added");
   },
 );
+
+// The page can replace Function.prototype.call and .apply after this script
+// starts (1.0.6 release review R-006). Every call the script makes goes
+// through the Reflect.apply it captured before the page ran, so the cleaning
+// keeps working; replacing them used to make every wrapper throw and fail open.
+check("page-proof: a page that replaces call and apply does not stop the cleaning", async () => {
+  // fetch as a function of the PAGE's realm, as in a browser: its own
+  // .call is then the page's, which the page replaces below.
+  const w = realm("www.youtube.com", {
+    prelude: "(function () { var outer = fetch; fetch = function fetch(input, init) { return outer(input, init); }; })();",
+  });
+  vm.runInContext(
+    "Function.prototype.call = function () { throw new Error('page replaced call'); };" +
+      "Function.prototype.apply = function () { throw new Error('page replaced apply'); };",
+    w,
+  );
+  w.ytInitialPlayerResponse = PLAYER();
+  assert(!("adPlacements" in w.ytInitialPlayerResponse), "player data kept its ads");
+  w.__reply = reply(PLAYER());
+  const r = await w.fetch(new Request("https://www.youtube.com/youtubei/v1/player"));
+  assert(!("playerAds" in (await r.json())), "the fetch reply kept its ads");
+  const x = new w.XMLHttpRequest();
+  x.open("POST", "/youtubei/v1/player");
+  x.responseType = "json";
+  x._finish(JSON.stringify(PLAYER()));
+  assert(!("adPlacements" in x.response), "the xhr reply kept its ads");
+});
+
+check("source never invokes through .call, .apply or .bind", () => {
+  // Every invocation goes through the Reflect.apply captured at document
+  // start. Any .call/.apply/.bind resolves the live Function.prototype, which
+  // the page owns (review R-006). The page-realm poisoning check above
+  // reaches only the stubs built in the page's realm (review 2026-10-12,
+  // R-005), so this static rule is what covers the rest: comments are
+  // stripped, and any such call site in the code fails the gate.
+  const code = SRC.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+  const found = code.match(/\.(call|apply|bind)\s*\(/g) || [];
+  assert(found.length === 0, "invocations through the live prototype: " + found.join(" "));
+});
 
 check("source never names the browser", () => {
   assert(

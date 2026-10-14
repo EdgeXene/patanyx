@@ -391,6 +391,21 @@ impl StoreData {
 /// that IS created is <= 40 chars, where the two normalizations are identical
 /// (a test pins that). `Err` carries the IPC code for an empty or over-long
 /// name.
+/// The name of a folder the store ALREADY holds, as a request names it to
+/// rename, delete or unfile it: trimmed and lowercased, but up to the
+/// longest name the store's writers make (tag editing caps at 40 characters
+/// before lowercasing, and one capital can lowercase to more than one
+/// character). Creating a folder, or renaming TO a name, keeps the strict
+/// rule in [`normalize_folder_name`].
+pub fn existing_folder_name(raw: &str) -> Result<String, &'static str> {
+    let name = raw.trim().to_lowercase();
+    let trimmed = name.trim();
+    if trimmed.is_empty() || trimmed.chars().count() > 40 * 3 {
+        return Err("bad_args");
+    }
+    Ok(trimmed.to_string())
+}
+
 pub fn normalize_folder_name(raw: &str) -> Result<String, &'static str> {
     let name = raw.trim().to_lowercase();
     let trimmed = name.trim();

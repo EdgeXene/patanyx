@@ -431,7 +431,7 @@ pub fn activate_now(state: &mut AppState) -> bool {
     // applying to it. Durable, and before the request leaves, so a failure
     // here refuses rather than leaving the two sides disagreeing.
     let here = this_device_hex(state);
-    if let (Some(vault), Some(here)) = (state.vault.as_mut(), here) {
+    if let (Ok(vault), Some(here)) = (state.vault_for_write(), here) {
         if vault.clear_released_device_if(&here).is_err()
             || vault.clear_release_pending_if(&here).is_err()
         {

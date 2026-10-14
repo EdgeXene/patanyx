@@ -67,6 +67,8 @@ const TAB_STATUS = {
   content_script_registered: "applied",
   session_lock_registered: "applied",
   tunnel: "applied",
+  divergence_script: "applied",
+  youtube_ads_script: "applied",
 };
 
 // The harness records text PER NODE and does not aggregate children the way a
@@ -115,6 +117,8 @@ check("every row names its setting and its state", () => {
     "Login autofill script installed",
     "Lock vault when the screen locks",
     "Tunnel carrying this browser's traffic",
+    "Fingerprint Divergence script",
+    "YouTube ad blocking script",
   ]) {
     assert(text.includes(label), `no row labelled "${label}" (got: ${text})`);
   }
@@ -186,6 +190,59 @@ check("the tunnel row's not_attempted means off, not inapplicable", () => {
   );
 });
 
+check("a script nobody asked for, or still being answered, gets no row", () => {
+  // Rust sends null for both scripts while the setting is off for the tab or
+  // the engine has not answered yet (reviews R-003, R-007). A row there would
+  // invent either a confirmation or a refusal.
+  const rows = rowsAfter({ ...TAB_STATUS, divergence_script: null, youtube_ads_script: null });
+  const text = rows.map(rowText).join(" | ");
+  assert(!text.includes("Fingerprint Divergence script"), "invented a Divergence row: " + text);
+  assert(!text.includes("YouTube ad blocking script"), "invented a YouTube row: " + text);
+});
+
+check("a script the engine refused reads as refused and turns the shield amber", () => {
+  // The defect behind R-003 and R-007: the panels reported the SETTING, so a
+  // script the engine did not take still read as working.
+  for (const key of ["divergence_script", "youtube_ads_script"]) {
+    const rows = rowsAfter({ ...TAB_STATUS, [key]: "failed" });
+    const label = key === "divergence_script"
+      ? "Fingerprint Divergence script"
+      : "YouTube ad blocking script";
+    const row = rows.find((r) => rowText(r).includes(label));
+    assert(row, `the refused ${key} lost its row entirely`);
+    assert(rowText(row).includes("REFUSED by the engine"), `refused ${key} not shown: ${rowText(row)}`);
+    assert(
+      global.$("btn-privacy").classList.contains("is-warning"),
+      `a refused ${key} left the toolbar shield reading as fine`,
+    );
+  }
+  rowsAfter(TAB_STATUS);
+  assert(
+    !global.$("btn-privacy").classList.contains("is-warning"),
+    "(control) the shield stayed amber with every script confirmed",
+  );
+});
+
+check("the YouTube switch says when this tab's engine refused its script", () => {
+  // The switch reads the setting; the note under it reads the engine
+  // (review R-007). tab_status calls a refusal "failed".
+  const note = global.$("pv-youtube-ads-refused");
+  assert(note, "the refusal note is missing from index.html");
+  rowsAfter({ ...TAB_STATUS, youtube_ads_script: "failed" });
+  assert(!note.hidden, "the switch kept reading as working on a tab whose engine refused the script");
+  rowsAfter({ ...TAB_STATUS, youtube_ads_script: "applied" });
+  assert(note.hidden, "the refusal note stayed up after the engine confirmed the script");
+  rowsAfter({ ...TAB_STATUS, youtube_ads_script: "failed" });
+  rowsAfter({ ...TAB_STATUS, youtube_ads_script: null });
+  assert(note.hidden, "the refusal note outlived the tab it described");
+  const html = fs.readFileSync(process.env.HTML_PATH, "utf8");
+  const m = html.match(/id="pv-youtube-ads-refused"[^>]*>([\s\S]*?)<\/span>/);
+  assert(m, "the refusal note's markup is missing");
+  assert(/hidden/.test(m[0].split(">")[0]), "the refusal note must start hidden");
+  const words = m[1].toLowerCase();
+  assert(words.includes("this tab") && words.includes("ads"), "the note must say it is about this tab's ads: " + words);
+});
+
 // NEGATIVE CONTROL. Every other gate in this tree carries one, because a gate
 // that has never been observed to fail is a gate nobody has tested. Feed the
 // renderer the payload it USED to get -- the browser-wide `privacy_get` reply
@@ -207,6 +264,39 @@ check("(control) the old privacy_get payload produces no rows", () => {
   );
 });
 
+// The privacy_get reply carries the same answer for the active tab in its own
+// words ("refused"), and opening the panel must apply it too: a panel opened
+// before any tab_status event would otherwise show the switch as working.
+async function asyncChecks() {
+  const flush = async () => {
+    for (let i = 0; i < 12; i += 1) await new Promise((r) => setImmediate(r));
+  };
+  const note = global.$("pv-youtube-ads-refused");
+  const base = { block_ads: true, freeze_after_load: false, javascript: true, ephemeral: false, block_youtube_ads: true };
+  const name = "opening the privacy panel applies the active tab's YouTube answer";
+  try {
+    rowsAfter({ ...TAB_STATUS, youtube_ads_script: null });
+    global.rbResolve.privacy_get = { ...base, youtube_ads_script: "refused" };
+    global.$("btn-privacy").click();
+    await flush();
+    assert(!note.hidden, "privacy_get said refused and the note stayed hidden");
+    global.$("btn-privacy").click();
+    await flush();
+    global.rbResolve.privacy_get = { ...base, youtube_ads_script: "installed" };
+    global.$("btn-privacy").click();
+    await flush();
+    assert(note.hidden, "privacy_get said installed and the refusal note stayed up");
+    global.$("btn-privacy").click();
+    await flush();
+    console.log(`  ok  ${name}`);
+  } catch (e) {
+    failures.push(`${name}: ${e.message}`);
+    console.log(`  FAIL  ${name}: ${e.message}`);
+  }
+}
+
+(async () => {
+await asyncChecks();
 console.log();
 if (failures.length) {
   console.error("ENGINE-CONFIRMED GATE FAIL:");
@@ -214,3 +304,4 @@ if (failures.length) {
   process.exit(1);
 }
 console.log("ENGINE CONFIRMED UI OK");
+})();

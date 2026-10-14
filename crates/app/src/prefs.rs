@@ -262,7 +262,8 @@ impl PageTheme {
 /// meaning. (Chrome SCHEMES may re-tune them per background; an accent may
 /// not.)
 ///
-/// ALL NINE ARE FREE, and this is settled rather than pending.
+/// ALL OF THEM ARE FREE (nine until 1.0.7, fourteen since), and this is
+/// settled rather than pending.
 ///
 /// The set beyond the original four was the SEED of a future premium theme
 /// pack from 2026-08-04, shipped unlocked, with the note that nothing might
@@ -274,7 +275,7 @@ impl PageTheme {
 ///
 /// So there is no gate to add here, and adding one later would break a
 /// published commitment. A paid pack, if there is ever to be one, is NEW
-/// accents on top of these nine.
+/// accents on top of these fourteen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChromeTheme {
@@ -292,6 +293,12 @@ pub enum ChromeTheme {
     Teal,
     Slate,
     Purple,
+    /// The five below joined in 1.0.7. No pink: a standing rule.
+    Tangerine,
+    Mint,
+    Gold,
+    Lavender,
+    Copper,
 }
 
 impl ChromeTheme {
@@ -306,6 +313,11 @@ impl ChromeTheme {
             Self::Teal => "teal",
             Self::Slate => "slate",
             Self::Purple => "purple",
+            Self::Tangerine => "tangerine",
+            Self::Mint => "mint",
+            Self::Gold => "gold",
+            Self::Lavender => "lavender",
+            Self::Copper => "copper",
         }
     }
 
@@ -322,7 +334,27 @@ impl ChromeTheme {
             "teal" => Some(Self::Teal),
             "slate" => Some(Self::Slate),
             "purple" => Some(Self::Purple),
+            "tangerine" => Some(Self::Tangerine),
+            "mint" => Some(Self::Mint),
+            "gold" => Some(Self::Gold),
+            "lavender" => Some(Self::Lavender),
+            "copper" => Some(Self::Copper),
             _ => None,
+        }
+    }
+
+    /// The nearest accent a build before 1.0.7 knows. 1.0.6 fails to read a
+    /// prefs.json whose `chrome_theme` it does not know, falls back to every
+    /// default, and saves those defaults at once (reproduced on the published
+    /// 1.0.6 binary, 2026-10-12: DNS went from Quad9 to System). So `save`
+    /// stores this under `chrome_theme` and the real choice under a key older
+    /// builds ignore. The nine accents 1.0.6 has map to themselves.
+    pub fn legacy(self) -> Self {
+        match self {
+            Self::Tangerine | Self::Gold | Self::Copper => Self::Amber,
+            Self::Mint => Self::Teal,
+            Self::Lavender => Self::Violet,
+            other => other,
         }
     }
 }
@@ -344,6 +376,12 @@ pub enum ChromeScheme {
     White,
     /// True black, for the people who mean it.
     Black,
+    /// Dark lifted one step toward a warm grey (1.0.7).
+    Graphite,
+    /// Black pulled toward deep blue (1.0.7).
+    Midnight,
+    /// A warm off-white with dark text (1.0.7).
+    Paper,
 }
 
 impl ChromeScheme {
@@ -352,6 +390,9 @@ impl ChromeScheme {
             Self::Dark => "dark",
             Self::White => "white",
             Self::Black => "black",
+            Self::Graphite => "graphite",
+            Self::Midnight => "midnight",
+            Self::Paper => "paper",
         }
     }
 
@@ -360,6 +401,103 @@ impl ChromeScheme {
             "dark" => Some(Self::Dark),
             "white" => Some(Self::White),
             "black" => Some(Self::Black),
+            "graphite" => Some(Self::Graphite),
+            "midnight" => Some(Self::Midnight),
+            "paper" => Some(Self::Paper),
+            _ => None,
+        }
+    }
+
+    /// The nearest scheme a build before 1.0.7 knows; see `ChromeTheme::legacy`.
+    pub fn legacy(self) -> Self {
+        match self {
+            Self::Graphite => Self::Dark,
+            Self::Midnight => Self::Black,
+            Self::Paper => Self::White,
+            other => other,
+        }
+    }
+}
+
+/// The toolbar groups a user can fold into one button each (1.0.7), in row
+/// order. The ids are what chrome.js (TOOLBAR_GROUPS), the markup
+/// (data-group) and the stylesheet (html[data-folded]) key on.
+pub const TOOLBAR_GROUPS: [&str; 4] = ["network", "tabs", "saved", "tools"];
+
+/// Known group ids only, each once, in row order: what is stored and what is
+/// answered, whatever order or repeats the caller sent.
+pub fn normalize_toolbar_groups<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let given: Vec<&str> = ids.into_iter().collect();
+    TOOLBAR_GROUPS
+        .iter()
+        .filter(|g| given.contains(g))
+        .map(|g| g.to_string())
+        .collect()
+}
+
+/// A hand-edited or older file cannot fold a group that does not exist: a
+/// value that is not a list reads as nothing folded, and unknown ids drop.
+fn lenient_toolbar_groups<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let Some(items) = v.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(normalize_toolbar_groups(items.iter().filter_map(|item| item.as_str())))
+}
+
+/// The look fields read leniently (1.0.7): a value this build does not know,
+/// written by a later build, reads as the default instead of failing the
+/// whole file. A failed file loads as every default and the next save keeps
+/// them, which is how a newer accent cost a 1.0.6 user their DNS choice.
+fn lenient_chrome_theme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ChromeTheme, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(ChromeTheme::parse).unwrap_or_default())
+}
+fn lenient_chrome_scheme<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ChromeScheme, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(ChromeScheme::parse).unwrap_or_default())
+}
+fn lenient_chrome_texture<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ChromeTexture, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    Ok(v.as_str().and_then(ChromeTexture::parse).unwrap_or_default())
+}
+
+/// Which TEXTURE the chrome wears over its strips and panel cards (1.0.7):
+/// a faint CSS gradient, chrome-only, never visible to pages. Orthogonal to
+/// the accent and the scheme; the three together are what a theme pack
+/// sets. Absent reads `Plain`, which draws nothing, as every earlier build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChromeTexture {
+    /// No texture. Stored as "none", the word the stylesheet and chrome.js
+    /// use; the variant is not called None so it never shadows Option's.
+    #[default]
+    #[serde(rename = "none")]
+    Plain,
+    /// A soft accent glow from the top-left corner.
+    Glow,
+    /// A fine horizontal grain.
+    Grain,
+    /// Faint diagonal hairlines.
+    Stripes,
+}
+
+impl ChromeTexture {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "none",
+            Self::Glow => "glow",
+            Self::Grain => "grain",
+            Self::Stripes => "stripes",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "none" => Some(Self::Plain),
+            "glow" => Some(Self::Glow),
+            "grain" => Some(Self::Grain),
+            "stripes" => Some(Self::Stripes),
             _ => None,
         }
     }
@@ -649,6 +787,13 @@ fn fingerprint_noise_default() -> bool {
     true
 }
 
+/// ON by default: the notice is new, and an upgrade that ships it switched
+/// off would ship it to nobody. `bool`'s own default would read an old
+/// prefs.json as OFF, so the field carries this instead.
+fn duplicate_site_notice_default() -> bool {
+    true
+}
+
 
 /// "en" and never anything cleverer: guessing from the OS would make the
 /// first launch differ per machine, and the stored value must survive a
@@ -867,10 +1012,27 @@ pub struct Prefs {
     pub capture_scope: CapturePreference,
     /// Chrome accent theme. Absent field reads Default, which renders
     /// byte-identically to every build before theming existed.
+    ///
+    /// STORED FOR OLDER BUILDS TOO (1.0.7): on disk this key holds the
+    /// nearest accent a build before 1.0.7 knows (`ChromeTheme::legacy`), and
+    /// a newer accent goes under `chrome_theme_v2`, which `parse_stored`
+    /// reads first. Read leniently: a value this build does not know (from a
+    /// later one) reads as the default instead of failing the whole file.
+    #[serde(default, deserialize_with = "lenient_chrome_theme")]
     pub chrome_theme: ChromeTheme,
-    /// Chrome scheme (Dark/White/Black). Absent field reads Dark: same
-    /// byte-identical promise as the accent above.
+    /// Chrome scheme. Absent field reads Dark: same byte-identical promise as
+    /// the accent above, and the same storage rule (`chrome_scheme_v2`).
+    #[serde(default, deserialize_with = "lenient_chrome_scheme")]
     pub chrome_scheme: ChromeScheme,
+    /// Chrome texture (1.0.7). Absent field reads Plain: no texture, the
+    /// chrome every earlier build drew. A new key, which older builds ignore;
+    /// read leniently so a later build's texture cannot fail this file.
+    #[serde(default, deserialize_with = "lenient_chrome_texture")]
+    pub chrome_texture: ChromeTexture,
+    /// Toolbar groups folded into one button each (1.0.7). Absent reads
+    /// empty: nothing folded, the toolbar every earlier build drew.
+    #[serde(default, deserialize_with = "lenient_toolbar_groups")]
+    pub toolbar_folded: Vec<String>,
     /// Download a verified update in the background the moment a check
     /// offers one, so the consent click is an instant restart instead of a
     /// wait. INSTALLING still requires that click -- this flag never
@@ -906,6 +1068,18 @@ pub struct Prefs {
     /// shape `ephemeral` has. See `platform::privacy::divergence_script`.
     #[serde(default = "fingerprint_noise_default")]
     pub fingerprint_noise: bool,
+    /// Whether opening a site that another tab already has open shows the
+    /// "already open" notice. Only this switch is stored: which sites the
+    /// user dismissed during a session is kept in memory and never written
+    /// here (see `duplicate_site`).
+    #[serde(default = "duplicate_site_notice_default")]
+    pub duplicate_site_notice: bool,
+    /// Whether the chrome's own motion (panel fades, tab slides, notice
+    /// slides) is turned off. Off by default: an absent field reads as
+    /// bool's false, which is the chrome every earlier build rendered. The
+    /// system's reduced-motion setting is followed by the stylesheet on its
+    /// own; this is the switch for a user whose system has none.
+    pub reduce_motion: bool,
     /// Whether the bookmark folder bar is shown under the toolbar.
     ///
     /// `false` is the correct absent-field meaning and needs no override fn:
@@ -969,10 +1143,14 @@ impl Default for Prefs {
             capture_scope: CapturePreference::default(),
             chrome_theme: ChromeTheme::default(),
             chrome_scheme: ChromeScheme::default(),
+            chrome_texture: ChromeTexture::default(),
+            toolbar_folded: Vec::new(),
             update_background_download: true,
             update_auto_apply: false,
             vault_lock_on_session_lock: lock_on_session_lock_default(),
             fingerprint_noise: fingerprint_noise_default(),
+            duplicate_site_notice: duplicate_site_notice_default(),
+            reduce_motion: false,
             toolbar_labels: ToolbarLabels::default(),
             toolbar_placement: ToolbarPlacement::default(),
             bookmarks_bar: false,
@@ -1013,32 +1191,42 @@ fn onboarding_marker_path() -> PathBuf {
         .join("onboarding-seen")
 }
 
-/// `<vault dir>/tutorial-1.0.5-seen`: the feature-videos banner has been
-/// answered (Watch or Not now). Its own marker, for the reason the
-/// onboarding one is: Prefs is not on disk for most installs. Versioned in
-/// the name, so a later release with new videos can ask once more without
-/// reading this one.
-fn tutorial_marker_path() -> PathBuf {
+/// `<vault dir>/tutorial-<release>-seen`: the feature-videos banner for that
+/// release has been answered (Watch or Not now). Its own marker, for the
+/// reason the onboarding one is: Prefs is not on disk for most installs.
+/// Versioned in the name, so a later release with a new video asks once
+/// more without reading an earlier one: 1.0.5 for the first three videos,
+/// 1.0.7 for Kept Sites (Windows).
+fn tutorial_marker_path(release: &str) -> PathBuf {
     let vault = patanyx_vault::Vault::default_path();
     vault
         .parent()
         .map_or_else(|| PathBuf::from("."), |p| p.to_path_buf())
-        .join("tutorial-1.0.5-seen")
+        .join(format!("tutorial-{release}-seen"))
 }
 
-/// Whether the feature-videos banner was answered on this install.
+/// Whether the 1.0.5 feature-videos banner was answered on this install.
 pub fn tutorial_seen() -> bool {
-    tutorial_marker_path().exists()
+    tutorial_marker_path("1.0.5").exists()
 }
 
-/// Marks the banner answered. A write failure only means the banner shows
-/// once more on the next launch.
+/// Whether the 1.0.7 Kept Sites banner was answered on this install.
+pub fn keep_video_seen() -> bool {
+    tutorial_marker_path("1.0.7").exists()
+}
+
+/// Marks the banner answered, both releases at once: either banner
+/// offered the videos panel, which holds every video, and About keeps
+/// the way back. A write failure only means a banner shows once more on
+/// the next launch.
 pub fn mark_tutorial_seen() {
-    let path = tutorial_marker_path();
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    for release in ["1.0.5", "1.0.7"] {
+        let path = tutorial_marker_path(release);
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(path, b"");
     }
-    let _ = std::fs::write(path, b"");
 }
 
 /// The decision table, separated from the I/O that feeds it so it can be
@@ -1198,7 +1386,50 @@ pub fn parse_stored(raw: &str) -> Result<Prefs, serde_json::Error> {
     if prefs.dns != DnsMode::default() {
         prefs.resolver_chosen = true;
     }
+    read_look_from_newer_keys(raw, &mut prefs);
     Ok(prefs)
+}
+
+/// The keys `chrome_theme_v2` and `chrome_scheme_v2` hold a look a build
+/// before 1.0.7 cannot read (see `ChromeTheme::legacy`); when present and
+/// known here they win over the older-build values beside them. A value
+/// this build does not know is ignored, and the older-build key stands.
+fn read_look_from_newer_keys(raw: &str, prefs: &mut Prefs) {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return;
+    };
+    if let Some(theme) = value.get("chrome_theme_v2").and_then(|v| v.as_str()).and_then(ChromeTheme::parse) {
+        prefs.chrome_theme = theme;
+    }
+    if let Some(scheme) = value.get("chrome_scheme_v2").and_then(|v| v.as_str()).and_then(ChromeScheme::parse) {
+        prefs.chrome_scheme = scheme;
+    }
+}
+
+/// What `save` writes: the prefs as serde gives them, except that the look
+/// is stored twice. Under `chrome_theme` and `chrome_scheme`, the nearest
+/// value a build before 1.0.7 knows, so that build reads the file instead of
+/// failing it and saving every default over it (it does exactly that: the
+/// published 1.0.6, run on such a file 2026-10-12, turned Quad9 DNS back to
+/// System); under `chrome_theme_v2` and `chrome_scheme_v2`, the real choice,
+/// only when it differs, which `parse_stored` reads back first.
+pub fn stored_body(prefs: &Prefs) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::to_value(prefs)?;
+    if let Some(map) = value.as_object_mut() {
+        let theme = prefs.chrome_theme;
+        let scheme = prefs.chrome_scheme;
+        map.insert("chrome_theme".into(), serde_json::Value::from(theme.legacy().as_str()));
+        map.insert("chrome_scheme".into(), serde_json::Value::from(scheme.legacy().as_str()));
+        map.remove("chrome_theme_v2");
+        map.remove("chrome_scheme_v2");
+        if theme.legacy() != theme {
+            map.insert("chrome_theme_v2".into(), serde_json::Value::from(theme.as_str()));
+        }
+        if scheme.legacy() != scheme {
+            map.insert("chrome_scheme_v2".into(), serde_json::Value::from(scheme.as_str()));
+        }
+    }
+    serde_json::to_string_pretty(&value)
 }
 
 /// The resolver the ENGINE was given at startup.
@@ -1245,7 +1476,7 @@ pub fn save(prefs: &Prefs) -> Result<(), &'static str> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|_| "io")?;
     }
-    let body = serde_json::to_string_pretty(prefs).map_err(|_| "io")?;
+    let body = stored_body(prefs).map_err(|_| "io")?;
     // WRITE-THEN-RENAME. This used to be a plain write, argued as "a torn
     // write loses a resolver preference and `load` falls back to the default"
     // -- which was accurate about the mechanism and wrong about the cost.
@@ -1473,6 +1704,11 @@ mod tests {
             ChromeTheme::Teal,
             ChromeTheme::Slate,
             ChromeTheme::Purple,
+            ChromeTheme::Tangerine,
+            ChromeTheme::Mint,
+            ChromeTheme::Gold,
+            ChromeTheme::Lavender,
+            ChromeTheme::Copper,
         ] {
             assert_eq!(ChromeTheme::parse(theme.as_str()), Some(theme));
         }
@@ -1486,10 +1722,134 @@ mod tests {
             ChromeScheme::Dark,
             ChromeScheme::White,
             ChromeScheme::Black,
+            ChromeScheme::Graphite,
+            ChromeScheme::Midnight,
+            ChromeScheme::Paper,
         ] {
             assert_eq!(ChromeScheme::parse(scheme.as_str()), Some(scheme));
         }
         assert_eq!(ChromeScheme::parse("sepia"), None);
+    }
+
+    #[test]
+    fn toolbar_folded_keeps_known_groups_once_in_row_order() {
+        let p: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(p.toolbar_folded.is_empty());
+        let p: Prefs =
+            serde_json::from_str(r#"{"toolbar_folded":["tools","bogus","network","tools"]}"#)
+                .unwrap();
+        assert_eq!(p.toolbar_folded, vec!["network".to_string(), "tools".to_string()]);
+        let p: Prefs = serde_json::from_str(r#"{"toolbar_folded":"tools"}"#).unwrap();
+        assert!(p.toolbar_folded.is_empty());
+        assert_eq!(
+            normalize_toolbar_groups(["saved", "tabs", "saved"]),
+            vec!["tabs".to_string(), "saved".to_string()]
+        );
+        let back: Prefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(back.toolbar_folded.is_empty());
+    }
+
+    /// The published 1.0.6, run on a prefs.json holding `"chrome_scheme":
+    /// "paper"`, failed the whole file and saved every default over it (DNS
+    /// went from Quad9 to System). A file written here must parse in a reader
+    /// that knows only 1.0.6's accents and schemes, and keep the rest.
+    #[test]
+    fn a_look_saved_here_reads_in_a_build_before_1_0_7() {
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum Theme106 {
+            Default,
+            Violet,
+            #[serde(alias = "rose")]
+            BloodRed,
+            Sky,
+            Green,
+            Amber,
+            Teal,
+            Slate,
+            Purple,
+        }
+        #[derive(Deserialize, Debug, PartialEq)]
+        #[serde(rename_all = "snake_case")]
+        enum Scheme106 {
+            Dark,
+            White,
+            Black,
+        }
+        #[derive(Deserialize)]
+        struct Prefs106 {
+            chrome_theme: Theme106,
+            chrome_scheme: Scheme106,
+            dns: DnsMode,
+        }
+
+        let mut p = Prefs::default();
+        p.dns = DnsMode::Quad9;
+        p.chrome_scheme = ChromeScheme::Paper;
+        p.chrome_theme = ChromeTheme::Tangerine;
+        let body = stored_body(&p).unwrap();
+        let old: Prefs106 =
+            serde_json::from_str(&body).expect("a build before 1.0.7 must be able to read this file");
+        assert_eq!(old.chrome_scheme, Scheme106::White);
+        assert_eq!(old.chrome_theme, Theme106::Amber);
+        assert_eq!(old.dns, DnsMode::Quad9);
+        // This build reads its own choice back from the newer keys.
+        let back = parse_stored(&body).unwrap();
+        assert_eq!(back.chrome_scheme, ChromeScheme::Paper);
+        assert_eq!(back.chrome_theme, ChromeTheme::Tangerine);
+        assert_eq!(back.dns, DnsMode::Quad9);
+        // Every new value maps to one 1.0.6 has, and every old one to itself.
+        for t in [ChromeTheme::Tangerine, ChromeTheme::Mint, ChromeTheme::Gold, ChromeTheme::Lavender, ChromeTheme::Copper] {
+            let raw = format!("{{\"chrome_theme\":\"{}\"}}", t.legacy().as_str());
+            assert!(serde_json::from_str::<std::collections::HashMap<String, Theme106>>(&raw).is_ok(), "{t:?}");
+        }
+        for s in [ChromeScheme::Dark, ChromeScheme::White, ChromeScheme::Black] {
+            assert_eq!(s.legacy(), s);
+        }
+        // An original look is stored once, as itself.
+        let mut q = Prefs::default();
+        q.chrome_scheme = ChromeScheme::Black;
+        q.chrome_theme = ChromeTheme::Purple;
+        let body = stored_body(&q).unwrap();
+        assert!(!body.contains("_v2"), "an original look gained a newer key: {body}");
+        let back = parse_stored(&body).unwrap();
+        assert_eq!((back.chrome_scheme, back.chrome_theme), (ChromeScheme::Black, ChromeTheme::Purple));
+    }
+
+    #[test]
+    fn a_look_this_build_does_not_know_never_fails_the_file() {
+        let raw = r#"{"dns":"quad9","chrome_theme":"neon","chrome_scheme":"sepia","chrome_texture":"velvet","chrome_theme_v2":"ultraviolet","chrome_scheme_v2":"sepia2"}"#;
+        let p = parse_stored(raw).expect("unknown look values must not fail the whole file");
+        assert_eq!(p.dns, DnsMode::Quad9);
+        assert_eq!(p.chrome_theme, ChromeTheme::Default);
+        assert_eq!(p.chrome_scheme, ChromeScheme::Dark);
+        assert_eq!(p.chrome_texture, ChromeTexture::Plain);
+        // A known older-build value stands when the newer key is unknown.
+        let p = parse_stored(r#"{"chrome_scheme":"white","chrome_scheme_v2":"sepia2"}"#).unwrap();
+        assert_eq!(p.chrome_scheme, ChromeScheme::White);
+    }
+
+    #[test]
+    fn chrome_texture_round_trips_and_absent_reads_none() {
+        for texture in [
+            ChromeTexture::Plain,
+            ChromeTexture::Glow,
+            ChromeTexture::Grain,
+            ChromeTexture::Stripes,
+        ] {
+            assert_eq!(ChromeTexture::parse(texture.as_str()), Some(texture));
+        }
+        assert_eq!(ChromeTexture::parse("velvet"), None);
+        assert_eq!(ChromeTexture::default(), ChromeTexture::Plain);
+        // The stored word for the default is "none", not the variant's name.
+        assert_eq!(
+            serde_json::to_string(&ChromeTexture::Plain).unwrap(),
+            "\"none\""
+        );
+        let p: Prefs = serde_json::from_str(r#"{"chrome_texture":"glow"}"#).unwrap();
+        assert_eq!(p.chrome_texture, ChromeTexture::Glow);
+        let p: Prefs = serde_json::from_str("{}").unwrap();
+        assert_eq!(p.chrome_texture, ChromeTexture::Plain);
         // The additive-field promise: a prefs.json written before schemes
         // existed reads Dark, the chrome every earlier build rendered.
         let old = r#"{"chrome_theme":"sky"}"#;
@@ -1564,6 +1924,49 @@ mod tests {
             "an old prefs.json must default to fingerprint noise ON; \
              bool's own default (false) is the unsafe direction here"
         );
+        // The duplicate-site notice is new: an upgrade must switch it on,
+        // not read the absent field as bool's false.
+        assert!(
+            prefs.duplicate_site_notice,
+            "an old prefs.json must default to the duplicate-site notice ON"
+        );
+    }
+
+    /// Reduce motion is OFF for an old prefs.json and for a fresh one (the
+    /// chrome every earlier build rendered moved), and an explicit ON
+    /// survives a restart.
+    #[test]
+    fn reduce_motion_is_off_unless_chosen_and_round_trips() {
+        let old: Prefs = serde_json::from_str(r#"{"dns":"system"}"#).expect("old prefs parse");
+        assert!(!old.reduce_motion, "an old prefs.json must not quiet the chrome");
+        assert!(!Prefs::default().reduce_motion);
+        let mut p = Prefs::default();
+        p.reduce_motion = true;
+        let json = serde_json::to_string(&p).expect("prefs serialize");
+        let back: Prefs = serde_json::from_str(&json).expect("prefs parse");
+        assert!(back.reduce_motion, "an explicit ON must survive a restart");
+    }
+
+    /// The notice's switch round-trips, and it is the ONLY thing the feature
+    /// puts in prefs.json: no site the user dismissed can end up here,
+    /// because the struct has nowhere to hold one.
+    #[test]
+    fn the_duplicate_site_switch_round_trips_and_stores_nothing_else() {
+        let mut p = Prefs::default();
+        assert!(p.duplicate_site_notice, "on by default");
+        p.duplicate_site_notice = false;
+        let json = serde_json::to_string(&p).expect("prefs serialize");
+        let back: Prefs = serde_json::from_str(&json).expect("prefs parse");
+        assert!(!back.duplicate_site_notice, "an explicit OFF must survive a restart");
+        let keys: Vec<String> = serde_json::from_str::<serde_json::Value>(&json)
+            .expect("object")
+            .as_object()
+            .expect("object")
+            .keys()
+            .filter(|k| k.contains("duplicate") || k.contains("dismiss"))
+            .cloned()
+            .collect();
+        assert_eq!(keys, vec!["duplicate_site_notice".to_string()]);
     }
 
     /// The 0.9.x panel forced every install onto Beta; 1.0.0 undoes that

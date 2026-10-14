@@ -95,6 +95,10 @@ struct InFlight {
     /// `TabState::on_top_level_navigation_starting`). Only the local-network
     /// exemption reads it; the banner does not.
     reaches_private: bool,
+    /// Whether this hop has already been moved to the other profile
+    /// (kept_profile.rs): a navigation is moved once, however many of its
+    /// requests are refused.
+    moved: bool,
 }
 
 /// What the correlation knows about the request it matched.
@@ -134,6 +138,13 @@ pub struct TopLevelRequests {
     /// URL is unknown, so until the document it belongs to is replaced it may
     /// be the URL of any request (final review R-001).
     frame_unreadable: bool,
+    /// Whether `NavigationStarting` is wired. Without it a top-level
+    /// navigation can go unrecorded, so no document request is proven a
+    /// frame's (code review round 4).
+    top_level_tracking: bool,
+    /// A top-level navigation started whose target could not be read; it
+    /// may be any URL until the next document commits.
+    top_level_unreadable: bool,
 }
 
 // THE BANNER DOES NOT CONSULT THE SUBFRAME SET, and once did. Two drafts made
@@ -181,6 +192,7 @@ impl TopLevelRequests {
                 // even when the entry already existed.
                 document_seen: false,
                 reaches_private,
+                moved: false,
             },
         );
     }
@@ -193,11 +205,30 @@ impl TopLevelRequests {
         self.in_flight.get(&navigation_id).map(|e| e.full_url.as_str())
     }
 
+    /// `NavigationStarting` was registered.
+    pub fn on_top_level_tracking_registered(&mut self) {
+        self.top_level_tracking = true;
+    }
+
+    /// A `NavigationStarting` the tab could not fully read: no arguments,
+    /// no target, or no id (unreadable ids share one slot, so a second
+    /// one would erase the first). Its target may be any URL until the
+    /// next document commits (code review rounds 4 and 5).
+    pub fn on_navigation_unreadable(&mut self) {
+        self.top_level_unreadable = true;
+    }
+
     /// `NavigationCompleted`, success or failure. A navigation that ended can
     /// no longer explain a request, and leaving it in would let a later
     /// same-URL frame be mistaken for the page.
     pub fn on_navigation_completed(&mut self, navigation_id: u64) {
         self.in_flight.remove(&navigation_id);
+    }
+
+    /// Whether any top-level navigation has started and not completed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn any_in_flight(&self) -> bool {
+        !self.in_flight.is_empty()
     }
 
     /// `ContentLoading` for the navigation with this id: a new document is
@@ -219,11 +250,57 @@ impl TopLevelRequests {
     /// other id, a frame's included, clears nothing. An unreadable id is never
     /// passed in: keeping a stale entry withholds an exemption, forgetting a
     /// live one could grant it.
+    ///
+    /// A top-level document committing also ends the doubt a navigation
+    /// the tab could not read left behind: a new page replaces any
+    /// navigation still pending before it.
     pub fn on_document_committed(&mut self, navigation_id: u64) {
+        self.top_level_unreadable = false;
         if self.in_flight.contains_key(&navigation_id) {
             self.frames_in_flight.clear();
             self.frame_unreadable = false;
         }
+    }
+
+    /// Whether a top-level navigation to `host` is in flight in this tab,
+    /// its document request matched already or not. The kept profile's
+    /// boundary asks this rather than `take_top_level_hop`, because an old
+    /// frame can win the race for the hop's slot (plan review 2026-10-13,
+    /// R-015): every document request for the host is then refused.
+    pub fn top_level_to_host(&self, host: &str) -> bool {
+        self.in_flight.values().any(|e| hop_host(&e.full_url).as_deref() == Some(host))
+    }
+
+    /// The complete URL of the in-flight top-level navigation THIS request
+    /// is for (same URL), marking it moved, or `None`. Only a hop that may
+    /// reach a private address is ever moved: the new tab's first page is
+    /// issued by the browser, so a hop the tab's own standing refused must
+    /// not be handed that standing (code review 2026-10-13, R-021). A
+    /// request to the same host for another URL moves nothing.
+    pub fn take_move_for(&mut self, request_uri: &str) -> Option<String> {
+        let wanted = identity(request_uri);
+        let entry = self
+            .in_flight
+            .values_mut()
+            .find(|e| !e.moved && e.reaches_private && e.uri == wanted)?;
+        entry.moved = true;
+        Some(entry.full_url.clone())
+    }
+
+    /// Whether this document request is PROVABLY a subframe's: frame
+    /// tracking is wired, no frame navigation's target was unreadable, and a
+    /// frame navigation to exactly this URL is in flight. The opposite
+    /// default to `frame_may_be_navigating_to`: missing evidence answers NO.
+    pub fn provably_frame(&self, request_uri: &str) -> bool {
+        if !self.frame_tracking
+            || self.frame_unreadable
+            || !self.top_level_tracking
+            || self.top_level_unreadable
+        {
+            return false;
+        }
+        let wanted = identity(request_uri);
+        self.frames_in_flight.values().any(|uri| uri == wanted)
     }
 
     /// The platform wired `FrameNavigationStarting`. Without this call no
@@ -332,9 +409,58 @@ impl TopLevelRequests {
     }
 }
 
+/// The host of a navigation URL, lowercased, or None.
+fn hop_host(url: &str) -> Option<String> {
+    crate::kept_profile::host_of_page(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kept_boundary_sees_a_top_level_hop_whoever_took_its_slot() {
+        let mut t = TopLevelRequests::default();
+        t.on_frame_tracking_registered();
+        t.on_navigation_starting(7, "https://news.example/a#x", true);
+        // An old frame to the same URL takes the slot first...
+        assert!(t.take_top_level_hop("https://news.example/a").is_some());
+        // ...the host still reads as a top-level navigation in flight.
+        assert!(t.top_level_to_host("news.example"));
+        assert!(!t.top_level_to_host("other.example"));
+        // Another URL on the host moves nothing; its own URL moves once,
+        // with the complete URL.
+        assert_eq!(t.take_move_for("https://news.example/other"), None);
+        assert_eq!(t.take_move_for("https://news.example/a").as_deref(), Some("https://news.example/a#x"));
+        assert_eq!(t.take_move_for("https://news.example/a"), None);
+        assert!(t.top_level_to_host("news.example"), "moved is still in flight, still refused");
+    }
+
+    #[test]
+    fn a_hop_that_may_not_reach_private_is_never_moved() {
+        let mut t = TopLevelRequests::default();
+        t.on_navigation_starting(2, "http://router.example/", false);
+        assert!(t.top_level_to_host("router.example"), "still refused in a kept tab");
+        assert_eq!(t.take_move_for("http://router.example/"), None);
+    }
+
+    #[test]
+    fn a_frame_is_proven_only_with_evidence() {
+        let mut t = TopLevelRequests::default();
+        t.on_frame_navigation_starting(3, "https://captcha.example/x");
+        assert!(!t.provably_frame("https://captcha.example/x"), "tracking not wired");
+        t.on_frame_tracking_registered();
+        assert!(!t.provably_frame("https://captcha.example/x"), "top-level tracking not wired");
+        t.on_top_level_tracking_registered();
+        assert!(t.provably_frame("https://captcha.example/x"));
+        t.on_navigation_unreadable();
+        assert!(!t.provably_frame("https://captcha.example/x"), "an unreadable top-level target spoils the proof");
+        t.on_document_committed(1);
+        assert!(t.provably_frame("https://captcha.example/x"));
+        assert!(!t.provably_frame("https://captcha.example/y"));
+        t.on_frame_navigation_unreadable();
+        assert!(!t.provably_frame("https://captcha.example/x"), "an unreadable frame spoils the proof");
+    }
 
     const PAGE: &str = "https://ipaddress.com/lookup";
 

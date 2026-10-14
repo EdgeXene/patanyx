@@ -188,16 +188,20 @@
   // never removed. An `await` on one hung its caller forever: a spinner that
   // never stops, a form that never re-enables.
   //
-  // Long enough not to fire during real work. The slowest command by far is a
-  // vault unlock, which runs Argon2id at 64 MiB and t=3 twice; 30s is many
-  // times that even on a slow machine.
+  // Long enough not to fire during real work. The slowest command with a
+  // deadline is a vault unlock, which runs Argon2id at 64 MiB and t=3 twice;
+  // 30s is many times that even on a slow machine. An encrypted export or an
+  // import of a whole Library can take far longer; neither has a deadline.
   const RB_TIMEOUT_MS = 30000;
   // A passphrase change or a Library repair runs several Argon2id
   // derivations and confirmed writes, and its outcome must never be
   // dropped: a reply arriving after a deadline is ignored, and a change that
   // DID happen would then read as a failure while the new passphrase is
-  // already the one that works. So these two wait for their answer however
-  // long it takes, with the button held down meanwhile. The one other way a
+  // already the one that works. An encrypted export or an import carries a
+  // whole Library with its pictures and can outlast any deadline, and an
+  // import's reply holds the one-time recovery key: dropped, the vault was
+  // replaced and its key never shown. So these four wait for their answer,
+  // however long, with the button held down meanwhile. The one other way a
   // reply never comes is a frame the Rust side drops for size, so that is
   // refused below, before anything is posted.
   // (No `Infinity` deadline: setTimeout clamps an oversized delay and would
@@ -209,7 +213,61 @@
   // answer, and nothing is sent.
   const RB_MAX_FRAME_BYTES = 1024 * 1024;
 
+  // The panel close fade and the per-frame layout sync (both further down)
+  // keep their state HERE, ahead of rb(): rb() reads it for every command,
+  // and the first commands go out before that part of the file has run.
+  let closingPanel = null;
+  let closingTimer = 0;
+  let chromeSyncPending = false;
+  let chromeSyncFrame = 0;
+  // The menu layer's open and fading flags, declared here beside the panel's
+  // for the same reason: rb() reads them (a page handoff settles a menu as it
+  // settles a panel), and rb() can run before the menu code is reached.
+  let menuOpen = false;
+  let menuClosing = false;
+
+  // The commands after which Rust hands the keyboard to a page (ipc.rs: a
+  // navigation, history, a tab opened, closed or switched to, the
+  // duplicate-site answer). Every other command may go out during a fade.
+  const PAGE_HANDOFF_COMMANDS = new Set([
+    "navigate",
+    "back",
+    "forward",
+    "reload",
+    "tab_new",
+    "tab_close",
+    "tab_switch",
+    "tab_open_with_profile",
+    "partner_open",
+    "sponsorship_open",
+    "premium_purchase_open",
+    "site_page_open",
+    "group_close",
+    "shelf_create",
+    "shelf_restore",
+    "startup_focus",
+    "duplicate_site_action",
+  ]);
+
   function rb(cmd, args, timeoutMs) {
+    // THE ARRANGEMENT REACHES RUST BEFORE A PAGE HANDOFF. A tab switch or a
+    // navigation must not arrive while Rust still believes a card covers the
+    // page (it refuses the keyboard handoff under a cover), so a card still
+    // fading is hidden now and the pending layout frame is sent first. Only
+    // for those commands: a panel's own hooks send plenty of others while
+    // it opens and closes, and they must not cut the fade short
+    // (review 2026-10-12, round 2).
+    // An open or fading menu covers the window just as a fading card does,
+    // so it is ended first too (release review, R-001: navigating with the
+    // menu open left the keyboard in the chrome).
+    if (
+      PAGE_HANDOFF_COMMANDS.has(cmd) &&
+      (closingPanel || chromeSyncPending || menuOpen || menuClosing)
+    ) {
+      if (menuOpen || menuClosing) finishMenuClose();
+      finishPanelClose();
+      flushChromeSync();
+    }
     return new Promise((resolve, reject) => {
       const id = nextId++;
       const frame = JSON.stringify({ id, cmd, args: args || {} });
@@ -433,6 +491,17 @@
   window.__rb_event = (msg) => {
     if (!msg || typeof msg.event !== "string") return;
     switch (msg.event) {
+      // A running export or import (backup_job.rs): progress while it runs,
+      // its result exactly once, and a close held for it.
+      case "backup_progress":
+        backupJobEvent("progress", msg.data);
+        break;
+      case "backup_finished":
+        backupJobEvent("finished", msg.data);
+        break;
+      case "backup_close_held":
+        backupCloseHeld(msg.data || {});
+        break;
       case "url_changed": {
         const data = msg.data || {};
         const url = data.url || "";
@@ -500,6 +569,10 @@
       // Ctrl+Shift+F, emitted by Rust so it works while a content webview
       // has focus. Toggled like every other panel: pressing it again while
       // the panel is open closes it.
+      // The window was maximized or restored (Windows, window_frame.rs).
+      case "window_state":
+        if (windowFrame) setWindowMaximized(!!(msg.data && msg.data.maximized));
+        break;
       case "find_tabs_open":
         togglePanelNamed("findtabs");
         break;
@@ -544,6 +617,23 @@
         }
         break;
       }
+      // The duplicate-site notice. Rust raises it only for a site the USER
+      // opened from the browser itself (the address bar, a bookmark, a tab
+      // they opened, Back and Forward, Continue on a warning), never for a
+      // page's own navigation, so a page can neither set it off nor swap it
+      // under the cursor. The words are Rust's. See
+      // duplicate_site.rs.
+      case "duplicate_site":
+        showDuplicateSite(msg.data);
+        break;
+      // Offer to keep Messenger's site across starts (keep_offer.rs).
+      // Rust decides when and words the sentence.
+      case "keep_site_offer":
+        showKeepOffer(msg.data);
+        break;
+      case "duplicate_site_retired":
+        retireDuplicateSite(msg.data && msg.data.notice_id);
+        break;
       // A Rust-side failure on something the USER asked for, surfaced where
       // they can see it. Deliberately narrow: only user-initiated paths emit
       // this. A page's window.open() failing is dropped in Rust instead,
@@ -886,6 +976,14 @@
       io: i18nText("chrome-js-error-io", "Could not read or write to this computer's storage"),
       library_not_replaced: i18nText("chrome-js-error-library-not-replaced", "The previous profile's Library could not be replaced, so bookmarks, Tab Shelf, and download records are unavailable. The imported vault and its passwords are still available."),
       library_replace_refused: i18nText("chrome-js-error-library-replace-refused", "The Library could not be prepared for safe replacement, so the vault was not imported."),
+      // An encrypted export or import runs on its own, and nothing that
+      // rewrites or replaces the vault or the Library may run under it.
+      backup_in_progress: i18nText("chrome-js-error-backup-in-progress", "An encrypted export or import is running. Try again when it has finished."),
+      backup_past_commit: i18nText("chrome-js-error-backup-past-commit", "The import can no longer be stopped. Keep PATANYX open until it finishes."),
+      backup_not_running: i18nText("chrome-js-error-backup-not-running", "That export or import has already ended."),
+      backup_cancelled: i18nText("chrome-js-error-backup-cancelled", "Stopped. Nothing was saved or replaced."),
+      backup_cancelled_cleanup_pending: i18nText("chrome-js-error-backup-cancelled-cleanup-pending", "Import stopped. Nothing was imported or replaced, but some of its temporary files remain. PATANYX tries to remove them the next time it opens your Library."),
+      backup_failed: i18nText("chrome-js-error-backup-failed", "An internal error stopped the export or import. An export leaves any file at its destination unchanged, but a temporary file whose name starts with .tmp- may remain beside it. PATANYX tries to finish or undo an interrupted import the next time you unlock your vault; if it had begun writing your vault, unlock with the new passphrase you chose, and if that is refused, with your previous one."),
       too_large: i18nText("chrome-js-error-too-large", "That file is too big to be a bookmarks export"),
       no_capture_page: i18nText("chrome-js-error-no-capture-page", "Nothing to capture on this page"),
       capture_failed: i18nText("chrome-js-error-capture-failed", "The capture failed; nothing was saved"),
@@ -982,6 +1080,11 @@
         i18nText("chrome-js-error-no-recovery-slot", "This vault has no recovery key. It was set up without one, so your passphrase is the only way in."),
       export_auth_failed: i18nText("chrome-js-error-export-auth-failed", "Wrong export passphrase, or the file is corrupt."),
       bad_export: i18nText("chrome-js-error-bad-export", "That file is not a PATANYX vault export."),
+      export_version_unreadable: i18nText("chrome-js-error-export-version-unreadable", "This backup was made by a newer PATANYX or by a test build, and this version cannot read it. If it came from a newer PATANYX, update this one, then import it again."),
+      import_over_limit: i18nText("chrome-js-error-import-over-limit", "Nothing was imported. The backup holds more than a PATANYX Library allows."),
+      import_earlier_unfinished: i18nText("chrome-js-error-import-earlier-unfinished", "Nothing was imported. Earlier imports on this computer did not finish. Unlock your vault once so PATANYX can finish or undo them, then import again."),
+      disk_full: i18nText("chrome-js-error-disk-full", "There is not enough free disk space to finish. Free some space, then try again."),
+      library_import_unfinished: i18nText("chrome-js-error-library-import-unfinished-nopath", "Your Library is closed because an import did not finish. To finish it, import the same backup file again."),
       export_not_confirmed: i18nText("chrome-js-error-export-not-confirmed", "Type the confirmation sentence exactly to continue."),
       target_is_vault:
         i18nText("chrome-js-error-target-is-vault", "That path is your live vault. Choose a different destination."),
@@ -1025,6 +1128,15 @@
       // in ipc.rs that fails when a code is missing from this table, so the
       // claim is enforced rather than repeated.
       no_tab: i18nText("chrome-js-error-no-tab", "No active tab. Open or select one, then try again."),
+      // "Allow ads and trackers on this tab" (state.rs set_tab_ads_allowed,
+      // privacy.rs ads_allow_unavailable). The same words appear under the
+      // box when it is disabled (renderAdsAllow), so a refused click and a
+      // greyed-out box can never give two different reasons.
+      ads_strict_tab: i18nText("chrome-js-error-ads-strict-tab", "Strict Tabs always block ads and trackers."),
+      ads_blocking_off: i18nText("chrome-js-error-ads-blocking-off", "Ad and tracker blocking is already off for every tab."),
+      ads_no_site: i18nText("chrome-js-error-ads-no-site", "This page has no site to allow them on."),
+      ads_not_ready: i18nText("chrome-js-error-ads-not-ready", "Not available right now. Try again later."),
+      ads_tab_frozen: i18nText("chrome-js-error-ads-tab-frozen", "Unfreeze this tab first. Turning this on or off reloads the page."),
       // Reader View (reader_view.rs). Each says what happened and, where
       // there is one, what to do; none promises a retry will help when it
       // will not.
@@ -1215,10 +1327,10 @@
   // tell "nothing happened" apart from "nothing was watching".
   let lastTabInterception;
   let activeTabId = null;
-  // Mirror of the hosts we have asked Rust to allow while frozen, keyed by
-  // tab id. The platform exposes no read-back of the override set, so this is
-  // what we sent, not what is in force — truthful only because this UI is the
-  // only thing that can send it.
+  // The hosts each tab's freeze lets through, keyed by tab id, exactly as
+  // tab_status reports them (`allowed_hosts`). Never what the chrome asked
+  // for: on WebKitGTK a host is still blocked until its replacement filter
+  // is installed, and the row must not say Allowed before then.
   let allowedHosts = new Map();
   let lastLedger = [];
   let ledgerTimer = null;
@@ -1368,6 +1480,8 @@
   }
 
   function prefersReducedMotion() {
+    // The browser's own switch (wearMotion) counts as much as the system's.
+    if (document.documentElement.dataset.motion === "reduce") return true;
     try {
       return !!window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     } catch (_) {
@@ -1634,6 +1748,9 @@
     // A double-click on the empty strip opens a tab, as in other browsers.
     // Only the strip itself: a double-click on a chip is two clicks on a tab.
     wrap.addEventListener("dblclick", (ev) => {
+      // Where the strip is the title bar (Windows), a double press there
+      // maximizes instead, as a title bar does (applyWindowFrame).
+      if (windowFrame) return;
       if (ev.target !== wrap) return;
       rb("tab_new").catch(() => {});
     });
@@ -2204,17 +2321,37 @@
       document.activeElement && document.activeElement.focus
         ? document.activeElement
         : null;
+    // A dialog still fading out is taken over by the new question: its hide
+    // timer is dropped, or it would hide the question just asked.
+    if (confirmHideTimer) {
+      clearTimeout(confirmHideTimer);
+      confirmHideTimer = 0;
+    }
+    overlay.classList.remove("closing");
     overlay.hidden = false;
     $("confirm-cancel").focus();
     return new Promise((resolve) => {
       confirmResolve = (answer) => {
-        overlay.hidden = true;
+        hideConfirm(overlay);
         if (returnFocusTo && document.contains(returnFocusTo)) {
           returnFocusTo.focus();
         }
         resolve(answer);
       };
     });
+  }
+  // The dialog fades out (chrome.css #confirm-overlay.closing) and is hidden
+  // when the fade has ended; the answer itself is settled at once.
+  let confirmHideTimer = 0;
+  function hideConfirm(overlay) {
+    overlay.classList.add("closing");
+    const hide = () => {
+      confirmHideTimer = 0;
+      overlay.hidden = true;
+      overlay.classList.remove("closing");
+    };
+    if (prefersReducedMotion()) hide();
+    else confirmHideTimer = setTimeout(hide, PANEL_CLOSE_MS);
   }
   function answerConfirm(answer) {
     if (!confirmResolve) return;
@@ -2259,6 +2396,9 @@
   // constant out of this file rather than restating the number, so the two
   // cannot drift apart.
   const TOAST_MS = 15000;
+  // How long a dismissed notice takes to fade (chrome.css .toast-out); the
+  // same length as --motion-fast, and zero under Reduce motion.
+  const TOAST_OUT_MS = 120;
 
   // How many notifications may be on screen at once.
   //
@@ -2274,41 +2414,170 @@
   // refusing it would make a flood silence the thing it buried.
   const MAX_VISIBLE_TOASTS = 3;
 
-  function toast(text, isError) {
-    const node = el("div", "toast" + (isError ? " error" : ""));
+  // `opts.actions` and `opts.sticky` exist for a notice that asks the user to
+  // CHOOSE (the duplicate-site notice). Such a notice carries its own buttons
+  // in place of the X, and it does not expire: a choice that disappears on a
+  // timer was never really offered. It is also not the first to go under
+  // MAX_VISIBLE_TOASTS -- ordinary notices make room first -- or three quick
+  // saves would take the question away unanswered (plan review R-005).
+  function toast(text, isError, opts) {
+    const options = opts || {};
+    const actions = Array.isArray(options.actions) ? options.actions : null;
+    const node = el("div", "toast" + (isError ? " error" : "") + (actions ? " has-actions" : ""));
     node.title = text;
     // The message is a child now rather than the node's own text, because the
     // node also carries a dismiss button. Still textContent, never HTML.
     node.appendChild(el("span", "toast-text", text));
 
-    // DISMISS. The container and the notice are `pointer-events: none` so a
-    // notice over the address bar cannot swallow a click meant for it; this
-    // button turns them back on for itself alone.
-    const close = el("button", "toast-close", "\u00d7");
-    close.type = "button";
-    const label = i18nText("chrome-js-toast-dismiss", "Dismiss");
-    close.setAttribute("aria-label", label);
-    close.title = label;
     let timer = null;
+    // The notice fades out (chrome.css .toast[data-out]) and is removed when the
+    // fade has ended; a second dismissal during the fade changes nothing.
+    // `node.remove()`, as before: the DOM harness runs timers at once and
+    // no-ops remove(), so in a gate the 15-second expiry fires immediately
+    // and removes nothing, and the credential gate counts notices that way.
+    // A removeChild here emptied its list before it looked.
     const dismiss = () => {
       if (timer) {
         clearTimeout(timer);
         timer = null;
       }
-      node.remove();
+      // A data attribute, not a class: the credential gate pins a notice's
+      // className as exactly "toast", and under the harness's instant timers
+      // every notice is already dismissed by the time it looks.
+      const gone = () => node.remove();
+      // A second dismissal during the fade removes the notice at once.
+      if (node.dataset.out) {
+        gone();
+        return;
+      }
+      node.dataset.out = "1";
+      if (prefersReducedMotion()) gone();
+      else setTimeout(gone, TOAST_OUT_MS);
     };
-    close.addEventListener("click", dismiss);
-    node.appendChild(close);
+    if (actions) {
+      // Each button's label is a catalog string the caller resolved; its
+      // handler decides what the choice does. textContent, never HTML.
+      const row = el("div", "toast-actions");
+      for (const action of actions) {
+        const button = el("button", "toast-action", action.label);
+        button.type = "button";
+        button.addEventListener("click", () => action.onClick());
+        row.appendChild(button);
+      }
+      node.appendChild(row);
+    } else {
+      // DISMISS. The container and the notice are `pointer-events: none` so a
+      // notice over the address bar cannot swallow a click meant for it; this
+      // button turns them back on for itself alone.
+      const close = el("button", "toast-close", "\u00d7");
+      close.type = "button";
+      const label = i18nText("chrome-js-toast-dismiss", "Dismiss");
+      close.setAttribute("aria-label", label);
+      close.title = label;
+      close.addEventListener("click", dismiss);
+      node.appendChild(close);
+    }
+    if (options.sticky) node.dataset.sticky = "1";
 
     const host = $("toasts");
     host.appendChild(node);
     // `removeChild`, not the evicted node's own `remove()`: the DOM harness
     // implements the former and no-ops the latter, and a `while` loop around a
-    // no-op removal never terminates.
+    // no-op removal never terminates. The oldest NON-sticky notice goes
+    // first; only if every one is sticky does the oldest go regardless.
     while (host.children.length > MAX_VISIBLE_TOASTS) {
-      host.removeChild(host.children[0]);
+      const victim =
+        Array.prototype.find.call(host.children, (child) => !(child.dataset && child.dataset.sticky)) ||
+        host.children[0];
+      host.removeChild(victim);
     }
-    timer = setTimeout(dismiss, TOAST_MS);
+    if (!options.sticky) timer = setTimeout(dismiss, TOAST_MS);
+    return node;
+  }
+
+  // THE DUPLICATE-SITE NOTICE. Rust decides when it shows and composes its
+  // sentence from the catalog; this only draws it and reports which button
+  // was pressed. A click names the NOTICE, never a tab or a site, so Rust can
+  // refuse one that has gone stale instead of acting on whatever the ids now
+  // point at (plan review R-002). One at a time, on both sides.
+  let duplicateNotice = null;
+
+  function retireDuplicateSite(noticeId) {
+    if (!duplicateNotice || duplicateNotice.id !== noticeId) return;
+    const node = duplicateNotice.node;
+    duplicateNotice = null;
+    if (node.parentNode) node.parentNode.removeChild(node);
+  }
+
+  function showDuplicateSite(data) {
+    if (!data || typeof data.notice_id !== "number" || typeof data.body !== "string") return;
+    if (duplicateNotice) retireDuplicateSite(duplicateNotice.id);
+    const id = data.notice_id;
+    const choose = (choice) => {
+      retireDuplicateSite(id);
+      rb("duplicate_site_action", { notice_id: id, choice }).catch((e) => {
+        // "stale": the notice no longer described the tabs, so Rust did
+        // nothing, and there is nothing to tell the user. Anything else is a
+        // real failure of something they asked for.
+        if (!(e && e.message === "stale")) toast(friendly(e), true);
+      });
+    };
+    const node = toast(data.body, false, {
+      sticky: true,
+      actions: [
+        { label: i18nText("chrome-js-duplicate-site-switch", "Switch to it"), onClick: () => choose("switch") },
+        { label: i18nText("chrome-js-duplicate-site-close", "Close this one"), onClick: () => choose("close") },
+        { label: i18nText("chrome-js-toast-dismiss", "Dismiss"), onClick: () => choose("dismiss") },
+      ],
+    });
+    node.dataset.noticeId = String(id);
+    duplicateNotice = { id, node };
+  }
+
+  // THE KEEP-THIS-SITE OFFER (1.0.7). Rust offers it once a session when
+  // Messenger opens on a site the start-up clear would wipe (keep_offer.rs).
+  // Keep sends the ordinary keep-list command with the site Rust named;
+  // Not now sends nothing. One offer on screen at a time.
+  let keepOffer = null;
+  function retireKeepOffer() {
+    if (!keepOffer) return;
+    const node = keepOffer;
+    keepOffer = null;
+    if (node.parentNode) node.parentNode.removeChild(node);
+  }
+  function showKeepOffer(data) {
+    if (!data || typeof data.site !== "string" || typeof data.body !== "string") return;
+    retireKeepOffer();
+    const site = data.site;
+    const node = toast(data.body, false, {
+      sticky: true,
+      actions: [
+        {
+          label: i18nText("chrome-js-keep-offer-keep", "Keep this site"),
+          onClick: () => {
+            retireKeepOffer();
+            rb("wipe_exempt_add", { host: site })
+              .then((reply) => {
+                renderKeptSites(reply);
+                // Rust says whether the tab really reopened in the kept
+                // storage, and whether kept storage can be used at all this
+                // session; the notice never claims more than that.
+                toast(
+                  reply && reply.reopened
+                    ? i18nText("chrome-js-keep-offer-kept", "Kept. This tab reopened in the site's own storage: sign in once more and it stays. You can remove it in Privacy.")
+                    : reply && reply.available === false
+                      ? i18nText("chrome-js-keep-offer-kept-next-start", "Kept from the next start. The site's own storage cannot be used right now, so sign in once more after PATANYX restarts and it stays signed in.")
+                      : i18nText("chrome-js-keep-offer-kept-later", "Kept. This tab could not move to the site's own storage, so open the site again in a new tab and sign in there."),
+                  false,
+                );
+              })
+              .catch((e) => toast(friendly(e), true));
+          },
+        },
+        { label: i18nText("chrome-js-keep-offer-later", "Not now"), onClick: retireKeepOffer },
+      ],
+    });
+    keepOffer = node;
   }
 
   // chat.js is injected as a SEPARATE script in chat builds and cannot see
@@ -2347,6 +2616,11 @@
         // a dialog that looks like it holds the keyboard; Rust also refuses to
         // hand the keyboard to a page a panel still covers.
         if (openPanelName) closeOpenPanel();
+        // No fade on the way to a page: the arrangement must reach Rust
+        // BEFORE the navigation does, or it refuses to hand the keyboard to
+        // a page it believes a panel still covers (review 2026-10-12, R-001).
+        finishPanelClose();
+        flushChromeSync();
         rb("navigate", { url }).catch(() => {});
       }
       return;
@@ -2435,7 +2709,16 @@
       const close = el("button", "panel-close", i18nText("chrome-js-panel-close-button", "Close"));
       close.type = "button";
       close.setAttribute("aria-label", i18nText("chrome-js-panel-close-aria", "Close this panel"));
-      close.addEventListener("click", () => togglePanelNamed(name));
+      close.addEventListener("click", () => {
+        // A card already fading out is closed; a second press must not
+        // read as "open it again" (round 2, R-002).
+        if (closingPanel && closingPanel.el === spec.el) return;
+        togglePanelNamed(name);
+        // Focus returns to the opener, as it does after Escape, rather than
+        // staying on a control inside a card that is going away.
+        const back = panelOpener(spec);
+        if (back && back.focus) back.focus();
+      });
       // Created at REGISTRATION, which runs at load -- before any fill can
       // arrive -- so without this hook every panel's Close stayed English
       // in a non-English session. Found by the first live en-XA run, not
@@ -2553,6 +2836,9 @@
         // rather than worded loosely enough to be true everywhere.
         const note = $("accent-scrollbar-note");
         if (note) note.hidden = !(r && r.page_scrollbar === "live");
+        printCaps = { print: !!(r && r.print), pdf: !!(r && r.save_pdf) };
+        syncMenuProxies();
+        applyWindowFrame(r);
         if (r && TOOLBAR_PLACEMENTS.includes(r.toolbar_placement)) {
           wearToolbarPlacement(r.toolbar_placement);
           return;
@@ -2561,8 +2847,44 @@
       })
       .catch(() => refreshToolbarPlacement());
   }
+  // ONE SYNC PER FRAME. Coverage and insets go to Rust together, from one
+  // requestAnimationFrame callback, coverage first (the arrangement must be
+  // known before a panel height is read against it). Every caller schedules
+  // and nothing sends directly, so a panel toggle, the banner it raised and
+  // the resize that followed cost one round trip instead of three, and no
+  // intermediate state is ever sent. The DOM stub runs the frame at once, so
+  // the gates see the same order they always did.
+  function sendChromeSync() {
+    chromeSyncPending = false;
+    chromeSyncFrame = 0;
+    sendChromeCoverage();
+    sendChromeInsets();
+  }
+  function scheduleChromeSync() {
+    if (chromeSyncPending) return;
+    chromeSyncPending = true;
+    chromeSyncFrame = window.requestAnimationFrame(sendChromeSync);
+  }
+  // Sends now what the next frame would have: for a command that depends on
+  // the arrangement having reached Rust first (a navigation hands the
+  // keyboard to the page, which Rust refuses under a cover).
+  function flushChromeSync() {
+    if (!chromeSyncPending) return;
+    if (chromeSyncFrame && window.cancelAnimationFrame) {
+      window.cancelAnimationFrame(chromeSyncFrame);
+    }
+    sendChromeSync();
+  }
   function syncChromeCoverage() {
-    const want = !!openPanelName;
+    scheduleChromeSync();
+  }
+  function syncChromeInsets() {
+    scheduleChromeSync();
+  }
+  function sendChromeCoverage() {
+    // A card still fading out keeps the window covered (beginPanelClose),
+    // and so does the main menu, which draws below the strip like a card.
+    const want = !!openPanelName || !!closingPanel || menuOpen || menuClosing;
     if (want === chromeCovered) return;
     chromeCovered = want;
     rb("chrome_overlay", { cover: want }).catch(() => {});
@@ -2587,6 +2909,50 @@
 
   // `opts.focus === false` opens a panel WITHOUT moving the keyboard into it.
   // Only the launch-time vault uses it; see the boot sequence.
+  // ---- the panel close fade -----------------------------------------------
+  //
+  // A closing card fades out (chrome.css .panel-closing) before it is hidden,
+  // and the window stays COVERED until the fade has finished: `closingPanel`
+  // counts as coverage and as height in the two send functions below, so a
+  // banner or a resize landing mid-fade cannot uncover the page under a card
+  // that is still drawn (which cut the card in half and, on Windows, flickered
+  // the page). Opening a panel finishes a pending close at once, so switching
+  // panels never uncovers and re-covers. Under Reduce motion there is no fade:
+  // the card is hidden in the same call, as it always was.
+  const PANEL_CLOSE_MS = 120;
+  function beginPanelClose(cur) {
+    finishPanelClose();
+    closingPanel = cur;
+    cur.el.classList.add("panel-closing");
+    // Out of the keyboard's reach for the fade: `pointer-events: none` in the
+    // stylesheet stops clicks, and inert stops Tab and Enter from reaching a
+    // control on a card that is logically closed (round 2, R-002).
+    cur.el.inert = true;
+    document.body.classList.add("modal-closing");
+    // No fade either where the backdrop must stay opaque: WebKitGTK without
+    // compositing paints a translucent repaint over its own previous pixels
+    // (chrome.css, solid-backdrop), so a fading card there would ghost.
+    if (prefersReducedMotion() || document.body.classList.contains("solid-backdrop")) {
+      finishPanelClose();
+      return;
+    }
+    closingTimer = setTimeout(finishPanelClose, PANEL_CLOSE_MS);
+  }
+  function finishPanelClose() {
+    if (!closingPanel) return;
+    const cur = closingPanel;
+    closingPanel = null;
+    clearTimeout(closingTimer);
+    closingTimer = 0;
+    cur.el.hidden = true;
+    cur.el.inert = false;
+    cur.el.classList.remove("panel-modal", "panel-closing");
+    document.body.classList.remove("modal-closing");
+    document.body.classList.toggle("modal-open", !!openPanelName);
+    syncChromeCoverage();
+    syncChromeInsets();
+  }
+
   function togglePanelNamed(name, opts) {
     const target = panels.get(name);
     if (!target) return;
@@ -2604,12 +2970,19 @@
     if (openPanelName) {
       const cur = panels.get(openPanelName);
       openPanelName = null;
-      cur.el.hidden = true;
-      cur.el.classList.remove("panel-modal");
       cur.button.setAttribute("aria-pressed", "false");
+      // onClose BEFORE the fade: the vault clears its secrets there, so the
+      // card that fades out is already empty.
       runPanelHook(cur.onClose, "onClose");
+      beginPanelClose(cur);
     }
     if (!wasOpen) {
+      // Named first, so a card still fading out is hidden now WITHOUT the
+      // window being uncovered in between: finishPanelClose reads
+      // openPanelName for coverage, and switching panels must never uncover
+      // and re-cover (on Windows that is a visible flicker of the page).
+      openPanelName = name;
+      finishPanelClose();
       target.el.hidden = false;
       // The class rather than a per-panel stylesheet edit: update.js,
       // integrity.js and chat.js build their panels at runtime and never
@@ -2617,7 +2990,6 @@
       // out of eight and look like a rendering bug in the other three.
       target.el.classList.add("panel-modal");
       target.button.setAttribute("aria-pressed", "true");
-      openPanelName = name;
       applyPanelZoom(target.el);
       runPanelHook(target.onOpen, "onOpen");
       // Move focus INTO the panel that just opened. Without this the first Tab
@@ -2638,7 +3010,13 @@
         if (items.length) items[0].focus();
       }, 0);
     }
-    document.body.classList.toggle("modal-open", !!openPanelName);
+    // A card still fading out keeps the body modal (the strip's z-order and
+    // the 12px backing band hold until it is gone); the scrim itself fades
+    // under `modal-closing`.
+    document.body.classList.toggle(
+      "modal-open",
+      !!openPanelName || !!closingPanel,
+    );
     syncChromeCoverage();
     // ALWAYS, in both directions, and after the arrangement rather than
     // before it: on GTK this message is the only thing that actually resizes
@@ -2706,8 +3084,12 @@
     // Innermost surface first, ONE layer per press: a modal panel outranks
     // the find bar, and handling both in this single listener is what makes
     // that ordering a fact rather than a registration-order accident.
+    if (menuOpen) {
+      closeMenu();
+      return;
+    }
     if (openPanelName) {
-      const opener = panels.get(openPanelName)?.button;
+      const opener = panelOpener(panels.get(openPanelName));
       closeOpenPanel();
       // Focus returns to the control that opened the panel -- now the pill in
       // the toolbar itself. Without this it lands on <body> and the next Tab
@@ -2718,6 +3100,716 @@
     }
     closeFindBar();
   });
+
+  // ---- menus: the main menu and the folded groups (1.0.7) -------------------
+  //
+  // A menu is its own layer, NOT a panel. A panel's open closes the open panel
+  // and runs that panel's onClose (chat wipes its conversations there); a
+  // menu must leave the open panel exactly as it is, draw over it, and go
+  // away without touching it. So menus have their own open flag, counted in
+  // the coverage and the insets beside the panels', and the Escape handler
+  // above closes a menu before it closes anything else. One menu is open at a
+  // time: the main menu, or the menu of one folded group. Every entry clicks
+  // a real button, the pattern the palette uses: one code path per action,
+  // never a second copy of what an action does.
+  const MENU_OPEN_PX = 420;
+  // menuOpen and menuClosing are declared with closingPanel, ahead of rb().
+  // Like closingPanel, a closing layer fades for PANEL_CLOSE_MS and the
+  // window stays covered until it is hidden.
+  let menuCloseTimer = 0;
+  // The menu open now, and the one still fading: { el, button, group,
+  // fill(), entries(), heightPx() }. A switch from one menu to another hides
+  // the old one at once rather than fading two.
+  let menuLayer = null;
+  let closingLayer = null;
+  // The height the insets report while a menu shows, kept through its fade.
+  let menuHeightPx = MENU_OPEN_PX;
+  // The pills that left the rows for the main menu. They wear in-menu
+  // (hidden) from here as well as from the markup, because two of them are
+  // appended at runtime.
+  const IN_MENU_PILLS = new Set(["btn-reader", "btn-about", "btn-integrity", "btn-update"]);
+  // TOOLBAR GROUPS: id -> the buttons it folds, in row order. The markup
+  // carries the same membership as data-group on each button, with a pill
+  // per group (id group-<id>); toolbar-groups-gate.js holds the two
+  // together. The shield and the freeze chip are in none, on purpose: they
+  // carry the standing protection state, and no fold may hide it.
+  const TOOLBAR_GROUPS = [
+    ["network", ["btn-tab", "btn-dns", "btn-tunnel"]],
+    ["tabs", ["btn-tab-group", "btn-side-by-side"]],
+    ["saved", ["btn-vault", "btn-fill", "btn-library"]],
+    ["tools", ["btn-theme", "btn-ocr-region", "btn-chat"]],
+  ];
+  const TOOLBAR_GROUP_IDS = TOOLBAR_GROUPS.map(([g]) => g);
+  // When the row runs out of room it folds from its right end.
+  const AUTO_FOLD_ORDER = ["tools", "saved", "tabs", "network"];
+  // What the user chose (the pref, as Rust last answered it), and what the
+  // window's width forced on top of it. Only the first is ever stored.
+  //
+  // Seeded from the document: Rust serves it with the stored folds already
+  // on <html> (main.rs with_boot_attributes), and a measurement before
+  // toolbar_folded_get answers must keep them (round 4, R-004). At this
+  // point the attribute can only hold the stored choice; the width's folds
+  // are added by this script, later.
+  let userFolded = new Set(
+    TOOLBAR_GROUP_IDS.filter((g) =>
+      (document.documentElement.dataset.folded || "").split(" ").includes(g),
+    ),
+  );
+  // A fold change on its way to Rust: what the boxes show until it is
+  // answered (round 4, R-005); the toolbar keeps wearing what is stored.
+  let foldWanted = null;
+  let foldSeq = 0;
+  const autoFolded = new Set();
+  const isFolded = (g) => userFolded.has(g) || autoFolded.has(g);
+  function groupOf(id) {
+    for (const [g, members] of TOOLBAR_GROUPS) if (members.includes(id)) return g;
+    return null;
+  }
+  // Where the keyboard goes when a panel closes: its own button, unless that
+  // button cannot be seen, in which case the visible control that reached
+  // it -- the menu button, or the folded group's pill.
+  function panelOpener(spec) {
+    if (!spec || !spec.button) return null;
+    if (IN_MENU_PILLS.has(spec.button.id)) return $("btn-main-menu");
+    const g = groupOf(spec.button.id);
+    if (g && isFolded(g)) return $("group-" + g);
+    return spec.button;
+  }
+  // Entry -> the real button it clicks (null: an action of its own). A table
+  // like PALETTE_ACTIONS, and for the same reason: one place the gates can
+  // read, and a harness that does not parse markup attributes still sees it.
+  // The markup carries the same pairing as data-proxy-for; toolbar-gate.js
+  // holds the two together.
+  const MENU_ENTRIES = [
+    ["menu-reader", "btn-reader"],
+    ["menu-print", null],
+    ["menu-save-pdf", "btn-save-pdf"],
+    ["menu-find", null],
+    ["menu-find-tabs", null],
+    ["menu-image-check", null],
+    ["menu-site-info", "btn-site-info"],
+    ["menu-integrity", "btn-integrity"],
+    ["menu-update", "btn-update"],
+    ["menu-about", "btn-about"],
+    ["menu-customize", "btn-theme"],
+  ];
+  // An entry shows the state of the button it stands for.
+  function mirrorInto(entry, real) {
+    entry.disabled = !!real.disabled;
+    const pressed = real.getAttribute("aria-pressed");
+    if (pressed === null) entry.removeAttribute("aria-checked");
+    else entry.setAttribute("aria-checked", pressed);
+    for (const cls of ["is-active", "is-warning", "is-intercepted", "premium-locked"]) {
+      entry.classList.toggle(cls, real.classList.contains(cls));
+    }
+  }
+  // What an entry calls a button: its accessible name, which is where a
+  // button says a condition it is in (Tab Activity's carries an interception
+  // while it lasts, round 3, R-002), then its visible label; plus the count
+  // on its badge, if one is showing (Chat's unread messages).
+  // Two buttons abbreviate their visible label ("TA", "Groups") and carry
+  // the full name in their accessible name, which a menu has room for; the
+  // rest show their visible label, since some accessible names are long
+  // descriptions (Library's). A button in a warning or interception state
+  // says so in its accessible name, so that wins whenever it applies.
+  const ENTRY_USES_FULL_NAME = new Set(["btn-tab", "btn-tab-group"]);
+  function entryLabelFor(real) {
+    const labelEl = real.querySelector(".feature-label");
+    const visible = labelEl && labelEl.textContent && labelEl.textContent.trim();
+    const full = real.getAttribute("aria-label");
+    const condition =
+      real.classList.contains("is-intercepted") || real.classList.contains("is-warning");
+    let text =
+      ((condition || ENTRY_USES_FULL_NAME.has(real.id)) && full) ||
+      visible ||
+      full ||
+      real.getAttribute("title") ||
+      real.id;
+    const badge = real.querySelector(".badge");
+    if (badge && !badge.hidden && badge.textContent && badge.textContent.trim()) {
+      text += " (" + badge.textContent.trim() + ")";
+    }
+    return text;
+  }
+  // What the platform can do, from chrome_caps. Print and Save as PDF are
+  // offered only where it says yes (WebKitGTK has neither); until it has
+  // answered, they are not offered, never offered and then failing.
+  let printCaps = { print: false, pdf: false };
+  // Whether OCR answered available. Its own flag rather than a field of
+  // printCaps, which chrome_caps replaces wholesale; and not ocrAvailable
+  // itself, which is declared further down and read here at startup.
+  let menuOcr = false;
+  // Image check needs the OCR models (the same ocr_status answer that
+  // shows its tab); until that answer, it is not offered.
+  // The Menu's Premium entries; the markup marks the same two with
+  // data-premium, which applyPremiumState locks and a licence unlocks.
+  const PREMIUM_MENU_ENTRIES = new Set(["menu-find-tabs", "menu-image-check"]);
+  const MENU_NEEDS = { "menu-print": "print", "menu-save-pdf": "pdf", "menu-image-check": "ocr" };
+  function syncMenuProxies() {
+    let warning = false;
+    for (const [id, proxyFor] of MENU_ENTRIES) {
+      const entry = $(id);
+      if (!entry) continue;
+      const needs = MENU_NEEDS[id];
+      const allowed = !needs || (needs === "ocr" ? menuOcr : printCaps[needs]);
+      if (!proxyFor) {
+        if (entry.hidden !== !allowed) entry.hidden = !allowed;
+        continue;
+      }
+      const real = document.getElementById(proxyFor);
+      // No real control in this build means no entry. The real button's
+      // own `hidden` is NOT consulted: the in-menu pills are hidden by class,
+      // never by attribute, and the DOM harness starts every element hidden.
+      const hide = !real || !allowed;
+      if (entry.hidden !== hide) entry.hidden = hide;
+      if (!real) continue;
+      mirrorInto(entry, real);
+      if (real.classList.contains("is-warning")) warning = true;
+    }
+    // The menu button carries the dot while anything inside wants attention.
+    $("btn-main-menu").classList.toggle("is-warning", warning);
+  }
+  // About 40px a row and 16px of padding: the chrome must cover the menu's
+  // whole height or a backend that sizes the chrome to it (GTK) clips the
+  // last rows (review round 2, R-006).
+  const MENU_ROW_PX = 40;
+  const mainMenuEntries = () =>
+    MENU_ENTRIES.map(([id]) => $(id)).filter((b) => b && !b.hidden && !b.disabled);
+  const MAIN_MENU = {
+    el: $("main-menu"),
+    button: $("btn-main-menu"),
+    group: null,
+    fill: syncMenuProxies,
+    entries: mainMenuEntries,
+    heightPx: () =>
+      Math.max(MENU_OPEN_PX, closedChromePx() + 4 + MENU_ROW_PX * mainMenuEntries().length + 16),
+  };
+  // The panel a button opens, by name, or null for a button that only acts.
+  // Buttons that open a panel registered to another button: About this site
+  // (the address bar's (i)) opens Tab Activity, whose registered opener is
+  // its pill. Without this the entry did not know the panel was its own and
+  // toggled an open Tab Activity shut (release review, R-002).
+  const PANEL_ALSO_OPENED_BY = { "btn-site-info": "tab" };
+  function panelNameFor(button) {
+    if (button && PANEL_ALSO_OPENED_BY[button.id]) return PANEL_ALSO_OPENED_BY[button.id];
+    for (const [name, spec] of panels) if (spec.button === button) return name;
+    return null;
+  }
+  // What choosing an entry does with the real button behind it. A panel
+  // that is already open is brought forward, never toggled shut by the
+  // entry meant to show it (round 2, R-011). An entry that opens a panel
+  // leaves the keyboard to that panel; one that only acts (Save as PDF)
+  // returns it to the menu's button, which stays on screen (round 2, R-003).
+  function activateProxy(real) {
+    const name = panelNameFor(real);
+    if (name && openPanelName === name) {
+      closeMenu({ keepFocus: true });
+      const items = focusablesIn(panels.get(name).el);
+      if (items.length) items[0].focus();
+      return;
+    }
+    closeMenu({ keepFocus: !!name });
+    real.click();
+  }
+  // The group menu: one layer reused by every folded pill, filled at open
+  // from the group's own buttons. The labels are the buttons' own, already
+  // in the user's language; a button this build or this moment does not
+  // show (Chat in a public build, Fill with nothing to fill, DNS where the
+  // engine offers no resolver choice) has no entry either.
+  const groupMenuEl = $("group-menu");
+  let groupMenuItems = [];
+  // The real button behind each entry, in the same order.
+  let groupMenuReals = [];
+  const groupMembers = (g) => (TOOLBAR_GROUPS.find(([id]) => id === g) || [g, []])[1];
+  const shownMembers = (g) =>
+    groupMembers(g)
+      .map((id) => document.getElementById(id))
+      .filter((real) => real && !real.hidden);
+  function buildGroupEntries(g) {
+    for (const item of groupMenuItems) groupMenuEl.removeChild(item);
+    groupMenuItems = [];
+    groupMenuReals = shownMembers(g);
+    for (const real of groupMenuReals) {
+      const entry = el("button", "menu-entry");
+      entry.type = "button";
+      entry.setAttribute("role", "menuitem");
+      entry.appendChild(el("span", "menu-entry-label", entryLabelFor(real)));
+      mirrorInto(entry, real);
+      entry.addEventListener("click", () => activateProxy(real));
+      groupMenuEl.appendChild(entry);
+      groupMenuItems.push(entry);
+    }
+  }
+  // While a group's menu is open its entries follow their buttons: state and
+  // label in place, and the list rebuilt when a button appears or goes (Fill
+  // when an offer comes, Chat in a build that has it), with the keyboard
+  // kept in the menu (round 3, R-003).
+  function syncOpenGroupMenu() {
+    if (!menuOpen || !menuLayer || !menuLayer.group) return;
+    const now = shownMembers(menuLayer.group);
+    const same =
+      now.length === groupMenuReals.length && now.every((real, i) => real === groupMenuReals[i]);
+    if (!same) {
+      // The keyboard stays on the button it was on; if that one went, it
+      // goes to the first entry that can be used, or to the pill (round 4,
+      // R-003: it used to land on the first entry, so Enter pressed a
+      // different button from the one chosen).
+      const at = groupMenuItems.indexOf(document.activeElement);
+      const focusedReal = at >= 0 ? groupMenuReals[at] : null;
+      buildGroupEntries(menuLayer.group);
+      if (at >= 0) {
+        const keep = groupMenuReals.indexOf(focusedReal);
+        const usable = groupMenuItems.filter((b) => !b.disabled);
+        const target =
+          keep >= 0 && !groupMenuItems[keep].disabled ? groupMenuItems[keep] : usable[0];
+        if (target) target.focus();
+        else menuLayer.button.focus();
+      }
+      return;
+    }
+    groupMenuItems.forEach((entry, i) => {
+      const real = groupMenuReals[i];
+      mirrorInto(entry, real);
+      const label = entry.children && entry.children[0];
+      const text = entryLabelFor(real);
+      if (label && label.textContent !== text) label.textContent = text;
+    });
+  }
+  function fillGroupMenu(g, pill) {
+    buildGroupEntries(g);
+    groupMenuEl.setAttribute("aria-labelledby", pill.id);
+    return positionGroupMenu(pill);
+  }
+  // Anchored at the pill: below it on the top strip, beside it on a rail.
+  // Run at open and again after every measurement, because the pill moves
+  // with the window's width (round 4, R-002). Returns the height the chrome
+  // must cover to show it.
+  function positionGroupMenu(pill) {
+    const r = pill.getBoundingClientRect();
+    const w = window.innerWidth || 0;
+    const placement = document.documentElement.dataset.toolbarPlacement;
+    // On a rail the menu clears the RAIL, not just the pill: the rail is
+    // wider than its buttons and sits above the menu (z 50 over 45), so a
+    // menu placed at the pill's edge lost its first few pixels under it
+    // (seen in Chromium, 2026-10-12).
+    const rail = $("sidebar");
+    const railBox = rail && !rail.hidden ? rail.getBoundingClientRect() : null;
+    let top;
+    if (placement === "left") {
+      top = Math.round(r.top);
+      const edge = railBox ? Math.max(r.right, railBox.right) : r.right;
+      groupMenuEl.style.setProperty("--menu-left", Math.round(edge + 4) + "px");
+    } else if (placement === "right") {
+      top = Math.round(r.top);
+      const edge = railBox ? Math.min(r.left, railBox.left) : r.left;
+      groupMenuEl.style.setProperty("--menu-right", Math.round(w - edge + 4) + "px");
+    } else {
+      top = Math.round(r.bottom + 4);
+      const left = w ? Math.min(r.left, w - 236) : r.left;
+      groupMenuEl.style.setProperty("--menu-left", Math.round(Math.max(8, left)) + "px");
+    }
+    groupMenuEl.style.setProperty("--menu-top", top + "px");
+    // What the chrome must cover to show it: the menu's own bottom, at
+    // least the main menu's height.
+    return Math.max(MENU_OPEN_PX, top + MENU_ROW_PX * groupMenuItems.length + 16);
+  }
+  function groupMenuFor(g) {
+    const pill = $("group-" + g);
+    let height = MENU_OPEN_PX;
+    return {
+      el: groupMenuEl,
+      button: pill,
+      group: g,
+      fill: () => {
+        height = fillGroupMenu(g, pill);
+      },
+      entries: () => groupMenuItems.filter((b) => !b.hidden && !b.disabled),
+      heightPx: () => height,
+    };
+  }
+  function hideLayerNow(layer) {
+    layer.el.hidden = true;
+    layer.el.inert = false;
+    layer.el.classList.remove("menu-closing");
+  }
+  function openMenu(layer) {
+    layer = layer || MAIN_MENU;
+    if (menuOpen && menuLayer && menuLayer.el === layer.el && menuLayer.button === layer.button) {
+      return;
+    }
+    if (menuOpen) closeMenu({ keepFocus: true, instant: true });
+    if (menuCloseTimer) {
+      clearTimeout(menuCloseTimer);
+      menuCloseTimer = 0;
+      if (closingLayer) hideLayerNow(closingLayer);
+      closingLayer = null;
+    }
+    menuClosing = false;
+    menuOpen = true;
+    menuLayer = layer;
+    layer.fill();
+    menuHeightPx = layer.heightPx();
+    layer.el.classList.remove("menu-closing");
+    layer.el.inert = false;
+    layer.el.hidden = false;
+    layer.button.setAttribute("aria-expanded", "true");
+    document.body.classList.add("menu-open");
+    syncChromeCoverage();
+    syncChromeInsets();
+    const first = layer.entries()[0];
+    if (first) first.focus();
+  }
+  // `opts.keepFocus`: an entry that opened a panel leaves the keyboard to
+  // the panel; otherwise it returns to the menu's button. `opts.instant`:
+  // another menu is taking over, so this one goes without a fade.
+  function closeMenu(opts) {
+    if (!menuOpen) return;
+    const layer = menuLayer;
+    menuOpen = false;
+    menuLayer = null;
+    layer.button.setAttribute("aria-expanded", "false");
+    // body.menu-open stays until the menu is hidden: the window is still
+    // covered through the fade, and on the transparent backend the body
+    // must stay transparent with it (round 3, R-004).
+    const hide = () => {
+      menuCloseTimer = 0;
+      menuClosing = false;
+      closingLayer = null;
+      hideLayerNow(layer);
+      if (!menuOpen) document.body.classList.remove("menu-open");
+      syncChromeCoverage();
+      syncChromeInsets();
+    };
+    if ((opts && opts.instant) || prefersReducedMotion()) {
+      hide();
+    } else {
+      menuClosing = true;
+      closingLayer = layer;
+      // A fading menu takes no keyboard (round 2, R-003), as a fading card.
+      layer.el.inert = true;
+      layer.el.classList.add("menu-closing");
+      menuCloseTimer = setTimeout(hide, PANEL_CLOSE_MS);
+    }
+    if (!(opts && opts.keepFocus)) layer.button.focus();
+  }
+  // Theme's Toolbar section, scrolled into view once the card can scroll.
+  // On WebKitGTK the chrome is grown to the panel's height only after the
+  // panel opens, so a scroll made at once runs in a window too short to hold
+  // the card and is lost (seen live, 2026-10-12: the first Customize toolbar
+  // opened Theme at the top). It is made again on the window's next resize,
+  // and once more a moment later in case no resize comes.
+  function scrollThemeToToolbar() {
+    const go = () => {
+      if (openPanelName !== "theme") return;
+      const section = $("labels-choice");
+      if (section && section.scrollIntoView) section.scrollIntoView({ block: "start" });
+    };
+    setTimeout(go, 0);
+    const onResize = () => {
+      window.removeEventListener("resize", onResize);
+      go();
+    };
+    window.addEventListener("resize", onResize);
+    setTimeout(() => {
+      window.removeEventListener("resize", onResize);
+      go();
+    }, 400);
+  }
+  // Ends a menu now: an open one closes without its fade, a fading one is
+  // hidden at once. For a page handoff, which must reach Rust after the
+  // window is uncovered (rb() calls this, then flushes the sync).
+  function finishMenuClose() {
+    if (menuOpen) closeMenu({ keepFocus: true, instant: true });
+    if (menuClosing && closingLayer) {
+      if (menuCloseTimer) {
+        clearTimeout(menuCloseTimer);
+        menuCloseTimer = 0;
+      }
+      menuClosing = false;
+      const layer = closingLayer;
+      closingLayer = null;
+      hideLayerNow(layer);
+      if (!menuOpen) document.body.classList.remove("menu-open");
+      syncChromeCoverage();
+      syncChromeInsets();
+    }
+  }
+  $("btn-main-menu").addEventListener("click", () => {
+    if (menuOpen && menuLayer === MAIN_MENU) closeMenu();
+    else openMenu(MAIN_MENU);
+  });
+  for (const [entryId, proxyFor] of MENU_ENTRIES) {
+    const entry = $(entryId);
+    if (!entry) continue;
+    entry.addEventListener("click", () => {
+      if (proxyFor) {
+        const real = document.getElementById(proxyFor);
+        if (!real) {
+          closeMenu();
+          return;
+        }
+        activateProxy(real);
+        // Customize toolbar lands on the Toolbar section of Theme.
+        if (entryId === "menu-customize") scrollThemeToToolbar();
+        return;
+      }
+      if (entry.id === "menu-print") {
+        closeMenu();
+        rb("page_print").catch((e) => toast(friendly(e), true));
+        return;
+      }
+      // A Premium entry that is locked states it and does nothing: no
+      // panel, no picker, no notice, and the menu stays open. Rust gates
+      // both features again on its side.
+      if (PREMIUM_MENU_ENTRIES.has(entry.id) && !premiumState.premium) return;
+      if (entry.id === "menu-find") {
+        // A menu leaves an open panel alone, but Find must not search
+        // under one: the panel would cover the results and keep the
+        // keyboard (plan review 2026-10-13, R-003).
+        closeMenu({ keepFocus: true });
+        closeOpenPanel();
+        openFindBar();
+        return;
+      }
+      if (entry.id === "menu-find-tabs") {
+        closeMenu({ keepFocus: true });
+        if (openPanelName !== "findtabs") togglePanelNamed("findtabs");
+        return;
+      }
+      if (entry.id === "menu-image-check") {
+        // Opens Image check in Tools, then its own picker, which checks
+        // the licence again before anything is read.
+        closeMenu({ keepFocus: true });
+        $("btn-tab-imagecheck").click();
+        $("leakcheck-pick").click();
+      }
+    });
+  }
+  for (const g of TOOLBAR_GROUP_IDS) {
+    const pill = $("group-" + g);
+    if (!pill) continue;
+    pill.addEventListener("click", () => {
+      if (menuOpen && menuLayer && menuLayer.group === g) closeMenu();
+      else openMenu(groupMenuFor(g));
+    });
+  }
+  // Arrow keys walk the entries; Home and End jump. Escape is the document
+  // handler's. Tab is left alone: the menu is small and the strip is next.
+  function menuKeys(ev) {
+    const items = menuLayer ? menuLayer.entries() : [];
+    if (!items.length) return;
+    const at = items.indexOf(document.activeElement);
+    let to = -1;
+    if (ev.key === "ArrowDown") to = (at + 1) % items.length;
+    else if (ev.key === "ArrowUp") to = (at - 1 + items.length) % items.length;
+    else if (ev.key === "Home") to = 0;
+    else if (ev.key === "End") to = items.length - 1;
+    if (to < 0) return;
+    ev.preventDefault();
+    items[to].focus();
+  }
+  $("main-menu").addEventListener("keydown", menuKeys);
+  groupMenuEl.addEventListener("keydown", menuKeys);
+  // A press outside an open menu closes it: see the panel dismissal handler
+  // below, which owns every press and settles the menu first.
+
+  // ---- toolbar folds -------------------------------------------------------
+  //
+  // Worn as html[data-folded], a space-separated list of the folded groups:
+  // the saved choice plus whatever the width forced. A folded pill shows the
+  // warning or active state of any button inside it, so a fold never hides
+  // that something wants attention.
+  //
+  // An interception on Tab Activity is a warning on its folded pill, and the
+  // button's accessible name, which carries the condition, becomes the
+  // pill's description (round 3, R-002); a badge with a count (Chat's
+  // unread messages) puts a dot on the pill. Every write here changes
+  // something or is skipped, because the state observer watches these very
+  // elements and a write of the same value is still a mutation (round 3,
+  // R-001).
+  function syncGroupPills() {
+    for (const [g, members] of TOOLBAR_GROUPS) {
+      const pill = $("group-" + g);
+      if (!pill) continue;
+      let warning = false;
+      let active = false;
+      let badged = false;
+      const conditions = [];
+      for (const id of members) {
+        const b = document.getElementById(id);
+        if (!b || b.hidden) continue;
+        const intercepted = b.classList.contains("is-intercepted");
+        const warned = b.classList.contains("is-warning");
+        if (intercepted || warned) {
+          warning = true;
+          const name = b.getAttribute("aria-label");
+          if (name) conditions.push(name);
+        }
+        active = active || b.classList.contains("is-active");
+        const badge = b.querySelector(".badge");
+        badged = badged || !!(badge && !badge.hidden && badge.textContent && badge.textContent.trim());
+      }
+      pill.classList.toggle("is-warning", warning);
+      pill.classList.toggle("is-active", active);
+      pill.classList.toggle("has-badge", badged);
+      const state = $("group-" + g + "-state");
+      const text = conditions.join(" ");
+      if (state && state.textContent !== text) state.textContent = text;
+    }
+  }
+  // `measuring`: an intermediate pass of autoFold, which unfolds and refolds
+  // to measure; a menu is judged only on the result, or every resize closed
+  // an automatically folded group's open menu (round 3, R-006).
+  function wearFolds(measuring) {
+    const folded = TOOLBAR_GROUP_IDS.filter(isFolded);
+    const want = folded.join(" ");
+    if (want) {
+      if (document.documentElement.dataset.folded !== want) {
+        document.documentElement.dataset.folded = want;
+      }
+    } else if (document.documentElement.dataset.folded !== undefined) {
+      delete document.documentElement.dataset.folded;
+    }
+    if (measuring) return;
+    for (const g of TOOLBAR_GROUP_IDS) {
+      const box = $("fold-" + g);
+      if (box) box.checked = (foldWanted || userFolded).has(g);
+    }
+    syncGroupPills();
+    // A group that unfolded while its menu was open has nothing to anchor
+    // to; its buttons are back on the row, and the keyboard goes to the
+    // first of them if it was in the menu. (A group still folded keeps its
+    // menu; autoFold places it again.)
+    if (menuOpen && menuLayer && menuLayer.group && !isFolded(menuLayer.group)) {
+      const g = menuLayer.group;
+      const hadFocus = groupMenuItems.includes(document.activeElement);
+      closeMenu({ keepFocus: true, instant: true });
+      const first = shownMembers(g)[0];
+      if (hadFocus && first) first.focus();
+    }
+  }
+  const knownGroups = (list) =>
+    TOOLBAR_GROUP_IDS.filter((g) => Array.isArray(list) && list.includes(g));
+  async function refreshFolds() {
+    try {
+      const r = await rb("toolbar_folded_get");
+      userFolded = new Set(knownGroups(r && r.groups));
+    } catch (_) {
+      // Leave the folds as they stand.
+    }
+    wearFolds();
+    autoFold();
+  }
+  // Two boxes changed before the first reply used to build both requests on
+  // the last ANSWERED set, so the second overwrote the first (round 3,
+  // R-007). Each change builds on the last set ASKED for, and only the reply
+  // to the newest request is worn; Rust takes the requests in order, so the
+  // newest is what it stored.
+  for (const g of TOOLBAR_GROUP_IDS) {
+    const box = $("fold-" + g);
+    if (!box) continue;
+    box.addEventListener("change", () => {
+      const want = new Set(foldWanted || userFolded);
+      if (box.checked) want.add(g);
+      else want.delete(g);
+      foldWanted = want;
+      const seq = ++foldSeq;
+      rb("toolbar_folded_set", { groups: TOOLBAR_GROUP_IDS.filter((id) => want.has(id)) })
+        .then((r) => {
+          // Every successful reply is what Rust stored at that moment, so it
+          // is kept even when a newer request is still on its way; only the
+          // newest reply is worn. A refusal then falls back to the last
+          // stored set, not to the one shown before the click (round 4,
+          // R-001).
+          userFolded = new Set(knownGroups(r && r.groups));
+          if (seq !== foldSeq) return;
+          foldWanted = null;
+          autoFold();
+        })
+        .catch((e) => {
+          if (seq === foldSeq) {
+            foldWanted = null;
+            autoFold();
+          }
+          toast(friendly(e), true);
+        });
+    });
+  }
+  // FOLD ON MEASURED OVERFLOW. On the top strip, row two wraps when the
+  // window is narrower than its buttons; folding from the right end until
+  // it fits keeps it one row, and unfolding when there is room again is the
+  // same pass: start from the saved folds, fold while it wraps. Never
+  // stored. On a rail there is no row to wrap, so nothing is forced there.
+  function rowTwoWraps() {
+    const shown = movableButtons().filter((n) => n.offsetParent != null);
+    if (shown.length < 2) return false;
+    const first = shown[0].offsetTop;
+    return shown.some((n) => n.offsetTop > first + 2);
+  }
+  function autoFold() {
+    autoFolded.clear();
+    if (!sidebarShowing()) {
+      wearFolds(true);
+      for (const g of AUTO_FOLD_ORDER) {
+        if (!rowTwoWraps()) break;
+        if (userFolded.has(g)) continue;
+        autoFolded.add(g);
+        wearFolds(true);
+      }
+    }
+    wearFolds();
+    // A group menu kept open through the measurement goes where its pill
+    // is now; the width that triggered this pass may have moved it.
+    if (menuOpen && menuLayer && menuLayer.group) {
+      menuHeightPx = positionGroupMenu(menuLayer.button);
+      syncChromeInsets();
+    }
+  }
+  if (typeof ResizeObserver !== "undefined") {
+    new ResizeObserver(() => autoFold()).observe($("toolbar"));
+  }
+  refreshFolds();
+
+  // Updates and Integrity arrive at runtime (update.js, integrity.js append
+  // to #toolbar); they wear in-menu the moment they do. A member's class or
+  // visibility changing re-reads the folded pills. Guarded like the sidebar
+  // sweep: the DOM harness has no MutationObserver.
+  function hideMenuPills() {
+    for (const id of IN_MENU_PILLS) {
+      const b = document.getElementById(id);
+      // Only when missing: classList.add of a class already there still
+      // writes the attribute, the observer below watches it, and an
+      // unconditional add looped it forever (round 3, R-001).
+      if (b && !b.classList.contains("in-menu")) b.classList.add("in-menu");
+    }
+  }
+  hideMenuPills();
+  syncMenuProxies();
+  // Watched whether a menu is open or not, and in both homes a button can
+  // have (the toolbar, and the rail in a side layout): the menu button's dot
+  // and a folded pill's state must follow the real buttons at all times,
+  // not only while a menu shows (round 2, R-004). The writes these make are
+  // to entries outside the watched trees, or are no-ops on a second pass,
+  // so the observer settles.
+  if (typeof MutationObserver !== "undefined") {
+    const watchState = new MutationObserver(() => {
+      hideMenuPills();
+      syncMenuProxies();
+      syncGroupPills();
+      syncOpenGroupMenu();
+    });
+    for (const id of ["toolbar", "sidebar"]) {
+      const host = $(id);
+      if (host) {
+        watchState.observe(host, {
+          childList: true,
+          subtree: true,
+          attributes: true,
+          attributeFilter: ["class", "hidden", "disabled", "aria-pressed", "aria-label"],
+        });
+      }
+    }
+  }
 
   // ---- find bar ----
   // The engines do the searching through their native find APIs; this bar
@@ -3100,6 +4192,14 @@
   }
 
   document.addEventListener("keydown", (ev) => {
+    // Tab out of an open menu closes it and gives the keyboard back to its
+    // button, the usual menu behaviour. It must not walk into the panel the
+    // menu is drawn over while the menu stays open (round 2, R-002).
+    if (ev.key === "Tab" && menuOpen) {
+      ev.preventDefault();
+      closeMenu();
+      return;
+    }
     if (ev.key !== "Tab" || !openPanelName) return;
     const panel = panels.get(openPanelName);
     if (!panel) return;
@@ -3122,6 +4222,20 @@
   });
 
   document.addEventListener("mousedown", (ev) => {
+    // A MENU IS THE INNERMOST LAYER and settles the press first. A press in
+    // the menu or on the button that opened it belongs to the menu; any
+    // other press closes the menu and nothing else, one layer per press as
+    // Escape does. Without this, a press on an entry reached the code below
+    // as "outside the panel" and closed the panel under the menu, running
+    // its onClose (chat wipes its conversations there) before the entry's
+    // own click arrived (review round 2, R-001).
+    if (menuOpen) {
+      const t = ev.target;
+      const own =
+        t && t.closest && t.closest("#main-menu, #group-menu, #btn-main-menu, .group-pill");
+      if (!own) closeMenu();
+      return;
+    }
     if (openPanelName) {
       const panel = panels.get(openPanelName);
       // Only a click on the scrim itself. A click inside the card, or anywhere
@@ -3336,11 +4450,30 @@
   $("btn-allow-site").addEventListener("click", () => {
     // Was `lastTabStatus.host` -- a field `tab_status` has never sent. This
     // button has been dead since it shipped: `host` read `undefined` on every
-    // click, so "Allow this site while frozen" allowed nothing. `origin` is
+    // click, so "Allow this host while frozen" allowed nothing. `origin` is
     // the field that actually carries this, added above for the same
     // purpose Forget-this-site needed it for.
-    const host = lastTabStatus && lastTabStatus.origin;
-    if (host) allowHost(host);
+    const host = allowSiteHost();
+    if (host) allowHost(host, lastTabStatus && lastTabStatus.id);
+  });
+  // "Allow ads and trackers on this tab". The box FOLLOWS tab_status, not
+  // the click: it goes back to what Rust last said until Rust answers, and
+  // the answer (then the status pushed after the reload) moves it. Named by
+  // tab id, because the panel paints from an async push and a tab switch
+  // can land between the paint and the click. The site is not sent: Rust
+  // reads it from the tab, and reloads the tab both ways.
+  $("tab-ads-allow").addEventListener("change", () => {
+    const box = $("tab-ads-allow");
+    const wanted = box.checked;
+    const st = lastTabStatus || {};
+    box.checked = st.ads_allowed === true;
+    if (typeof st.id !== "number") return;
+    rb("tab_ads_allow", { tab_id: st.id, allowed: wanted })
+      .then(applyTabStatus)
+      .catch((e) => {
+        toast(friendly(e), true);
+        rb("tab_status").then(applyTabStatus).catch(() => {});
+      });
   });
   // The second, more conventional way into Tab Activity -- see the comment
   // on #btn-site-info in index.html for why this opens the SAME panel rather
@@ -4129,7 +5262,10 @@
   // translation from a chip is one accidental click, from the panel it is a
   // deliberate one.
   $("translate-chip").addEventListener("click", () => {
-    if ($("tab-panel").hidden) togglePanelNamed("tab");
+    // By the manager's state, not `hidden`: a card still fading out is not
+    // hidden yet, and skipping the toggle would let its timer hide the panel
+    // just asked for (review 2026-10-12, R-002).
+    if (openPanelName !== "tab") togglePanelNamed("tab");
     selectTabPanelSection("btn-tab-translate");
   });
 
@@ -4485,6 +5621,8 @@
   // one-time banner and, always, from About.
   let tutorialTopic = "reader-view";
   const TUTORIAL_TOPICS = [
+    // Windows only (1.0.7): its button shows when Rust has the video.
+    ["keep-sites", "tutorial-topic-keep"],
     ["reader-view", "tutorial-topic-reader"],
     ["tab-groups", "tutorial-topic-groups"],
     ["side-by-side", "tutorial-topic-side"],
@@ -4534,6 +5672,13 @@
       .finally(() => tutorialPending.delete(topic));
   }
   function tutorialSteps(topic) {
+    if (topic === "keep-sites") {
+      return [
+        i18nText("chrome-js-tutorial-keep-step-1", "Open Messenger, and PATANYX offers to keep the site. Click Keep this site: the tab reopens in that site's own storage, and you sign in once more."),
+        i18nText("chrome-js-tutorial-keep-step-2", "For any other site, click Privacy in the toolbar and type its name, such as example.com, under Sites to keep when PATANYX starts. Click Keep this site, then sign in to it once more."),
+        i18nText("chrome-js-tutorial-keep-step-3", "Kept sites keep their storage between sessions, so they stay signed in unless the site itself signs you out. That storage also holds what other sites store inside their pages; everything else is still cleared at every start. Click Stop keeping beside a site, and the next start clears every kept site, so each asks you to sign in again."),
+      ];
+    }
     if (topic === "tab-groups") {
       return [
         i18nText("chrome-js-tutorial-groups-step-1", "Right-click a tab, choose a color and an optional name, then click Make a group with this tab."),
@@ -4543,13 +5688,13 @@
     }
     if (topic === "side-by-side") {
       return [
-        i18nText("chrome-js-tutorial-side-step-1", "Click Side by Side in the toolbar, or press Ctrl+Shift+S, to show this tab beside the one next to it."),
+        i18nText("chrome-js-tutorial-side-step-1", "Click Side by Side in the toolbar (under Tabs, if that group is folded), or press Ctrl+Shift+S, to show this tab beside the one next to it."),
         i18nText("chrome-js-tutorial-side-step-2", "To choose the pair yourself, right-click the other tab and click Show beside the tab on screen."),
         i18nText("chrome-js-tutorial-side-step-3", "Click into either half to work in it. Click Side by Side again to go back to one page."),
       ];
     }
     return [
-      i18nText("chrome-js-tutorial-reader-step-1", "Click Reader View in the toolbar, or press F9, to read the article on this page as plain text, without the menus, ads and pop-ups around it."),
+      i18nText("chrome-js-tutorial-reader-step-1", "Press F9, or open the Menu and choose Reader View, to read the article on this page as plain text, without the site menus, ads and pop-ups around it."),
       i18nText("chrome-js-tutorial-reader-step-2", "A− and A+ change the text size. Serif switches the typeface."),
       i18nText("chrome-js-tutorial-reader-step-3", "Press F9 again, or click Close, to go back to the page."),
     ];
@@ -4604,6 +5749,20 @@
   rebuildOnLocaleFill(() => {
     if (openPanelName === "tutorial") renderTutorial();
   });
+  // ONE BANNER, TWO RELEASES. On Windows it announces Kept Sites (1.0.7)
+  // once, also to people who answered it for 1.0.5; elsewhere, or once
+  // that is answered, it is the 1.0.5 banner as before. One element, so
+  // its styling, the side toolbar's offsets and BANNERS cover both (plan
+  // review 2026-10-13). The 1.0.7 text is set here, after any locale
+  // fill, which rewrites the markup's own 1.0.5 text first.
+  let tutorialBannerTopic = "reader-view";
+  let keepVideo = false;
+  function applyTutorialBannerText() {
+    if (tutorialBannerTopic !== "keep-sites") return;
+    $("tutorial-banner-title").textContent = i18nText("chrome-js-tutorial-keep-banner-title", "New in 1.0.7: PATANYX offers to keep Messenger signed in between sessions");
+    $("tutorial-banner-body").textContent = i18nText("chrome-js-tutorial-keep-banner-body", "Keep Messenger or any other site in its own storage, which also holds what other sites store inside its pages. Everything else is still cleared at every start. A short, silent video shows how, and watching it downloads nothing.");
+  }
+  rebuildOnLocaleFill(applyTutorialBannerText);
   // Watch and Not now both answer the banner for good (the marker), and
   // About keeps the way back.
   function answerTutorialBanner() {
@@ -4616,7 +5775,10 @@
   }
   $("tutorial-banner-watch").addEventListener("click", () => {
     answerTutorialBanner();
+    // The video this banner announced.
+    tutorialTopic = tutorialBannerTopic;
     if (openPanelName !== "tutorial") togglePanelNamed("tutorial");
+    else renderTutorial();
   });
   $("tutorial-banner-later").addEventListener("click", answerTutorialBanner);
   // Asked after the first-run tour, never over it: called from the boot
@@ -4624,15 +5786,84 @@
   function maybeShowTutorialBanner() {
     rb("tutorial_seen_get")
       .then((data) => {
-        if (data && data.seen === false) {
-          const banner = $("tutorial-banner");
-          if (banner.hidden) {
-            banner.hidden = false;
-            syncChromeInsets();
-          }
+        if (!data) return;
+        keepVideo = data.keep_video === true;
+        $("tutorial-topic-keep").hidden = !keepVideo;
+        let topic = null;
+        if (keepVideo && data.keep_seen === false) topic = "keep-sites";
+        else if (data.seen === false) topic = "reader-view";
+        if (topic === null) return;
+        tutorialBannerTopic = topic;
+        applyTutorialBannerText();
+        const banner = $("tutorial-banner");
+        if (banner.hidden) {
+          banner.hidden = false;
+          syncChromeInsets();
         }
       })
       .catch(() => {});
+  }
+
+  // ---- the window frame on Windows (1.0.7) ----
+  //
+  // The window has no title bar there (main.rs), so the tab strip is the
+  // title bar: these controls, the drag area and the top resize band each
+  // send one window_control (window_frame.rs parses it). chrome_caps
+  // reports window_frame only on Windows; on Linux none of this shows and
+  // a double-click on the empty strip still opens a tab.
+  let windowFrame = false;
+  function setWindowMaximized(on) {
+    document.documentElement.dataset.windowMaximized = on ? "on" : "off";
+    const label = on
+      ? i18nText("chrome-js-win-restore", "Restore")
+      : i18nText("chrome-js-win-maximize", "Maximize");
+    $("win-max").setAttribute("aria-label", label);
+    $("win-max").title = label;
+  }
+  function applyWindowFrame(caps) {
+    windowFrame = !!(caps && caps.window_frame);
+    $("window-controls").hidden = !windowFrame;
+    $("window-drag").hidden = !windowFrame;
+    $("window-resize").hidden = !windowFrame;
+    if (windowFrame) setWindowMaximized(!!caps.window_maximized);
+  }
+  function windowControl(args) {
+    rb("window_control", args).catch(() => {});
+  }
+  // A press on a window control must not move the keyboard inside the
+  // chrome either (the address bar keeps its caret), as with a real
+  // title bar; Rust hands it back to the page (code review R-001).
+  for (const id of ["win-min", "win-max", "win-close"]) {
+    $(id).addEventListener("mousedown", (ev) => ev.preventDefault());
+  }
+  // A locale fill writes the static "Maximize" over the live label;
+  // put the state back after it (code review 2026-10-13, R-004).
+  rebuildOnLocaleFill(() => {
+    if (windowFrame) setWindowMaximized(document.documentElement.dataset.windowMaximized === "on");
+  });
+  $("win-min").addEventListener("click", () => windowControl({ action: "minimize" }));
+  $("win-max").addEventListener("click", () => windowControl({ action: "maximize" }));
+  $("win-close").addEventListener("click", () => windowControl({ action: "close" }));
+  // Only the strip's own space is title bar: a press on a tab, a button
+  // or anything inside them belongs to that control.
+  function isTitleSpace(target) {
+    return target === $("tabstrip") || target === $("tabs") || target === $("window-drag");
+  }
+  // A press moves the window through the system's own move loop (so
+  // Aero Snap works); a second press of a double press maximizes or
+  // restores. Decided on the press, because the move loop keeps the
+  // release, and with it the dblclick, from ever reaching the page.
+  $("tabstrip").addEventListener("mousedown", (ev) => {
+    if (!windowFrame || ev.button !== 0 || !isTitleSpace(ev.target)) return;
+    ev.preventDefault();
+    windowControl({ action: ev.detail >= 2 ? "maximize" : "drag" });
+  });
+  for (const edge of ["n", "nw", "ne"]) {
+    $("window-resize-" + edge).addEventListener("mousedown", (ev) => {
+      if (!windowFrame || ev.button !== 0) return;
+      ev.preventDefault();
+      windowControl({ action: "resize", edge });
+    });
   }
 
   // ---- first-run tour ----
@@ -4706,6 +5937,10 @@
       { label: i18nText("chrome-js-palette-updates", "Open Updates"), buttonId: "btn-update" },
       { label: i18nText("chrome-js-palette-site-info", "About this site"), buttonId: "btn-site-info" },
       { label: i18nText("chrome-js-palette-save-pdf", "Save page as PDF"), buttonId: "btn-save-pdf" },
+      // Print has no toolbar button; its menu entry is the one element that
+      // does it, so the palette clicks that (1.0.7).
+      { label: i18nText("chrome-js-palette-print", "Print this page"), buttonId: "menu-print" },
+      { label: i18nText("chrome-js-palette-read-text", "Read text on this page"), buttonId: "btn-ocr-region" },
       { label: i18nText("chrome-js-palette-about", "About PATANYX"), buttonId: "btn-about" },
       // Premium tab-pack entries. Their buttons are hidden literals in
       // index.html (the gate resolves ids there), and the premium refusal
@@ -5020,7 +6255,10 @@
       refreshTheme();
       refreshAccent();
       refreshScheme();
+      refreshTexture();
       refreshToolbarLabels();
+      refreshMotion();
+      refreshDuplicateNotice();
       rb("bookmarks_bar_get")
         .then((r) => wearBookmarkBar(r.shown))
         .catch(() => {});
@@ -5044,6 +6282,10 @@
     // trusted page's memory once the user has moved on.
     $("recovery-key").textContent = "";
     showState("open");
+    if (reloadListsAfterKey) {
+      reloadListsAfterKey = false;
+      void reloadLists();
+    }
   });
 
   // ---- tunnel panel + the fail-closed banner -----------------------------
@@ -5588,6 +6830,58 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
   }
 
+  // The duplicate-site notice's switch, in the theme panel's Tabs section.
+  // Same prefs-pair shape as the fingerprint switch above: the reply re-marks
+  // the box, so it never shows a state the pref does not hold. Rust applies
+  // the change at once, including taking down a notice already on screen
+  // when the switch goes off.
+  $("duplicate-notice").addEventListener("change", (ev) => {
+    rb("duplicate_notice_set", { enabled: ev.target.checked })
+      .then((r) => {
+        $("duplicate-notice").checked = !!r.enabled;
+      })
+      .catch(() => refreshDuplicateNotice());
+  });
+
+  async function refreshDuplicateNotice() {
+    try {
+      const r = await rb("duplicate_notice_get");
+      $("duplicate-notice").checked = !!r.enabled;
+    } catch (e) {
+      // Leave the box as it stands, as refreshFingerprint does.
+    }
+  }
+
+  // ---- motion -------------------------------------------------------------
+  //
+  // The chrome's own switch for its motion, beside the system's reduced-motion
+  // setting, which the stylesheet honours on its own. Worn as a data attribute
+  // the stylesheet keys its duration tokens on, so one attribute quiets every
+  // transition; prefersReducedMotion() reads it too, for the timings this file
+  // keeps in JS. Same shape as the duplicate-site switch above: the box
+  // follows Rust's reply, never the click.
+  function wearMotion(reduce) {
+    if (reduce) {
+      document.documentElement.dataset.motion = "reduce";
+    } else {
+      delete document.documentElement.dataset.motion;
+    }
+    $("reduce-motion").checked = !!reduce;
+  }
+  $("reduce-motion").addEventListener("change", (ev) => {
+    rb("motion_set", { reduce: ev.target.checked })
+      .then((r) => wearMotion(!!r.reduce))
+      .catch(() => refreshMotion());
+  });
+  async function refreshMotion() {
+    try {
+      const r = await rb("motion_get");
+      wearMotion(!!r.reduce);
+    } catch (e) {
+      // Leave the attribute as it stands.
+    }
+  }
+
   // WebView2's profile-level belt-and-braces layer. It is intentionally not
   // part of PRIVACY_TOGGLES: those mutate PATANYX's per-tab policy, while
   // this pair persists an engine-profile choice and applies it through its
@@ -5737,6 +7031,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   //      button opens it rather than this panel claiming it.
 
   let divergenceHost = "";
+  // What the open proof line was last asked about; see applyTabStatus.
+  let lastDivergenceKey = "";
 
   async function refreshDivergenceSite() {
     const section = $("divergence-site");
@@ -5758,15 +7054,25 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       $("dv-off").checked = !!proof.off_for_this_site;
       $("dv-off").disabled = !divergenceHost;
       // Observed, never inferred from the pref: a tab opened before the
-      // pref last changed still carries what it was built with.
-      if (!proof.enabled_globally) {
-        $("dv-proof").textContent =
-          i18nText("chrome-js-divergence-proof-off", "Fingerprint Divergence is off in this tab.");
-      } else if (proof.registered) {
+      // pref last changed still carries what it was built with. And only an
+      // install the ENGINE confirmed reads as installed (review R-003): a
+      // built script the engine refused used to read as installed too.
+      // `install` is absent only from an older Rust; `registered` stands in.
+      const install = proof.install || (proof.registered ? "installed" : "not_wanted");
+      if (install === "installed") {
         $("dv-proof").textContent =
           "Installed for " +
           (proof.surfaces || []).join(", ") +
           ". This is not proof a site was fooled.";
+      } else if (install === "refused") {
+        $("dv-proof").textContent =
+          i18nText("chrome-js-divergence-proof-refused", "Not installed in this tab: the engine did not accept the script.");
+      } else if (install === "pending") {
+        $("dv-proof").textContent =
+          i18nText("chrome-js-divergence-proof-pending", "Waiting for the engine to install it in this tab.");
+      } else if (!proof.enabled_globally) {
+        $("dv-proof").textContent =
+          i18nText("chrome-js-divergence-proof-off", "Fingerprint Divergence is off in this tab.");
       } else {
         $("dv-proof").textContent =
           i18nText("chrome-js-divergence-proof-none", "No divergence in this tab; it keeps what it started with.");
@@ -6139,10 +7445,22 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
   }
 
+  // The YouTube switch's refusal note (review R-007). The switch is what was
+  // asked; the note follows what the ACTIVE tab's engine did, from either
+  // payload that carries it: privacy_status says "refused", tab_status says
+  // "failed" (the engine list's word for the same answer).
+  function applyYoutubeAdsInstall(refused) {
+    const note = $("pv-youtube-ads-refused");
+    if (note) note.hidden = !refused;
+  }
+
   function applyPrivacyStatus(st) {
     if (!st) return;
     for (const t of PRIVACY_TOGGLES) {
       $(t.id).checked = !!st[t.key];
+    }
+    if (st.youtube_ads_script !== undefined) {
+      applyYoutubeAdsInstall(st.youtube_ads_script === "refused");
     }
 
     // The browser-wide cookie control's wording, written verbatim from what
@@ -6240,7 +7558,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     $("privacy-foot").textContent =
       active === 0
         ? i18nText("chrome-js-privacy-foot-none", "No protections selected.")
-        : i18nText("chrome-js-privacy-foot-active", "Applies to all open tabs.");
+        : i18nText("chrome-js-privacy-foot-active", "Each switch's note says which tabs it reaches. Strict Tabs keep their own settings, and a tab where you allowed ads and trackers keeps them allowed.");
   }
 
   // ---- the shield --------------------------------------------------------
@@ -6291,6 +7609,15 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // bundled floor, and every hour that passes makes it staler. Rust has
     // always reported this; nothing had ever listened.
     const blocklistFailed = blocklistFailure !== null;
+    // "Allow ads and trackers on this tab". The shield describes THIS tab,
+    // and where ads are allowed PATANYX's ad and tracker blocking is off
+    // whatever the browser-wide switch says. So it is not counted as a
+    // protection here, the badge shows no blocked count (a zero would read
+    // as "nothing worth blocking on this page"), and the sentence says so
+    // first.
+    const tabAllowed = st.ads_allowed === true;
+    const tabBlocking = blockingActive && !tabAllowed;
+    const tabActive = shieldActive - (blockingActive && tabAllowed ? 1 : 0);
 
     const warn = refused.length > 0 || blocklistFailed;
     const btn = $("btn-privacy");
@@ -6300,7 +7627,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // `.is-active` in the stylesheet precisely so that a browser with three
     // protections running and one refused reads amber -- the refusal is the
     // fact the user does not already assume.
-    btn.classList.toggle("is-active", shieldActive > 0);
+    btn.classList.toggle("is-active", tabActive > 0);
     btn.classList.toggle("is-warning", warn);
 
     // THE BADGE PREFERS THE NUMBER PEOPLE ACTUALLY LOOK AT.
@@ -6323,9 +7650,9 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     //
     // Where either fails it falls back to the protections count, which is
     // always true even if it is less interesting.
-    const showBlocked = countsBlocked && blockingActive;
-    const badgeValue = showBlocked ? blockedOnPage : shieldActive;
-    badge.hidden = !showBlocked && shieldActive === 0;
+    const showBlocked = countsBlocked && tabBlocking;
+    const badgeValue = showBlocked ? blockedOnPage : tabActive;
+    badge.hidden = !showBlocked && tabActive === 0;
     badge.textContent = String(badgeValue);
     badge.classList.toggle("badge-count", showBlocked);
     // Green only once something was actually stopped; a muted zero, so the
@@ -6336,6 +7663,9 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // count alone would say "3 active" on a browser that had just been told
     // no, which is true and useless.
     const parts = [];
+    if (tabAllowed) {
+      parts.push(i18nText("chrome-js-shield-ads-allowed", "PATANYX's ad and tracker list is off for this tab"));
+    }
     // What was stopped here leads, when it is a real observation -- it is the
     // reason someone looks at the badge, and the badge is now showing it.
     if (showBlocked) {
@@ -6348,12 +7678,15 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
               " blocked on this page",
       );
     }
-    parts.push(
-      shieldActive === 0
+    // In a tab where ads and trackers are allowed, "No protections active"
+    // would be false: PATANYX still refuses sites reported for phishing or
+    // malware there. The allowance line above already says what is off.
+    if (!(tabAllowed && tabActive === 0)) parts.push(
+      tabActive === 0
         ? i18nText("chrome-js-shield-active-none", "No protections active")
-        : shieldActive +
+        : tabActive +
             " protection" +
-            (shieldActive === 1 ? "" : "s") +
+            (tabActive === 1 ? "" : "s") +
             " active",
     );
     const refusedPart = refused.length
@@ -6482,12 +7815,19 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
 
   // Inserted as text, never as HTML, like everything else that crosses the
   // IPC boundary into this trusted page.
-  function showRecoveryKey(key, note) {
+  function showRecoveryKey(key, note, result) {
     $("recovery-key").textContent = key;
     const slot = $("recovery-import-note");
     if (slot) {
       slot.textContent = note || "";
       slot.hidden = !note;
+    }
+    // A result (what an import restored) is not a warning and is not drawn
+    // as one.
+    const done = $("recovery-import-result");
+    if (done) {
+      done.textContent = result || "";
+      done.hidden = !result;
     }
     showState("recovery");
   }
@@ -7040,7 +8380,47 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     renderNotes();
   }
 
+  // Counts locks. A result handler that awaits anything captures it first and
+  // draws nothing if it changed meanwhile: a recovery key or a Library's
+  // counts must never appear over a locked screen. Only a lock moves it; an
+  // import's own handover to the imported vault does not, since that sends
+  // no vault_locked.
+  let vaultGeneration = 0;
+  // Set when an import's result arrives with the idle countdown already
+  // running: the lists refresh only when the person acknowledges the key,
+  // since a refresh counts as presence and would restart the countdown.
+  let reloadListsAfterKey = false;
+
   function onLocked() {
+    vaultGeneration += 1;
+    // HIDDEN IS NOT GONE. The recovery-key screen and the no-vault import
+    // form hold secrets too, and hiding their elements leaves them readable
+    // in a locked browser (code review round 2, R-001). Emptied here, where
+    // the screen is going away anyway; never in clearSecrets, which also runs
+    // just before a key is shown.
+    $("recovery-key").textContent = "";
+    for (const id of ["recovery-import-note", "recovery-import-result"]) {
+      const el = $(id);
+      if (el) {
+        el.textContent = "";
+        el.hidden = true;
+      }
+    }
+    for (const id of ["import-export-pass", "import-pass1", "import-pass2"]) {
+      const field = $(id);
+      if (field) field.value = "";
+    }
+    // An export's result names the Library's counts, and a refusal names an
+    // item by its title or address. Emptied, and any translation still on its
+    // way is invalidated so it cannot write them back (code review round 5,
+    // R-001).
+    for (const id of ["bk-exp-error", "bk-exp-ok"]) {
+      const line = $(id);
+      if (line) {
+        i18nHold(line);
+        line.textContent = "";
+      }
+    }
     // THE DECRYPTED PAGE COMES OFF THE SCREEN WITH THE VAULT. Rust clears
     // the staged slot on lock, so the token 404s and nothing can be
     // re-fetched -- but an image already loaded stays rendered, and a
@@ -7214,6 +8594,173 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
   });
 
+  // ---- export and import jobs (backup_job.rs) ------------------------------------
+  // An encrypted export or a whole-Library import runs on its own: the command
+  // answers at once with {job}, progress arrives as backup_progress, and the
+  // result exactly once as backup_finished, carrying what the command used to
+  // return. The start reply waits for its answer however long it takes (the
+  // job id travels in it), and a result that arrives before that reply has
+  // been handled is kept until it is.
+  const backupJobs = new Map();
+  const backupFinishedEarly = new Map();
+  function backupJobEvent(kind, data) {
+    if (!data || typeof data.job !== "number") return;
+    const job = backupJobs.get(data.job);
+    if (kind === "progress") {
+      if (job && job.onProgress) job.onProgress(data);
+      return;
+    }
+    if (job) {
+      backupJobs.delete(data.job);
+      job.settle(data);
+    } else {
+      backupFinishedEarly.set(data.job, data);
+    }
+  }
+
+  // Resolves with the result or rejects with an Error carrying the code, as
+  // rb() does. How the job was stopped, if it was, is left on `ui.stoppedBy`.
+  // An answer that is not a job is already the result.
+  async function runBackupJob(cmd, args, ui) {
+    ui.stoppedBy = null;
+    ui.lockFollows = false;
+    const started = await rb(cmd, args, RB_UNTIL_ANSWERED);
+    if (!started || typeof started.job !== "number") return started;
+    ui.started(started.job);
+    const finished = await new Promise((resolve) => {
+      const early = backupFinishedEarly.get(started.job);
+      if (early) {
+        backupFinishedEarly.delete(started.job);
+        resolve(early);
+        return;
+      }
+      backupJobs.set(started.job, { settle: resolve, onProgress: ui.progress });
+    });
+    ui.stoppedBy = finished.stopped_by || null;
+    // The vault locks right after this result (a lock asked for during an
+    // import's commit, or the idle lock). Set before the result is handed
+    // back, so nothing is drawn that the lock would only hide.
+    ui.lockFollows = !!finished.lock_follows;
+    if (finished.ok) return finished.data || {};
+    throw new Error(finished.error || "unknown_error");
+  }
+
+  function backupPhaseText(phase) {
+    switch (phase) {
+      case "preparing":
+        return i18nText("chrome-js-backup-job-preparing", "Preparing: deriving the key from the passphrase.");
+      case "writing":
+        return i18nText("chrome-js-backup-job-writing", "Writing the encrypted export.");
+      case "checking":
+        return i18nText("chrome-js-backup-job-checking", "Checking the export by reading it back.");
+      case "reading":
+        return i18nText("chrome-js-backup-job-reading", "Reading the backup.");
+      case "committing":
+        return i18nText("chrome-js-backup-job-committing", "Writing the imported vault and Library. This can no longer be stopped; keep PATANYX open.");
+      default:
+        return "";
+    }
+  }
+
+  // Where each stage sits on the bar. Key derivation has no bytes to count
+  // and the commit none to report, so they leave it where it is.
+  const BACKUP_STAGE_SPAN = {
+    writing: [0, 0.8],
+    checking: [0.8, 0.99],
+    reading: [0, 0.95],
+  };
+
+  // The progress block under one form, wired once: a bar that moves only as
+  // work is reported, a line saying what is happening (with the picture count
+  // as plain numbers, so nothing needs a translation round trip four times a
+  // second), and Stop while stopping is still possible.
+  function backupProgressUi(prefix) {
+    const box = $(prefix + "progress");
+    const bar = $(prefix + "bar");
+    const line = $(prefix + "status");
+    const stop = $(prefix + "stop");
+    let job = null;
+    const ui = {
+      stoppedBy: null,
+      started(id) {
+        job = id;
+        if (box) box.hidden = false;
+        if (line) line.textContent = backupPhaseText("preparing");
+        if (stop) stop.disabled = false;
+      },
+      progress(d) {
+        if (!box || d.job !== job) return;
+        // One bar for the whole job: each stage fills its own stretch of it,
+        // and it never moves back (a stop, or the next stage starting at zero,
+        // leaves it where it was).
+        const span = BACKUP_STAGE_SPAN[d.phase];
+        if (bar && span && typeof d.total === "number" && d.total > 0) {
+          const within = Math.min(d.done / d.total, 1);
+          bar.value = Math.max(bar.value, Math.min(span[0] + within * (span[1] - span[0]), 0.99));
+        }
+        let text = d.stopping
+          ? i18nText("chrome-js-backup-job-stopping", "Stopping.")
+          : backupPhaseText(d.phase);
+        if (!d.stopping && d.phase !== "committing" && Number(d.items_total) > 0) {
+          text += " " + i18nText("chrome-js-backup-job-pictures", "Pictures:") + " " +
+            Number(d.items_done) + " / " + Number(d.items_total);
+        }
+        if (line) line.textContent = text;
+        if (stop) stop.disabled = !d.cancellable || !!d.stopping;
+      },
+      done() {
+        job = null;
+        if (box) box.hidden = true;
+        if (bar) bar.value = 0;
+        if (line) line.textContent = "";
+      },
+    };
+    if (stop) {
+      stop.addEventListener("click", async () => {
+        if (job === null) return;
+        stop.disabled = true;
+        try {
+          await rb("backup_job_cancel", { job });
+          if (line) line.textContent = i18nText("chrome-js-backup-job-stopping", "Stopping.");
+        } catch (e) {
+          if (line) line.textContent = friendly(e);
+        }
+      });
+    }
+    return ui;
+  }
+
+  // A lock during an import's commit waits for it, then locks: the new
+  // recovery key was never shown and cannot be shown again. Said plainly,
+  // without the key, so the person knows they have none.
+  function importKeyLostToLock(imported) {
+    let text = i18nText("chrome-js-import-key-lost-to-lock", "The vault was imported, but PATANYX locked before its new recovery key could be shown, so that key is lost. Your vault opens with the new passphrase you chose.");
+    // Kept copies of the replaced vault are still said, here as on the
+    // recovery-key screen (audit 2026-10-08): they may open with a retired
+    // passphrase.
+    if (imported && typeof imported.retained_copies === "number" && imported.retained_copies > 0) {
+      text += " " + i18nText("chrome-js-import-retained-copies", "PATANYX kept some vault files it found beside your vault because it could not confirm they belonged to the vault you replaced. If they are older copies of it, they may still open with an earlier passphrase or recovery key. They are in the same folder as your vault file; their names start with vault.rbv. or .tmp-, and some may be hidden. Delete them by hand if you do not want them.");
+    }
+    // A Library that did not come back is said too, with what to do next
+    // (code review round 4, R-002).
+    if (imported && typeof imported.library === "string" && imported.library !== "replaced") {
+      text += " " + (imported.library === "library_import_unfinished"
+        ? i18nText("chrome-js-import-key-lost-library-unfinished", "The backup's Library could not be moved into place yet, so your Library is closed. Unlock the vault to try again; if it stays closed, import the same backup file again.")
+        : i18nText("chrome-js-import-key-lost-library-unavailable", "Your Library could not be opened, so bookmarks, Tab Shelf and download records are unavailable."));
+    }
+    toast(text, true, { sticky: true });
+  }
+
+  function backupCloseHeld(d) {
+    toast(
+      d.committing
+        ? i18nText("chrome-js-backup-close-held-committing", "The import is finishing. Closing PATANYX now loses the new recovery key, which is shown only once. Close again to close anyway.")
+        : i18nText("chrome-js-backup-close-held-working", "Stopping the export or import. PATANYX closes when it has stopped, or after 10 seconds."),
+    );
+  }
+
+  const exportJobUi = backupProgressUi("bk-exp-");
+
   $("bk-export-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
     const err = $("bk-exp-error");
@@ -7230,18 +8777,161 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       err.textContent = i18nText("chrome-js-backup-exp-required", "Choose a destination and set an export passphrase.");
       return;
     }
+    // The button stays down until the result, however long a large Library
+    // takes to write, so a second press cannot start a second export.
+    const button = $("bk-exp-submit");
+    if (button) button.disabled = true;
+    const generation = vaultGeneration;
     try {
-      await rb("vault_export_encrypted", { dest, passphrase });
+      const written = await runBackupJob("vault_export_encrypted", { dest, passphrase }, exportJobUi);
+      // Locked meanwhile, or locking right after: the pane is going, and
+      // nothing is drawn into it. Whether the export was saved is still said,
+      // in a notice that stays, without the Library's counts (code review
+      // round 4, R-003).
+      if (exportJobUi.lockFollows || generation !== vaultGeneration) {
+        exportOutcomeAfterLock(written);
+        return;
+      }
+      // Refused before anything was written: the Library holds something
+      // this version could not import back. The passphrases stay, so a
+      // retry after the fix is one click.
+      if (written && written.refused) {
+        exportRefusal(err, written);
+        return;
+      }
       $("bk-exp-pass1").value = "";
       $("bk-exp-pass2").value = "";
-      // Named plainly because it is a separate secret from the vault
-      // passphrase and there is no recovery key for an export.
-      ok.textContent =
-        i18nText("chrome-js-backup-exp-written", "Encrypted export written. Only its passphrase can open it; there is no recovery key.");
+      await exportWritten(ok, written || {}, generation);
+      // Locked while the counts were worded: they stay off the screen, and
+      // the outcome is still said (code review round 5, R-002).
+      if (generation !== vaultGeneration) {
+        exportOutcomeAfterLock(written);
+        return;
+      }
+      // Stop was pressed, but the backup was already whole: it is written.
+      if (exportJobUi.stoppedBy) {
+        ok.textContent += " " + i18nText("chrome-js-backup-exp-late-stop", "The export was already complete, so stopping it changed nothing.");
+      }
     } catch (e) {
-      err.textContent = friendly(e);
+      if (e && e.message === "backup_cancelled" && exportJobUi.stoppedBy === "lock") {
+        toast(i18nText("chrome-js-backup-exp-stopped-by-lock", "The export stopped because the vault locked. It was not saved."));
+      } else if (exportJobUi.lockFollows || generation !== vaultGeneration) {
+        // A failure around a lock is still said where it stays visible.
+        toast(e && e.message === "backup_cancelled"
+          ? i18nText("chrome-js-backup-exp-stopped", "Export stopped before it was saved. Any file already at that location is unchanged.")
+          : friendly(e), true, { sticky: true });
+      }
+      if (exportJobUi.lockFollows || generation !== vaultGeneration) return;
+      err.textContent = e && e.message === "backup_cancelled"
+        ? i18nText("chrome-js-backup-exp-stopped", "Export stopped before it was saved. Any file already at that location is unchanged.")
+        : friendly(e);
+    } finally {
+      exportJobUi.done();
+      if (button) button.disabled = false;
     }
   });
+
+  // An export that ended around a lock: whether it was saved is said in a
+  // notice that stays, never the Library's counts or an item's name.
+  function exportOutcomeAfterLock(written) {
+    if (written && written.refused) {
+      toast(i18nText("chrome-js-backup-exp-library-unusable", "Nothing was written. Part of your Library failed the check PATANYX runs before every backup."), true, { sticky: true });
+      return;
+    }
+    let note = i18nText("chrome-js-backup-exp-saved-locked", "The encrypted export was saved.");
+    if (exportJobUi.stoppedBy) {
+      note += " " + i18nText("chrome-js-backup-exp-late-stop", "The export was already complete, so stopping it changed nothing.");
+    }
+    toast(note, false, { sticky: true });
+  }
+
+  // What the export put in the file, said once and plainly. Named because the
+  // export passphrase is a separate secret from the vault's, and there is no
+  // recovery key for an export. Composed into one string and written once.
+  async function exportWritten(ok, written, generation) {
+    let text;
+    if (written.library_included === false) {
+      text = i18nText("chrome-js-backup-exp-written-vault-only", "Encrypted export written with your vault only. Your Library was not open, so it is not in this file. Only its passphrase can open it; there is no recovery key.");
+    } else {
+      const n = (key) => Number(written[key]) || 0;
+      const args = {
+        bookmarks: n("bookmarks"),
+        groups: n("tab_groups"),
+        pages: n("deep_recall_pages"),
+        pictures: n("pictures"),
+        exceptions: n("site_exceptions"),
+      };
+      const c = (v) => v.toLocaleString("en-US");
+      text = await i18nResolve(
+        "chrome-js-backup-exp-written",
+        args,
+        "Encrypted export written with your vault and your Library. Only its passphrase can open it; " +
+          "there is no recovery key. Bookmarks: " + c(args.bookmarks) + ", shelved windows: " + c(args.groups) +
+          ", Deep Recall pages: " + c(args.pages) + ", pictures: " + c(args.pictures) +
+          ", Divergence Exceptions: " + c(args.exceptions) + ".",
+      );
+    }
+    const leftOut = Number(written.pictures_left_out) || 0;
+    if (leftOut > 0) {
+      text += " " + (await i18nResolve(
+        "chrome-js-backup-exp-pictures-left-out",
+        { count: leftOut },
+        "Pictures left out: " + leftOut.toLocaleString("en-US") +
+          ". Each one was missing from this computer, so its page was saved without it.",
+      ));
+    }
+    // The wording above can take round trips in another language; a lock in
+    // that moment keeps the Library's counts off the locked screen (code
+    // review round 1, R-004).
+    if (generation !== undefined && generation !== vaultGeneration) return;
+    ok.textContent = text;
+  }
+
+  // An export that wrote nothing, and what is in the way. `item` is the title
+  // or address the person knows the item by; it is their own data, shown here
+  // and nowhere else.
+  function exportRefusal(err, refused) {
+    const item = typeof refused.item === "string" ? refused.item : "";
+    switch (refused.refused) {
+      case "export_too_many_bookmarks": {
+        const limit = Number(refused.bookmark_limit) || 100000;
+        i18nSet(err, "chrome-js-backup-exp-too-many-bookmarks", { limit },
+          "Nothing was written. A backup can carry up to " + limit.toLocaleString("en-US") +
+            " bookmarks, and your Library has more. Delete some, then try again.");
+        return;
+      }
+      case "export_item_too_large":
+        if (item) {
+          i18nSet(err, "chrome-js-backup-exp-item-too-large", { item },
+            "Nothing was written. \"" + item + "\" is too large for a backup. Delete it from your Library, then try again.");
+          return;
+        }
+        break;
+      case "export_picture_unreadable":
+        if (item) {
+          i18nSet(err, "chrome-js-backup-exp-picture-unreadable", { item },
+            "Nothing was written. The picture saved with \"" + item + "\" could not be read. Try again. If it still cannot be read, delete it from your Library, then export again.");
+          return;
+        }
+        break;
+      case "export_library_changed":
+        if (item) {
+          i18nSet(err, "chrome-js-backup-exp-library-changed", { item },
+            "Nothing was written. The picture saved with \"" + item + "\" was removed from your Library during the export. Export again.");
+          return;
+        }
+        break;
+      case "export_library_too_large":
+        err.textContent = i18nText("chrome-js-backup-exp-library-too-large", "Nothing was written. Without pictures, your Library comes to more than 512 MB, the most a backup can carry. Delete some Deep Recall pages, then try again.");
+        return;
+      case "export_library_over_limit":
+        err.textContent = i18nText("chrome-js-backup-exp-library-over-limit", "Nothing was written. Your Library holds more than a backup can carry.");
+        return;
+      default:
+        break;
+    }
+    err.textContent = i18nText("chrome-js-backup-exp-library-unusable", "Nothing was written. Part of your Library failed the check PATANYX runs before every backup.");
+  }
 
   $("bk-plain-form").addEventListener("submit", async (ev) => {
     ev.preventDefault();
@@ -7304,6 +8994,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   // prefix is the only thing that varies.
   function wireImportForm(prefix) {
     const id = (suffix) => prefix + suffix;
+    // A whole-Library import runs as a job, with its progress under the form.
+    const jobUi = backupProgressUi(prefix);
     const form = $(id("form"));
     // A missing form is not an error, it is just not on this page.
     if (!form) return;
@@ -7343,13 +9035,46 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
           { path: r.path },
           "Chosen: " + r.path,
         );
+        await inspectChosen();
       } catch (e) {
         err.textContent = friendly(e);
       }
     });
 
+    // AN OLDER BACKUP REPLACES MORE THAN IT BRINGS BACK. Files from before the
+    // whole-Library backup carry the vault and, at most, bookmarks, and the
+    // import still replaces the whole Library, so the person is told what
+    // will be gone BEFORE they confirm, not afterwards. Only where the form
+    // has room for it: the no-vault screen has no Library to lose.
+    let inspectToken = 0;
+    // The file the older-backup note has been shown for, so a submit can tell
+    // whether the person has seen it.
+    let warnedOlderFor = null;
+    async function inspectChosen() {
+      const note = $(id("older"));
+      if (!note) return;
+      const mine = ++inspectToken;
+      note.hidden = true;
+      const src = $(id("src")).value.trim();
+      if (!src) return;
+      try {
+        const kind = await rb("vault_import_inspect", { src });
+        if (mine !== inspectToken) return;
+        note.hidden = !(kind && kind.older);
+        if (!note.hidden) warnedOlderFor = src;
+      } catch (e) {
+        // The import itself reports an unreadable file; this note only adds
+        // to a file it can read.
+      }
+    }
+    $(id("src")).addEventListener("change", inspectChosen);
+
     form.addEventListener("submit", async (ev) => {
       ev.preventDefault();
+      // Captured before the first await, so a lock during the older-backup
+      // check below still stops the import from being sent (code review
+      // round 1, R-001).
+      const generation = vaultGeneration;
       const err = $(id("error"));
       err.textContent = "";
       delete err.dataset.reason;
@@ -7380,20 +9105,73 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         err.dataset.reason = "mismatch";
         return;
       }
+      // AN OLDER BACKUP IS NAMED BEFORE IT REPLACES ANYTHING. A typed path
+      // submitted with Enter can arrive before the check that shows the note,
+      // so the check runs here too: if the note has not been on screen for
+      // this file, it is shown and nothing is imported until the next submit.
+      if ($(id("older")) && warnedOlderFor !== src) {
+        let kind = null;
+        try {
+          kind = await rb("vault_import_inspect", { src });
+        } catch (e) {
+          // The import itself reports a file it cannot read.
+        }
+        if (generation !== vaultGeneration) return;
+        if (kind && kind.older) {
+          warnedOlderFor = src;
+          $(id("older")).hidden = false;
+          return;
+        }
+      }
+      // Held down until the answer, however long a whole Library takes, so a
+      // second press cannot start a second import underneath the first.
+      const button = $(id("submit"));
+      if (button) button.disabled = true;
       try {
-        const imported = await rb("vault_import", {
-          src,
-          passphrase: exportPass,
-          new_passphrase: p1,
-        });
+        const imported = await runBackupJob(
+          "vault_import",
+          { src, passphrase: exportPass, new_passphrase: p1 },
+          jobUi,
+        );
         for (const suffix of ["src", "export-pass", "pass1", "pass2"]) {
           $(id(suffix)).value = "";
         }
+        // Locked while it ran, or locking right after this result (a lock
+        // during the commit waits for it): the recovery key and the counts are
+        // never drawn over the locked screen. The key is lost then, as a lock
+        // always loses it, and the person is told so, without the key.
+        if (jobUi.lockFollows || generation !== vaultGeneration) {
+          if (imported && (imported.recovery_key || imported.key_lost)) importKeyLostToLock(imported);
+          return;
+        }
         $(id("chosen")).textContent = "";
+        if ($(id("older"))) $(id("older")).hidden = true;
+        warnedOlderFor = null;
+        // The replaced vault's session ends on screen too, as a lock ends it:
+        // a password still revealed, or an edit form still open, belongs to
+        // the vault that is gone. Left up, the next render showed the old
+        // password beside the imported entry with the same id, and saving the
+        // open form wrote it into the imported vault (review 2026-10-12,
+        // R-001). Before the recovery-key screen, which it does not touch.
+        clearSecrets();
         if (imported && imported.library !== "replaced") {
           err.textContent = imported.library === "not_replaced"
             ? i18nText("chrome-js-import-library-not-replaced", "The vault was imported, but the previous profile's Library could not be replaced. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.")
-            : i18nText("chrome-js-import-library-not-opened", "The vault was imported and the previous Library was replaced, but the new Library could not be opened. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.");
+            : imported.library === "library_import_unfinished"
+              ? i18nText("chrome-js-import-library-unfinished", "The vault was imported, but the backup's Library could not be moved into place, so your Library is closed. First, write down the new recovery key below. Then lock the vault and unlock it to try again. If the Library stays closed, import the same backup file again.")
+              : i18nText("chrome-js-import-library-not-opened", "The vault was imported and the previous Library was replaced, but the new Library could not be opened. Bookmarks, Tab Shelf, and download records are unavailable. Write down the new recovery key below before continuing.");
+        }
+        // What came back, counted, so nothing the person expected is silently
+        // missing. Shown with the recovery key only, as a result rather than
+        // a warning, and never left behind in the form's error line. Older
+        // backups' replies carry no counts and add nothing.
+        const restored =
+          imported && imported.library === "replaced" ? await importRestoredText(imported) : "";
+        // The counts' wording can take a round trip in another language; a
+        // lock in that moment still keeps the key off the screen.
+        if (generation !== vaultGeneration) {
+          if (imported && (imported.recovery_key || imported.key_lost)) importKeyLostToLock(imported);
+          return;
         }
         // Copies of the replaced vault the import could not prove were its
         // own generations were KEPT, and the user must hear it: they may
@@ -7410,15 +9188,92 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         // pane the recovery screen hides, and on the no-vault path that pane
         // is never shown again (compliance audit, same day).
         if (imported && imported.recovery_key) {
-          showRecoveryKey(imported.recovery_key, err.textContent);
+          showRecoveryKey(imported.recovery_key, err.textContent, restored);
         } else {
           showState("open");
         }
-        await reloadLists();
+        // The idle countdown started with this result (the commit outlasted
+        // the idle timeout): refreshing the lists now would count as presence
+        // and quietly restart it (code review round 4, R-001).
+        if (imported && imported.idle_warning && imported.recovery_key) {
+          reloadListsAfterKey = true;
+        } else {
+          await reloadLists();
+        }
       } catch (e) {
-        err.textContent = friendly(e);
+        const code = e && e.message;
+        const byLock = jobUi.stoppedBy === "lock";
+        const message =
+          code === "backup_cancelled"
+            ? byLock
+              ? i18nText("chrome-js-import-stopped-by-lock", "The import stopped because PATANYX was locked. Nothing was imported or replaced.")
+              : i18nText("chrome-js-import-stopped", "Import stopped. Nothing was imported or replaced.")
+            : code === "backup_cancelled_cleanup_pending"
+              ? byLock
+                ? i18nText("chrome-js-import-stopped-by-lock-cleanup-pending", "The import stopped because PATANYX was locked. Nothing was imported or replaced, but some of its temporary files remain. PATANYX tries to remove them the next time it opens your Library.")
+                : i18nText("chrome-js-import-stopped-cleanup-pending", "Import stopped. Nothing was imported or replaced, but some of its temporary files remain. PATANYX tries to remove them the next time it opens your Library.")
+              : friendly(e);
+        // A lock came with this outcome, before it, or caused it: the pane is
+        // going, so what happened (a stop, leftovers, or a commit that failed
+        // and what to do next) is said where it stays visible (code review
+        // round 3, R-001 and R-002). None of it is a secret.
+        if (byLock || jobUi.lockFollows || generation !== vaultGeneration) {
+          toast(message, true, { sticky: true });
+          return;
+        }
+        err.textContent = message;
+      } finally {
+        jobUi.done();
+        if (button) button.disabled = false;
       }
     });
+  }
+
+  // The counts a whole-Library import reports; empty for an older backup's
+  // reply, which has none. Download records left behind are counted too:
+  // nothing the person had is dropped without a word.
+  async function importRestoredText(imported) {
+    const r = imported.restored;
+    if (!r) return "";
+    const n = (key) => Number(r[key]) || 0;
+    const c = (v) => v.toLocaleString("en-US");
+    const parts = [];
+    if (imported.library_included === false) {
+      parts.push(i18nText("chrome-js-import-no-library", "This backup held only a vault, so your Library now has no bookmarks, shelved windows or Deep Recall pages."));
+    } else {
+      const args = {
+        bookmarks: n("bookmarks"),
+        groups: n("tab_groups"),
+        pages: n("deep_recall_pages"),
+        pictures: n("pictures"),
+        exceptions: n("site_exceptions"),
+      };
+      parts.push(await i18nResolve(
+        "chrome-js-import-restored",
+        args,
+        "Restored from the backup. Bookmarks: " + c(args.bookmarks) + ", shelved windows: " + c(args.groups) +
+          ", Deep Recall pages: " + c(args.pages) + ", pictures: " + c(args.pictures) +
+          ", Divergence Exceptions: " + c(args.exceptions) + ".",
+      ));
+    }
+    if (n("downloads_kept") > 0) {
+      parts.push(await i18nResolve(
+        "chrome-js-import-downloads-kept",
+        { count: n("downloads_kept") },
+        "Download records kept from this computer: " + c(n("downloads_kept")) + ".",
+      ));
+    }
+    if (n("downloads_dropped") > 0) {
+      parts.push(await i18nResolve(
+        "chrome-js-import-downloads-dropped",
+        { count: n("downloads_dropped") },
+        "Download records not kept because they failed their check: " + c(n("downloads_dropped")) + ".",
+      ));
+    }
+    if (r.downloads_not_kept_library_closed === true) {
+      parts.push(i18nText("chrome-js-import-downloads-not-kept", "Download records on this computer were not kept, because your Library was closed."));
+    }
+    return parts.join(" ");
   }
 
   wireImportForm("import-");
@@ -7987,7 +9842,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     "findbar",
   ];
 
-  function syncChromeInsets() {
+  function sendChromeInsets() {
     const extra = bannerExtraPx();
     // THE FLOOR IS APPLIED AFTER THE EXTRA, NOT BEFORE IT.
     //
@@ -8015,9 +9870,13 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // the double-rounding overshoot -- but the wire wants an integer, and a
     // silently rejected inset leaves native geometry disagreeing with the CSS
     // that was published from the same number.
-    const top = openPanelName
-      ? Math.ceil(panels.get(openPanelName).heightPx + extra)
-      : strip;
+    // A card still fading out keeps its height (beginPanelClose).
+    const shown = openPanelName ? panels.get(openPanelName) : closingPanel;
+    const top = shown
+      ? Math.ceil(shown.heightPx + extra)
+      : menuOpen || menuClosing
+        ? Math.ceil(menuHeightPx + extra)
+        : strip;
     // The stylesheet needs this number too, and the SAME one: a panel is
     // placed below the chrome, and `--chrome-closed-px` is the BARE closed
     // strip with no banner in it. With a banner showing, a panel positioned
@@ -8085,6 +9944,12 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     retireBlockedOnNavigation(st);
     if (!st) return;
     lastTabStatus = st;
+    // The tab this status describes is the active one. Nothing else ever set
+    // activeTabId, so the ledger's "Allow while frozen" button returned before
+    // sending anything and the Allowed rows could never show (final review,
+    // second pass).
+    const switchedTab = typeof st.id === "number" && st.id !== activeTabId;
+    if (typeof st.id === "number") activeTabId = st.id;
     // The hosts the freeze really lets through, from Rust. An exception that
     // failed to install is rolled back there, and the ledger must not keep
     // showing it as Allowed (final review, R-003).
@@ -8092,16 +9957,22 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       const prev = allowedHosts.get(st.id);
       const next = new Set(st.allowed_hosts.filter((h) => typeof h === "string"));
       const same = prev && prev.size === next.size && [...next].every((h) => prev.has(h));
-      if (!same) {
-        allowedHosts.set(st.id, next);
-        if (lastLedger) renderLedger(lastLedger);
-      }
+      if (!same) allowedHosts.set(st.id, next);
+      if (!same && !switchedTab && lastLedger) renderLedger(lastLedger);
+    }
+    // A switch leaves the previous tab's ledger in hand. renderLedger draws
+    // nothing for it, and an open panel asks for this tab's at once rather
+    // than at the next poll (release review R-003).
+    if (switchedTab) {
+      if (lastLedger) renderLedger(lastLedger);
+      if (ledgerTimer) refreshLedger();
     }
     // The engine-confirmed rows belong HERE, not in applyPrivacyStatus: every
     // one of them is a property of THIS tab, and this is the payload that
     // carries them. Called first so the section is populated even if something
     // below throws on an unexpected field.
     renderEngineConfirmed(st);
+    if ("youtube_ads_script" in st) applyYoutubeAdsInstall(st.youtube_ads_script === "failed");
     // The fail-closed banner's input: the measured tunnel state rides this
     // same payload (there is deliberately no separate event channel for it).
     noteTunnelMeasured(st.tunnel);
@@ -8124,6 +9995,15 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // the previous site's requests and, worse, let the user toggle them while
     // believing they were acting on the site now in front of them.
     if (openPanelName === "privacy") refreshPermissions();
+    // The Divergence proof describes ONE tab, so it follows the tab too: a
+    // switch with the panel open left "Installed for ..." up about the tab
+    // before it (review 2026-10-12, R-003). Re-asked only when the tab, its
+    // site, or the engine's answer for it changed.
+    const divergenceKey = [st.id, st.origin, st.divergence_script].join("|");
+    if (openPanelName === "privacy" && divergenceKey !== lastDivergenceKey) {
+      lastDivergenceKey = divergenceKey;
+      refreshDivergenceSite();
+    }
     const phase = st.freeze_phase || "loaded";
     const requested = phase === "frozen";
     const enforceable = st.freeze_enforced !== false;
@@ -8136,6 +10016,9 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const reallyFrozen = requested && enforcement === "active";
     const freezePending = requested && enforcement === "pending";
     const freezeFailed = requested && enforcement === "failed";
+    // "No network requests" is false once a host is allowed through the
+    // freeze, so a frozen tab with exceptions says so (release review R-006).
+    const hasAllowed = Array.isArray(st.allowed_hosts) && st.allowed_hosts.length > 0;
 
     // Toolbar freeze chip: the label is the TRUE state, always visible.
     const btn = $("btn-freeze");
@@ -8163,8 +10046,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         ? i18nText("chrome-js-freeze-title-failed", "Freeze FAILED; this tab can still send requests")
         : freezePending
           ? i18nText("chrome-js-freeze-title-pending", "Freezing this tab; requests may continue")
+          : reallyFrozen && hasAllowed
+            ? i18nText("chrome-js-freeze-title-frozen-allowed", "Frozen: no new network requests except to hosts you allowed. Click to unfreeze.")
           : reallyFrozen
-            ? i18nText("chrome-js-freeze-title-frozen", "Frozen: no network requests. Click to unfreeze.")
+            ? i18nText("chrome-js-freeze-title-frozen", "Frozen: no new network requests. Click to unfreeze.")
             : i18nText("chrome-js-freeze-title-live", "Freeze this tab: stop it from making network requests");
 
     // Panel mirror of the same state.
@@ -8175,8 +10060,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
           ? i18nText("chrome-js-freeze-desc-failed", "Freeze failed. This tab can still send requests; close it if that matters.")
           : freezePending
             ? i18nText("chrome-js-freeze-desc-pending", "Freezing. Requests may continue.")
+            : reallyFrozen && hasAllowed
+              ? i18nText("chrome-js-freeze-desc-frozen-allowed", "Frozen. No new network requests except to hosts you allowed.")
             : reallyFrozen
-              ? i18nText("chrome-js-freeze-desc-frozen", "Frozen. No network requests.")
+              ? i18nText("chrome-js-freeze-desc-frozen", "Frozen. No new network requests.")
               : i18nText("chrome-js-freeze-desc-live", "Live. Network requests can continue.");
     const panelFreeze = $("btn-tabfreeze");
     panelFreeze.textContent = requested
@@ -8336,6 +10223,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // of them conditional, is how the two controls would drift apart.
 
     syncAllowSiteButton();
+    renderAdsAllow(st);
 
     // Translation state rides with tab status, so the panel AND the toolbar
     // chip repaint on navigation and on every phase change -- not only on the
@@ -8383,24 +10271,42 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   }
 
   // ---- from the privsurface draft ----
-  // Best-effort host for the "allow this site" convenience button, derived
-  // from the URL bar. The ledger row buttons use the exact normalized hosts
-  // Rust recorded, so they are always right; this one is a shortcut and the
-  // Rust-side validation is the backstop.
-  function normalizeAllowHost(url) {
-    const host = hostOf(url || "");
-    if (!host || (host === url && !/:\/\//.test(url))) return "";
-    if (host.startsWith("[")) {
-      const end = host.indexOf("]");
-      return end > 0 ? host.slice(1, end) : "";
-    }
-    return host.split(":")[0];
+  // The host the toolbar's Allow button names AND sends: the active tab's
+  // loaded origin from tab_status, never the editable address bar, so the
+  // label and the request cannot differ (release review R-004). It is the
+  // same spelling the ledger rows use (Rust's host_of). A host Rust would
+  // refuse (an IPv6 literal) leaves the button disabled, not erroring.
+  function allowSiteHost() {
+    const origin = lastTabStatus && lastTabStatus.origin;
+    return typeof origin === "string" && /^[A-Za-z0-9.:-]+$/.test(origin) ? origin : "";
+  }
+
+  // "Allow ads and trackers on this tab": the box, whether it can be turned
+  // on, why not, and the privacy receipt's line, all from tab_status. A box
+  // that cannot be turned on is disabled with the reason under it, in the
+  // words a refused click gets (ERROR_TEXT).
+  function renderAdsAllow(st) {
+    const box = $("tab-ads-allow");
+    const reason = $("tab-ads-allow-reason");
+    const allowed = st.ads_allowed === true;
+    const available = st.ads_allow_available === true;
+    box.checked = allowed;
+    box.disabled = !available;
+    // The row greys out with the box. Looked up rather than assumed, so a
+    // markup change that moves the box cannot throw out of tab_status and
+    // take every reader after this one down with it.
+    const row = box.closest(".toggle-row");
+    if (row) row.classList.toggle("unsupported", !available);
+    const why = available ? "" : (ERROR_TEXT && ERROR_TEXT[st.ads_allow_reason]) || "";
+    reason.textContent = why;
+    reason.hidden = !why;
+    $("receipt-ads-allowed").hidden = !allowed;
   }
 
   // ---- from the privsurface draft ----
   function syncAllowSiteButton() {
     const btn = $("btn-allow-site");
-    const host = normalizeAllowHost(urlInput.value);
+    const host = allowSiteHost();
     btn.disabled = !host;
     if (host) {
       i18nSet(
@@ -8410,24 +10316,20 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         "Allow " + host + " while frozen",
       );
     } else {
-      btn.textContent = i18nText("chrome-js-allowsite-allow-generic", "Allow this site while frozen");
+      btn.textContent = i18nText("chrome-js-allowsite-allow-generic", "Allow this host while frozen");
     }
   }
 
   // ---- from the privsurface draft ----
-  function allowHost(host) {
-    if (!host || activeTabId == null) return;
-    const tabId = activeTabId;
-    rb("tab_allow_site", { host })
+  // `tabId` is the tab whose rows or status the host was read from. After a
+  // switch nothing is sent: the host came from another tab's requests
+  // (release review R-003), and Rust refuses a mismatch as well. The reply's
+  // allowed_hosts is the only thing that marks a row Allowed.
+  function allowHost(host, tabId) {
+    if (!host || typeof tabId !== "number" || tabId !== activeTabId) return;
+    rb("tab_allow_site", { host, tab: tabId })
       .then((st) => {
-        let set = allowedHosts.get(tabId);
-        if (!set) {
-          set = new Set();
-          allowedHosts.set(tabId, set);
-        }
-        set.add(host);
         applyTabStatus(st);
-        if (lastLedger) renderLedger(lastLedger);
       })
       .catch((e) => {
         $("ledger-foot").textContent = friendly(e);
@@ -8558,6 +10460,12 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   function renderLedger(data) {
     const list = $("ledger-list");
     list.textContent = "";
+    // Rows are drawn only for the tab they were read from. A ledger fetched
+    // before a switch, or answered after one, is another tab's request
+    // history, and its Allow buttons would act on this tab (release review
+    // R-003). Nothing is drawn until this tab's own ledger arrives.
+    const ledgerTab = data && typeof data.tab_id === "number" ? data.tab_id : null;
+    if (ledgerTab === null || ledgerTab !== activeTabId) return;
     const items = (data && data.items) || [];
     // Whether the blocked column is observed on this platform. On WebKitGTK
     // the content blocker reports no per-request matches, so the blocked
@@ -8620,7 +10528,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       allowBtn.disabled = already;
       allowBtn.title =
         i18nText("chrome-js-ledger-allow-title", "Allow this host while frozen. Ends when the tab closes.");
-      allowBtn.addEventListener("click", () => allowHost(rec.host));
+      allowBtn.addEventListener("click", () => allowHost(rec.host, ledgerTab));
       row.appendChild(allowBtn);
 
       // THE AD-LIST EXCEPTION, if this tab holds one for this host.
@@ -9398,6 +11306,15 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         $("library-locked-note").textContent = st.error && vaultUnlocked
           ? friendly(new Error(st.error))
           : i18nText("chrome-js-library-locked-note", "Unlock the vault for bookmarks, shelved tabs, and download records. PATANYX offers this when started on its own. Downloads finished before unlock are not recorded.");
+        // An import that did not finish names the file to import again.
+        if (vaultUnlocked && st.error === "library_import_unfinished" && typeof st.import_source === "string") {
+          i18nSet(
+            $("library-locked-note"),
+            "chrome-js-error-library-import-unfinished",
+            { path: st.import_source },
+            "Your Library is closed because an import did not finish. To finish it, import " + st.import_source + " again.",
+          );
+        }
         // The one open failure the person can fix from here: the vault
         // opened and the Library did not, which is what a passphrase change
         // in 0.9.x left behind.
@@ -11057,7 +12974,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     $(tab).addEventListener("click", () => {
       // From the palette the panel may still be closed; opening it first
       // makes every tab button a complete door of its own.
-      if ($("integrity-host").hidden) {
+      if (openPanelName !== "tools") {
         // togglePanelNamed runs onOpen (which selects the integrity tab) and
         // then sends arrangement + height itself; re-selecting after it is
         // what lands the palette on the tab the user actually chose.
@@ -11289,6 +13206,11 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     "teal",
     "slate",
     "purple",
+    "tangerine",
+    "mint",
+    "gold",
+    "lavender",
+    "copper",
   ];
   // ---- the palette, resolved and reported ----
   // The stylesheet is the only place a theme is DEFINED (nine accents, three
@@ -11352,6 +13274,34 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       .catch(() => {});
   }
 
+  // ---- textures and theme packs (1.0.7) ------------------------------------
+  //
+  // A texture is a third axis beside the scheme and the accent: a faint
+  // chrome-only gradient worn as html[data-texture], one pref
+  // (chrome_texture), one IPC pair, no engine involvement. A theme pack is
+  // a PRESET of the three axes and nothing more: picking one sends the three
+  // existing set commands, and Rust keeps no pack pref. The panel marks the
+  // pack whose three values match the chrome's current three, and says
+  // "Custom" when none does, so the marking is derived from the truth and
+  // can never disagree with the individual pickers below it. The preview
+  // colours on each card are copies of chrome.css's --sf-strip and --accent
+  // for the pack's pair; theme-packs-gate.js fails on a copy that drifts.
+  const CHROME_TEXTURES = ["none", "glow", "grain", "stripes"];
+  // Every pick, by hand or by preset, advances this. A preset's three writes
+  // are awaited one after another, and a hand pick made while one is pending
+  // used to be overwritten by the preset's remaining writes (review round 1,
+  // R-003); a preset that finds the generation moved after an await stops.
+  let lookGeneration = 0;
+  const THEME_PACKS = [
+    { id: "original", scheme: "dark", accent: "default", texture: "none", preview: { bg: "#1f2026", accent: "#4f8cff" } },
+    { id: "ion-storm", scheme: "black", accent: "violet", texture: "glow", preview: { bg: "#0d0d11", accent: "#a180ff" } },
+    { id: "sardonyx-night", scheme: "midnight", accent: "blood_red", texture: "grain", preview: { bg: "#171b31", accent: "#d84040" } },
+    { id: "aether-paper", scheme: "paper", accent: "sky", texture: "none", preview: { bg: "#ece7e0", accent: "#0077b8" } },
+    { id: "chloris-graphite", scheme: "graphite", accent: "green", texture: "stripes", preview: { bg: "#2e2e32", accent: "#39ff14" } },
+    { id: "chrysos-black", scheme: "black", accent: "gold", texture: "glow", preview: { bg: "#0d0d11", accent: "#e6c650" } },
+    { id: "thalassa-mist", scheme: "graphite", accent: "teal", texture: "grain", preview: { bg: "#2e2e32", accent: "#2fd1c0" } },
+    { id: "iris-midnight", scheme: "midnight", accent: "lavender", texture: "glow", preview: { bg: "#171b31", accent: "#c4a7ff" } },
+  ];
   function wearTheme(name) {
     if (name === "default") {
       delete document.documentElement.dataset.theme;
@@ -11362,6 +13312,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       $("accent-" + t).classList.toggle("active", t === name);
     }
     publishChromePalette();
+    markPack();
   }
   async function refreshAccent() {
     try {
@@ -11371,6 +13322,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   }
   for (const t of ACCENT_THEMES) {
     $("accent-" + t).addEventListener("click", async () => {
+      lookGeneration += 1;
       try {
         const r = await rb("chrome_theme_set", { theme: t });
         wearTheme(r.theme);
@@ -11383,6 +13335,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   // default flashes only for users who chose another theme, briefly.
   refreshAccent();
   refreshToolbarLabels();
+  refreshMotion();
+  refreshTexture();
   refreshBookmarkBar();
   // The placement comes with chrome_caps rather than from its own get, so a
   // Left user's first paint is their layout instead of the top one visibly
@@ -11395,7 +13349,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   // root element, and chrome.css resolves an absent or unknown value to
   // the original dark chrome, so a stale read renders exactly what every
   // pre-scheme build rendered.
-  const CHROME_SCHEMES = ["dark", "white", "black"];
+  const CHROME_SCHEMES = ["dark", "white", "black", "graphite", "midnight", "paper"];
   function wearScheme(name) {
     if (name === "dark") {
       delete document.documentElement.dataset.scheme;
@@ -11408,6 +13362,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // The scheme changes what the accent tokens MIX WITH, so the resolved
     // palette moves with it.
     publishChromePalette();
+    markPack();
   }
   // Toolbar labels. Same three-part shape as the scheme above: a wear
   // function that owns the attribute and the button marking, a refresher
@@ -11547,6 +13502,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       document.documentElement.dataset.toolbarPlacement = placement;
     }
     placeButtons(placement);
+    // A rail has no row to wrap; the top strip may need folds again.
+    autoFold();
     for (const p of TOOLBAR_PLACEMENTS) {
       const btn = $("placement-" + p);
       if (btn) btn.classList.toggle("active", p === placement);
@@ -11660,6 +13617,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   }
   for (const s of CHROME_SCHEMES) {
     $("scheme-" + s).addEventListener("click", async () => {
+      lookGeneration += 1;
       try {
         const r = await rb("chrome_scheme_set", { scheme: s });
         wearScheme(r.scheme);
@@ -11669,6 +13627,83 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     });
   }
   refreshScheme();
+
+  function wearTexture(name) {
+    if (name === "none") {
+      delete document.documentElement.dataset.texture;
+    } else {
+      document.documentElement.dataset.texture = name;
+    }
+    for (const t of CHROME_TEXTURES) {
+      $("texture-" + t).classList.toggle("active", t === name);
+    }
+    markPack();
+  }
+  async function refreshTexture() {
+    try {
+      const r = await rb("chrome_texture_get");
+      if (r && CHROME_TEXTURES.includes(r.texture)) wearTexture(r.texture);
+    } catch (_) {}
+  }
+  for (const t of CHROME_TEXTURES) {
+    $("texture-" + t).addEventListener("click", async () => {
+      lookGeneration += 1;
+      try {
+        const r = await rb("chrome_texture_set", { texture: t });
+        wearTexture(r.texture);
+      } catch (e) {
+        toast(friendly(e), true);
+      }
+    });
+  }
+
+  // The chrome's current look, read from the attributes the stylesheet keys
+  // on, which the three wear functions own: the one place the truth is.
+  function currentLook() {
+    const d = document.documentElement.dataset;
+    return {
+      scheme: d.scheme || "dark",
+      accent: d.theme || "default",
+      texture: d.texture || "none",
+    };
+  }
+  function markPack() {
+    const cur = currentLook();
+    let hit = false;
+    for (const p of THEME_PACKS) {
+      const on =
+        p.scheme === cur.scheme && p.accent === cur.accent && p.texture === cur.texture;
+      $("pack-" + p.id).classList.toggle("active", on);
+      hit = hit || on;
+    }
+    $("pack-custom").hidden = hit;
+  }
+  // Three writes, each worn as Rust confirms it, so a refused third leaves
+  // the first two applied and the panel showing exactly that (Custom).
+  // A reply is always worn: Rust has stored that value by then, and the
+  // chrome must show what is stored. What a newer pick stops is the NEXT
+  // write, so the preset never overwrites a choice made after it began.
+  async function applyPack(p) {
+    const gen = ++lookGeneration;
+    try {
+      const s = await rb("chrome_scheme_set", { scheme: p.scheme });
+      wearScheme(s.scheme);
+      if (gen !== lookGeneration) return;
+      const a = await rb("chrome_theme_set", { theme: p.accent });
+      wearTheme(a.theme);
+      if (gen !== lookGeneration) return;
+      const t = await rb("chrome_texture_set", { texture: p.texture });
+      wearTexture(t.texture);
+    } catch (e) {
+      toast(friendly(e), true);
+    }
+  }
+  for (const p of THEME_PACKS) {
+    const card = $("pack-" + p.id);
+    card.style.setProperty("--pack-bg", p.preview.bg);
+    card.style.setProperty("--pack-accent", p.preview.accent);
+    card.addEventListener("click", () => applyPack(p));
+  }
 
   function wireDnsChoice(id, mode) {
     $(id).addEventListener("click", async () => {
@@ -12249,7 +14284,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const post = pending.method && pending.method !== "GET";
     if (!canAllow) {
       i18nSet($("adlist-body"), "chrome-adlist-body-no-exception", { host: pending.host },
-        "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. That list is built for the requests pages make in the background, so a site you typed yourself can end up on it. On Linux there is no way to open a single site past the list. You can turn blocking off in the Privacy panel, which turns it off for every site until you turn it back on.");
+        "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. That list is built for the requests pages make in the background, so a site you typed yourself can end up on it. On Linux you cannot open just this address past the list. To open it, allow ads and trackers on this tab in Tab Activity, which lasts until the tab goes to another site or closes, or turn blocking off in the Privacy panel, which turns it off for every site until you turn it back on.");
     } else if (post) {
       i18nSet($("adlist-body"), "chrome-adlist-body-post", { host: pending.host },
         "PATANYX did not open " + pending.host + " because it is on the ad and tracker list. Your form was not sent, and Open anyway will not send it: it loads the address without what you typed. That applies to " + pending.host + " in this tab only and ends when you leave it or close the tab. Nothing else on the list is unblocked.");
@@ -12371,6 +14406,11 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       // the same "what the engine confirmed, not what was requested" rule as
       // every other row above.
       content_script_registered: i18nText("chrome-js-engine-content-script-registered", "Login autofill script installed"),
+      // The two document-start scripts a setting asks for (reviews R-003 and
+      // R-007). Rust sends null, and so no row, while the setting is off for
+      // this tab or the engine's answer has not arrived yet.
+      divergence_script: i18nText("chrome-js-engine-divergence-script", "Fingerprint Divergence script"),
+      youtube_ads_script: i18nText("chrome-js-engine-youtube-ads-script", "YouTube ad blocking script"),
       // Process-wide and MEASURED, not read back off an API: a background
       // thread completes a real SOCKS5 greeting against the loopback tunnel
       // front and reads the tunnel's own status before this says "confirmed".
@@ -12522,6 +14562,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // to the tab logic -- selectToolsTab re-runs on every switch.)
     $("leakcheck").hidden = !ocrAvailable;
     if ($("btn-tab-imagecheck")) $("btn-tab-imagecheck").hidden = !ocrAvailable;
+    menuOcr = ocrAvailable;
+    syncMenuProxies();
   })();
 
   // Whether the chosen resolver is reachable, asked once at startup.
@@ -14374,9 +16416,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
             { what },
             `Permanently delete ${what}? This also removes their tags, their ` +
               `Quick Access pins, and the page snapshots kept for change ` +
-              `checks. It cannot be undone, and PATANYX has no bookmark ` +
-              `export to restore from. Your shelved tabs, downloads and ` +
-              `archived pages are not affected.`,
+              `checks. It cannot be undone here. An encrypted export you made ` +
+              `earlier can bring them back, but importing it replaces your ` +
+              `whole vault and Library. Deleting them does not affect your ` +
+              `shelved tabs, downloads or archived pages.`,
           ),
           i18nText("chrome-js-manager-delete-all-label", "Delete everything"),
         );
@@ -15092,6 +17135,27 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       groupCloseArmed = false;
       groupStatus("", false);
     },
+  });
+
+  // The Guide and the Premium guide, from About. Unlike the two buttons
+  // beside them, these leave the chrome: each opens its page on patanyx.net
+  // in a new tab. The chrome sends a NAME and Rust holds the address
+  // (site_pages.rs): no Premium address on patanyx.net may sit in a chrome
+  // asset (premium-toolbar-gate.js). About is closed FIRST: rb() finishes a
+  // close that has begun before a page handoff, but it does not start one,
+  // so without this the tab opened behind About and the keyboard stayed in
+  // the chrome (plan review 2026-10-13, R-001).
+  function openSitePage(page) {
+    closeOpenPanel();
+    rb("site_page_open", { page }).catch((e) => toast(friendly(e), true));
+  }
+  $("about-guide").addEventListener("click", () => openSitePage("guide"));
+  $("about-premium-guide").addEventListener("click", () => openSitePage("premium_guide"));
+  // The Premium guide links the purchase page, so it shows only while
+  // Premium is on sale (Rust refuses it otherwise too). Starts hidden in
+  // the markup: an unanswered premium_status shows nothing.
+  premiumListeners.push((st) => {
+    $("about-premium-guide").hidden = !(st && st.on_sale);
   });
 
   registerPanel("about", {

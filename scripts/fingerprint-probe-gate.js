@@ -27,7 +27,7 @@ let divergence = fs.readFileSync(
   path.join(root, "crates/app/src/content_scripts/fingerprint_divergence.js"),
   "utf8",
 );
-const reportCall = "window.chrome.webview.postMessage(payload);";
+const reportCall = "probeApply(probePost, probeRecv, [payload]);";
 if (process.env.PATANYX_FINGERPRINT_PROBE_OMIT_CALLSITE) {
   if (!divergence.includes(reportCall)) {
     throw new Error("cannot plant defect: fingerprint report call site changed");
@@ -270,6 +270,265 @@ check("counter calls do not change divergence return values", () => {
   );
 });
 
+// ---- page script cannot read the report, whatever it hooks ---------------
+// Page script runs AFTER this document-start script, in the same realm. When
+// the bridge was looked up at send time and the batch built with
+// JSON.stringify and push, every hook below read the whole report (measured
+// on WebKitGTK 2.50.6 and V8, 2026-09-23), and replacing the bridge also kept
+// it from the host. Each must now see nothing while the host still receives
+// the exact batch. Both engines' bridge shapes are driven, with postMessage
+// on a prototype as the real bridges have it, so an own-property wrap and a
+// prototype wrap are different attacks.
+const HOSTILE_EXPECTED =
+  '{"kind":"fingerprint_probe_counts","counts":[{"surface":"canvas","count":3}]}';
+// Objects AND strings: the report is built as a string, and a string (or a
+// piece of one) passing through a page-reachable setter is as much a leak as
+// the object it replaced.
+const REPORT_SHAPED = `function reportShaped(v) {
+  if (typeof v === "string") return /fingerprint_probe_counts|"surface"|"count"/.test(v);
+  return !!v && typeof v === "object" &&
+    ("kind" in v || "counts" in v || "surface" in v);
+}`;
+const BRIDGES = {
+  webview2: {
+    install(ctx, deliver) {
+      function WebView() {}
+      WebView.prototype.postMessage = function (raw) { deliver(raw); };
+      ctx.chrome = { webview: new WebView() };
+    },
+    path: "window.chrome.webview",
+    replace: `window.chrome = { webview: { postMessage: function (m) { seen.push(String(m)); } } };`,
+  },
+  webkitgtk: {
+    install(ctx, deliver) {
+      function UserMessageHandler() {}
+      UserMessageHandler.prototype.postMessage = function (raw) { deliver(raw); };
+      ctx.webkit = { messageHandlers: { ipc: new UserMessageHandler() } };
+    },
+    path: "window.webkit.messageHandlers.ipc",
+    replace: `window.webkit = { messageHandlers: { ipc: { postMessage: function (m) { seen.push(String(m)); } } } };`,
+  },
+};
+function pageHooks(bridge) {
+  return {
+    "own-property wrap": `var b = ${bridge.path}, o = b.postMessage;
+      b.postMessage = function (m) { seen.push(String(m)); return o.apply(this, arguments); };`,
+    "prototype wrap": `var p = Object.getPrototypeOf(${bridge.path}), op = p.postMessage;
+      p.postMessage = function (m) { seen.push(String(m)); return op.apply(this, arguments); };`,
+    "bridge replaced": bridge.replace,
+    "Object.prototype.toJSON getter": `${REPORT_SHAPED}
+      Object.defineProperty(Object.prototype, "toJSON", { configurable: true,
+        get: function () { if (reportShaped(this)) seen.push(Object.keys(this).join(",")); return undefined; } });`,
+    "Array.prototype[0] setter": `${REPORT_SHAPED}
+      Object.defineProperty(Array.prototype, "0", { configurable: true,
+        get: function () { return undefined; },
+        set: function (v) { if (reportShaped(v)) seen.push(typeof v === "string" ? v : Object.keys(v).join(","));
+          Object.defineProperty(this, "0", { value: v, writable: true, enumerable: true, configurable: true }); } });`,
+  };
+}
+function runHostile(source, bridgeName, hookName) {
+  const bridge = BRIDGES[bridgeName];
+  const scheduled = [];
+  const native = [];
+  const seen = [];
+  function CanvasRenderingContext2D() {}
+  CanvasRenderingContext2D.prototype.getImageData = function () {
+    return { data: new Uint8ClampedArray([12, 34, 56, 255, 78, 90, 12, 255]) };
+  };
+  const ctx = {
+    seen,
+    CanvasRenderingContext2D,
+    Uint8ClampedArray,
+    URL,
+    location: { hostname: "gate.example", ancestorOrigins: [] },
+    setTimeout(fn, delay) {
+      scheduled.push({ fn, delay });
+      return scheduled.length;
+    },
+    addEventListener() {},
+  };
+  ctx.window = ctx;
+  ctx.self = ctx;
+  bridge.install(ctx, (raw) => native.push(raw));
+  vm.createContext(ctx);
+  vm.runInContext(
+    source.replace("__DIVERGENCE_TOKEN__", "gate-token").replace("__DIVERGENCE_OVERRIDES__", "{}"),
+    ctx,
+    { filename: "fingerprint_divergence.js" },
+  );
+  // The page's own script: the hook, then three canvas reads.
+  vm.runInContext(pageHooks(bridge)[hookName], ctx, { filename: "page.js" });
+  vm.runInContext(
+    "var c = new CanvasRenderingContext2D(); c.getImageData(); c.getImageData(); c.getImageData();",
+    ctx,
+    { filename: "page.js" },
+  );
+  scheduled.forEach((t) => t.fn());
+  return { seen, native };
+}
+function hostileFailures(source) {
+  const failed = [];
+  for (const bridgeName of Object.keys(BRIDGES)) {
+    for (const hookName of Object.keys(pageHooks(BRIDGES[bridgeName]))) {
+      const { seen, native } = runHostile(source, bridgeName, hookName);
+      if (seen.length || native.length !== 1 || native[0] !== HOSTILE_EXPECTED) {
+        failed.push(
+          `${bridgeName}, ${hookName}: page saw ${JSON.stringify(seen)}, host got ${JSON.stringify(native)}`,
+        );
+      }
+    }
+  }
+  return failed;
+}
+
+check("page script cannot read or block the report, whatever it hooks", () => {
+  const failed = hostileFailures(divergence);
+  assert(!failed.length, failed.join("; "));
+});
+
+// The check above must be able to fail. Each planted defect restores one
+// shape that leaks (the two measured ones, and the finished string passing
+// through an array), EXECUTES the result, and must be caught; a planting
+// string that no longer matches fails the gate rather than skipping.
+check("the hostile-page check catches every leaking shape when planted", () => {
+  const plants = {
+    "send-time bridge lookup": [
+      "probeApply(probePost, probeRecv, [payload]);",
+      "(window.chrome && window.chrome.webview ? window.chrome.webview : window.webkit.messageHandlers.ipc).postMessage(payload);",
+    ],
+    "JSON.stringify of an object": [
+      `'{"kind":"fingerprint_probe_counts","counts":[' + body + "]}";`,
+      `JSON.stringify({ kind: "fingerprint_probe_counts" }).slice(0, -1) + ',"counts":[' + body + "]}";`,
+    ],
+    "the finished string stored through an array": [
+      "probeApply(probePost, probeRecv, [payload]);",
+      "var leaked = []; leaked.push(payload); probeApply(probePost, probeRecv, [payload]);",
+    ],
+  };
+  for (const [name, [from, to]] of Object.entries(plants)) {
+    assert(divergence.includes(from), "cannot plant " + name + ": source changed");
+    assert(
+      hostileFailures(divergence.replace(from, to)).length > 0,
+      "planted " + name + " was not caught",
+    );
+  }
+});
+
+// A batch whose send throws is dropped, not resent, and the pagehide flush
+// plus the still-pending timer never deliver one batch twice. Counts are
+// cleared while the batch is built, before the send.
+check("a failed send drops its batch once, and pagehide never doubles one", () => {
+  const scheduled = [];
+  const listeners = {};
+  const delivered = [];
+  let bridgeDown = true;
+  function CanvasRenderingContext2D() {}
+  CanvasRenderingContext2D.prototype.getImageData = function () {
+    return { data: new Uint8ClampedArray([12, 34, 56, 255]) };
+  };
+  const ctx = {
+    CanvasRenderingContext2D,
+    Uint8ClampedArray,
+    URL,
+    location: { hostname: "gate.example", ancestorOrigins: [] },
+    setTimeout(fn) {
+      scheduled.push(fn);
+      return scheduled.length;
+    },
+    addEventListener(type, fn) {
+      listeners[type] = fn;
+    },
+  };
+  ctx.window = ctx;
+  ctx.self = ctx;
+  ctx.chrome = {
+    webview: {
+      postMessage(raw) {
+        if (bridgeDown) throw new Error("bridge down");
+        delivered.push(raw);
+      },
+    },
+  };
+  vm.createContext(ctx);
+  vm.runInContext(
+    divergence.replace("__DIVERGENCE_TOKEN__", "gate-token").replace("__DIVERGENCE_OVERRIDES__", "{}"),
+    ctx,
+  );
+  const read = () => vm.runInContext("new CanvasRenderingContext2D().getImageData();", ctx);
+  read();
+  read();
+  scheduled.shift()(); // flushes two probes into a bridge that throws
+  bridgeDown = false;
+  read();
+  assert(typeof listeners.pagehide === "function", "no pagehide flush registered");
+  listeners.pagehide(); // early flush
+  while (scheduled.length) scheduled.shift()(); // the pending timer fires too
+  assert(delivered.length === 1, "expected one batch, got " + JSON.stringify(delivered));
+  assert(
+    delivered[0] === '{"kind":"fingerprint_probe_counts","counts":[{"surface":"canvas","count":1}]}',
+    "the failed batch was resent or the new one lost: " + delivered[0],
+  );
+});
+
+check("a page that cancels the flush timer only delays the report", () => {
+  // Review 2026-10-12 R-002: timer ids are small integers, so a page can
+  // clear the flush timer. probeTimer then stayed set and no later probe
+  // scheduled another, holding every report until pagehide. A long-overdue
+  // batch is now sent by the next probe.
+  const scheduled = [];
+  const delivered = [];
+  let clock = 1000;
+  function CanvasRenderingContext2D() {}
+  CanvasRenderingContext2D.prototype.getImageData = function () {
+    return { data: new Uint8ClampedArray([12, 34, 56, 255]) };
+  };
+  const ctx = {
+    CanvasRenderingContext2D,
+    Uint8ClampedArray,
+    URL,
+    location: { hostname: "gate.example", ancestorOrigins: [] },
+    performance: { now: () => clock },
+    setTimeout(fn) {
+      scheduled.push(fn);
+      return scheduled.length;
+    },
+    addEventListener() {},
+  };
+  ctx.window = ctx;
+  ctx.self = ctx;
+  ctx.chrome = { webview: { postMessage(raw) { delivered.push(raw); } } };
+  vm.createContext(ctx);
+  vm.runInContext(
+    divergence.replace("__DIVERGENCE_TOKEN__", "gate-token").replace("__DIVERGENCE_OVERRIDES__", "{}"),
+    ctx,
+  );
+  const read = () => vm.runInContext("new CanvasRenderingContext2D().getImageData();", ctx);
+  read();
+  read();
+  read();
+  assert(scheduled.length === 1, "(control) three probes, one timer");
+  scheduled.length = 0; // the page cleared every timer id it could guess
+  // A page that also replaces the clock after document start changes nothing.
+  ctx.performance = { now: () => 0 };
+  clock += 1500;
+  read();
+  assert(delivered.length === 0, "a batch was sent before its timer was overdue");
+  clock += 4000;
+  read();
+  assert(
+    delivered.length === 1 &&
+      delivered[0] === '{"kind":"fingerprint_probe_counts","counts":[{"surface":"canvas","count":4}]}',
+    "the cancelled batch was not sent by the next probe: " + JSON.stringify(delivered),
+  );
+  assert(scheduled.length === 1, "the probe after a cancelled timer did not schedule its own");
+  scheduled.shift()();
+  assert(
+    delivered.length === 2 &&
+      delivered[1] === '{"kind":"fingerprint_probe_counts","counts":[{"surface":"canvas","count":1}]}',
+    "the new batch was lost: " + JSON.stringify(delivered),
+  );
+});
+
 check("both native platform channels are wired per tab", () => {
   for (const token of [
     "add_WebMessageReceived",
@@ -278,8 +537,12 @@ check("both native platform channels are wired per tab", () => {
   ]) {
     assert(windowsRs.includes(token), "Windows channel lost " + token);
   }
+  // Receiver-qualified: the bare call is a substring of the
+  // unregister_script_message_handler(HANDLER) line that must precede it, so
+  // it would still match with the real registration replaced by `true`.
   for (const token of [
-    'register_script_message_handler(HANDLER)',
+    "ucm.unregister_script_message_handler(HANDLER);",
+    "ucm.register_script_message_handler(HANDLER)",
     "connect_script_message_received(Some(HANDLER)",
     "fingerprint_probe_report(&message)",
     "UserEvent::FingerprintProbes",

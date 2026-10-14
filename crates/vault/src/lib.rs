@@ -24,6 +24,7 @@ mod crypto;
 mod error;
 mod format;
 mod backup;
+mod backup_v4;
 /// The one-live-process file lock. Public because the Library replacement in
 /// the app crate needs the same primitive on a DIFFERENT file: an import is a
 /// multi-step transaction across two encrypted stores, and serialising it is
@@ -37,6 +38,13 @@ mod writer_tests;
 pub use error::VaultError;
 pub use recovery::{RecoveryKey, RECOVERY_LEN};
 pub use backup::{ExportError, PLAINTEXT_EXPORT_CONFIRMATION};
+#[cfg(fuzzing)]
+pub use backup_v4::fuzz_read_sealed;
+pub use backup_v4::{
+    backup_file_version, BackupReader, BackupSink, BackupSource, BackupStage, BackupStats,
+    BackupWatch, PendingImport, Section, SectionKind, SectionLimits, WatchSnapshot,
+    BACKUP_VERSION, MAX_VAULT_SECTION,
+};
 pub use lock::{LockError, VaultLock};
 pub use model::{
     ActivationRecord, Contact, ContactBook, CredentialEntry, CredentialMeta, LicenceRecord,
@@ -520,7 +528,20 @@ impl Vault {
         // outright: reading it partially and re-saving would silently drop
         // fields this build does not know about, which is exactly how `relay`
         // and the contact `note` were lost before SCHEMA_VERSION was bumped.
-        if envelope.schema > model::SCHEMA_VERSION {
+        Self::check_payload_schema(envelope.schema)?;
+        let mut data: VaultData = serde_json::from_slice(plaintext).map_err(|e| {
+            VaultError::BadFormat(format!("decrypted payload is not valid json: {e}"))
+        })?;
+        data.schema = model::SCHEMA_VERSION;
+        Ok(data)
+    }
+
+    /// The one rule for a decrypted payload's declared schema, applied before
+    /// anything is built from it: the vault file here, and both export
+    /// versions on import (backup.rs), so an import can never accept what an
+    /// unlock would refuse.
+    pub(crate) fn check_payload_schema(schema: u32) -> Result<(), VaultError> {
+        if schema > model::SCHEMA_VERSION {
             // ITS OWN ERROR, not BadFormat. A vault written by a NEWER build is
             // not damaged -- it decrypted perfectly, and every byte of it is
             // intact. It is simply from the future, and this build refuses it
@@ -530,20 +551,16 @@ impl Vault {
             // someone looking for a corrupt file that did not exist. The
             // distinction is free: the code already knows both numbers.
             return Err(VaultError::NewerVault {
-                found: envelope.schema,
+                found: schema,
                 supported: model::SCHEMA_VERSION,
             });
         }
-        if envelope.schema == 0 {
+        if schema == 0 {
             return Err(VaultError::BadFormat(
                 "payload declares no schema".to_string(),
             ));
         }
-        let mut data: VaultData = serde_json::from_slice(plaintext).map_err(|e| {
-            VaultError::BadFormat(format!("decrypted payload is not valid json: {e}"))
-        })?;
-        data.schema = model::SCHEMA_VERSION;
-        Ok(data)
+        Ok(())
     }
 
     /// Takes the recovery key minted while migrating a v1 vault, if there was
@@ -562,7 +579,22 @@ impl Vault {
         params: KdfParams,
         data: VaultData,
     ) -> Result<Self, VaultError> {
-        let guard = lock::acquire(&path).map_err(VaultError::from)?;
+        Self::assemble_waiting(path, master, params, data, std::time::Duration::ZERO)
+    }
+
+    /// [`Vault::assemble`], waiting up to `patience` for the lock: for an
+    /// import that installs its vault just after closing the live one, where a
+    /// child process another thread is starting can still share the closed
+    /// vault's lock file for a moment (`lock::acquire_patiently`). Only off the
+    /// UI thread: the wait sleeps.
+    pub(crate) fn assemble_waiting(
+        path: PathBuf,
+        master: Zeroizing<[u8; crypto::KEY_LEN]>,
+        params: KdfParams,
+        data: VaultData,
+        patience: std::time::Duration,
+    ) -> Result<Self, VaultError> {
+        let guard = lock::acquire_patiently(&path, patience).map_err(VaultError::from)?;
         Ok(Self {
             last_backup_error: None,
             import_retained_leftovers: 0,
@@ -582,6 +614,13 @@ impl Vault {
 
     pub(crate) fn push_slot(&mut self, slot: format::Slot) {
         self.slots.push(slot);
+    }
+
+    /// Takes back the slot `push_slot` added last, for a caller whose save of
+    /// it failed: a slot that never reached the disk must not stay in memory,
+    /// where the next ordinary save would write it after all.
+    pub(crate) fn pop_slot(&mut self) -> Option<format::Slot> {
+        self.slots.pop()
     }
 
     /// Swaps one unlock method for another in place.

@@ -56,8 +56,10 @@
   // the page the user asked to translate.
   if (window.top !== window) return;
 
-  var OUT = "patanyxTranslate";
-  var ASK = "patanyxTranslateAsk";
+  // Every page can look these handler names up, so they must not name the
+  // product; unix.rs pins them to its constants.
+  var OUT = "translate";
+  var ASK = "translateAsk";
   // The single string the host's ask channel accepts. Deliberately not a
   // request for anything: the page cannot name a tab, a page, or a language.
   // Everything about WHAT gets translated is decided host-side.

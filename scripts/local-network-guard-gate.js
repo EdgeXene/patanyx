@@ -735,7 +735,7 @@ const PUBLIC_HTTP = {
   check(
     /\} else \{[\s\S]{0,300}std::thread::sleep\(LOCAL_NETWORK_GUARD_ANSWER_WAIT\);\s*let _ = overdue_proxy\.send_event\(UserEvent::LocalNetworkGuardOverdue\(id\)\);/.test(windows) &&
       /UserEvent::LocalNetworkGuardOverdue\(id\)\) => \{\s*app\.on_local_network_guard_overdue\(id\)/.test(main) &&
-      /fn on_local_network_guard_overdue\(&mut self, id: u64\) \{[\s\S]{0,200}platform::note_local_network_guard_overdue\(&tab\.view\);\s*tab\.finish_initial_navigation\(\);/.test(stateRs),
+      /fn on_local_network_guard_overdue\(&mut self, id: u64\) \{[\s\S]{0,200}platform::note_local_network_guard_overdue\(&tab\.view\);\s*(?:let failed = )?tab\.finish_initial_navigation\(\);/.test(stateRs),
     "an unanswered guard releases the first page after a bounded wait",
   );
   check(

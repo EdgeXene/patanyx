@@ -22,6 +22,13 @@
 # (`--features linux-bridge`) gets the same proof as the strict one. The
 # resulting binary is then asked `--build-identity`, so a features list that
 # did not take effect fails here instead of passing as a strict build.
+#
+# The reproduced binary is also scanned for the markers of a build that is
+# never published (chat, premium-unlocked) and for unremapped build paths,
+# from the one list in scripts/forbidden-build-markers.py. `--build-identity`
+# cannot catch a chat build: it reports the same variant as the public one.
+# A features list that compiles either in therefore fails here; this script
+# proves what is about to be published, nothing else.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT="$(pwd)"
@@ -35,7 +42,11 @@ WORK="${1:-$(mktemp -d)}"
 CLEAN_WORK=0
 [ $# -eq 0 ] && CLEAN_WORK=1
 mkdir -p "$WORK"
-cleanup() { [ "$CLEAN_WORK" = 1 ] && rm -rf "$WORK"; }
+# An `if`, not `[ ... ] && rm`: the EXIT trap's last status becomes the
+# script's, so with a workdir given (nothing to clean) the `&&` form turned
+# every successful run into exit 1. Measured 2026-10-11 on a reproducible
+# strict build: "REPRODUCIBLE: ..." printed, exit status 1.
+cleanup() { if [ "$CLEAN_WORK" = 1 ]; then rm -rf "$WORK"; fi; }
 trap cleanup EXIT
 
 echo "workdir: $WORK"
@@ -78,6 +89,9 @@ if [ "$HASH_A" = "$HASH_B" ]; then
         || { echo "FAIL: expected the strict build" >&2; exit 1; } ;;
     esac
   fi
+  # A and B are byte-identical here, so scanning A covers both.
+  python3 -I "$ROOT/scripts/forbidden-build-markers.py" "$WORK/target-a/release/patanyx" \
+    || { echo "FAIL: the reproduced binary is not one that may be published" >&2; exit 1; }
   exit 0
 fi
 echo "NOT REPRODUCIBLE" >&2

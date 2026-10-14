@@ -65,6 +65,21 @@ pub fn palette(scheme: ChromeScheme) -> Palette {
             bg: 0x101014,
             border: 0x26262e,
         },
+        ChromeScheme::Graphite => Palette {
+            fg: 0xe4e4e9,
+            bg: 0x2f2f34,
+            border: 0x49494f,
+        },
+        ChromeScheme::Midnight => Palette {
+            fg: 0xe4e4e9,
+            bg: 0x1a1e34,
+            border: 0x30344e,
+        },
+        ChromeScheme::Paper => Palette {
+            fg: 0x2a2626,
+            bg: 0xe8e3dd,
+            border: 0xbeb9b8,
+        },
     }
 }
 
@@ -208,6 +223,9 @@ mod tests {
             (ChromeScheme::Dark, ":root"),
             (ChromeScheme::White, r#":root[data-scheme="white"]"#),
             (ChromeScheme::Black, r#":root[data-scheme="black"]"#),
+            (ChromeScheme::Graphite, r#":root[data-scheme="graphite"]"#),
+            (ChromeScheme::Midnight, r#":root[data-scheme="midnight"]"#),
+            (ChromeScheme::Paper, r#":root[data-scheme="paper"]"#),
         ] {
             let block = scheme_block(css, selector).unwrap_or_else(|| {
                 panic!("no {selector} block in chrome.css defines --tx/--sf-card/--ln")

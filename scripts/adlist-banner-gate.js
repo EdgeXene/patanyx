@@ -231,7 +231,7 @@ check("the no-exception copy names the browser-wide switch and its cost", async 
   await flush();
   const body = global.$("adlist-body").textContent;
   assert(
-    body.includes("no way to open a single site"),
+    body.includes("cannot open just this address past the list"),
     "the copy does not say a per-site exception is unavailable: " + body,
   );
   assert(

@@ -40,7 +40,9 @@
  * and never sends a readout, argument, URL, token, method name, or sample.
  * It has no network primitive or dynamic import. The host treats every
  * report as untrusted because hostile page code can use the same native
- * bridge. The token cannot leak through
+ * bridge. The page cannot read the report on its way out, or stop it
+ * arriving: the bridge is captured at document start and the message is
+ * built from primitives (see flushProbeCounts). The token cannot leak through
  * Function.prototype.toString on the patched functions: toString returns
  * source text, and closure VALUES are not in it.
  *
@@ -96,22 +98,64 @@
     // mechanisms on Windows) must not stack hooks -- stacked getImageData
     // noise would double and break within-site consistency. Document-start
     // scripts run before page script, so a page cannot pre-plant this.
-    if (window.__patanyxDiverged) {
+    //
+    // NO GLOBAL MARKER. This used to set a non-enumerable, product-named
+    // property on window, on the theory that hiding it from Object.keys hid
+    // it. It did not: Object.getOwnPropertyNames(window), an "in" check
+    // and a plain read all found it, so any page could tell PATANYX in
+    // particular was running, in one line. Telling a site "something is
+    // farbling" is inherent (the no-stealth rule below). Telling it "PATANYX
+    // is farbling" is a separate and much narrower bit, and this script must
+    // not hand that one over.
+    //
+    // So a second run recognises the first by the hooks it left behind.
+    // Every installed wrapper calls the probe counter, so its source text
+    // contains noteProbe( -- or note( in the OffscreenCanvas wrappers, which
+    // take the counter as a parameter -- and Function.prototype.toString
+    // already shows that to any page that asks (the accepted no-stealth
+    // cost), so this check reveals nothing new. EVERY hooked method is
+    // listed, not just a few, because a realm that lacks some APIs must
+    // still be recognised by whichever hooks it did get. divergence-gate.js reads
+    // this list and fails if a run replaces anything missing from it.
+    var hookSource = Function.prototype.toString;
+    var HOOKED = [
+      ["CanvasRenderingContext2D", "getImageData"],
+      ["HTMLCanvasElement", "toDataURL"],
+      ["HTMLCanvasElement", "toBlob"],
+      ["OffscreenCanvasRenderingContext2D", "getImageData"],
+      ["OffscreenCanvas", "convertToBlob"],
+      ["AudioBuffer", "getChannelData"],
+      ["AudioBuffer", "copyFromChannel"],
+      ["AnalyserNode", "getFloatFrequencyData"],
+      ["AnalyserNode", "getFloatTimeDomainData"],
+      ["AnalyserNode", "getByteFrequencyData"],
+      ["AnalyserNode", "getByteTimeDomainData"],
+      ["WebGLRenderingContext", "getParameter"],
+      ["WebGL2RenderingContext", "getParameter"],
+      ["Element", "getBoundingClientRect"],
+      ["Element", "getClientRects"],
+      ["Range", "getBoundingClientRect"],
+      ["Range", "getClientRects"],
+    ];
+    var alreadyHooked = function () {
+      for (var hookIndex = 0; hookIndex < HOOKED.length; hookIndex++) {
+        try {
+          var owner = window[HOOKED[hookIndex][0]];
+          var fn = owner && owner.prototype && owner.prototype[HOOKED[hookIndex][1]];
+          if (typeof fn === "function") {
+            var text = hookSource.call(fn);
+            if (text.indexOf("noteProbe(") !== -1 || text.indexOf('note("') !== -1) {
+              return true;
+            }
+          }
+        } catch (eHooked) {
+          /* an unreadable method is not evidence either way */
+        }
+      }
+      return false;
+    };
+    if (alreadyHooked()) {
       return;
-    }
-    // NON-ENUMERABLE, and that is not stealth creeping in through the back
-    // door. The no-stealth rule below accepts that a page probing the
-    // patched natives can tell this is on; it does not require handing over
-    // a property, named after the product, that any script sweeping
-    // Object.keys(window) for browser-specific globals finds for free.
-    // Telling a site "something is farbling" is inherent. Telling it
-    // "PATANYX is farbling" is a separate and much narrower bit, and that
-    // one is avoidable. Plain assignment as the fallback: idempotence
-    // matters more than the property descriptor.
-    try {
-      Object.defineProperty(window, "__patanyxDiverged", { value: true });
-    } catch (e) {
-      window.__patanyxDiverged = true;
     }
 
     var TOKEN = "__DIVERGENCE_TOKEN__";
@@ -329,8 +373,9 @@
     // hostile bridge, timer, serializer, or event listener can only lose the
     // reading; it must never throw into the API the page called. The bridge
     // receives exactly a fixed surface name and an integer delta. Counts are
-    // reset only after a send attempt, so reporting work never touches any
-    // value the divergence math returns.
+    // cleared as the batch is built, before the send, so a send that throws
+    // loses that batch rather than repeating it, and reporting work never
+    // touches any value the divergence math returns.
     var probeCounts = {
       audio: 0,
       canvas: 0,
@@ -338,54 +383,107 @@
       element_measurement: 0,
     };
     var probeTimer = null;
+    var probeTimerAt = 0;
     var probeSetTimeout = typeof setTimeout === "function" ? setTimeout : null;
-    var probeStringify = JSON.stringify;
+    // A CLOCK, captured with its receiver like the bridge below. A page can
+    // cancel any timer it can name, and timer ids are small integers, so the
+    // flush timer can be cleared from outside; probeTimer then stayed set and
+    // no later probe scheduled another, holding every report until pagehide
+    // (review 2026-10-12, R-002). A batch whose timer is long overdue is sent
+    // by the next probe instead.
+    var probeClock = null;
+    var probeClockRecv = null;
+    try {
+      if (typeof performance === "object" && performance && typeof performance.now === "function") {
+        probeClock = performance.now;
+        probeClockRecv = performance;
+      } else if (typeof Date === "function" && typeof Date.now === "function") {
+        probeClock = Date.now;
+        probeClockRecv = Date;
+      }
+    } catch (eClock) {
+      probeClock = null;
+    }
+    // THE BRIDGE IS CAPTURED HERE, AT DOCUMENT START, and never looked up
+    // when a batch is sent. Page script runs after this line, in the same
+    // realm. Measured on WebKitGTK and V8: when the bridge was looked up at
+    // send time, a page that wrapped the bridge's postMessage method, on the
+    // object or on its prototype, or replaced window.chrome / window.webkit
+    // read the whole report, and the replacement also stopped it reaching
+    // the browser.
+    // Holding the function, its receiver and Reflect.apply from before any
+    // page script exists closes that. WebView2 first, then WebKitGTK: the
+    // same precedence the send-time lookup had.
+    var probeApply = null;
+    var probePost = null;
+    var probeRecv = null;
+    try {
+      probeApply = Reflect.apply;
+      var probeWebview = window.chrome && window.chrome.webview;
+      if (probeWebview && typeof probeWebview.postMessage === "function") {
+        probePost = probeWebview.postMessage;
+        probeRecv = probeWebview;
+      } else {
+        var probeHandlers = window.webkit && window.webkit.messageHandlers;
+        var probeIpc = probeHandlers && probeHandlers.ipc;
+        if (probeIpc && typeof probeIpc.postMessage === "function") {
+          probePost = probeIpc.postMessage;
+          probeRecv = probeIpc;
+        }
+      }
+    } catch (eBridge) {
+      probePost = null;
+    }
     var flushProbeCounts = function () {
       probeTimer = null;
       try {
-        var counts = [];
+        // PRIMITIVES ONLY, and that is load-bearing. JSON.stringify looks up
+        // toJSON through the prototype chain and push() stores through it,
+        // so a page that defined an Object.prototype.toJSON getter or an
+        // Array.prototype index setter read the report even with the bridge
+        // captured (measured, both engines). String concatenation of fixed
+        // names and integers, and reads of this closure's own properties,
+        // consult nothing a page can reach.
+        var body = "";
         var names = ["audio", "canvas", "webgl", "element_measurement"];
         for (var i = 0; i < names.length; i++) {
           var surface = names[i];
           var count = probeCounts[surface];
           if (count > 0) {
-            counts.push({ surface: surface, count: count });
+            body +=
+              (body ? "," : "") +
+              '{"surface":"' +
+              surface +
+              '","count":' +
+              count +
+              "}";
             probeCounts[surface] = 0;
           }
         }
-        if (!counts.length) {
+        if (!body || !probePost || !probeApply) {
           return;
         }
-        var payload = probeStringify({
-          kind: "fingerprint_probe_counts",
-          counts: counts,
-        });
-        if (
-          window.chrome &&
-          window.chrome.webview &&
-          typeof window.chrome.webview.postMessage === "function"
-        ) {
-          window.chrome.webview.postMessage(payload);
-        } else if (
-          window.webkit &&
-          window.webkit.messageHandlers &&
-          window.webkit.messageHandlers.ipc &&
-          typeof window.webkit.messageHandlers.ipc.postMessage ===
-            "function"
-        ) {
-          window.webkit.messageHandlers.ipc.postMessage(payload);
-        }
+        var payload =
+          '{"kind":"fingerprint_probe_counts","counts":[' + body + "]}";
+        probeApply(probePost, probeRecv, [payload]);
       } catch (eReport) {
         /* reporting is optional; page behaviour is not */
       }
     };
     var noteProbe = function (surface) {
       try {
+        var now = probeClock && probeApply ? probeApply(probeClock, probeClockRecv, []) : 0;
+        // Twice the delay and still not fired: the page cancelled it. Send
+        // what it was holding now, before this probe joins a new batch.
+        if (probeTimer !== null && now > 0 && now - probeTimerAt > 4000) {
+          flushProbeCounts();
+        }
         if (probeCounts[surface] < 9007199254740991) {
           probeCounts[surface] += 1;
         }
         if (probeTimer === null && probeSetTimeout) {
           probeTimer = probeSetTimeout(flushProbeCounts, 2000);
+          probeTimerAt = now;
         }
       } catch (eCount) {
         /* a counter must never alter the intercepted call */

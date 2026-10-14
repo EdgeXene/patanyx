@@ -34,6 +34,12 @@ Usage:
                          byte-identical to the ones published with 1.0.6. One of
                          the two forms is REQUIRED: a release may not skip /v1.
 
+Each binary is also scanned for the markers of a build that is never published
+(chat, premium-unlocked) and for unremapped build paths (/.cargo/, /.rustup/),
+from the one list in forbidden-build-markers.py. --build-identity cannot say
+this: a chat build reports the same variant as the public one. Until 1.0.7 the
+scan was a step done by hand (1.0.6 review, R-001).
+
 Exit 0 when every check passes; 1 with every failure listed otherwise.
 Signatures are checked by `patanyx-sign verify` in the publish script; this
 checks the MAPPING the signature cannot judge.
@@ -41,10 +47,27 @@ checks the MAPPING the signature cannot judge.
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
 import sys
+
+
+def _load_markers():
+    # Loaded by explicit path, beside this file: the test and the publish run
+    # this script under `python3 -I`, which leaves the script's own directory
+    # off sys.path, so a plain import would not find it.
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location(
+        "forbidden_build_markers", os.path.join(here, "forbidden-build-markers.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+MARKERS = _load_markers()
 
 BRIDGE_FLOOR = "2.52.5"
 # The one release that publishes the bridge. Bridge mode for any other
@@ -88,6 +111,13 @@ def check_feed(name, manifest, binary, variant, failures):
     except Exception as e:  # noqa: BLE001 - every shape problem is a refusal
         failures.append(f"{name}: manifest {manifest} unreadable: {e}")
         return None
+    # Before asking the binary anything: a chat or premium-unlocked build
+    # answers --build-identity exactly like the public one.
+    try:
+        for finding in MARKERS.scan(binary):
+            failures.append(f"{name}: {binary} {finding}")
+    except OSError as e:
+        failures.append(f"{name}: binary {binary} cannot be scanned for build markers: {e}")
     try:
         ident = identity(binary)
     except Exception as e:  # noqa: BLE001

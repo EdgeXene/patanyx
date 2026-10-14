@@ -854,7 +854,7 @@ pub fn apply_staged(proxy: &tao::event_loop::EventLoopProxy<crate::UserEvent>) -
         if installer::is_restore_failure(&e) {
             // The worst case: the new file could not start AND the old one
             // could not be put back. The panel says how to get a working copy.
-            mark_install_broken(&e);
+            mark_install_broken(&e, &manifest.version().to_string());
         }
         install_error_code(&e)
     })?;
@@ -1080,6 +1080,12 @@ pub(crate) fn unix_now() -> u64 {
 /// one would never elapse.
 fn remember_pending(dir: &Path, envelope: &[u8], staged: &Path, manifest: &Manifest) {
     let version = manifest.version().to_string();
+    // A release the automatic install gave up on is not staged for it again,
+    // by this process or any other (see `FailedRelease`). The download stays
+    // Ready in memory, so the person can still install it with a click.
+    if automatic_install_stopped(dir, &version) {
+        return;
+    }
     let first_seen = read_pending_meta(dir)
         .filter(|m| m.version == version)
         .map(|m| m.first_seen_unix)
@@ -1125,6 +1131,256 @@ fn read_pending_meta(dir: &Path) -> Option<PendingMeta> {
         staged: staged.to_string(),
         first_seen_unix: v["first_seen_unix"].as_u64()?,
     })
+}
+
+/// How many times a pending update may fail at startup before PATANYX stops
+/// installing it by itself (review R-005). A failure there costs a launch up
+/// to the preflight timeout on Linux, and nothing used to end the retries.
+const STARTUP_INSTALL_ATTEMPTS: u32 = 3;
+
+fn failed_release_path(dir: &Path) -> PathBuf {
+    dir.join("failed-release.json")
+}
+
+/// Releases the automatic install failed on, kept in the data dir so every
+/// PATANYX process sees them. Without it a second process could stage a
+/// release again after the first gave up, and the next launch would repeat
+/// the install that just failed (updater review r5 R-002). It stops only the
+/// AUTOMATIC install: a person can still install a stopped release from the
+/// Updates panel, and other versions are never affected.
+///
+/// `counts` holds the failures of each version still being tried, and
+/// `stopped` every version given up on, each per version, so failures of
+/// different releases (a channel switch, say) never reset or bypass each
+/// other (reviews 2026-10-12, R-002 of rounds 1 and 3). Entries leave only
+/// when the running browser reaches their version; nothing is evicted, so a
+/// stop holds until then (round 3, R-003). Releases are rare, and reaching
+/// one prunes it, so the file stays small.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FailedReleases {
+    counts: Vec<(String, u32)>,
+    stopped: Vec<String>,
+}
+
+impl FailedReleases {
+    fn is_stopped(&self, version: &str) -> bool {
+        self.stopped.iter().any(|v| v == version)
+    }
+
+    /// The record after one more failure of `version`. Pure, so the counting
+    /// is tested. A failed restore stops at once (the old file could not be
+    /// put back, so trying again by itself is the one thing never to do);
+    /// other failures stop at `STARTUP_INSTALL_ATTEMPTS`. Once stopped, stays
+    /// stopped until the running version reaches it.
+    fn after_failure(mut self, version: &str, restore_failed: bool) -> Self {
+        if self.is_stopped(version) {
+            return self;
+        }
+        let attempts = self.attempts(version).saturating_add(1);
+        self.counts.retain(|(v, _)| v != version);
+        if restore_failed || attempts >= STARTUP_INSTALL_ATTEMPTS {
+            self.stopped.push(version.to_string());
+        } else {
+            self.counts.push((version.to_string(), attempts));
+        }
+        self
+    }
+
+    /// Forget every version the running browser has reached: those can no
+    /// longer be offered. A version still newer is kept whatever else the
+    /// startup decision said, so an engine refusal does not wipe the history
+    /// of a release that will be offered again (review 2026-10-12, R-003).
+    /// An entry that does not parse is kept: never drop a stop on a guess.
+    fn reached_by(mut self, running: &Version) -> Self {
+        let reached = |v: &str| v.parse::<Version>().is_ok_and(|v| v <= *running);
+        self.counts.retain(|(v, _)| !reached(v));
+        self.stopped.retain(|v| !reached(v));
+        self
+    }
+
+    fn attempts(&self, version: &str) -> u32 {
+        if self.is_stopped(version) {
+            return STARTUP_INSTALL_ATTEMPTS;
+        }
+        self.counts.iter().find(|(v, _)| v == version).map_or(0, |(_, n)| *n)
+    }
+}
+
+fn read_failed_releases(dir: &Path) -> Option<FailedReleases> {
+    let raw = std::fs::read_to_string(failed_release_path(dir)).ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let counts = v["counts"]
+        .as_array()?
+        .iter()
+        .map(|c| Some((c["version"].as_str()?.to_string(), u32::try_from(c["attempts"].as_u64()?).ok()?)))
+        .collect::<Option<Vec<_>>>()?;
+    let stopped = v["stopped"]
+        .as_array()?
+        .iter()
+        .map(|x| x.as_str().map(str::to_string))
+        .collect::<Option<Vec<String>>>()?;
+    Some(FailedReleases { counts, stopped })
+}
+
+/// How long a launch waits for another PATANYX to finish with the record
+/// before it gives up on the automatic install for this launch. Startup runs
+/// before any window, so the wait is bounded (round 2, R-001).
+const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Proof that this process holds the record's lock. Every write takes one,
+/// so the record is never changed without the lock (round 2, R-002).
+struct RecordLock(#[allow(dead_code)] std::fs::File);
+
+/// Take the record's lock, waiting at most `RECORD_LOCK_WAIT`. `None` when it
+/// cannot be had (held elsewhere, or locking does not work here): the caller
+/// then changes nothing.
+fn lock_failed_releases(dir: &Path) -> Option<RecordLock> {
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join("failed-release.lock"))
+    {
+        Ok(file) => file,
+        Err(err) => {
+            eprintln!("PATANYX: could not open the failed-update record's lock: {err}");
+            return None;
+        }
+    };
+    let deadline = std::time::Instant::now() + RECORD_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(RecordLock(file)),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => return None,
+            Err(std::fs::TryLockError::Error(err)) => {
+                eprintln!("PATANYX: could not lock the failed-update record: {err}");
+                return None;
+            }
+        }
+    }
+}
+
+/// Publish the record by rename, so a reader never sees half a file. Only
+/// callable with the lock held.
+fn write_failed_releases(_held: &RecordLock, dir: &Path, record: &FailedReleases) -> bool {
+    let json = json!({
+        "counts": record
+            .counts
+            .iter()
+            .map(|(v, n)| json!({ "version": v, "attempts": n }))
+            .collect::<Vec<_>>(),
+        "stopped": record.stopped,
+    });
+    let temp = dir.join("failed-release.json.tmp");
+    let written = std::fs::write(&temp, json.to_string())
+        .and_then(|()| std::fs::rename(&temp, failed_release_path(dir)));
+    if let Err(err) = written {
+        let _ = std::fs::remove_file(&temp);
+        eprintln!("PATANYX: could not record the failed update: {err}");
+        return false;
+    }
+    true
+}
+
+/// The record after counting one failure, as WRITTEN. `None` when it could
+/// not be written: then nothing changed for any other process, and the
+/// caller must not act as if the count or a stop took effect (round 3,
+/// R-001).
+fn note_failed_install_locked(
+    held: &RecordLock,
+    dir: &Path,
+    version: &str,
+    restore_failed: bool,
+) -> Option<FailedReleases> {
+    let next = read_failed_releases(dir).unwrap_or_default().after_failure(version, restore_failed);
+    write_failed_releases(held, dir, &next).then_some(next)
+}
+
+/// Count one failed install of `version`, if the record's lock can be had
+/// and the record written. `None` otherwise: the failure goes uncounted.
+fn note_failed_install(dir: &Path, version: &str, restore_failed: bool) -> Option<FailedReleases> {
+    let held = lock_failed_releases(dir)?;
+    note_failed_install_locked(&held, dir, version, restore_failed)
+}
+
+/// Whether the automatic install has given up on `version`. Lock-free: the
+/// record is only ever replaced whole.
+fn automatic_install_stopped(dir: &Path, version: &str) -> bool {
+    read_failed_releases(dir).is_some_and(|r| r.is_stopped(version))
+}
+
+/// Forget the versions the running browser has reached. Skipped when the
+/// lock cannot be had; the next launch tidies up instead.
+fn forget_reached_releases(dir: &Path, running: &Version) {
+    if !failed_release_path(dir).exists() {
+        return;
+    }
+    let Some(held) = lock_failed_releases(dir) else {
+        return;
+    };
+    let next = read_failed_releases(dir).unwrap_or_default().reached_by(running);
+    write_failed_releases(&held, dir, &next);
+}
+
+/// How the automatic startup install of one release went.
+#[derive(Debug)]
+enum StartupAttempt {
+    /// Another PATANYX is using the record; nothing was tried this launch.
+    RecordBusy,
+    /// The automatic install has given up on this release.
+    Stopped,
+    Installed,
+    /// The install failed. `stopped` says whether that was the failure that
+    /// stopped it; `counted` is false for another window's install.
+    Failed { error: std::io::Error, counted: bool, stopped: bool, attempts: u32 },
+}
+
+/// The automatic install at startup, start to finish under the record's
+/// lock: whether the release is still allowed, the install, and the count.
+/// Checked outside the lock, two launches could both decide to install a
+/// release one of them was about to stop (round 2, R-003). A launch that
+/// cannot get the lock installs nothing and starts normally.
+fn startup_attempt(
+    dir: &Path,
+    version: &str,
+    install: impl FnOnce() -> std::io::Result<()>,
+) -> StartupAttempt {
+    let Some(held) = lock_failed_releases(dir) else {
+        return StartupAttempt::RecordBusy;
+    };
+    if read_failed_releases(dir).is_some_and(|r| r.is_stopped(version)) {
+        return StartupAttempt::Stopped;
+    }
+    match install() {
+        Ok(()) => StartupAttempt::Installed,
+        Err(error) => {
+            if !counts_as_failed_install(&error) {
+                return StartupAttempt::Failed { error, counted: false, stopped: false, attempts: 0 };
+            }
+            let restore_failed = installer::is_restore_failure(&error);
+            match note_failed_install_locked(&held, dir, version, restore_failed) {
+                Some(record) => StartupAttempt::Failed {
+                    counted: true,
+                    stopped: record.is_stopped(version),
+                    attempts: record.attempts(version),
+                    error,
+                },
+                // Not written: no count and no stop took effect anywhere.
+                None => StartupAttempt::Failed { error, counted: false, stopped: false, attempts: 0 },
+            }
+        }
+    }
+}
+
+/// Whether a startup install error is a failure OF THE RELEASE. Another
+/// PATANYX holding the install lock, or having installed an update already,
+/// says nothing about the release, and counting it let a second launch use up
+/// the attempts of an install still in progress (review 2026-10-12, R-001).
+fn counts_as_failed_install(e: &std::io::Error) -> bool {
+    !installer::is_another_install(e)
 }
 
 fn clean_pending(dir: &Path) -> std::io::Result<()> {
@@ -1189,8 +1445,19 @@ pub fn apply_pending_at_startup() -> bool {
     let engine = EngineSnapshot::now();
     let Decision::Update(_) = decide(&current, &FLOOR, platform, &engine.running(), &manifest) else {
         let _ = clean_pending(&dir);
+        // Whatever this browser has reached is behind it now. Only that: a
+        // release refused for the engine is still newer and keeps its record.
+        forget_reached_releases(&dir, &current);
         return false;
     };
+    let version = manifest.version().to_string();
+    // Given up on, by this process or another: drop the pending copy so it
+    // is not re-read at every launch. (Checked again under the lock below;
+    // this read only saves work.)
+    if automatic_install_stopped(&dir, &version) {
+        let _ = clean_pending(&dir);
+        return false;
+    }
     if !crate::prefs::load().update_auto_apply {
         return false;
     }
@@ -1201,27 +1468,88 @@ pub fn apply_pending_at_startup() -> bool {
     // `apply` re-reads and re-hashes the staged bytes against the signed
     // manifest before touching the running binary; a failure leaves both the
     // browser and the staged file in place.
-    match installer::apply(&staged, &manifest) {
-        Ok(()) => {
-            let _ = clean_pending(&dir);
-            let _ = std::fs::remove_file(&staged);
-            true
+    let outcome = startup_attempt(&dir, &version, || installer::apply(&staged, &manifest));
+    if let StartupAttempt::Failed { error, attempts, .. } = &outcome {
+        // Always in the log. The worst case (old version not put back)
+        // also reaches the Updates panel of this very run, which is the
+        // old version still running from memory.
+        eprintln!("PATANYX: update not installed at startup: {error}");
+        if startup_follow_up(&outcome).gave_up {
+            eprintln!(
+                "PATANYX: the update to {version} failed {attempts} times at startup; it \
+                 will not be installed automatically again (Updates can still install it)"
+            );
         }
-        Err(e) => {
-            // Always in the log. The worst case (old version not put back)
-            // also reaches the Updates panel of this very run, which is the
-            // old version still running from memory.
-            eprintln!("PATANYX: update not installed at startup: {e}");
-            mark_install_broken(&e);
-            false
+    }
+    let next = startup_follow_up(&outcome);
+    if next.clean_pending {
+        let _ = clean_pending(&dir);
+    }
+    if next.remove_staged {
+        let _ = std::fs::remove_file(&staged);
+    }
+    if let (true, StartupAttempt::Failed { error, .. }) = (next.show_broken, &outcome) {
+        // The record already holds the stop, written under the lock above.
+        show_install_broken(error);
+    }
+    next.relaunched
+}
+
+/// What startup does after an attempt. Pure, so every branch is tested (round
+/// 3, R-004).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct StartupFollowUp {
+    /// The replacement is running: this process must exit.
+    relaunched: bool,
+    clean_pending: bool,
+    remove_staged: bool,
+    /// The recovery screen: the old version could not be put back.
+    show_broken: bool,
+    /// This failure was the one that stopped the automatic install.
+    gave_up: bool,
+}
+
+fn startup_follow_up(outcome: &StartupAttempt) -> StartupFollowUp {
+    match outcome {
+        StartupAttempt::Installed => StartupFollowUp {
+            relaunched: true,
+            clean_pending: true,
+            remove_staged: true,
+            ..Default::default()
+        },
+        StartupAttempt::RecordBusy => StartupFollowUp::default(),
+        StartupAttempt::Stopped => StartupFollowUp { clean_pending: true, ..Default::default() },
+        StartupAttempt::Failed { error, counted, stopped, .. } => {
+            if installer::is_restore_failure(error) {
+                // show_install_broken drops the pending copy itself.
+                StartupFollowUp { show_broken: true, ..Default::default() }
+            } else if *counted && *stopped {
+                StartupFollowUp { clean_pending: true, gave_up: true, ..Default::default() }
+            } else {
+                StartupFollowUp::default()
+            }
         }
     }
 }
 
 /// Record a restore failure for the panel, and drop the pending update so
 /// nothing tries the same install again by itself: a copy put back by hand,
-/// or the next launch, must not repeat the swap that just went wrong.
-fn mark_install_broken(e: &std::io::Error) {
+/// or the next launch, must not repeat the swap that just went wrong. The
+/// failed-release record makes that hold across processes too.
+fn mark_install_broken(e: &std::io::Error, version: &str) {
+    if !installer::is_restore_failure(e) {
+        return;
+    }
+    if note_failed_install(&data_dir(), version, true).is_none() {
+        eprintln!("PATANYX: the failed update could not be recorded; the pending copy is removed instead");
+    }
+    show_install_broken(e);
+}
+
+/// The panel's half of a failed restore: drop the pending update and put up
+/// the recovery screen. The record's half is the caller's, because the
+/// startup path already holds the record's lock.
+fn show_install_broken(e: &std::io::Error) {
     let Some(broken) = installer::restore_failure(e) else {
         return;
     };
@@ -2218,9 +2546,11 @@ pub mod installer {
         // version decision this process made is about a file that is gone:
         // installing now could put an older release over a newer one.
         if !still_running_file(current)? {
-            return Err(std::io::Error::other(
+            // Typed, so the startup cap does not count it as a failure of
+            // the release (counts_as_failed_install).
+            return Err(std::io::Error::other(AnotherInstall(
                 "PATANYX was already updated by another window; restart PATANYX to use it",
-            ));
+            )));
         }
         let staging = sibling(current, "new");
         write_fresh(&staging, bytes, 0o755)?;
@@ -2280,6 +2610,26 @@ pub mod installer {
 
     impl std::error::Error for RestoreFailed {}
 
+    /// Another PATANYX process is installing, or has installed, an update.
+    /// Says nothing about the release itself, so it is typed: the startup
+    /// retry cap must not spend an attempt on it.
+    #[derive(Debug)]
+    #[cfg_attr(windows, allow(dead_code))]
+    pub(super) struct AnotherInstall(pub(super) &'static str);
+
+    impl std::fmt::Display for AnotherInstall {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for AnotherInstall {}
+
+    /// Whether `e` says another PATANYX got to the install first.
+    pub(super) fn is_another_install(e: &std::io::Error) -> bool {
+        e.get_ref().is_some_and(|inner| inner.is::<AnotherInstall>())
+    }
+
     /// The old-version-not-restored failure inside `e`, if that is what it is.
     pub(super) fn restore_failure(e: &std::io::Error) -> Option<&RestoreFailed> {
         e.get_ref().and_then(|inner| inner.downcast_ref::<RestoreFailed>())
@@ -2334,11 +2684,14 @@ pub mod installer {
             .truncate(false)
             .write(true)
             .open(sibling(exe, "update-lock"))?;
-        file.try_lock().map_err(|_| {
-            std::io::Error::new(
+        // Only contention is "another PATANYX": a filesystem that cannot
+        // lock at all is an ordinary failure, and counts (round 2, R-004).
+        file.try_lock().map_err(|err| match err {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
                 std::io::ErrorKind::WouldBlock,
-                "another PATANYX is installing this update right now",
-            )
+                AnotherInstall("another PATANYX is installing this update right now"),
+            ),
+            std::fs::TryLockError::Error(err) => err,
         })?;
         Ok(file)
     }
@@ -2443,15 +2796,45 @@ pub mod installer {
     /// is the whole reason this is not three lines.
     #[cfg(windows)]
     fn swap_and_relaunch(current: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        swap_aside(current, bytes, |path, bytes| std::fs::write(path, bytes), relaunch)
+    }
+
+    /// The Windows swap, with the write and the relaunch as parameters so the
+    /// rollback is tested on every platform (review R-002).
+    ///
+    /// Both failures after the rename put the working browser back: a write
+    /// that failed (the file at the path may be partial), and a relaunch that
+    /// failed after a good write (the new file is in place but did not start).
+    /// The new file is never running in either case, so the rename back can
+    /// replace it. If even that rename fails, the error is `RestoreFailed`,
+    /// which is what puts the Updates panel's recovery screen up; it used to
+    /// be dropped here, so that screen existed only on unix.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(super) fn swap_aside(
+        current: &Path,
+        bytes: &[u8],
+        write: impl FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+        relaunch: impl FnOnce(&Path) -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
         let aside = current.with_extension("old");
         let _ = std::fs::remove_file(&aside);
+        // Nothing has changed yet if this fails.
         std::fs::rename(current, &aside)?;
-        if let Err(error) = std::fs::write(current, bytes) {
-            // Put the working browser back before reporting failure.
-            let _ = std::fs::rename(&aside, current);
-            return Err(error);
+        let Err(error) = write(current, bytes).and_then(|()| relaunch(current)) else {
+            return Ok(());
+        };
+        if let Err(restore) = std::fs::rename(&aside, current) {
+            return Err(std::io::Error::other(RestoreFailed {
+                exe: current.to_path_buf(),
+                // Only claim a copy that is really there.
+                kept_at: std::fs::symlink_metadata(&aside)
+                    .is_ok_and(|m| m.is_file())
+                    .then(|| aside.clone()),
+                start_error: error.to_string(),
+                restore_error: restore.to_string(),
+            }));
         }
-        relaunch(current)
+        Err(error)
     }
 
     /// Start the replacement and let this process exit normally.
@@ -2461,7 +2844,9 @@ pub mod installer {
     /// hard exit here would skip that, and the vault zeroizes its key material
     /// on drop.
     fn relaunch(path: &Path) -> std::io::Result<()> {
-        std::process::Command::new(path).spawn()?;
+        // Marked, so the replacement waits for this process's kept-profile
+        // lock instead of starting without kept storage (main.rs).
+        std::process::Command::new(path).env(crate::RELAUNCH_ENV, "1").spawn()?;
         Ok(())
     }
 
@@ -2958,6 +3343,365 @@ mod tests {
         // instead of assuming the failed update is gone (review r5 R-001).
         std::fs::create_dir(pending_envelope_path(dir.path())).unwrap();
         assert!(clean_pending(dir.path()).is_err(), "a failed removal must not read as clean");
+    }
+
+    /// The startup retry cap (review R-005): every combination of a repeat,
+    /// a new version and a failed restore.
+    #[test]
+    fn a_failing_release_stops_installing_itself_after_the_cap() {
+        let r = FailedReleases::default().after_failure("9.9.9", false);
+        assert_eq!((r.attempts("9.9.9"), r.is_stopped("9.9.9")), (1, false));
+        let r = r.after_failure("9.9.9", false);
+        assert_eq!((r.attempts("9.9.9"), r.is_stopped("9.9.9")), (2, false));
+        let three = r.clone().after_failure("9.9.9", false);
+        assert!(three.is_stopped("9.9.9"), "the cap must stop the automatic install");
+        assert!(three.clone().after_failure("9.9.9", false).is_stopped("9.9.9"), "stays stopped");
+
+        // A failed restore stops at once, on the first failure.
+        assert!(FailedReleases::default().after_failure("9.9.9", true).is_stopped("9.9.9"));
+        assert!(r.after_failure("9.9.9", true).is_stopped("9.9.9"));
+
+        // Another version failing never un-stops one (review 2026-10-12,
+        // R-002: stable stopped, a beta fails once, back to stable).
+        let other = three.after_failure("9.10.0-beta.1", false);
+        assert!(other.is_stopped("9.9.9"), "a different version's failure forgot a stop");
+        assert_eq!(other.attempts("9.10.0-beta.1"), 1);
+        let both = other.after_failure("9.10.0-beta.1", true);
+        assert!(both.is_stopped("9.9.9") && both.is_stopped("9.10.0-beta.1"));
+
+        // Stops are never evicted, however many there are (round 3, R-003).
+        let mut many = FailedReleases::default();
+        for minor in 0..40u32 {
+            many = many.after_failure(&format!("9.{minor}.0"), true);
+        }
+        assert_eq!(many.stopped.len(), 40);
+        assert!(many.is_stopped("9.0.0") && many.is_stopped("9.39.0"));
+
+        // Counts are per version: alternating two failing releases still
+        // reaches the cap for each (round 3, R-002).
+        let alt = FailedReleases::default()
+            .after_failure("1.0.9", false)
+            .after_failure("1.0.9", false)
+            .after_failure("1.0.10-beta.1", false)
+            .after_failure("1.0.9", false);
+        assert!(alt.is_stopped("1.0.9"), "a channel switch reset the count: {alt:?}");
+        assert_eq!(alt.attempts("1.0.10-beta.1"), 1);
+    }
+
+    /// Only versions the running browser has reached are forgotten; a newer
+    /// one keeps its history whatever else the startup decision said (review
+    /// 2026-10-12, R-003), and an entry that does not parse is kept.
+    #[test]
+    fn only_reached_versions_are_forgotten() {
+        let r = FailedReleases::default()
+            .after_failure("1.0.9", true)
+            .after_failure("1.0.8", true)
+            .after_failure("not-a-version", true)
+            .after_failure("1.0.10", false);
+        let after = r.reached_by(&Version::new(1, 0, 9));
+        assert!(!after.is_stopped("1.0.8") && !after.is_stopped("1.0.9"), "reached versions must go");
+        assert!(after.is_stopped("not-a-version"), "an unparsable stop was dropped on a guess");
+        assert_eq!(after.attempts("1.0.10"), 1, "a newer release lost its count");
+        let older = FailedReleases::default().after_failure("1.0.10", false).reached_by(&Version::new(1, 0, 9));
+        assert_eq!(older.attempts("1.0.10"), 1);
+        let gone = older.reached_by(&Version::new(1, 0, 10));
+        assert_eq!(gone, FailedReleases::default());
+    }
+
+    /// The record lives in the data dir, so every process reads it, and a
+    /// stopped release is not staged for the automatic install again (updater
+    /// review r5 R-002). Another version still stages.
+    #[test]
+    fn a_stopped_release_is_not_staged_again_by_any_process() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let manifest = verify_manifest(
+            signed_manifest_for(Version::new(9, 9, 9), Platform::LinuxX86_64).as_bytes(),
+            &dev_trusted_keys(),
+        )
+        .expect("must verify");
+        let staged = dir.path().join("patanyx-9.9.9-linux-x86_64.bin");
+
+        assert!(!automatic_install_stopped(dir.path(), "9.9.9"));
+        for _ in 0..STARTUP_INSTALL_ATTEMPTS - 1 {
+            assert!(!note_failed_install(dir.path(), "9.9.9", false).unwrap().is_stopped("9.9.9"));
+        }
+        remember_pending(dir.path(), b"envelope-bytes", &staged, &manifest);
+        assert!(read_pending_meta(dir.path()).is_some(), "below the cap it still stages");
+        clean_pending(dir.path()).unwrap();
+
+        assert!(note_failed_install(dir.path(), "9.9.9", false).unwrap().is_stopped("9.9.9"));
+        assert!(automatic_install_stopped(dir.path(), "9.9.9"));
+        assert!(!automatic_install_stopped(dir.path(), "9.9.10"), "only that version");
+        remember_pending(dir.path(), b"envelope-bytes", &staged, &manifest);
+        assert!(read_pending_meta(dir.path()).is_none(), "a stopped release was staged again");
+        assert!(!pending_envelope_path(dir.path()).exists());
+
+        let newer = verify_manifest(
+            signed_manifest_for(Version::new(9, 9, 10), Platform::LinuxX86_64).as_bytes(),
+            &dev_trusted_keys(),
+        )
+        .expect("must verify");
+        remember_pending(dir.path(), b"envelope-bytes", &staged, &newer);
+        assert_eq!(read_pending_meta(dir.path()).expect("stages").version, "9.9.10");
+
+        // The record is published whole: no temporary file is left behind.
+        assert!(!dir.path().join("failed-release.json.tmp").exists());
+        forget_reached_releases(dir.path(), &Version::new(9, 9, 9));
+        assert!(!automatic_install_stopped(dir.path(), "9.9.9"));
+    }
+
+    /// Many writers at once, each in its own thread with its own handle on
+    /// the record, as several PATANYX processes would have (review
+    /// 2026-10-12, R-001). Without the lock the read-modify-write races: a
+    /// restore-failure stop is overwritten, and counted failures are lost.
+    #[test]
+    fn concurrent_failures_never_lose_a_stop_or_a_count() {
+        for round in 0..25 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().to_path_buf();
+            let workers: Vec<_> = (0..8)
+                .map(|i| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        if i == 3 {
+                            note_failed_install(&path, "9.9.8", true)
+                        } else {
+                            note_failed_install(&path, "9.9.9", false)
+                        }
+                    })
+                })
+                .collect();
+            for w in workers {
+                w.join().unwrap();
+            }
+            let r = read_failed_releases(&path).expect("a whole record");
+            assert!(r.is_stopped("9.9.8"), "round {round}: a restore-failure stop was lost: {r:?}");
+            assert!(r.is_stopped("9.9.9"), "round {round}: seven failures did not reach the cap: {r:?}");
+        }
+    }
+
+    /// A stop of one version never resets another version's count.
+    #[test]
+    fn a_stop_leaves_another_versions_count_alone() {
+        let r = FailedReleases::default()
+            .after_failure("9.9.9", false)
+            .after_failure("9.9.9", false)
+            .after_failure("9.9.8", true);
+        assert_eq!(r.attempts("9.9.9"), 2);
+        assert!(r.after_failure("9.9.9", false).is_stopped("9.9.9"));
+    }
+
+    /// A damaged record reads as no record: the cap then does not hold, which
+    /// is the behavior before it existed, never a refusal to update.
+    #[test]
+    fn a_damaged_failed_release_record_is_ignored() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for junk in ["", "{}", "not json", "{\"counts\":[]}",
+                     "{\"counts\":[{\"version\":\"9.9.9\",\"attempts\":-1}],\"stopped\":[]}",
+                     "{\"counts\":[],\"stopped\":[1]}"] {
+            std::fs::write(failed_release_path(dir.path()), junk).unwrap();
+            assert!(read_failed_releases(dir.path()).is_none(), "accepted {junk:?}");
+            assert!(!automatic_install_stopped(dir.path(), "9.9.9"));
+        }
+    }
+
+    /// Another PATANYX holding the install lock, or having installed already,
+    /// is not a failure of the release (review 2026-10-12, R-001).
+    #[test]
+    fn another_window_installing_is_not_a_failure_of_the_release() {
+        let busy = std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            installer::AnotherInstall("another PATANYX is installing this update right now"),
+        );
+        assert!(!counts_as_failed_install(&busy));
+        assert!(!counts_as_failed_install(&std::io::Error::other(installer::AnotherInstall("already"))));
+        assert!(counts_as_failed_install(&std::io::Error::new(std::io::ErrorKind::WouldBlock, "something else")));
+        assert!(counts_as_failed_install(&std::io::Error::new(std::io::ErrorKind::AlreadyExists, "stale file")));
+        assert!(counts_as_failed_install(&std::io::Error::other("preflight failed")));
+    }
+
+    /// The automatic startup install, behaviourally (round 2, R-003 and
+    /// R-005): a stopped release is never handed to the installer, failures
+    /// count up to the cap, another window's install never counts, and a
+    /// failed restore stops it at once.
+    #[test]
+    fn the_startup_attempt_follows_the_record() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let fail = || Err(std::io::Error::other("preflight failed"));
+        for n in 1..STARTUP_INSTALL_ATTEMPTS {
+            match startup_attempt(d, "9.9.9", fail) {
+                StartupAttempt::Failed { counted: true, stopped: false, attempts, .. } => assert_eq!(attempts, n),
+                other => panic!("attempt {n}: {other:?}"),
+            }
+        }
+        let busy = || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                installer::AnotherInstall("another PATANYX is installing this update right now"),
+            ))
+        };
+        assert!(matches!(startup_attempt(d, "9.9.9", busy), StartupAttempt::Failed { counted: false, .. }));
+        assert!(matches!(
+            startup_attempt(d, "9.9.9", fail),
+            StartupAttempt::Failed { counted: true, stopped: true, .. }
+        ));
+        let mut called = false;
+        assert!(matches!(
+            startup_attempt(d, "9.9.9", || {
+                called = true;
+                Ok(())
+            }),
+            StartupAttempt::Stopped
+        ));
+        assert!(!called, "a stopped release was handed to the installer");
+        assert!(matches!(startup_attempt(d, "9.9.10", || Ok(())), StartupAttempt::Installed));
+
+        let restore = || {
+            Err(std::io::Error::other(installer::RestoreFailed {
+                exe: PathBuf::from("/x/PATANYX"),
+                kept_at: None,
+                start_error: "start".into(),
+                restore_error: "restore".into(),
+            }))
+        };
+        assert!(matches!(
+            startup_attempt(d, "9.9.11", restore),
+            StartupAttempt::Failed { counted: true, stopped: true, .. }
+        ));
+        assert!(automatic_install_stopped(d, "9.9.11"));
+    }
+
+    /// A launch that cannot get the record's lock installs nothing and waits
+    /// only a bounded time; while one launch is installing, another cannot
+    /// slip an install in on a stale decision (round 2, R-001 and R-003).
+    #[test]
+    fn a_launch_that_cannot_get_the_record_installs_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path().to_path_buf();
+        let held = lock_failed_releases(&d).expect("lock");
+        let started = std::time::Instant::now();
+        let mut called = false;
+        let outcome = startup_attempt(&d, "9.9.9", || {
+            called = true;
+            Ok(())
+        });
+        assert!(matches!(outcome, StartupAttempt::RecordBusy), "{outcome:?}");
+        assert!(!called, "installed without the record's lock");
+        let waited = started.elapsed();
+        assert!(waited >= RECORD_LOCK_WAIT && waited < RECORD_LOCK_WAIT * 3, "waited {waited:?}");
+        assert!(note_failed_install(&d, "9.9.9", true).is_none(), "wrote the record without the lock");
+        assert!(read_failed_releases(&d).is_none());
+        drop(held);
+
+        // One launch mid-install holds the lock; a second one gives up.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let d2 = d.clone();
+        let first = std::thread::spawn(move || {
+            startup_attempt(&d2, "9.9.9", || {
+                tx.send(()).unwrap();
+                std::thread::sleep(RECORD_LOCK_WAIT + std::time::Duration::from_millis(800));
+                Err(std::io::Error::other("preflight failed"))
+            })
+        });
+        rx.recv().unwrap();
+        let mut second_called = false;
+        let second = startup_attempt(&d, "9.9.9", || {
+            second_called = true;
+            Ok(())
+        });
+        assert!(matches!(second, StartupAttempt::RecordBusy), "{second:?}");
+        assert!(!second_called);
+        assert!(matches!(first.join().unwrap(), StartupAttempt::Failed { counted: true, .. }));
+    }
+
+    /// A count that could not be written is not reported as counted, so
+    /// startup never announces or acts on a stop no other process will see
+    /// (round 3, R-001).
+    #[test]
+    fn an_unwritten_count_is_not_a_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A directory where the record goes: the rename over it fails.
+        std::fs::create_dir(failed_release_path(dir.path())).unwrap();
+        for _ in 0..STARTUP_INSTALL_ATTEMPTS + 1 {
+            let outcome = startup_attempt(dir.path(), "9.9.9", || Err(std::io::Error::other("preflight failed")));
+            assert!(
+                matches!(outcome, StartupAttempt::Failed { counted: false, stopped: false, .. }),
+                "{outcome:?}"
+            );
+        }
+        assert!(note_failed_install(dir.path(), "9.9.9", true).is_none());
+        assert!(!dir.path().join("failed-release.json.tmp").exists(), "a temp file was left behind");
+    }
+
+    /// Every startup outcome's follow-up (round 3, R-004).
+    #[test]
+    fn every_startup_outcome_has_its_follow_up() {
+        let none = StartupFollowUp::default();
+        assert_eq!(
+            startup_follow_up(&StartupAttempt::Installed),
+            StartupFollowUp { relaunched: true, clean_pending: true, remove_staged: true, ..none }
+        );
+        assert_eq!(startup_follow_up(&StartupAttempt::RecordBusy), StartupFollowUp::default());
+        assert_eq!(
+            startup_follow_up(&StartupAttempt::Stopped),
+            StartupFollowUp { clean_pending: true, ..StartupFollowUp::default() }
+        );
+        let failed = |counted, stopped| StartupAttempt::Failed {
+            error: std::io::Error::other("preflight failed"),
+            counted,
+            stopped,
+            attempts: 3,
+        };
+        assert_eq!(
+            startup_follow_up(&failed(true, true)),
+            StartupFollowUp { clean_pending: true, gave_up: true, ..StartupFollowUp::default() }
+        );
+        assert_eq!(startup_follow_up(&failed(true, false)), StartupFollowUp::default());
+        assert_eq!(startup_follow_up(&failed(false, false)), StartupFollowUp::default());
+        let broken = StartupAttempt::Failed {
+            error: std::io::Error::other(installer::RestoreFailed {
+                exe: PathBuf::from("/x/PATANYX"),
+                kept_at: None,
+                start_error: "start".into(),
+                restore_error: "restore".into(),
+            }),
+            counted: false,
+            stopped: false,
+            attempts: 0,
+        };
+        assert_eq!(
+            startup_follow_up(&broken),
+            StartupFollowUp { show_broken: true, ..StartupFollowUp::default() },
+            "a failed restore shows the recovery screen even when the record could not be written"
+        );
+    }
+
+    /// The startup path goes through startup_attempt with the real
+    /// installer, and the not-newer branch forgets only what was reached.
+    #[test]
+    fn startup_install_uses_the_failed_release_record() {
+        let src = include_str!("updater.rs");
+        let start = src.find("pub fn apply_pending_at_startup() -> bool {").expect("startup fn");
+        let end = start + src[start..].find("\nfn mark_install_broken").expect("next fn");
+        let body = &src[start..end];
+        assert!(
+            body.contains("let outcome = startup_attempt(&dir, &version, || installer::apply(&staged, &manifest));"),
+            "the startup install no longer goes through the locked attempt"
+        );
+        assert_eq!(body.matches("installer::apply(").count(), 1, "a second, unlocked install path");
+        assert!(body.contains("forget_reached_releases(&dir, &current);"), "the not-newer branch must forget");
+        for acted in [
+            "if next.clean_pending {\n        let _ = clean_pending(&dir);",
+            "if next.remove_staged {\n        let _ = std::fs::remove_file(&staged);",
+            "show_install_broken(error);",
+            "next.relaunched\n}",
+        ] {
+            assert!(body.contains(acted), "startup no longer acts on: {acted}");
+        }
+        let broken = &src[src.find("fn mark_install_broken(").unwrap()..];
+        let broken = &broken[..broken.find("\n}\n").unwrap()];
+        assert!(broken.contains("note_failed_install(&data_dir(), version, true)"));
     }
 
     /// The reader refuses a `staged` value that is anything but a bare
@@ -4025,6 +4769,9 @@ mod pre_swap_tests {
         let first = installer::lock_update(&exe).expect("first takes the lock");
         let second = installer::lock_update(&exe).expect_err("second is refused");
         assert_eq!(second.kind(), std::io::ErrorKind::WouldBlock);
+        // Contention is typed, so the startup cap never counts it (round 2,
+        // R-005: the marker test built the marker by hand).
+        assert!(installer::is_another_install(&second), "real contention is not typed: {second}");
         drop(first);
         installer::lock_update(&exe).expect("free again once the first ends");
         let _ = std::fs::remove_dir_all(&dir);
@@ -4154,6 +4901,99 @@ mod pre_swap_tests {
         assert_eq!(std::fs::read(&current).unwrap(), b"new browser");
         assert_eq!(std::fs::read(dir.join("PATANYX.prev")).unwrap(), b"old browser");
         assert!(!staging.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The Windows swap (review R-002), driven through the same helper the
+    /// Windows build uses: a good swap leaves the new file at the path and
+    /// the old one aside.
+    #[test]
+    fn the_windows_swap_puts_the_new_file_in_place() {
+        let dir = scratch("aside-ok");
+        let current = dir.join("PATANYX.exe");
+        std::fs::write(&current, b"old browser").unwrap();
+        installer::swap_aside(&current, b"new browser", |p, b| std::fs::write(p, b), |_| Ok(()))
+            .expect("swaps");
+        assert_eq!(std::fs::read(&current).unwrap(), b"new browser");
+        assert_eq!(std::fs::read(dir.join("PATANYX.old")).unwrap(), b"old browser");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A relaunch that fails after a good write used to leave the new file at
+    /// the path; the working browser goes back instead.
+    #[test]
+    fn a_failed_windows_relaunch_puts_the_working_browser_back() {
+        let dir = scratch("aside-relaunch");
+        let current = dir.join("PATANYX.exe");
+        std::fs::write(&current, b"old browser").unwrap();
+        let err = installer::swap_aside(&current, b"new browser", |p, b| std::fs::write(p, b), |_| {
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("reported");
+        assert_eq!(err.to_string(), "relaunch failed");
+        assert!(!installer::is_restore_failure(&err), "the restore worked");
+        assert_eq!(std::fs::read(&current).unwrap(), b"old browser");
+        assert!(!dir.join("PATANYX.old").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A write that fails partway leaves a partial file; the rename back
+    /// replaces it with the working browser.
+    #[test]
+    fn a_failed_windows_write_puts_the_working_browser_back() {
+        let dir = scratch("aside-write");
+        let current = dir.join("PATANYX.exe");
+        std::fs::write(&current, b"old browser").unwrap();
+        let err = installer::swap_aside(
+            &current,
+            b"new browser",
+            |p, _| {
+                std::fs::write(p, b"new bro").unwrap();
+                Err(std::io::Error::other("disk full"))
+            },
+            |_| panic!("a failed write must not relaunch"),
+        )
+        .expect_err("reported");
+        assert_eq!(err.to_string(), "disk full");
+        assert_eq!(std::fs::read(&current).unwrap(), b"old browser");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The rename back can fail too. That used to be dropped on Windows; it
+    /// is the typed failure now, naming the kept copy only when it exists.
+    #[test]
+    fn a_failed_windows_restore_is_reported() {
+        let dir = scratch("aside-restore");
+        let current = dir.join("PATANYX.exe");
+        let aside = dir.join("PATANYX.old");
+        std::fs::write(&current, b"old browser").unwrap();
+        let err = installer::swap_aside(&current, b"new browser", |p, b| std::fs::write(p, b), |path| {
+            // The path becomes a non-empty directory, which a rename cannot
+            // replace; the copy aside stays where it is.
+            std::fs::remove_file(path).unwrap();
+            std::fs::create_dir(path).unwrap();
+            std::fs::write(path.join("blocker"), b"x").unwrap();
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("reported");
+        assert!(installer::is_restore_failure(&err), "{err}");
+        assert_eq!(super::install_error_code(&err), "install_restore_failed");
+        let broken = installer::restore_failure(&err).expect("typed");
+        assert_eq!(broken.exe, current);
+        assert_eq!(broken.kept_at.as_deref(), Some(aside.as_path()));
+        assert_eq!(std::fs::read(&aside).unwrap(), b"old browser");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let dir = scratch("aside-restore-gone");
+        let current = dir.join("PATANYX.exe");
+        std::fs::write(&current, b"old browser").unwrap();
+        let err = installer::swap_aside(&current, b"new browser", |p, b| std::fs::write(p, b), |path| {
+            std::fs::remove_file(path.with_extension("old")).unwrap();
+            Err(std::io::Error::other("relaunch failed"))
+        })
+        .expect_err("reported");
+        let broken = installer::restore_failure(&err).expect("typed");
+        assert_eq!(broken.kept_at, None, "no copy may be claimed once it is gone");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

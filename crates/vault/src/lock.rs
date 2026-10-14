@@ -95,6 +95,29 @@ pub fn acquire(vault_path: &Path) -> Result<VaultLock, LockError> {
     })
 }
 
+/// [`acquire`], waiting up to `patience` for a holder that is about to let go.
+///
+/// For the one place a lock is taken right after this process released it: an
+/// import installs its vault just after closing the live one. On unix the lock
+/// belongs to an open file, and a child process another thread is starting
+/// shares that file until it runs its program, which closes it; for that
+/// moment the lock reads as held. A copy of the app that really holds the
+/// vault holds it longer than `patience` and is still reported as `Busy`.
+pub fn acquire_patiently(
+    vault_path: &Path,
+    patience: std::time::Duration,
+) -> Result<VaultLock, LockError> {
+    let until = std::time::Instant::now() + patience;
+    loop {
+        match acquire(vault_path) {
+            Err(LockError::Busy) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            other => return other,
+        }
+    }
+}
+
 #[cfg(unix)]
 fn open_locked(path: &Path) -> Result<File, LockError> {
     use std::os::unix::fs::OpenOptionsExt;
@@ -177,6 +200,28 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    /// A holder that lets go within the patience is waited for; one that keeps
+    /// the lock is still refused once the patience runs out.
+    #[test]
+    fn a_patient_acquire_waits_out_a_brief_holder_but_not_a_real_one() {
+        let dir = Dir::new("patient");
+        let vault = dir.0.join("vault.rbv");
+        let brief = acquire(&vault).expect("the brief holder");
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(brief);
+        });
+        let waited = acquire_patiently(&vault, std::time::Duration::from_millis(2000));
+        releaser.join().unwrap();
+        let held = waited.expect("a holder that let go after 100 ms was not waited for");
+
+        let started = std::time::Instant::now();
+        let refused = acquire_patiently(&vault, std::time::Duration::from_millis(150));
+        assert!(matches!(refused, Err(LockError::Busy)), "a real holder was not reported");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150), "it gave up before its patience");
+        drop(held);
     }
 
     /// The defect this exists for: two instances on one vault, where the

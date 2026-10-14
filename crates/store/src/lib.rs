@@ -71,6 +71,9 @@ mod blob;
 mod crypto;
 mod error;
 mod format;
+mod library_backup;
+#[cfg(test)]
+mod library_backup_tests;
 #[cfg(test)]
 mod library_key_tests;
 mod model;
@@ -82,8 +85,14 @@ mod retire_tests;
 mod writer_tests;
 
 pub use error::StoreError;
+pub use library_backup::{
+    is_valid_blob_id, validate_backup, BackupError, BackupPictures, KeptDownloads, LibraryBackup,
+    RestoreInProgress,
+    RestoreSummary, ValidatedBackup, ARCHIVE_TEXT_MAX_CHARS, LIBRARY_BACKUP_SCHEMA,
+    MAX_BACKUP_PICTURE_BYTES, MAX_BOOKMARKS, MAX_SHELF_SEQ,
+};
 pub use model::{
-    normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
+    existing_folder_name, normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
     DownloadRecord, PageSnapshot, RecordedDigest, Shelf, ShelfGroup, ShelfTab, StoreData,
 };
 // Re-exported so callers of the bookmark API don't need to name the
@@ -634,6 +643,13 @@ impl Store {
         group: Option<ShelfGroup>,
     ) -> Result<Shelf, StoreError> {
         let seq_before = self.data.next_shelf_seq;
+        // Refused at the same boundary a backup is held to: past it, the
+        // Library could no longer be backed up, and a counter allowed to run
+        // on would one day wrap and reuse a shelf id. Unreachable one shelf at
+        // a time; reachable only from a backup restored at the boundary.
+        if seq_before >= MAX_SHELF_SEQ {
+            return Err(StoreError::Full("no shelf numbers are left".into()));
+        }
         let shelf = self.data.plan_new_shelf_grouped(name, tabs, group, now_unix());
         if let Err(err) = self.save() {
             self.data.shelves.pop();
@@ -705,6 +721,13 @@ impl Store {
     /// Persist-on-write, same rule as the vault: a failed save is a hard
     /// error so an entry never exists only in memory.
     pub fn add_bookmark(&mut self, url: &str, title: &str) -> Result<String, StoreError> {
+        // Bounded so that every Library this build holds is one its own
+        // backup can restore (`library_backup::MAX_BOOKMARKS`).
+        if self.data.bookmarks.len() >= MAX_BOOKMARKS {
+            return Err(StoreError::Full(format!(
+                "the Library holds its limit of {MAX_BOOKMARKS} bookmarks"
+            )));
+        }
         let id = random_id();
         self.data.bookmarks.push(Bookmark {
             id: id.clone(),
@@ -1081,10 +1104,17 @@ impl Store {
     pub fn replace_bookmarks(&mut self, bookmarks: Vec<Bookmark>) -> Result<usize, StoreError> {
         let previous = self.data.clone();
         let mut seen = std::collections::BTreeSet::new();
-        self.data.bookmarks = bookmarks
+        let kept: Vec<Bookmark> = bookmarks
             .into_iter()
             .filter(|b| !b.id.is_empty() && seen.insert(b.id.clone()))
             .collect();
+        // NOT capped at MAX_BOOKMARKS. This is how a backup made by an older
+        // PATANYX gets its bookmarks back, after its vault has already
+        // replaced this one, so a refusal here would empty the Library
+        // instead of protecting it. Older files never had the limit; a
+        // Library restored over it is told so by the next export's self-check
+        // (`export_too_many_bookmarks`), which names what is in the way.
+        self.data.bookmarks = kept;
         let bookmarks_now = self.data.bookmarks.clone();
         let mut removed_snapshots = Vec::new();
         self.data.page_snapshots.retain(|snapshot| {
@@ -2902,7 +2932,20 @@ impl Store {
                 "the archive holds its limit of {MAX_ARCHIVE_RECORDS} pages"
             )));
         }
-        let incoming = picture.map(|bytes| bytes.len() as u64).unwrap_or(0);
+        // Bounded so that every Library this build holds is one its own
+        // backup can restore (`library_backup::ARCHIVE_TEXT_MAX_CHARS`). A
+        // refusal, like the two limits above: the page is not saved with its
+        // text silently cut.
+        if text.chars().count() > ARCHIVE_TEXT_MAX_CHARS {
+            return Err(StoreError::Full(format!(
+                "the text read from this page is longer than {ARCHIVE_TEXT_MAX_CHARS} characters"
+            )));
+        }
+        // Judged on bytes as stored, which is what `archive_bytes` sums and
+        // what a restore re-checks: on plaintext, four pictures could pass
+        // here and leave the total 49 bytes per picture over the limit, a
+        // Library a backup could then never restore.
+        let incoming = picture.map(|bytes| blob::BlobStore::stored_len(bytes.len())).unwrap_or(0);
         if self.archive_bytes().saturating_add(incoming) > MAX_ARCHIVE_BYTES {
             return Err(StoreError::Full(format!(
                 "archived pictures would pass the limit of {} MB",

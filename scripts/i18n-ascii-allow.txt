@@ -15,4 +15,9 @@ Elektron
 Thalassa
 Lithos
 Porphyra
+Pyrrhos
+Minthe
+Chrysos
+Iris
+Chalkos
 [Interface] ...

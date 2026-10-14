@@ -104,10 +104,19 @@ requireThat(
 );
 
 const divergence = read("crates/app/src/content_scripts/fingerprint_divergence.js");
+// Both native paths are captured at document start and reached through one
+// send. A bridge looked up at send time is one page script can wrap or
+// replace, and then it reads the report.
 requireThat(
-  divergence.includes("window.chrome.webview.postMessage(payload);") &&
-    divergence.includes("window.webkit.messageHandlers.ipc.postMessage(payload);"),
+  divergence.includes("var probeWebview = window.chrome && window.chrome.webview;") &&
+    divergence.includes("var probeHandlers = window.webkit && window.webkit.messageHandlers;") &&
+    divergence.includes("var probeIpc = probeHandlers && probeHandlers.ipc;") &&
+    occurrences(divergence, "probeApply(probePost, probeRecv, [payload]);") === 1,
   "divergence reporting lost a native content-message path",
+);
+requireThat(
+  !/\b(webview|ipc|messageHandlers)\.postMessage\s*\(/.test(divergence),
+  "divergence reporting looks the bridge up at send time, where page script can wrap it",
 );
 
 const activeContent = [autofill, divergence]

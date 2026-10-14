@@ -61,6 +61,11 @@ pub struct TabPolicy {
     /// their blocking. Takes effect at the next YouTube page load (scripts
     /// register per document; nothing is evaluated in a live page).
     pub block_youtube_ads: bool,
+    /// A Strict Tab (`quarantine()`), and only that preset sets it. An open
+    /// Strict Tab keeps every protection it was opened with whatever the
+    /// browser-wide switches do afterwards (`rebased_on`); the browser-wide
+    /// policy itself never carries it.
+    pub strict: bool,
 }
 
 impl Default for TabPolicy {
@@ -80,6 +85,7 @@ impl Default for TabPolicy {
             block_ads: true,
             freeze_after_load: false,
             block_youtube_ads: true,
+            strict: false,
         }
     }
 }
@@ -96,6 +102,7 @@ impl TabPolicy {
             block_ads: true,
             freeze_after_load: true,
             block_youtube_ads: true,
+            strict: true,
         }
     }
 
@@ -118,6 +125,32 @@ impl TabPolicy {
             block_ads: true,
             freeze_after_load: false,
             block_youtube_ads: true,
+            strict: false,
+        }
+    }
+
+    /// The policy an OPEN tab runs under once the browser-wide policy becomes
+    /// `browser`.
+    ///
+    /// A Strict Tab keeps its preset whole: every one of its protections is
+    /// already at its tightest, so a browser-wide switch can tighten nothing
+    /// and must loosen nothing. The browser-wide policy used to be copied onto
+    /// every open tab, so flipping any Privacy switch turned JavaScript ON in
+    /// an open Strict Tab, ended its freeze-after-load and made its blocking
+    /// follow the switch (measured on WebKitGTK: the engine's own script
+    /// setting read back true).
+    ///
+    /// Every other tab takes the browser-wide switches but keeps the storage
+    /// mode it was built with: an existing engine profile cannot change, so
+    /// copying the browser-wide `ephemeral` only made the tab misreport it.
+    pub fn rebased_on(&self, browser: &TabPolicy) -> TabPolicy {
+        if self.strict {
+            return self.clone();
+        }
+        TabPolicy {
+            ephemeral: self.ephemeral,
+            strict: false,
+            ..browser.clone()
         }
     }
 
@@ -134,6 +167,193 @@ impl TabPolicy {
             ProfileMode::Persistent
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// "ALLOW ADS AND TRACKERS ON THIS TAB"
+//
+// One tab, one site, memory only. The allowance is recorded against the site
+// the tab shows when the user ticks the box, and it ends the moment the tab's
+// top-level document goes to any other site, or the tab closes. It is never
+// written anywhere: it lives on `TabState`, which dies with the tab.
+//
+// What it lifts is PATANYX's own ad and tracker list (`block_ads`) and the
+// YouTube ad script (`block_youtube_ads`) in that one tab. Nothing else moves:
+// JavaScript, the storage mode, freeze-after-load and the Strict Tab marker
+// keep their values, and the malicious-site check is not a policy field at all,
+// so nothing here can reach it. A Strict Tab refuses the switch outright.
+// ---------------------------------------------------------------------------
+
+/// The policy a tab runs under with ads and trackers allowed on it (`allowed`
+/// true) or not. Only the two ad switches move, and only toward OFF: allowing
+/// can never turn on a switch the input had off, and `false` returns the input
+/// unchanged.
+pub fn with_ads_allowed(policy: &TabPolicy, allowed: bool) -> TabPolicy {
+    TabPolicy {
+        block_ads: policy.block_ads && !allowed,
+        block_youtube_ads: policy.block_youtube_ads && !allowed,
+        ..policy.clone()
+    }
+}
+
+/// The site an allowance is tied to: the scheme and the registrable domain of
+/// the URL's host, written `https://example.co.uk`.
+///
+/// THE SCHEME IS PART OF THE SITE, on purpose. `http://example.com` can be
+/// answered by anyone on the network path and `https://example.com` cannot, so
+/// an allowance given on one does not carry to the other: moving between them
+/// ends it, which is the cautious direction to be wrong in.
+///
+/// The registrable domain comes from the bundled public suffix list
+/// (`psl::registrable_domain`), the same answer the password manager relies
+/// on. A host with none -- an IP address, a single-label host such as
+/// `localhost`, a host that is itself a public suffix -- is its own site and
+/// compares exactly, which is what psl.rs requires of every caller.
+///
+/// None for anything without an http(s) host: about:blank, data:, file:, the
+/// browser's own pages, ws:, a malformed URL. No site, no allowance.
+pub fn ads_site_of(url: &str) -> Option<String> {
+    let lowered = url.trim().to_ascii_lowercase();
+    let scheme = if lowered.starts_with("https://") {
+        "https"
+    } else if lowered.starts_with("http://") {
+        "http"
+    } else {
+        return None;
+    };
+    let host = host_of(&lowered)?;
+    let site = crate::psl::registrable_domain(&host)
+        .map(str::to_string)
+        .unwrap_or(host);
+    Some(format!("{scheme}://{site}"))
+}
+
+/// Whether an allowance given for `allowed_site` survives a top-level
+/// navigation to `url`. Only a URL on the same site, by the same scheme, keeps
+/// it. A different site, a URL with no site and the other scheme all end it,
+/// and with no allowance there is nothing to keep.
+pub fn ads_allowance_survives(allowed_site: Option<&str>, url: &str) -> bool {
+    match (allowed_site, ads_site_of(url)) {
+        (Some(allowed), Some(next)) => allowed == next,
+        _ => false,
+    }
+}
+
+/// Why the switch cannot be turned ON for a tab right now, as the wire code
+/// the chrome turns into its reason, or None when it can.
+///
+/// A tab that is already allowed can always be turned back off, so it is
+/// never unavailable. Otherwise the reasons are checked in the order a user
+/// can do least about: a Strict Tab always blocks; with blocking already off
+/// for every tab there is nothing to allow; a page with no site has nothing
+/// to tie the allowance to; and `ready` is the engine saying it cannot yet
+/// keep its promises if the switch goes on (WebKitGTK, before the filters it
+/// needs to put back and to keep are in memory).
+pub fn ads_allow_unavailable(
+    allowed: bool,
+    strict: bool,
+    blocking_on: bool,
+    has_site: bool,
+    ready: bool,
+) -> Option<&'static str> {
+    if allowed {
+        None
+    } else if strict {
+        Some("ads_strict_tab")
+    } else if !blocking_on {
+        Some("ads_blocking_off")
+    } else if !has_site {
+        Some("ads_no_site")
+    } else if !ready {
+        Some("ads_not_ready")
+    } else {
+        None
+    }
+}
+
+/// What WebKitGTK does with a main-frame navigation that just ended this
+/// tab's allowance. It goes on only if blocking was put back synchronously,
+/// before the navigation's next request; otherwise it is refused, because
+/// letting it through would load the next site with the ad and tracker
+/// filters still off. Refusing costs one click. Not refusing would cost the
+/// promise the switch makes.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AfterAllowanceEnded {
+    Proceed,
+    Refuse,
+}
+
+#[cfg_attr(windows, allow(dead_code))]
+pub fn after_allowance_ended(ended: bool, restored_now: bool) -> AfterAllowanceEnded {
+    if ended && !restored_now {
+        AfterAllowanceEnded::Refuse
+    } else {
+        AfterAllowanceEnded::Proceed
+    }
+}
+
+/// The allowance as the engine glue holds it: the site it was given for, and
+/// the policy the tab goes back to when it ends.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdsAllowance {
+    site: String,
+    base: TabPolicy,
+}
+
+/// The hosts on the ad and tracker lists that the malicious-site list ALSO
+/// refuses, sorted and without repeats.
+///
+/// WHY THIS EXISTS. On WebKitGTK the malicious list is enforced in the
+/// navigation handler only, which sees top-level and frame navigations and not
+/// subresources (blocklist.rs). For a host on both lists, the ad filter is
+/// today what stops a script or an image from it. A tab with ads allowed has
+/// no ad filter, so these hosts are compiled into a small filter of their own
+/// and kept blocked there.
+///
+/// Each host is checked, and so is every parent domain of it, so a malicious
+/// entry for `example.com` keeps `ads.example.com` blocked even when the
+/// lookup passed in matches exactly. The reverse cannot be done, and this is a
+/// stated residual: a malicious entry that is only a SUBDOMAIN of a listed ad
+/// host (`evil.ads.example` under an ad-list `ads.example`) cannot be found,
+/// because the malicious list ships as hashes and cannot be enumerated. Such a
+/// host's subresources are not refused in an allowed tab on Linux; its
+/// navigations still are.
+pub fn malicious_overlap<'a, I, F>(hosts: I, is_malicious: F) -> Vec<String>
+where
+    I: IntoIterator<Item = &'a str>,
+    F: Fn(&str) -> bool,
+{
+    let mut found = BTreeSet::new();
+    for host in hosts {
+        let mut candidate = host;
+        loop {
+            if is_malicious(candidate) {
+                found.insert(host.to_string());
+                break;
+            }
+            match candidate.find('.') {
+                Some(dot) => candidate = &candidate[dot + 1..],
+                None => break,
+            }
+        }
+    }
+    found.into_iter().collect()
+}
+
+/// The overlap filter (`malicious_overlap`) as WebKit content-blocker rules
+/// and the store id they compile under, or None when no host is on both
+/// lists. The id is derived from the rules, so a refreshed malicious list
+/// that changes the overlap changes the id and nothing else does.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn overlap_filter(hosts: &[String]) -> Option<(String, String)> {
+    let rules = RuleSet::from_lines(&hosts.join("\n"));
+    if rules.blocked_hosts.is_empty() {
+        return None;
+    }
+    let json = content_blocker_json(&rules);
+    let id = format!("{}-overlap", filter_id_for(&json));
+    Some((json, id))
 }
 
 /// One row of the per-tab ledger: a host the tab contacted, how many
@@ -721,6 +941,11 @@ impl FreezeController {
         self.phase
     }
 
+    /// Frozen by the user's own click: survives navigation and reloads.
+    pub fn is_manually_frozen(&self) -> bool {
+        self.phase == FreezePhase::Frozen && self.manual
+    }
+
     /// Frozen by the heuristic (Strict Tab's freeze-after-load), not by the
     /// user. This is the freeze that yields to the next top-level navigation;
     /// a manual one never does.
@@ -1126,6 +1351,17 @@ pub struct TabState {
     /// that completes WITHOUT one is noticed (see
     /// `on_top_level_navigation_completed`).
     commit_seen: Option<u64>,
+    /// The top-level navigation that ended this tab's ads allowance, until it
+    /// completes: if it never commits a document (it became a download, or
+    /// was cancelled), the page the allowance was for is still on screen, and
+    /// its next reload must skip the cache (release review 2026-10-12, round
+    /// 2, R-002).
+    allowance_ended_by: Option<u64>,
+    /// The engine answered a reload without the cache with a failure, after
+    /// the call that asked had returned. Taken by the next reload, which then
+    /// skips the cache in its place (release review 2026-10-12, round 6,
+    /// R-003: nothing reloads on the engine's say-so).
+    bypass_reload_failed: bool,
     /// Verdict recorded by the TLS-failure signal, for when the live
     /// certificate can no longer be read after the load failed. Cleared on
     /// every navigation so an http page never shows a stale https verdict.
@@ -1221,6 +1457,20 @@ pub struct TabState {
     /// This tab's first navigation waits for the once-per-process session
     /// wipe. WINDOWS ONLY; see `initial_navigation_ready`.
     pub waiting_for_wipe: bool,
+    /// WebKitGTK only: bundled ad and tracker filter loads started for this
+    /// tab that have not ended yet. On a fresh profile the tracker list
+    /// compiles for about two seconds, and a first page issued meanwhile sent
+    /// its tracker requests (measured on WebKitGTK 2.54: 7 to 8 on 3 of 3
+    /// fresh profiles), so the first page waits until this is zero.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub bundled_filters_loading: u32,
+    /// Which WebView2 profile this tab's pages live in (kept_profile.rs).
+    /// Set by the backend when the tab is built; Main everywhere else.
+    pub profile: crate::kept_profile::ProfileKind,
+    /// Whether the last top-level hop `decide_intercepted` matched may
+    /// reach a private address: a MAIN tab moves only such a page to the
+    /// kept profile (code review 2026-10-13, R-021).
+    pub last_hop_reaches_private: bool,
     /// A page's requests for a new tab at a PRIVATE address, oldest first,
     /// each with the verdict of the page that asked when the engine raised
     /// it, waiting for wry's own callback, which runs later from the message
@@ -1240,13 +1490,29 @@ pub struct TabState {
     /// swapped through the content manager instead, and on a tab whose
     /// registration the engine refused.
     pub scrollbar_script_id: Option<String>,
-    /// Windows: the engine's id for this tab's YouTube ad script, so turning
+    /// Windows: the engine's ids for this tab's YouTube ad script, so turning
     /// the switch off can remove it. `youtube_script_adding` covers the one
-    /// COM round trip before the id arrives: the completion handler reads the
+    /// COM round trip before an id arrives: the completion handler reads the
     /// policy again and removes the script itself if the switch went off
-    /// meanwhile. Unused on unix, which keeps the script object instead.
-    pub youtube_script_id: Option<String>,
+    /// meanwhile. Normally at most one; a copy whose removal the engine
+    /// refused stays listed, because it is still running (review 2026-10-12,
+    /// R-001: a single slot forgot it). Unused on unix, which keeps the
+    /// script object instead.
+    pub youtube_script_ids: Vec<String>,
     pub youtube_script_adding: bool,
+    /// What the engine did with this tab's Fingerprint Divergence script,
+    /// set once at tab build (the script cannot be added to a live tab).
+    pub divergence_install: ScriptInstall,
+    /// "Allow ads and trackers on this tab", while it is on. Memory only and
+    /// per tab: it is dropped with this struct, which is dropped with the tab,
+    /// and nothing serializes it.
+    ///
+    /// HERE, beside the engine handlers, and not only on AppState's `Tab`: the
+    /// allowance has to end inside NavigationStarting (Windows) and inside the
+    /// main frame's load and response signals (WebKitGTK), before the next
+    /// site's requests go out, and those handlers reach this struct and
+    /// nothing else. One copy, so AppState can never act on a stale one.
+    ads_allowance: Option<AdsAllowance>,
 }
 
 /// See `TabState::youtube_script_step`.
@@ -1256,6 +1522,68 @@ pub enum YoutubeScriptStep {
     Add,
     Remove,
     Nothing,
+}
+
+/// What the engine did with one of this tab's document-start scripts
+/// (Fingerprint Divergence, the YouTube ad script). The panels report THIS,
+/// not the setting that asked for the script: on unix a tab without a content
+/// manager takes no script, and on Windows the engine can refuse a
+/// registration, and in both cases the setting still reads as on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ScriptInstall {
+    /// Nothing was asked of the engine: the setting is off for this tab, or
+    /// (Divergence) OS randomness failed and no script was built.
+    #[default]
+    NotWanted,
+    /// Handed to the engine, whose answer has not arrived yet. Windows only:
+    /// its registration is answered asynchronously.
+    Pending,
+    /// The engine accepted it.
+    Installed,
+    /// The engine refused it, never answered it, or (unix) had no content
+    /// manager to take it.
+    Refused,
+}
+
+impl ScriptInstall {
+    /// The value for a "What the engine confirmed" row, in that list's
+    /// vocabulary. `None` leaves the row out: a script nobody asked for, or
+    /// one whose answer has not arrived, has nothing confirmed or refused to
+    /// report, and the list must not invent either.
+    pub fn engine_row(self) -> Option<&'static str> {
+        match self {
+            ScriptInstall::Installed => Some("applied"),
+            ScriptInstall::Refused => Some("failed"),
+            ScriptInstall::NotWanted | ScriptInstall::Pending => None,
+        }
+    }
+
+    /// The wire name, for replies that report the state itself.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ScriptInstall::NotWanted => "not_wanted",
+            ScriptInstall::Pending => "pending",
+            ScriptInstall::Installed => "installed",
+            ScriptInstall::Refused => "refused",
+        }
+    }
+}
+
+/// The YouTube ad script's state from what is wanted and what is in place.
+/// A registered script counts as installed even after the switch went off: a
+/// refused removal leaves it running, and this reports the engine, not the
+/// switch. A registration in flight is pending whichever way the switch
+/// points; its completion handler settles it.
+pub fn youtube_script_install(wanted: bool, registered: bool, adding: bool) -> ScriptInstall {
+    if registered {
+        ScriptInstall::Installed
+    } else if adding {
+        ScriptInstall::Pending
+    } else if wanted {
+        ScriptInstall::Refused
+    } else {
+        ScriptInstall::NotWanted
+    }
 }
 
 /// A committed document's standing for the local-network boundary.
@@ -1425,6 +1753,8 @@ impl TabState {
             committed: None,
             expected_navigation: None,
             commit_seen: None,
+            allowance_ended_by: None,
+            bypass_reload_failed: false,
             tls_error_verdict: None,
             tls_issuer: None,
             freeze_json: None,
@@ -1442,13 +1772,158 @@ impl TabState {
             fingerprint_probe_reporting: SettingState::NotAttempted,
             local_network_guard: SettingState::NotAttempted,
             waiting_for_wipe: false,
+            bundled_filters_loading: 0,
+            profile: crate::kept_profile::ProfileKind::Main,
+            last_hop_reaches_private: false,
             new_window_requests: Vec::new(),
             new_window_tracking: false,
             permissions_registered: SettingState::NotAttempted,
             scrollbar_script_id: None,
-            youtube_script_id: None,
+            youtube_script_ids: Vec::new(),
             youtube_script_adding: false,
+            divergence_install: ScriptInstall::NotWanted,
+            ads_allowance: None,
         }
+    }
+
+    /// The site ads and trackers are allowed on in this tab, if they are.
+    pub fn ads_allowed_site(&self) -> Option<&str> {
+        self.ads_allowance.as_ref().map(|a| a.site.as_str())
+    }
+
+    /// The policy this tab goes back to when its allowance ends, which is
+    /// the policy in force when there is none.
+    pub fn ads_base_policy(&self) -> TabPolicy {
+        match &self.ads_allowance {
+            Some(allowance) => allowance.base.clone(),
+            None => self.policy.clone(),
+        }
+    }
+
+    /// Takes `base` (the preset at build, the browser-wide policy rebased onto
+    /// this tab afterwards) and returns the policy now in force: `base`, with
+    /// ads and trackers allowed if the user allowed them on this tab.
+    ///
+    /// THE ONE PLACE an engine's `apply_policy` gets the policy it enforces.
+    /// A browser-wide Privacy switch therefore cannot quietly turn blocking
+    /// back on in an allowed tab, and no caller can apply a policy that
+    /// forgot the allowance: the allowance is not the caller's to pass. The
+    /// base is kept, so when the allowance ends the tab returns to what the
+    /// switches say NOW, not to what they said when it began.
+    pub fn apply_base_policy(&mut self, base: &TabPolicy) -> TabPolicy {
+        if base.strict {
+            // Never reachable through `grant_ads_allowance`, which refuses a
+            // Strict Tab. Kept so that no path can leave one allowed.
+            self.ads_allowance = None;
+        }
+        if let Some(allowance) = &mut self.ads_allowance {
+            allowance.base = base.clone();
+        }
+        self.policy = with_ads_allowed(base, self.ads_allowance.is_some());
+        self.policy.clone()
+    }
+
+    /// Turns the allowance on for `site` and returns the policy now in force.
+    /// Refused for a Strict Tab, and for a tab that blocks nothing to begin
+    /// with. Giving it again moves it to `site`.
+    pub fn grant_ads_allowance(&mut self, site: String) -> Result<TabPolicy, &'static str> {
+        let base = self.ads_base_policy();
+        if base.strict {
+            return Err("ads_strict_tab");
+        }
+        if !base.block_ads {
+            return Err("ads_blocking_off");
+        }
+        self.policy = with_ads_allowed(&base, true);
+        self.ads_allowance = Some(AdsAllowance { site, base });
+        Ok(self.policy.clone())
+    }
+
+    /// Ends the allowance and puts the base policy back. Returns whether
+    /// there was one to end.
+    pub fn end_ads_allowance(&mut self) -> bool {
+        match self.ads_allowance.take() {
+            Some(allowance) => {
+                self.policy = allowance.base;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The top-level document is about to become `url`. Ends the allowance
+    /// unless `url` is on the same site by the same scheme, and returns
+    /// whether it ended. Every engine's "the main frame is going somewhere"
+    /// signal calls this, BEFORE that document's requests go out.
+    pub fn end_ads_allowance_unless_same_site(&mut self, url: &str) -> bool {
+        if self.ads_allowance.is_none() || ads_allowance_survives(self.ads_allowed_site(), url) {
+            return false;
+        }
+        self.end_ads_allowance()
+    }
+
+    /// Top-level navigation `navigation_id` just ended the allowance
+    /// (`end_ads_allowance_unless_same_site`). Its completion then says
+    /// whether the page the allowance was for is still on screen
+    /// (`on_top_level_navigation_completed`). An unreadable id is not
+    /// remembered, and that case keeps the old page until it next loads.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn note_allowance_ended_by(&mut self, navigation_id: Option<u64>) {
+        self.allowance_ended_by = navigation_id;
+    }
+
+    /// Whether another top-level navigation is about to replace the page:
+    /// one the browser has announced and not yet started (the clean re-issue
+    /// after the tracking-parameter strip, an address typed), or one that has
+    /// started and not completed. A kept page is not reloaded over it
+    /// (release review 2026-10-12, round 3, R-002).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn replacement_pending(&self) -> bool {
+        self.expected_navigation.is_some() || self.toplevel.any_in_flight()
+    }
+
+    /// The navigation whose document is on screen, as far as this tab can
+    /// name it: a kept-page repair is for that document only (round 6, R-002).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn current_document(&self) -> Option<u64> {
+        self.commit_seen
+    }
+
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn note_bypass_reload_failed(&mut self) {
+        self.bypass_reload_failed = true;
+    }
+
+    /// Whether a reload without the cache failed since the last time this
+    /// was asked (`note_bypass_reload_failed`).
+    pub fn take_bypass_reload_failed(&mut self) -> bool {
+        std::mem::take(&mut self.bypass_reload_failed)
+    }
+
+    /// Whether this tab wants PATANYX's ad and tracker filters installed now.
+    ///
+    /// WebKitGTK reads it when a filter LOAD finishes, and that is the race
+    /// guard for the per-tab filters: a load started before the user allowed
+    /// ads must not put the filters back afterwards, and one that lands after
+    /// the allowance ended must not be dropped. Deciding by what the tab wants
+    /// at the moment the load lands, rather than by which request it belonged
+    /// to, is right in both directions. (Adding a filter id that may already
+    /// be installed is what every policy change has always done on this
+    /// backend. The process-wide overlap compile, where a stale result must
+    /// never be kept, is guarded by `FilterGeneration`.)
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn wants_ad_filters(&self) -> bool {
+        self.policy.block_ads
+    }
+
+    /// Whether this tab needs the small filter that keeps hosts on BOTH the ad
+    /// list and the malicious-site list blocked (`malicious_overlap`): only
+    /// while its ad filters are off because the user allowed ads here.
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn wants_overlap_filter(&self) -> bool {
+        self.ads_allowance
+            .as_ref()
+            .is_some_and(|allowance| allowance.base.block_ads)
     }
 
     /// The storage mode to SHOW THE USER: the engine's answer, not ours.
@@ -1569,6 +2044,9 @@ impl TabState {
             };
             self.toplevel
                 .on_navigation_starting(UNREADABLE_NAVIGATION_ID, uri, start.reaches_private);
+            // The next unreadable one takes the same slot, so this target
+            // cannot be relied on to stay recorded (code review round 5).
+            self.toplevel.on_navigation_unreadable();
             return start;
         };
         let previous = self.toplevel.hop_url(navigation_id).map(str::to_string);
@@ -1656,7 +2134,7 @@ impl TabState {
     pub fn youtube_script_step(&self) -> YoutubeScriptStep {
         match (
             self.policy.block_youtube_ads,
-            self.youtube_script_id.is_some(),
+            !self.youtube_script_ids.is_empty(),
             self.youtube_script_adding,
         ) {
             (_, _, true) => YoutubeScriptStep::Nothing,
@@ -1664,6 +2142,18 @@ impl TabState {
             (false, true, false) => YoutubeScriptStep::Remove,
             _ => YoutubeScriptStep::Nothing,
         }
+    }
+
+    /// What the engine did with this tab's YouTube ad script (Windows, where
+    /// the engine's id is the evidence). Unix asks `youtube_script_install`
+    /// with its own evidence, the script object it holds.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn youtube_install(&self) -> ScriptInstall {
+        youtube_script_install(
+            self.policy.block_youtube_ads,
+            !self.youtube_script_ids.is_empty(),
+            self.youtube_script_adding,
+        )
     }
 
     /// The engine accepted the guard's registration call but has not
@@ -1812,7 +2302,19 @@ impl TabState {
     /// An unreadable id, or a completion event with no arguments at all
     /// (passed as `None, true`), cannot be checked against `commit_seen`, so a
     /// success resets the standing too (final review 4, R-003).
-    pub fn on_top_level_navigation_completed(&mut self, navigation_id: Option<u64>, success: bool) {
+    ///
+    /// Returns true when this was the navigation that ended the ads allowance
+    /// and it never committed a document: the page loaded with ads allowed is
+    /// still on screen, and the caller marks its next reload to skip the
+    /// cache.
+    pub fn on_top_level_navigation_completed(&mut self, navigation_id: Option<u64>, success: bool) -> bool {
+        let page_kept = match (navigation_id, self.allowance_ended_by) {
+            (Some(id), Some(ended)) if id == ended => {
+                self.allowance_ended_by = None;
+                !success && self.commit_seen != Some(id)
+            }
+            _ => false,
+        };
         match navigation_id {
             Some(id) => {
                 if success && self.commit_seen != Some(id) {
@@ -1826,6 +2328,7 @@ impl TabState {
                 }
             }
         }
+        page_kept
     }
 
     /// Decides one intercepted request and does the ledger accounting.
@@ -2001,6 +2504,7 @@ impl TabState {
             }
             _ => TopLevelRole::NotTopLevel,
         };
+        self.last_hop_reaches_private = top_level.as_ref().is_some_and(|hop| hop.reaches_private);
         let decision = self.decide_request(uri, websocket, rules, now, override_host, role);
         (decision, top_level.map(|hop| hop.url))
     }
@@ -2108,6 +2612,60 @@ impl TabState {
     /// because the caller holds a RefCell borrow it must release before any
     /// COM call (see the borrow comment at the Windows request handler).
     #[cfg_attr(not(windows), allow(dead_code))]
+    /// The kept-profile boundary for one ALLOWED document request
+    /// (kept_profile.rs). Asked only after the ordinary decision allowed the
+    /// request, so a move never turns a refusal into a navigation (plan
+    /// review 2026-10-13, R-018). `nav_url` is what `decide_intercepted`
+    /// correlated as this tab's own page, if anything.
+    ///
+    /// In a KEPT tab it fails closed: a non-kept host loads only as a
+    /// provable subframe. In a MAIN tab that keeps data, a correlated page on
+    /// a kept host moves to KEPT; nothing else changes there.
+    pub fn profile_verdict(
+        &mut self,
+        uri: &str,
+        nav_url: Option<&str>,
+        kept: &[String],
+        supported: bool,
+    ) -> ProfileVerdict {
+        use crate::kept_profile::{kept_document, kind_for_url, KeptDocument, ProfileKind};
+        // A KEPT tab enforces its boundary whatever happens to the kept
+        // profile's availability later (code review round 3, R-047):
+        // `supported` only governs moving pages into it.
+        if !supported && self.profile == ProfileKind::Main {
+            return ProfileVerdict::Pass;
+        }
+        match self.profile {
+            ProfileKind::Kept => {
+                let Some(host) = crate::kept_profile::host_of_page(uri) else {
+                    // Not an http(s) document (about:, data:, blob:): nothing
+                    // goes to the network and no site's storage is created.
+                    return ProfileVerdict::Pass;
+                };
+                let top = self.toplevel.top_level_to_host(&host);
+                let frame = self.toplevel.provably_frame(uri);
+                match kept_document(kept, &host, top, frame) {
+                    KeptDocument::Allow => ProfileVerdict::Pass,
+                    KeptDocument::Refuse => ProfileVerdict::Refuse,
+                    KeptDocument::RefuseAndMove => match self.toplevel.take_move_for(uri) {
+                        Some(url) => ProfileVerdict::Move(url),
+                        None => ProfileVerdict::Refuse,
+                    },
+                }
+            }
+            ProfileKind::Main => match nav_url {
+                Some(url)
+                    if !self.policy.ephemeral
+                        && self.last_hop_reaches_private
+                        && kind_for_url(url, kept, false, true) == ProfileKind::Kept =>
+                {
+                    ProfileVerdict::Move(url.to_string())
+                }
+                _ => ProfileVerdict::Pass,
+            },
+        }
+    }
+
     pub fn adlist_override_host(&self) -> Option<String> {
         self.adlist_override.clone()
     }
@@ -2370,11 +2928,23 @@ const NETWORK_SCHEMES: &[&str] = &["http://", "https://", "ws://", "wss://"];
 /// no port, no userinfo, no trailing dot — so ledger keys and rule matches
 /// are not defeated by cosmetic URL variation.
 pub fn host_of(url: &str) -> Option<String> {
+    // As a URL parser reads these schemes (and so as both engines do): ASCII
+    // tab and newline are removed anywhere, and a backslash ends the
+    // authority like a slash. Without that, "https://evil.example\@good.example/"
+    // read as good.example while the engine went to evil.example (review
+    // 2026-10-12 of the per-tab ads switch, a red-team lead).
+    let cleaned: String;
+    let url = if url.contains(['\t', '\n', '\r']) {
+        cleaned = url.chars().filter(|c| !matches!(c, '\t' | '\n' | '\r')).collect();
+        cleaned.as_str()
+    } else {
+        url
+    };
     let rest = NETWORK_SCHEMES
         .iter()
         .find_map(|prefix| url.strip_prefix(prefix))?;
     let authority = rest
-        .split(['/', '?', '#'])
+        .split(['/', '\\', '?', '#'])
         .next()
         .filter(|a| !a.is_empty())?;
     // userinfo would poison the host if kept ("https://evil@real.com/").
@@ -2619,10 +3189,15 @@ pub const GPC_SCRIPT: &str = r#"(function () {
 //   REPLACED by the accent unless it also sets `scrollbar-color`. The About
 //   disclosure says so.
 // - Readable by the page. `document.adoptedStyleSheets` and
-//   `getComputedStyle` both expose the value, so a page can learn which of
-//   the nine accents this visitor wears. That is a few bits of fingerprint,
-//   accepted knowingly on 2026-08-17 as the price of the feature, and
-//   disclosed in About beside the accent setting itself.
+//   `getComputedStyle` both expose the value, so a page can learn which
+//   accent this visitor wears. That was accepted knowingly on 2026-08-17 as
+//   the price of the feature, recorded as "which of the nine accents". The
+//   value also says whether a light scheme is on, because White (and since
+//   1.0.7 Paper) use darker ladders; that was true then and was not named.
+//   Counted: 9 x 2 = 18 values then (about 4.2 bits), 14 x 2 = 28 since 1.0.7
+//   (about 4.8 bits). Disclosed in About beside the accent setting itself
+//   (ACCENT_REACH, which names the accent only). Textures and the other
+//   scheme tokens never reach the page.
 //
 // LIVE on Windows, in two halves. A registration script cannot reach a
 // document that already exists, and this crate never evaluates script in
@@ -2989,12 +3564,12 @@ mod youtube_ads_tests {
         st.policy.block_youtube_ads = false;
         assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "the handler decides an in-flight add");
         st.youtube_script_adding = false;
-        st.youtube_script_id = Some("1".into());
+        st.youtube_script_ids = vec!["1".into()];
         assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Remove);
         st.policy.block_youtube_ads = true;
         assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "already registered");
         st.policy.block_youtube_ads = false;
-        st.youtube_script_id = None;
+        st.youtube_script_ids.clear();
         assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing, "off and nothing in place");
     }
 
@@ -3009,6 +3584,72 @@ mod youtube_ads_tests {
         assert!(st.on_local_network_guard_overdue(), "overdue must release the YouTube wait");
         assert!(st.initial_navigation_ready());
         assert!(!st.on_local_network_guard_overdue(), "nothing left to release");
+    }
+
+    /// The status reports the engine, never the switch (review R-007): every
+    /// combination of wanted, registered and in flight.
+    #[test]
+    fn the_install_state_reports_the_engine_not_the_switch() {
+        use super::{youtube_script_install, ScriptInstall};
+        for wanted in [false, true] {
+            for adding in [false, true] {
+                assert_eq!(
+                    youtube_script_install(wanted, true, adding),
+                    ScriptInstall::Installed,
+                    "a registered script is in force whatever the switch says (wanted {wanted}, adding {adding})",
+                );
+            }
+            assert_eq!(youtube_script_install(wanted, false, true), ScriptInstall::Pending);
+        }
+        assert_eq!(
+            youtube_script_install(true, false, false),
+            ScriptInstall::Refused,
+            "switched on, nothing registered, nothing in flight: the engine did not take it",
+        );
+        assert_eq!(youtube_script_install(false, false, false), ScriptInstall::NotWanted);
+
+        // The Windows reading goes through the same rule, from TabState.
+        let mut st = tab(true);
+        assert_eq!(st.youtube_install(), ScriptInstall::Refused, "on, never added");
+        st.youtube_script_adding = true;
+        assert_eq!(st.youtube_install(), ScriptInstall::Pending);
+        st.on_local_network_guard_overdue();
+        assert_eq!(st.youtube_install(), ScriptInstall::Refused, "an answer that never came is not an install");
+        st.youtube_script_ids = vec!["7".into()];
+        assert_eq!(st.youtube_install(), ScriptInstall::Installed);
+        st.policy.block_youtube_ads = false;
+        assert_eq!(st.youtube_install(), ScriptInstall::Installed, "a refused removal leaves it running");
+        st.youtube_script_ids.clear();
+        assert_eq!(st.youtube_install(), ScriptInstall::NotWanted);
+
+        // Two copies, one removed: the one the engine kept is still running
+        // (review 2026-10-12, R-001).
+        st.youtube_script_ids = vec!["7".into(), "8".into()];
+        st.youtube_script_ids.retain(|id| id != "7");
+        assert_eq!(st.youtube_install(), ScriptInstall::Installed);
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Remove, "off with a copy left: remove it");
+    }
+
+    /// Only an answer is a row: confirmed or refused. Nothing asked and an
+    /// answer still in flight leave the engine list alone.
+    #[test]
+    fn only_an_engine_answer_becomes_a_row() {
+        use super::ScriptInstall;
+        assert_eq!(ScriptInstall::Installed.engine_row(), Some("applied"));
+        assert_eq!(ScriptInstall::Refused.engine_row(), Some("failed"));
+        assert_eq!(ScriptInstall::Pending.engine_row(), None);
+        assert_eq!(ScriptInstall::NotWanted.engine_row(), None);
+        assert_eq!(ScriptInstall::default(), ScriptInstall::NotWanted, "a new tab claims nothing");
+        let names: Vec<_> = [
+            ScriptInstall::NotWanted,
+            ScriptInstall::Pending,
+            ScriptInstall::Installed,
+            ScriptInstall::Refused,
+        ]
+        .iter()
+        .map(|s| s.as_str())
+        .collect();
+        assert_eq!(names, ["not_wanted", "pending", "installed", "refused"]);
     }
 
     /// The hosts in the script's own check and the WebKit patterns must be
@@ -3176,18 +3817,32 @@ mod divergence_tests {
                 "fingerprint_divergence.js must not contain {forbidden}"
             );
         }
+        // Both engine bridges are captured at document start, and the one
+        // send goes through the captured function. A bridge looked up at send
+        // time can be wrapped or replaced by page script, which then reads
+        // the report (measured on WebKitGTK and V8).
+        for capture in [
+            "var probeWebview = window.chrome && window.chrome.webview;",
+            "var probeHandlers = window.webkit && window.webkit.messageHandlers;",
+            "var probeIpc = probeHandlers && probeHandlers.ipc;",
+        ] {
+            assert_eq!(DIVERGENCE_TEMPLATE.matches(capture).count(), 1, "{capture}");
+        }
         assert_eq!(
             DIVERGENCE_TEMPLATE
-                .matches("window.chrome.webview.postMessage(payload)")
+                .matches("probeApply(probePost, probeRecv, [payload]);")
                 .count(),
             1
         );
-        assert_eq!(
-            DIVERGENCE_TEMPLATE
-                .matches("window.webkit.messageHandlers.ipc.postMessage(payload)")
-                .count(),
-            1
-        );
+        // No global of any kind. A page reads window's properties with
+        // Object.getOwnPropertyNames, enumerable or not, and a product-named
+        // one told every site which browser this is.
+        for forbidden_global in ["defineProperty(window", "window.__"] {
+            assert!(
+                !DIVERGENCE_TEMPLATE.contains(forbidden_global),
+                "fingerprint_divergence.js must not set a window property: {forbidden_global}"
+            );
+        }
         for forbidden_content in [
             "sample:",
             "pixels:",
@@ -3213,6 +3868,10 @@ mod divergence_tests {
         // global (self/window/parent/top/opener), which WOULD carry data out of
         // the page.
         const BANNED_RECEIVERS: [&str; 5] = ["self", "window", "parent", "top", "opener"];
+        // The engine bridges are reached only through the function captured
+        // at document start. A postMessage call on one of these is a
+        // send-time lookup that page script can intercept.
+        const BRIDGE_RECEIVERS: [&str; 5] = ["webview", "ipc", "messageHandlers", "chrome", "webkit"];
         for (i, line) in DIVERGENCE_TEMPLATE.lines().enumerate() {
             let mut from = 0usize;
             while let Some(rel) = line[from..].find("postMessage") {
@@ -3250,12 +3909,18 @@ mod divergence_tests {
                     .into_iter()
                     .rev()
                     .collect();
-                let count_bridge = line.trim() == "window.chrome.webview.postMessage(payload);"
-                    || line.trim() == "window.webkit.messageHandlers.ipc.postMessage(payload);";
                 assert!(
-                    count_bridge || !BANNED_RECEIVERS.contains(&receiver.as_str()),
+                    !BANNED_RECEIVERS.contains(&receiver.as_str()),
                     "fingerprint_divergence.js line {}: postMessage on `{}` \
                      would send out of the page: {}",
+                    i + 1,
+                    receiver,
+                    line.trim()
+                );
+                assert!(
+                    !BRIDGE_RECEIVERS.contains(&receiver.as_str()),
+                    "fingerprint_divergence.js line {}: postMessage on `{}` looks \
+                     the engine bridge up at send time: {}",
                     i + 1,
                     receiver,
                     line.trim()
@@ -3302,6 +3967,18 @@ mod shipped_adlist_guard {
     //! Windows 1.0.x, where turning ad and tracker blocking off made the same
     //! page play.
     //!
+    //! `consent.dailymotion.com` is the consent.google.com case again, with the
+    //! Spotify caveat: besides the dialog it carries Sourcepoint's page-view
+    //! report (wrapper/v2/pv-data), and a host rule cannot separate the two. Where
+    //! the GDPR applies, Dailymotion serves its "Data privacy at Dailymotion"
+    //! dialog from that host (Dailymotion's own alias for its Sourcepoint
+    //! consent platform) and holds the player until the visitor answers.
+    //! Upstream files it under Tracking. Refused (once the list is in force),
+    //! the dialog never appears and the video page stays a black player;
+    //! allowed, a choice dismisses the
+    //! dialog and the next video does not ask again. Measured through a French
+    //! exit on WebKitGTK 2.54, 2026-10-12.
+    //!
     //! These names are in `scripts/adlist-allow.txt`, so a regeneration drops
     //! them again. This test is the part that fails loudly if one comes back
     //! by another route.
@@ -3326,6 +4003,9 @@ mod shipped_adlist_guard {
             "gateway.instagram.com",
             "graphql.instagram.com",
             "graph-fallback.instagram.com",
+            // Dailymotion's consent dialog where the GDPR applies: refused,
+            // every video page is a black player that never starts.
+            "consent.dailymotion.com",
         ] {
             assert!(
                 !rules.blocks_host(host),
@@ -3349,6 +4029,14 @@ mod shipped_adlist_guard {
             "adeventtracker.spotify.com",
             "crashdump.spotify.com",
             "ads.spotify.com",
+            // Dailymotion also loads LiveRamp from privacymanager.io on every
+            // page. Its configuration there is one rule of type "ATS", an
+            // identity envelope: tracking, not the consent dialog, so it stays
+            // refused while consent.dailymotion.com is let through.
+            "launchpad.privacymanager.io",
+            "launchpad-wrapper.privacymanager.io",
+            "ats-wrapper.privacymanager.io",
+            "geo.privacymanager.io",
         ] {
             assert!(rules.blocks_host(host), "{host} should still be blocked");
         }
@@ -3510,8 +4198,10 @@ pub fn content_blocker_json(rules: &RuleSet) -> String {
 // on every revocation.
 //
 // Removed 2026-09-15: Linux gets the held-page
-// explanation, not the button. The only route past the list here is the
-// browser-wide switch, and About says exactly that.
+// explanation, not the button. The routes past the list here are the
+// browser-wide switch and, since 1.0.7, "Allow ads and trackers on this tab",
+// which takes the whole list off ONE tab's own content manager for one site
+// rather than excepting one host inside it; About says so.
 //
 // Left as a comment rather than as uncalled functions on purpose. Dormant
 // mechanism with no caller is how the next reader concludes the feature exists
@@ -3535,15 +4225,45 @@ pub fn freeze_filter_json(exceptions: &[String]) -> String {
         "action": { "type": "block" },
     })];
     for host in exceptions {
-        rules.push(serde_json::json!({
-            "trigger": {
-                "url-filter": host_url_filter(host),
-                "url-filter-is-case-sensitive": false,
-            },
-            "action": { "type": "ignore-previous-rules" },
-        }));
+        for pattern in exact_host_url_filters(host) {
+            rules.push(serde_json::json!({
+                "trigger": {
+                    "url-filter": pattern,
+                    "url-filter-is-case-sensitive": false,
+                },
+                "action": { "type": "ignore-previous-rules" },
+            }));
+        }
     }
     serde_json::to_string(&serde_json::Value::Array(rules)).unwrap_or_else(|_| "[]".to_string())
+}
+
+/// A freeze exception's patterns: the host EXACTLY. The ad-list pattern
+/// (host_url_filter) also matches every subdomain, which is right for a
+/// tracker list and wrong for an exception: allowing cdn.example must not
+/// let a frozen page reach leak.cdn.example, and on Windows it does not
+/// (FreezeController::should_block checks exact membership of host_of).
+///
+/// - After the host only an optional port, then the path's "/": a URL with
+///   an http(s) or ws(s) scheme always serializes its path, so the
+///   authority ends there. "cdn.example:443@leak.example" is userinfo in
+///   front of ANOTHER host, and a bare "[:/]" after the host matched it
+///   (Allow while frozen review, second pass, R-002).
+/// - An optional trailing dot, and brackets for an IPv6 literal: host_of
+///   drops both, so the ledger's host must match either spelling of the
+///   URL, as Windows' membership check does (second pass, R-003).
+/// - Two patterns, because WebKit's url-filter has no alternation: http(s),
+///   and ws(s) so a WebSocket to an allowed host gets through as it does on
+///   Windows (a_websocket_host_override_allows_the_upgrade_even_frozen).
+fn exact_host_url_filters(host: &str) -> [String; 2] {
+    let escaped = escape_host_for_filter(host);
+    let host = if host.contains(':') {
+        format!("\\[{escaped}\\]")
+    } else {
+        escaped
+    };
+    let rest = "\\.?(:[0-9]+)?/";
+    [format!("^https?://{host}{rest}"), format!("^wss?://{host}{rest}")]
 }
 
 /// One CSS rule hiding every known ad container. `!important` because the
@@ -3574,9 +4294,101 @@ pub fn filter_id_for(json: &str) -> String {
     format!("patanyx-{hash:016x}")
 }
 
+/// What the kept-profile boundary does with an allowed document request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileVerdict {
+    /// Not this boundary's business: the request proceeds.
+    Pass,
+    /// Refused with the ordinary empty 403.
+    Refuse,
+    /// Refused with PATANYX's placeholder, and the page at this complete
+    /// URL opens in a tab of the other profile.
+    Move(String),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn kept(hosts: &[&str]) -> Vec<String> {
+        hosts.iter().map(|h| h.to_string()).collect()
+    }
+
+    #[test]
+    fn a_kept_tab_moves_its_own_page_off_a_non_kept_site_and_fails_closed() {
+        use crate::kept_profile::ProfileKind;
+        let list = kept(&["messenger.com"]);
+        let mut st = TabState::new(&TabPolicy::default());
+        st.profile = ProfileKind::Kept;
+        st.toplevel.on_frame_tracking_registered();
+        st.toplevel.on_top_level_tracking_registered();
+        // The kept site itself, page or not: passes.
+        assert_eq!(st.profile_verdict("https://www.messenger.com/t/1", None, &list, true), ProfileVerdict::Pass);
+        // The tab navigates to a non-kept site: moved once, then refused.
+        st.toplevel.on_navigation_starting(9, "https://news.example/story#top", true);
+        assert_eq!(
+            st.profile_verdict("https://news.example/story", None, &list, true),
+            ProfileVerdict::Move("https://news.example/story#top".to_string())
+        );
+        assert_eq!(st.profile_verdict("https://news.example/story", None, &list, true), ProfileVerdict::Refuse);
+        // A provable frame of another site loads.
+        st.toplevel.on_frame_navigation_starting(4, "https://captcha.example/w");
+        assert_eq!(st.profile_verdict("https://captcha.example/w", None, &list, true), ProfileVerdict::Pass);
+        // A document nobody announced: refused.
+        assert_eq!(st.profile_verdict("https://unknown.example/", None, &list, true), ProfileVerdict::Refuse);
+        // Not http(s): nothing to keep or leak.
+        assert_eq!(st.profile_verdict("about:blank", None, &list, true), ProfileVerdict::Pass);
+        // A kept tab keeps refusing even once kept storage is switched off.
+        assert_eq!(st.profile_verdict("https://unknown.example/", None, &list, false), ProfileVerdict::Refuse);
+    }
+
+    #[test]
+    fn a_top_level_navigation_without_an_id_spoils_frame_proof() {
+        use crate::kept_profile::ProfileKind;
+        let list = kept(&["messenger.com"]);
+        let mut st = TabState::new(&TabPolicy::default());
+        st.profile = ProfileKind::Kept;
+        st.toplevel.on_frame_tracking_registered();
+        st.toplevel.on_top_level_tracking_registered();
+        st.toplevel.on_frame_navigation_starting(4, "https://captcha.example/w");
+        assert_eq!(st.profile_verdict("https://captcha.example/w", None, &list, true), ProfileVerdict::Pass);
+        // Two top-level navigations without ids: the second takes the
+        // first one's slot, so the first's target is no longer known.
+        st.on_top_level_navigation_starting(None, "https://captcha.example/w");
+        st.on_top_level_navigation_starting(None, "https://other.example/");
+        assert_eq!(st.profile_verdict("https://captcha.example/w", None, &list, true), ProfileVerdict::Refuse);
+        // A document commits: the doubt ends with it.
+        st.toplevel.on_navigation_starting(7, "https://www.messenger.com/", false);
+        st.on_document_committed(Some(7), false);
+        st.toplevel.on_frame_navigation_starting(5, "https://captcha.example/w");
+        assert_eq!(st.profile_verdict("https://captcha.example/w", None, &list, true), ProfileVerdict::Pass);
+    }
+
+    #[test]
+    fn a_main_tab_moves_only_its_own_page_to_a_kept_site() {
+        let list = kept(&["messenger.com"]);
+        let mut st = TabState::new(&TabPolicy::default());
+        // A hop that may not reach a private address is not moved.
+        assert_eq!(
+            st.profile_verdict("https://www.messenger.com/", Some("https://www.messenger.com/#x"), &list, true),
+            ProfileVerdict::Pass
+        );
+        st.last_hop_reaches_private = true;
+        assert_eq!(
+            st.profile_verdict("https://www.messenger.com/", Some("https://www.messenger.com/#x"), &list, true),
+            ProfileVerdict::Move("https://www.messenger.com/#x".to_string())
+        );
+        // A frame of a kept site inside an ordinary page stays where it is.
+        assert_eq!(st.profile_verdict("https://www.messenger.com/embed", None, &list, true), ProfileVerdict::Pass);
+        // An ordinary page stays.
+        assert_eq!(st.profile_verdict("https://news.example/", Some("https://news.example/"), &list, true), ProfileVerdict::Pass);
+        // A private tab never moves.
+        let mut private = TabState::new(&TabPolicy::ephemeral());
+        assert_eq!(
+            private.profile_verdict("https://www.messenger.com/", Some("https://www.messenger.com/"), &list, true),
+            ProfileVerdict::Pass
+        );
+    }
 
     // --- URL classification ------------------------------------------------
 
@@ -3602,6 +4414,23 @@ mod tests {
             host_of("ws://localhost:9000"),
             Some("localhost".to_string())
         );
+    }
+
+    /// The host is the one the engine will contact: a backslash ends the
+    /// authority and tab/newline characters are dropped, as a URL parser does.
+    /// So a crafted URL cannot read as an allowed site while it goes to
+    /// another one (per-tab ads switch, red-team lead).
+    #[test]
+    fn host_extraction_reads_the_host_the_engine_contacts() {
+        assert_eq!(host_of("https://evil.example\\@good.example/"), Some("evil.example".into()));
+        assert_eq!(host_of("https://evil.example\\path"), Some("evil.example".into()));
+        assert_eq!(host_of("https://ev\til.exa\nmple/"), Some("evil.example".into()));
+        assert_eq!(host_of("https://good.example@evil.example/"), Some("evil.example".into()));
+        assert_eq!(
+            ads_site_of("https://evil.example\\@good.example/"),
+            Some("https://evil.example".into())
+        );
+        assert!(!ads_allowance_survives(Some("https://good.example"), "https://evil.example\\@good.example/"));
     }
 
     #[test]
@@ -3915,7 +4744,7 @@ mod tests {
         let json = freeze_filter_json(&["example.com".to_string(), "app.io".to_string()]);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         let rules = parsed.as_array().unwrap();
-        assert_eq!(rules.len(), 3, "block-all plus one ignore per exception");
+        assert_eq!(rules.len(), 5, "block-all plus two ignores (http(s), ws(s)) per exception");
         assert_eq!(rules[0]["action"]["type"], "block");
         for rule in &rules[1..] {
             assert_eq!(rule["action"]["type"], "ignore-previous-rules");
@@ -4442,6 +5271,50 @@ mod tests {
     }
 
     #[test]
+    fn freeze_exceptions_match_the_host_exactly_not_its_subdomains() {
+        let json = freeze_filter_json(&["cdn.example".to_string()]);
+        let rules: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let patterns: Vec<regex::Regex> = rules.as_array().unwrap()[1..]
+            .iter()
+            .map(|r| {
+                assert_eq!(r["trigger"]["url-filter-is-case-sensitive"], false);
+                regex::RegexBuilder::new(r["trigger"]["url-filter"].as_str().unwrap())
+                    .case_insensitive(true)
+                    .build()
+                    .unwrap()
+            })
+            .collect();
+        let lets_through = |url: &str| patterns.iter().any(|p| p.is_match(url));
+        for url in [
+            "https://cdn.example/app.js",
+            "http://cdn.example/",
+            "https://CDN.example:8443/x?y",
+            "https://cdn.example./",
+            "wss://cdn.example/socket",
+            "ws://cdn.example:8080/",
+        ] {
+            assert!(lets_through(url), "{url} must get through");
+        }
+        for url in [
+            "https://leak.cdn.example/",
+            "https://cdn.example.evil/",
+            "https://cdn.examplex/",
+            "https://cdn.example:443@leak.example/data",
+            "https://cdn.example@leak.example/",
+            "https://evil/?https://cdn.example/",
+            "ftp://cdn.example/",
+        ] {
+            assert!(!lets_through(url), "{url} must stay blocked");
+        }
+        // An IPv6 literal, as host_of records it (no brackets).
+        let v6: serde_json::Value = serde_json::from_str(&freeze_filter_json(&["2001:db8::1".to_string()])).unwrap();
+        let v6 = regex::Regex::new(v6[1]["trigger"]["url-filter"].as_str().unwrap()).unwrap();
+        assert!(v6.is_match("https://[2001:db8::1]/"));
+        assert!(v6.is_match("https://[2001:db8::1]:8443/x"));
+        assert!(!v6.is_match("https://[2001:db8::10]/"));
+    }
+
+    #[test]
     fn a_replacement_freeze_keeps_the_old_one_until_it_is_installed() {
         let mut book = FreezeFilterBook::default();
         let ga = book.request("a".into());
@@ -4574,6 +5447,77 @@ mod tests {
             no_filter.contains("wake_freeze_status();"),
             "a freeze that came back with no filter must refresh the toolbar"
         );
+    }
+
+    #[test]
+    fn windows_freeze_confirmation_refreshes_the_toolbar() {
+        // Pinned against the source, the Windows twin of the test above. The
+        // engine confirms a freeze inside the request handler, long after the
+        // click; without a wake the chip said "Freezing..." over a tab that
+        // was already holding (measured on the 1.0.7 VM: 0 requests in 15 s
+        // while the toolbar still offered "Requests may continue").
+        let windows = include_str!("windows.rs");
+        let between = |from: &str, to: &str| {
+            let rest = &windows[windows.find(from).unwrap_or_else(|| panic!("no {from}"))..];
+            &rest[..rest.find(to).unwrap_or_else(|| panic!("no {to} after {from}"))]
+        };
+        let confirmed = between("st.confirm_freeze_block() {", "// The 403 never happened");
+        assert!(
+            confirmed.contains("send_event(UserEvent::TabStatusChanged)"),
+            "a confirmed freeze must refresh the toolbar"
+        );
+        let failed = between("st.freeze_block_failed(uri.as_deref());", "Ok(())");
+        assert!(
+            failed.contains("send_event(UserEvent::TabStatusChanged)"),
+            "a freeze that let a request out must refresh the toolbar at once"
+        );
+    }
+
+    #[test]
+    fn linux_first_page_waits_for_the_ad_and_tracker_filters() {
+        // Pinned against the source. On a fresh profile WebKitGTK compiles the
+        // tracker list for about two seconds, and a first page issued
+        // meanwhile sent its tracker requests (WebKitGTK 2.54: 6 to 8 on every
+        // fresh profile tried). The page now waits for the filters, and the
+        // new release path must still wait for the start-up clear.
+        let unix = include_str!("unix.rs");
+        let body = |name: &str| {
+            let at = unix.find(name).unwrap_or_else(|| panic!("unix.rs has {name}"));
+            &unix[at..at + unix[at..].find("\n}\n").expect("end of fn")]
+        };
+        let ready = body("pub fn initial_navigation_ready(");
+        assert!(
+            ready.contains("bundled_filters_loading == 0"),
+            "the first page must wait for the ad and tracker filters"
+        );
+        assert!(
+            ready.contains("session_wipe_finished("),
+            "a tab released by its filters must still wait for the start-up clear"
+        );
+        assert!(
+            body("pub fn build_content(").contains("waiting_for_wipe || !initial_navigation_ready(&view)"),
+            "a new tab must not issue its first page while its filters load"
+        );
+        assert!(
+            body("fn ensure_bundled_filter(").contains("bundled_filters_loading += 1"),
+            "each filter load must be counted"
+        );
+        // A tab closed while only its filters load must close at once: a close
+        // deferred to a start-up clear that has already finished never ran,
+        // and the tab stayed open and blank (code review, R-001).
+        assert!(
+            body("pub fn holds_session_wipe(").contains("session_wipe_finished("),
+            "only a running start-up clear may defer a close"
+        );
+        for callback in [
+            "unsafe extern \"C\" fn on_bundled_filter_loaded(",
+            "unsafe extern \"C\" fn on_filter_saved(",
+        ] {
+            assert!(
+                body(callback).contains("BundledLoadEnds::new("),
+                "{callback} must end the count on every path"
+            );
+        }
     }
 
     #[test]
@@ -6893,5 +7837,524 @@ mod local_network_tests {
         st.on_new_window_requested(Some("http://192.168.1.1/"));
         assert!(!st.take_new_window_verdict("http://192.168.1.1/"));
         assert!(st.take_new_window_verdict("http://news.example/"));
+    }
+}
+
+#[cfg(test)]
+mod rebase_tests {
+    use super::TabPolicy;
+
+    /// Every browser-wide policy the Privacy panel can produce: the five
+    /// switches in all 32 combinations. The browser-wide policy is never
+    /// strict.
+    fn every_browser_policy() -> Vec<TabPolicy> {
+        (0u8..32)
+            .map(|bits| TabPolicy {
+                ephemeral: bits & 1 != 0,
+                javascript: bits & 2 != 0,
+                block_ads: bits & 4 != 0,
+                freeze_after_load: bits & 8 != 0,
+                block_youtube_ads: bits & 16 != 0,
+                strict: false,
+            })
+            .collect()
+    }
+
+    /// An open Strict Tab keeps its preset whole, whatever the browser-wide
+    /// switches say: script stays off, the freeze stays on, blocking stays on.
+    #[test]
+    fn a_strict_tab_is_never_loosened_by_a_browser_wide_switch() {
+        let strict = TabPolicy::quarantine();
+        assert!(strict.strict, "the Strict Tab preset must mark itself");
+        for browser in every_browser_policy() {
+            assert_eq!(strict.rebased_on(&browser), strict, "loosened by {browser:?}");
+        }
+    }
+
+    /// Every other tab follows the browser-wide switches, keeps the storage
+    /// mode it was built with, and never becomes strict.
+    #[test]
+    fn other_tabs_follow_the_switches_and_keep_their_storage_mode() {
+        for built in [TabPolicy::default(), TabPolicy::ephemeral()] {
+            for browser in every_browser_policy() {
+                let rebased = built.rebased_on(&browser);
+                assert_eq!(rebased.ephemeral, built.ephemeral, "storage mode moved");
+                assert!(!rebased.strict);
+                assert_eq!(rebased.javascript, browser.javascript);
+                assert_eq!(rebased.block_ads, browser.block_ads);
+                assert_eq!(rebased.freeze_after_load, browser.freeze_after_load);
+                assert_eq!(rebased.block_youtube_ads, browser.block_youtube_ads);
+            }
+        }
+        assert!(!TabPolicy::default().strict && !TabPolicy::ephemeral().strict);
+    }
+}
+
+#[cfg(test)]
+mod ads_allowance_tests {
+    use super::*;
+
+    /// All 64 policies the six fields can make, the Strict marker included,
+    /// so nothing here depends on a policy being one of the presets.
+    fn every_policy() -> Vec<TabPolicy> {
+        (0u8..64)
+            .map(|bits| TabPolicy {
+                ephemeral: bits & 1 != 0,
+                javascript: bits & 2 != 0,
+                block_ads: bits & 4 != 0,
+                freeze_after_load: bits & 8 != 0,
+                block_youtube_ads: bits & 16 != 0,
+                strict: bits & 32 != 0,
+            })
+            .collect()
+    }
+
+    /// The five switches the Privacy panel can produce; never strict.
+    fn every_browser_policy() -> Vec<TabPolicy> {
+        every_policy().into_iter().filter(|p| !p.strict).collect()
+    }
+
+    const SITE: &str = "https://news.example";
+
+    #[test]
+    fn allowing_moves_only_the_two_ad_switches_and_only_toward_off() {
+        for p in every_policy() {
+            for allowed in [false, true] {
+                let out = with_ads_allowed(&p, allowed);
+                assert_eq!(out.block_ads, p.block_ads && !allowed, "{p:?} {allowed}");
+                assert_eq!(out.block_youtube_ads, p.block_youtube_ads && !allowed, "{p:?} {allowed}");
+                assert_eq!(out.javascript, p.javascript, "script moved: {p:?}");
+                assert_eq!(out.ephemeral, p.ephemeral, "storage moved: {p:?}");
+                assert_eq!(out.freeze_after_load, p.freeze_after_load, "freeze moved: {p:?}");
+                assert_eq!(out.strict, p.strict, "the Strict marker moved: {p:?}");
+            }
+            assert_eq!(with_ads_allowed(&p, false), p, "not allowing changed {p:?}");
+        }
+    }
+
+    #[test]
+    fn the_site_is_the_scheme_and_the_registrable_domain() {
+        for (url, site) in [
+            ("https://www.news.example/a?b#c", "https://news.example"),
+            ("https://news.example", "https://news.example"),
+            ("https://cdn.static.news.example:8443/x", "https://news.example"),
+            ("http://news.example/", "http://news.example"),
+            ("HTTPS://WWW.NEWS.EXAMPLE/", "https://news.example"),
+            ("https://news.example./", "https://news.example"),
+            ("https://user:pw@shop.mybank.co.uk/", "https://mybank.co.uk"),
+            ("https://www.mybank.co.uk/", "https://mybank.co.uk"),
+            ("https://mail.google.com/", "https://google.com"),
+            // A public suffix the list says anyone can register under: two
+            // tenants are two sites.
+            ("https://alice.github.io/", "https://alice.github.io"),
+        ] {
+            assert_eq!(ads_site_of(url).as_deref(), Some(site), "{url}");
+        }
+    }
+
+    #[test]
+    fn an_ip_or_single_label_host_is_its_own_exact_site() {
+        for (url, site) in [
+            ("http://192.168.1.1/admin", "http://192.168.1.1"),
+            ("https://1.1.1.1/", "https://1.1.1.1"),
+            ("http://127.0.0.1:8080/", "http://127.0.0.1"),
+            ("http://[2001:db8::1]:8080/", "http://2001:db8::1"),
+            ("http://localhost:3000/", "http://localhost"),
+            ("https://intranet/", "https://intranet"),
+            // A host that IS a public suffix has no registrable domain either.
+            ("https://github.io/", "https://github.io"),
+        ] {
+            assert_eq!(ads_site_of(url).as_deref(), Some(site), "{url}");
+        }
+        // Two addresses that share their last labels are still two sites.
+        assert!(!ads_allowance_survives(Some("http://192.168.1.1"), "http://10.1.1.1/"));
+        assert!(!ads_allowance_survives(Some("http://192.168.1.1"), "http://192.168.1.2/"));
+    }
+
+    #[test]
+    fn a_url_without_an_http_host_has_no_site() {
+        for url in [
+            "about:blank",
+            "data:text/html,hi",
+            "file:///etc/passwd",
+            "blob:https://news.example/123",
+            "ws://news.example/socket",
+            "wss://news.example/socket",
+            "rbchrome://index.html",
+            "http://rbchrome.localhost/",
+            "javascript:alert(1)",
+            "https://",
+            "http:///path",
+            "",
+        ] {
+            let site = ads_site_of(url);
+            // The chrome origin parses as a host, so it has a site; what
+            // matters is that it is never the SAME site as a page.
+            if url == "http://rbchrome.localhost/" {
+                assert_eq!(site.as_deref(), Some("http://rbchrome.localhost"));
+                continue;
+            }
+            assert_eq!(site, None, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_allowance_survives_only_the_same_site_by_the_same_scheme() {
+        let cases = [
+            ("https://news.example/next", true),
+            ("https://www.news.example/", true),
+            ("https://video.news.example/watch", true),
+            ("https://news.example:8443/", true),
+            ("http://news.example/", false),
+            ("https://other.example/", false),
+            ("https://news.example.evil.test/", false),
+            ("https://evilnews.example/", false),
+            ("about:blank", false),
+            ("data:text/html,x", false),
+            ("", false),
+        ];
+        for (url, survives) in cases {
+            assert_eq!(ads_allowance_survives(Some(SITE), url), survives, "{url}");
+            // With no allowance there is nothing to keep, whatever the URL.
+            assert!(!ads_allowance_survives(None, url), "{url}");
+        }
+        assert!(!ads_allowance_survives(Some("http://news.example"), "https://news.example/"));
+    }
+
+    #[test]
+    fn every_unavailable_combination_names_the_right_reason() {
+        for bits in 0u8..32 {
+            let (allowed, strict, blocking_on, has_site, ready) = (
+                bits & 1 != 0,
+                bits & 2 != 0,
+                bits & 4 != 0,
+                bits & 8 != 0,
+                bits & 16 != 0,
+            );
+            let expected = if allowed {
+                None
+            } else if strict {
+                Some("ads_strict_tab")
+            } else if !blocking_on {
+                Some("ads_blocking_off")
+            } else if !has_site {
+                Some("ads_no_site")
+            } else if !ready {
+                Some("ads_not_ready")
+            } else {
+                None
+            };
+            assert_eq!(
+                ads_allow_unavailable(allowed, strict, blocking_on, has_site, ready),
+                expected,
+                "allowed={allowed} strict={strict} on={blocking_on} site={has_site} ready={ready}"
+            );
+        }
+    }
+
+    #[test]
+    fn granting_lifts_only_the_ad_switches_and_ending_puts_them_back() {
+        let mut st = TabState::new(&TabPolicy::default());
+        let before = st.policy.clone();
+        let now = st.grant_ads_allowance(SITE.to_string()).expect("an ordinary tab may");
+        assert_eq!(now, with_ads_allowed(&before, true));
+        assert!(!st.policy.block_ads && !st.policy.block_youtube_ads);
+        assert_eq!(st.ads_allowed_site(), Some(SITE));
+        assert!(!st.wants_ad_filters());
+        assert!(st.wants_overlap_filter());
+        assert!(st.end_ads_allowance());
+        assert_eq!(st.policy, before);
+        assert_eq!(st.ads_allowed_site(), None);
+        assert!(st.wants_ad_filters());
+        assert!(!st.wants_overlap_filter());
+        assert!(!st.end_ads_allowance(), "ended twice");
+    }
+
+    #[test]
+    fn a_strict_tab_refuses_the_switch_and_no_policy_can_leave_one_allowed() {
+        let mut st = TabState::new(&TabPolicy::quarantine());
+        assert_eq!(st.grant_ads_allowance(SITE.to_string()), Err("ads_strict_tab"));
+        assert_eq!(st.policy, TabPolicy::quarantine());
+        assert_eq!(st.ads_allowed_site(), None);
+        // A tab somehow allowed and then given a Strict policy drops it.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        let applied = st.apply_base_policy(&TabPolicy::quarantine());
+        assert_eq!(applied, TabPolicy::quarantine());
+        assert_eq!(st.ads_allowed_site(), None);
+    }
+
+    #[test]
+    fn there_is_nothing_to_allow_in_a_tab_that_blocks_nothing() {
+        let off = TabPolicy {
+            block_ads: false,
+            ..TabPolicy::default()
+        };
+        let mut st = TabState::new(&off);
+        assert_eq!(st.grant_ads_allowance(SITE.to_string()), Err("ads_blocking_off"));
+        assert_eq!(st.ads_allowed_site(), None);
+    }
+
+    /// The reviewer's first rule. Every browser-wide policy, applied to an
+    /// allowed tab: blocking never comes back on by itself, every other
+    /// switch follows, and ending the allowance returns the tab to what the
+    /// switches say THEN.
+    #[test]
+    fn a_browser_wide_switch_never_turns_blocking_back_on_in_an_allowed_tab() {
+        for browser in every_browser_policy() {
+            let built = TabPolicy::default();
+            let mut st = TabState::new(&built);
+            st.grant_ads_allowance(SITE.to_string()).unwrap();
+            let rebased = st.policy.rebased_on(&browser);
+            let applied = st.apply_base_policy(&rebased);
+            assert!(!applied.block_ads, "blocking came back on under {browser:?}");
+            assert!(!applied.block_youtube_ads, "the YouTube script came back on under {browser:?}");
+            assert_eq!(applied.javascript, browser.javascript);
+            assert_eq!(applied.freeze_after_load, browser.freeze_after_load);
+            assert_eq!(applied.ephemeral, built.ephemeral);
+            assert_eq!(st.ads_allowed_site(), Some(SITE), "the switch dropped the allowance");
+            st.end_ads_allowance();
+            assert_eq!(st.policy, rebased, "ending did not return to the switches of the moment");
+        }
+    }
+
+    #[test]
+    fn another_tab_is_left_blocking() {
+        let mut allowed = TabState::new(&TabPolicy::default());
+        let mut other = TabState::new(&TabPolicy::default());
+        allowed.grant_ads_allowance(SITE.to_string()).unwrap();
+        // The same browser-wide change reaches both tabs.
+        let browser = TabPolicy {
+            block_youtube_ads: false,
+            ..TabPolicy::default()
+        };
+        allowed.apply_base_policy(&allowed.policy.rebased_on(&browser));
+        other.apply_base_policy(&other.policy.rebased_on(&browser));
+        assert!(other.policy.block_ads && other.wants_ad_filters());
+        assert_eq!(other.ads_allowed_site(), None);
+        assert!(!allowed.policy.block_ads);
+    }
+
+    /// Round 2, R-002: the navigation that ended the allowance became a
+    /// download or was cancelled, so it never committed and the allowed page
+    /// is still on screen. Only that navigation's completion says so.
+    #[test]
+    fn an_ending_navigation_that_never_commits_leaves_the_allowed_page_on_screen() {
+        // A download or a cancel: no document, unsuccessful.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        assert!(st.end_ads_allowance_unless_same_site("https://files.example/report.pdf"));
+        st.note_allowance_ended_by(Some(7));
+        assert!(!st.on_top_level_navigation_completed(Some(6), false), "another navigation's completion counted");
+        assert!(st.on_top_level_navigation_completed(Some(7), false), "the kept page was not reported");
+        assert!(!st.on_top_level_navigation_completed(Some(7), false), "reported twice");
+
+        // It loaded: the new document replaced the allowed page.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        assert!(st.end_ads_allowance_unless_same_site("https://other.example/"));
+        st.note_allowance_ended_by(Some(8));
+        st.on_document_committed(Some(8), false);
+        assert!(!st.on_top_level_navigation_completed(Some(8), true));
+
+        // It failed with an error page: that page replaced the allowed one.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        assert!(st.end_ads_allowance_unless_same_site("https://down.example/"));
+        st.note_allowance_ended_by(Some(9));
+        st.on_document_committed(Some(9), true);
+        assert!(!st.on_top_level_navigation_completed(Some(9), false));
+
+        // No allowance ended: nothing to report.
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.on_top_level_navigation_completed(Some(10), false));
+    }
+
+    /// A kept page is not reloaded over a navigation that is about to
+    /// replace it: the strip's clean re-issue (announced, or already started).
+    #[test]
+    fn a_replacement_on_its_way_is_seen_whichever_event_comes_first() {
+        // The strip announced the clean navigation; the original's completion
+        // arrives before the clean one starts.
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.replacement_pending());
+        st.note_app_navigation("https://other.example/page");
+        assert!(st.replacement_pending(), "an announced navigation was missed");
+        // The clean navigation started first, then the original completed.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.on_load_started(Some("https://other.example/page"));
+        st.on_top_level_navigation_starting(Some(5), "https://other.example/page");
+        st.on_top_level_navigation_completed(Some(4), false);
+        assert!(st.replacement_pending(), "a navigation in flight was missed");
+        st.on_top_level_navigation_completed(Some(5), true);
+        assert!(!st.replacement_pending(), "a finished navigation still counts");
+    }
+
+    /// Round 6: a failed reload without the cache is remembered once, and a
+    /// kept-page repair names the document it was for.
+    #[test]
+    fn a_failed_reload_is_taken_once_and_documents_are_named_by_commit() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.take_bypass_reload_failed());
+        st.note_bypass_reload_failed();
+        assert!(st.take_bypass_reload_failed());
+        assert!(!st.take_bypass_reload_failed(), "taken twice");
+        assert_eq!(st.current_document(), None);
+        st.on_document_committed(Some(3), false);
+        assert_eq!(st.current_document(), Some(3));
+        st.on_document_committed(Some(4), false);
+        assert_eq!(st.current_document(), Some(4), "a later document kept the old name");
+    }
+
+    #[test]
+    fn a_redirect_away_and_back_ends_the_allowance_for_good() {
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        // Same-site hops keep it.
+        assert!(!st.end_ads_allowance_unless_same_site("https://www.news.example/story"));
+        assert_eq!(st.ads_allowed_site(), Some(SITE));
+        // A to B: ended on B's first hop, before B is asked for anything.
+        assert!(st.end_ads_allowance_unless_same_site("https://tracker.example/click?u=x"));
+        assert!(st.policy.block_ads);
+        // B back to A does not bring it back.
+        assert!(!st.end_ads_allowance_unless_same_site("https://news.example/landing"));
+        assert_eq!(st.ads_allowed_site(), None);
+        assert!(st.policy.block_ads);
+    }
+
+    #[test]
+    fn back_forward_and_reload_are_judged_like_any_navigation() {
+        let mut st = TabState::new(&TabPolicy::default());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        // Reload, and back to an earlier page of the same site: kept.
+        assert!(!st.end_ads_allowance_unless_same_site("https://news.example/"));
+        assert!(!st.end_ads_allowance_unless_same_site("https://news.example/earlier"));
+        // Back to the previous site: ended.
+        assert!(st.end_ads_allowance_unless_same_site("https://search.example/?q=news"));
+        assert_eq!(st.ads_allowed_site(), None);
+    }
+
+    #[test]
+    fn a_hostless_url_ends_the_allowance() {
+        for url in ["about:blank", "data:text/html,x", "file:///tmp/x.html", ""] {
+            let mut st = TabState::new(&TabPolicy::default());
+            st.grant_ads_allowance(SITE.to_string()).unwrap();
+            assert!(st.end_ads_allowance_unless_same_site(url), "{url}");
+            assert!(st.policy.block_ads, "{url}");
+        }
+    }
+
+    /// The delayed-callback row. A filter load asked for while the tab
+    /// blocked lands after the user allowed ads: it must not go in. One asked
+    /// for when the allowance ended lands after it: it must.
+    #[test]
+    fn a_late_filter_load_follows_what_the_tab_wants_when_it_lands() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(st.wants_ad_filters(), "a new tab wants its filters");
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        assert!(!st.wants_ad_filters(), "a load landing now would re-block an allowed tab");
+        st.end_ads_allowance();
+        assert!(st.wants_ad_filters(), "a load landing now must not be dropped");
+        // Browser-wide blocking off: nothing lands, allowed or not.
+        st.apply_base_policy(&TabPolicy {
+            block_ads: false,
+            ..TabPolicy::default()
+        });
+        assert!(!st.wants_ad_filters());
+        assert!(!st.wants_overlap_filter());
+    }
+
+    /// The overlap filter is for the allowed tab whose ad filters the
+    /// allowance removed, and for nothing else.
+    #[test]
+    fn the_overlap_filter_is_wanted_only_while_the_allowance_removed_blocking() {
+        let mut st = TabState::new(&TabPolicy::default());
+        assert!(!st.wants_overlap_filter());
+        st.grant_ads_allowance(SITE.to_string()).unwrap();
+        assert!(st.wants_overlap_filter());
+        // Browser-wide blocking off while allowed: no tab has ad filters, and
+        // this one is no different.
+        st.apply_base_policy(&TabPolicy {
+            block_ads: false,
+            ..TabPolicy::default()
+        });
+        assert!(!st.wants_overlap_filter());
+        assert_eq!(st.ads_allowed_site(), Some(SITE), "kept for when blocking comes back");
+        st.apply_base_policy(&TabPolicy::default());
+        assert!(st.wants_overlap_filter());
+        assert!(!st.policy.block_ads, "blocking came back on silently");
+    }
+
+    /// The cold-cache row. With the filters it would have to put back not yet
+    /// in memory the switch is unavailable, and a main-frame navigation whose
+    /// allowance ended without blocking back in place is refused.
+    #[test]
+    fn a_cold_filter_cache_fails_closed() {
+        assert_eq!(ads_allow_unavailable(false, false, true, true, false), Some("ads_not_ready"));
+        assert_eq!(after_allowance_ended(true, false), AfterAllowanceEnded::Refuse);
+        assert_eq!(after_allowance_ended(true, true), AfterAllowanceEnded::Proceed);
+        assert_eq!(after_allowance_ended(false, false), AfterAllowanceEnded::Proceed);
+        assert_eq!(after_allowance_ended(false, true), AfterAllowanceEnded::Proceed);
+    }
+
+    /// Toggling on an open YouTube page: the Windows script registration is
+    /// removed when the switch goes on and put back when it goes off. Neither
+    /// reaches the page already showing, which is why the tab is reloaded.
+    #[test]
+    fn the_youtube_script_follows_the_switch() {
+        let mut st = TabState::new(&TabPolicy::default());
+        st.youtube_script_ids = vec!["7".into()];
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Nothing);
+        st.grant_ads_allowance("https://youtube.com".to_string()).unwrap();
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Remove);
+        st.youtube_script_ids.clear();
+        st.end_ads_allowance();
+        assert_eq!(st.youtube_script_step(), YoutubeScriptStep::Add);
+    }
+
+    #[test]
+    fn the_overlap_checks_every_parent_and_cannot_see_below_an_ad_host() {
+        let malicious = ["example.com", "evil.ads.example.net", "bad.test"];
+        let is_malicious = |h: &str| malicious.contains(&h);
+        let found = malicious_overlap(
+            [
+                "ads.example.com",       // parent is listed
+                "example.com",           // itself listed
+                "deep.a.b.example.com",  // grandparent listed
+                "tracker.example.org",   // not listed
+                "ads.example.net",       // only a SUBDOMAIN is listed: the residual
+                "bad.test",
+                "bad.test",              // repeats collapse
+            ],
+            is_malicious,
+        );
+        assert_eq!(
+            found,
+            vec!["ads.example.com", "bad.test", "deep.a.b.example.com", "example.com"]
+        );
+        assert!(!found.iter().any(|h| h == "ads.example.net"), "the residual changed; update the comment");
+    }
+
+    /// The list-refresh row, pure half: a refreshed malicious list that
+    /// changes the overlap changes the filter's id, so the engine knows the
+    /// filter its allowed tabs rely on is no longer the right one. An
+    /// unchanged overlap keeps the id; an empty one is no filter at all.
+    #[test]
+    fn a_refreshed_list_changes_the_overlap_filter_only_when_the_overlap_changes() {
+        let hosts = ["ads.example.com", "tracker.example.org"];
+        let v1 = malicious_overlap(hosts, |h| h == "example.com");
+        let v1_again = malicious_overlap(hosts, |h| h == "ads.example.com");
+        let v2 = malicious_overlap(hosts, |h| h == "example.com" || h == "tracker.example.org");
+        let (_, id1) = overlap_filter(&v1).unwrap();
+        let (_, id1_again) = overlap_filter(&v1_again).unwrap();
+        let (json2, id2) = overlap_filter(&v2).unwrap();
+        assert_eq!(id1, id1_again, "same overlap, different id");
+        assert_ne!(id1, id2, "a new overlapping host left the id alone");
+        assert!(json2.contains("tracker"), "the new host is not in the rules");
+        assert!(id2.ends_with("-overlap"));
+        assert_ne!(id2, bundled_ads_filter_id());
+        assert_ne!(id2, bundled_tracking_filter_id());
+        assert_eq!(overlap_filter(&[]), None);
+        assert_eq!(overlap_filter(&malicious_overlap(hosts, |_| false)), None);
     }
 }

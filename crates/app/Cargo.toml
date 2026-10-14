@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.6"
+version = "1.0.7"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -234,6 +234,9 @@ bsdiff = "0.2"
 ed25519-dalek = "2"
 # The activation tests write a device-id file beside a temp vault path.
 tempfile = "3"
+# The freeze-exception tests match the generated url-filter patterns against
+# real URLs (already in the lockfile through other crates; test-only).
+regex = "1"
 
 # build.rs compiles src/blocklist.txt into sorted hashes; it shares
 # hostrules.rs with the crate and therefore needs the same hasher.

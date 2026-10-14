@@ -348,6 +348,9 @@ pub struct Hosts {
 /// so Rc/RefCell is correct.
 pub struct TabView {
     state: Rc<RefCell<TabState>>,
+    /// For engine answers that arrive after the call that asked, so the
+    /// toolbar and panels hear them (review 2026-10-12, R-002).
+    proxy: EventLoopProxy<UserEvent>,
 }
 
 pub fn create_hosts(window: Window) -> Hosts {
@@ -646,7 +649,30 @@ fn desired_browser_args() -> String {
     args
 }
 
+/// The environment for the browsing profile (MAIN).
 fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
+    static ENV: OnceLock<Option<SendEnv>> = OnceLock::new();
+    ENV.get_or_init(|| create_hardened_environment(profile_dir()))
+        .as_ref()
+        .map(|e| &e.0)
+}
+
+/// The environment for the kept sites' profile (kept_profile.rs): the same
+/// options and arguments by construction, over its own folder.
+fn kept_environment() -> Option<&'static ICoreWebView2Environment> {
+    static ENV: OnceLock<Option<SendEnv>> = OnceLock::new();
+    ENV.get_or_init(|| create_hardened_environment(kept_profile_dir()))
+        .as_ref()
+        .map(|e| &e.0)
+}
+
+// The environment is created on, and only ever used from, the UI thread.
+// The wrapper exists solely to park it in a `OnceLock`.
+struct SendEnv(ICoreWebView2Environment);
+unsafe impl Send for SendEnv {}
+unsafe impl Sync for SendEnv {}
+
+fn create_hardened_environment(data_dir: Option<&'static Path>) -> Option<SendEnv> {
     use webview2_com::CoreWebView2EnvironmentOptions;
     use webview2_com::CreateCoreWebView2EnvironmentCompletedHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::{
@@ -658,14 +684,7 @@ fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
         GetUserDefaultUILanguage, LCIDToLocaleName, LOCALE_ALLOW_NEUTRAL_NAMES, MAX_LOCALE_NAME,
     };
 
-    static ENV: OnceLock<Option<SendEnv>> = OnceLock::new();
-    // The environment is created on, and only ever used from, the UI thread.
-    // The wrapper exists solely to park it in a `OnceLock`.
-    struct SendEnv(ICoreWebView2Environment);
-    unsafe impl Send for SendEnv {}
-    unsafe impl Sync for SendEnv {}
-
-    ENV.get_or_init(|| {
+    {
         let args = desired_browser_args();
 
         let options = CoreWebView2EnvironmentOptions::default();
@@ -682,7 +701,7 @@ fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
             options.set_language(String::from_utf16_lossy(&lang));
             options.set_scroll_bar_style(COREWEBVIEW2_SCROLLBAR_STYLE_DEFAULT);
 
-            let data_dir = profile_dir()
+            let data_dir = data_dir
                 .map(|d| HSTRING::from(d.as_os_str()))
                 .unwrap_or_default();
             let (tx, rx) = std::sync::mpsc::channel();
@@ -742,9 +761,7 @@ fn shared_environment() -> Option<&'static ICoreWebView2Environment> {
                 }
             }
         }
-    })
-    .as_ref()
-    .map(|e| &e.0)
+    }
 }
 
 /// Whether this process got its OWN hardened WebView2 environment.
@@ -846,6 +863,164 @@ fn translator_profile_dir() -> Option<&'static Path> {
         Some(dir)
     })
     .as_deref()
+}
+
+/// The kept sites' user-data folder (kept_profile.rs). None when it cannot
+/// be made, and then there is no kept profile at all: every tab is MAIN,
+/// which keeps nothing but leaks nothing either. Never the browsing
+/// profile's folder, and never wry's default beside the executable.
+fn kept_profile_dir() -> Option<&'static Path> {
+    static DIR: OnceLock<Option<PathBuf>> = OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = super::kept_profile_dir_for(&Vault::default_path());
+        if let Err(error) = std::fs::create_dir_all(&dir) {
+            diag(&format!(
+                "kept profile: could not create {} ({error}); kept sites are not kept this session",
+                dir.display()
+            ));
+            return None;
+        }
+        diag(&format!("kept profile: user data folder is {}", dir.display()));
+        Some(dir)
+    })
+    .as_deref()
+}
+
+/// Whether tabs can live in a kept profile this session.
+///
+/// Only for the sole running PATANYX, and only with the kept profile's own
+/// hardened environment: a fallback environment would quietly lose the
+/// crash-reporting and extension settings, and the panel reports MAIN's
+/// (code review 2026-10-13, R-025, R-026).
+pub fn kept_profile_supported() -> bool {
+    super::kept_enabled() && kept_profile_dir().is_some() && kept_environment().is_some()
+}
+
+/// The kept profile's start-up work, at start and without a kept tab: its
+/// clear (the cookie and cache cleanup, or the full clear when one is
+/// owed) and its stored permission decisions back to default. A hidden
+/// web view in that profile does both and stays, unused, for the rest of
+/// the process. Kept tabs wait for the clear (compliance audit
+/// 2026-10-13; code review rounds 4 and 5).
+pub fn begin_kept_profile_start(hosts: &Hosts, proxy: &EventLoopProxy<UserEvent>) {
+    if !with_kept_hidden_view(hosts, true, |webview| {
+        let _ = begin_new_session_wipe(webview, proxy, crate::kept_profile::ProfileKind::Kept);
+        clear_persisted_permissions(webview);
+    }) {
+        diag("kept profile: no web view for the start-up clear; the first kept tab runs it");
+    }
+}
+
+/// The kept profile's stored permission decisions back to default, through
+/// the hidden kept view, which outlives any tab (code review round 3):
+/// sweeping through a tab that is about to close could be cut off. With
+/// `create` false nothing new is built (at exit).
+pub fn sweep_kept_permissions(hosts: &Hosts, create: bool) {
+    let _ = with_kept_hidden_view(hosts, create, clear_persisted_permissions);
+}
+
+thread_local! {
+    static KEPT_HIDDEN_VIEW: RefCell<Option<WebView>> = const { RefCell::new(None) };
+}
+
+/// Runs `work` on a hidden web view in the kept profile, built on first
+/// use when `create` is set and kept for the life of the process. False
+/// when there is none.
+///
+/// Gated on holding the kept profile, not on browsing in it: a start that
+/// turned kept browsing off still runs the clear it owes (code review
+/// round 8).
+fn with_kept_hidden_view(hosts: &Hosts, create: bool, work: impl FnOnce(&WebView)) -> bool {
+    let holds = super::kept_sole() && kept_profile_dir().is_some() && kept_environment().is_some();
+    if !holds && KEPT_HIDDEN_VIEW.with(|slot| slot.borrow().is_none()) {
+        return false;
+    }
+    if create && KEPT_HIDDEN_VIEW.with(|slot| slot.borrow().is_none()) {
+        let built = new_webview_builder_for(crate::kept_profile::ProfileKind::Kept)
+            .with_visible(false)
+            .with_focused(false)
+            .build_as_child(&hosts.window);
+        match built {
+            Ok(webview) => {
+                let _ = webview.set_visible(false);
+                KEPT_HIDDEN_VIEW.with(|slot| *slot.borrow_mut() = Some(webview));
+            }
+            Err(error) => {
+                diag(&format!("kept profile: no hidden web view ({error})"));
+                return false;
+            }
+        }
+    }
+    KEPT_HIDDEN_VIEW.with(|slot| match slot.borrow().as_ref() {
+        Some(webview) => {
+            work(webview);
+            true
+        }
+        None => false,
+    })
+}
+
+/// Starts the ordinary profile's start-up clear before the first tab, from
+/// the chrome webview (which lives in it), so it runs even when the first
+/// tab is a kept site's (code review 2026-10-13, R-023). Tabs built while
+/// it runs wait for it, as before.
+/// A kept clear (or part of one) that failed: written to the ledger where
+/// it happens, then reported, so it survives a start that fails before the
+/// event is handled (code review round 9). The report closes kept tabs and
+/// turns kept storage off if even the removal of the ledger fails.
+fn owe_kept_clear(proxy: &EventLoopProxy<UserEvent>, marker: &str) {
+    record_kept_obligation(marker);
+    let _ = proxy.send_event(UserEvent::KeptClearOwed(marker.to_string()));
+}
+
+/// The marker on disk now, or the ledger removed when it cannot be
+/// written (both owe the full clear at the next start): a queued event
+/// can be lost, as when Windows ends the session (code review rounds 9
+/// and 10).
+fn record_kept_obligation(marker: &str) {
+    if crate::kept_profile::record(marker).is_err() {
+        crate::kept_profile::forfeit_ledger();
+    }
+}
+
+pub fn begin_main_profile_wipe(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+    let _ = begin_new_session_wipe(webview, proxy, crate::kept_profile::ProfileKind::Main);
+}
+
+/// Removes the kept profile's folder, at launch, before any environment
+/// over it exists: the complete clear for a profile whose site list lost a
+/// site (kept_profile::kept_start). True when the folder is gone.
+pub fn remove_kept_profile_folder() -> bool {
+    let dir = super::kept_profile_dir_for(&Vault::default_path());
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            diag(&format!(
+                "kept profile: could not remove {} ({error}); the first kept tab clears it instead",
+                dir.display()
+            ));
+            false
+        }
+    }
+}
+
+/// The builder for a tab in `kind`'s profile. MAIN is `new_webview_builder`.
+/// KEPT is the same construction over the kept folder and the kept
+/// environment; if that environment could not be made, the same arguments
+/// travel directly, as `new_webview_builder`'s fallback does.
+pub fn new_webview_builder_for(kind: crate::kept_profile::ProfileKind) -> WebViewBuilder<'static> {
+    let (crate::kept_profile::ProfileKind::Kept, Some(dir)) = (kind, kept_profile_dir()) else {
+        return new_webview_builder();
+    };
+    let builder = WebViewBuilder::new_with_web_context(Box::leak(Box::new(WebContext::new(Some(
+        dir.to_path_buf(),
+    )))));
+    let builder = match kept_environment() {
+        Some(env) => builder.with_environment(env.clone()),
+        None => builder.with_additional_browser_args(&desired_browser_args()),
+    };
+    builder.with_general_autofill_enabled(false)
 }
 
 /// Builder for the translator webview: its own data directory, and therefore
@@ -1107,6 +1282,14 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicIsize, AtomicU32, AtomicU64
 
 /// The readout's own child HWND. Zero = never created = feature off.
 static READOUT_CHILD: AtomicIsize = AtomicIsize::new(0);
+/// The fullscreen notice's own window: a POPUP owned by the main window,
+/// not a child. Measured 2026-10-12 on a Windows 11 VM: the child readout
+/// shows over a page in a normal window but never over a fullscreen page,
+/// in 1.0.6 as in 1.0.7, while every call reported it shown. An owned popup
+/// is a top-level window Windows always keeps above its owner, so whatever
+/// the page's window does inside the owner cannot cover it. Zero = never
+/// created = no notice can be drawn, and AppState refuses page fullscreen.
+static NOTICE_POPUP: AtomicIsize = AtomicIsize::new(0);
 /// The main window's HWND, for GetClientRect from the 'static callback.
 static READOUT_PARENT: AtomicIsize = AtomicIsize::new(0);
 /// The DPI-scaled HFONT, and the scale it was built for. Rebuilt only when
@@ -1149,37 +1332,71 @@ thread_local! {
 /// leaving the page, must not take the notice down before its time.
 static NOTICE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Shows the fullscreen notice (top centre) or takes it down.
-pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) {
+/// Whether the fullscreen notice can be drawn: the readout window was created
+/// and is still a window. AppState asks before giving a page the screen.
+pub fn fullscreen_notice_can_draw(_hosts: &Hosts) -> bool {
     use windows::Win32::Foundation::HWND;
-    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+    use windows::Win32::UI::WindowsAndMessaging::IsWindow;
 
+    let raw = NOTICE_POPUP.load(Ordering::Relaxed);
+    raw != 0 && unsafe { IsWindow(Some(HWND(raw as _))) }.as_bool()
+}
+
+/// Shows the fullscreen notice (top centre) or takes it down.
+///
+/// Returns whether the notice is showing: false for `None`, and false when it
+/// could not be shown, which AppState takes as "no page gets the screen".
+/// True means `SetWindowPos` showed the readout window and Windows reports it
+/// visible; what the compositor then does with it is not visible from here.
+#[must_use]
+pub fn set_fullscreen_notice(hosts: &Hosts, text: Option<&str>) -> bool {
     READOUT_SCALE.store(hosts.window.scale_factor().to_bits(), Ordering::Relaxed);
     match text {
         // Only when the readout window exists: the flag silences every hover
         // write, which must not happen for a notice that cannot be drawn.
-        Some(text) if READOUT_CHILD.load(Ordering::Relaxed) != 0 => {
+        Some(text) if fullscreen_notice_can_draw(hosts) => {
             NOTICE_ACTIVE.store(true, Ordering::Relaxed);
-            readout_draw(text, true);
-        }
-        Some(_) => diag("fullscreen notice: the readout window was never created; no notice shown"),
-        None => {
-            if NOTICE_ACTIVE.swap(false, Ordering::Relaxed) {
-                let raw = READOUT_CHILD.load(Ordering::Relaxed);
-                if raw != 0 {
-                    let _ = unsafe { ShowWindow(HWND(raw as _), SW_HIDE) };
-                }
+            if readout_draw(text, true) {
+                return true;
             }
+            diag("fullscreen notice: showing the readout window failed; no notice shown");
+            take_down_notice();
+            false
+        }
+        Some(_) => {
+            diag("fullscreen notice: the readout window was never created; no notice shown");
+            false
+        }
+        None => {
+            take_down_notice();
+            false
+        }
+    }
+}
+
+/// Hides the notice and gives the window back to the hover readout.
+fn take_down_notice() {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_HIDE};
+
+    if NOTICE_ACTIVE.swap(false, Ordering::Relaxed) {
+        let raw = NOTICE_POPUP.load(Ordering::Relaxed);
+        if raw != 0 {
+            let _ = unsafe { ShowWindow(HWND(raw as _), SW_HIDE) };
         }
     }
 }
 
 /// Re-places a showing notice after the window changed size (entering
 /// fullscreen resizes the window AFTER the notice first drew).
+///
+/// The result is not acted on: the notice already drew once when the page
+/// was given the screen (AppState checks that draw), and nothing here can
+/// reach AppState to end fullscreen.
 fn notice_reflow() {
     if NOTICE_ACTIVE.load(Ordering::Relaxed) {
         let text = READOUT_TEXT.with(|t| t.borrow().clone());
-        readout_draw(&text, true);
+        let _ = readout_draw(&text, true);
     }
 }
 
@@ -1258,6 +1475,34 @@ pub fn arm_hover_readout(hosts: &Hosts, scheme: crate::prefs::ChromeScheme) {
     READOUT_PARENT.store(parent.0 as isize, Ordering::Relaxed);
     READOUT_CHILD.store(hwnd.0 as isize, Ordering::Relaxed);
     rebuild_readout_font();
+
+    // The fullscreen notice's popup (see NOTICE_POPUP). Same class, so the
+    // same paint and hit-test code; owned by the main window, so it stays
+    // above it; never activated (WS_EX_NOACTIVATE here, SWP_NOACTIVATE on
+    // every show), so Esc keeps reaching the page; a tool window, so it has
+    // no taskbar button. A failure leaves it at zero: no notice, so no page
+    // fullscreen.
+    let notice = unsafe {
+        use windows::Win32::UI::WindowsAndMessaging::{WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP};
+        CreateWindowExW(
+            WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            w!("PatanyxHoverReadout"),
+            w!(""),
+            WS_POPUP,
+            0,
+            0,
+            0,
+            0,
+            Some(parent),
+            None,
+            Some(module.into()),
+            None,
+        )
+    };
+    match notice {
+        Ok(popup) => NOTICE_POPUP.store(popup.0 as isize, Ordering::Relaxed),
+        Err(_) => diag("fullscreen notice: CreateWindowExW failed; page fullscreen will be refused"),
+    }
     // No destruction path on purpose: the readout is a child of the tao
     // window and dies with it at process exit. The one resource that MUST be
     // freed on a repeating basis is the old HFONT on a DPI change, and
@@ -1317,7 +1562,9 @@ fn readout_apply(text: Option<&str>) {
     }
     let suppressed = READOUT_SUPPRESSED.load(Ordering::Relaxed);
     match text.filter(|_| !suppressed) {
-        Some(text) => readout_draw(text, false),
+        Some(text) => {
+            let _ = readout_draw(text, false);
+        }
         None => {
             let _ = unsafe { ShowWindow(HWND(raw as _), SW_HIDE) };
         }
@@ -1325,19 +1572,26 @@ fn readout_apply(text: Option<&str>) {
 }
 
 /// Measures and shows `text`: at the page's bottom-left (the hover readout)
-/// or top centre (`notice`, the fullscreen notice).
-fn readout_draw(text: &str, notice: bool) {
+/// or top centre (`notice`, the fullscreen notice). True when the window was
+/// shown: `SetWindowPos` succeeded and Windows reports the window visible.
+fn readout_draw(text: &str, notice: bool) -> bool {
     use windows::Win32::Foundation::{HWND, RECT, SIZE};
     use windows::Win32::Graphics::Gdi::{
         GetDC, GetTextExtentPoint32W, InvalidateRect, ReleaseDC, SelectObject, HFONT, HGDIOBJ,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        GetClientRect, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE, SWP_SHOWWINDOW, SW_HIDE,
+        GetClientRect, IsWindowVisible, SetWindowPos, ShowWindow, HWND_TOP, SWP_NOACTIVATE,
+        SWP_SHOWWINDOW, SW_HIDE,
     };
 
-    let raw = READOUT_CHILD.load(Ordering::Relaxed);
+    // The notice draws in its own popup, the readout in the child.
+    let raw = if notice {
+        NOTICE_POPUP.load(Ordering::Relaxed)
+    } else {
+        READOUT_CHILD.load(Ordering::Relaxed)
+    };
     if raw == 0 {
-        return; // Never created: the feature is off.
+        return false; // Never created: the feature is off.
     }
     let hwnd = HWND(raw as _);
 
@@ -1381,7 +1635,7 @@ fn readout_draw(text: &str, notice: bool) {
     let mut client = RECT::default();
     if unsafe { GetClientRect(parent, &mut client) }.is_err() {
         let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
-        return;
+        return false;
     }
     // The inset is stored in LOGICAL pixels (it is what the chrome measured
     // in CSS pixels and Rust lays out with); this path is physical throughout,
@@ -1391,7 +1645,16 @@ fn readout_draw(text: &str, notice: bool) {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let right_px = (f64::from(READOUT_RIGHT.load(Ordering::Relaxed)) * readout_scale()) as i32;
     let (x, y, w, h) = if notice {
-        crate::hover_style::notice_rect(client.right, client.bottom, text_w, line_h, readout_scale())
+        // The popup is top-level: its position is in SCREEN coordinates,
+        // so the client-area rectangle is moved to where the client is.
+        let (x, y, w, h) =
+            crate::hover_style::notice_rect(client.right, client.bottom, text_w, line_h, readout_scale());
+        let mut origin = windows::Win32::Foundation::POINT { x: 0, y: 0 };
+        if !unsafe { windows::Win32::Graphics::Gdi::ClientToScreen(parent, &mut origin) }.as_bool() {
+            let _ = unsafe { ShowWindow(hwnd, SW_HIDE) };
+            return false;
+        }
+        (x + origin.x, y + origin.y, w, h)
     } else {
         crate::hover_style::readout_rect(client.right, client.bottom, left_px, right_px, text_w, line_h)
     };
@@ -1400,7 +1663,7 @@ fn readout_draw(text: &str, notice: bool) {
     // (arm runs before the first tab), and siblings later in creation order
     // draw over earlier ones -- the same fact layout() and set_chrome_z are
     // built on. Without the raise the page simply covers the readout.
-    let _ = unsafe {
+    let placed = unsafe {
         SetWindowPos(
             hwnd,
             Some(HWND_TOP),
@@ -1410,8 +1673,10 @@ fn readout_draw(text: &str, notice: bool) {
             h,
             SWP_NOACTIVATE | SWP_SHOWWINDOW,
         )
-    };
+    }
+    .is_ok();
     let _ = unsafe { InvalidateRect(Some(hwnd), None, false) };
+    placed && unsafe { IsWindowVisible(hwnd) }.as_bool()
 }
 
 /// Builds (or rebuilds) the readout font for the current scale.
@@ -1770,6 +2035,9 @@ pub fn build_content(
     malicious_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
     id: u64,
     permissions: crate::state::PermissionBook,
+    // Which profile this tab lives in (kept_profile.rs); the builder was
+    // made for the same one by `new_webview_builder_for`.
+    profile: crate::kept_profile::ProfileKind,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
     // ENGINE-OWNED ZOOM HOTKEYS, on content tabs only.
     //
@@ -1851,6 +2119,22 @@ pub fn build_content(
     let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX, 0, 0, 0));
 
     let state = Rc::new(RefCell::new(TabState::new(policy)));
+    state.borrow_mut().profile = profile;
+    // The kept profile's first tab this session: the stored permission
+    // decisions go back to default (the start-up backstop the ordinary
+    // profile has through the chrome), and the saved page colors apply to
+    // this profile too (code review 2026-10-13, R-031, R-032).
+    if profile == crate::kept_profile::ProfileKind::Kept {
+        static FIRST_KEPT_TAB: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST_KEPT_TAB.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            clear_persisted_permissions(&webview);
+        }
+        // Every kept tab: a theme changed while no kept tab was open must
+        // still reach this profile (code review round 2, R-043).
+        // Auto too: the profile keeps whatever it was last given (code
+        // review round 3).
+        let _ = apply_page_theme(&webview, crate::prefs::load().page_theme);
+    }
     {
         // What the runtime accepted, recorded before anything can present it
         // as a protection.
@@ -1898,14 +2182,14 @@ pub fn build_content(
         let _ = connect_hover_readout(&webview);
     }
     connect_request_interception(&webview, state.clone(), malicious_override, proxy.clone(), id);
-    connect_navigation_events(&webview, state.clone(), proxy);
+    connect_navigation_events(&webview, state.clone(), proxy, id);
     connect_cert_errors(&webview, state.clone());
     // Fingerprint noise. Registered on the raw ICoreWebView2 rather than the
     // wry builder like autofill and GPC above, because this one needs ALL
     // FRAMES -- see install_divergence_script. Before the deferred load_url
     // below for the same reason the handlers are: the first document must
     // not be created before the registration lands.
-    install_divergence_script(&webview, policy.ephemeral);
+    install_divergence_script(&webview, &state, proxy, policy.ephemeral);
     // The local-network boundary's WebSocket half. CONTENT webviews only,
     // which is also what keeps it away from Private Chat: the chat UI is the
     // chrome webview, and Chat and Relay themselves are native Rust sockets
@@ -1918,7 +2202,7 @@ pub fn build_content(
     // YouTube's video ads: same registration path and place in the order, so
     // the first YouTube document already has it. Toggled later by
     // apply_policy.
-    sync_youtube_script(&webview, &state, Some((proxy.clone(), id)));
+    sync_youtube_script(&webview, &state, proxy, Some(id));
     // The first navigation happens HERE, not on the builder, and the
     // ordering is the whole point: wry issues `Navigate` inside
     // `build_as_child` when the builder carries a url, which is before any
@@ -1941,7 +2225,7 @@ pub fn build_content(
     let waiting_for_wipe = if policy.ephemeral {
         false
     } else {
-        begin_new_session_wipe(&webview, proxy)
+        begin_new_session_wipe(&webview, proxy, profile)
     };
     // THE FIRST PAGE ALSO WAITS FOR THE WEBSOCKET GUARD, so it is never
     // issued here. It is released through AppState
@@ -1954,7 +2238,7 @@ pub fn build_content(
     // (`new_tab_allowed`) before the tab existed.
     let _ = url;
     state.borrow_mut().waiting_for_wipe = waiting_for_wipe;
-    Ok((webview, TabView { state }, true))
+    Ok((webview, TabView { state, proxy: proxy.clone() }, true))
 }
 
 /// Registers the Fingerprint Divergence script for every document this
@@ -2050,25 +2334,44 @@ fn install_local_network_guard(
 /// guard's registration. The answer normally takes milliseconds.
 const LOCAL_NETWORK_GUARD_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-fn install_divergence_script(webview: &WebView, ephemeral: bool) {
+/// Registers this tab's Fingerprint Divergence script and records the
+/// engine's answer in `TabState::divergence_install` (review R-003): Pending
+/// until the completion handler runs, then Installed or Refused. The panels
+/// read that answer; they used to say "Installed" whenever a script was
+/// built, including when the engine refused it.
+fn install_divergence_script(
+    webview: &WebView,
+    state: &Rc<RefCell<TabState>>,
+    proxy: &EventLoopProxy<UserEvent>,
+    ephemeral: bool,
+) {
     use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
     use wry::WebViewExtWindows;
 
     // None = pref off, or OS randomness failed: register nothing, which is
     // the honest posture on both counts (no script, no claim).
     let Some(source) = privacy::divergence_script(ephemeral) else {
+        state.borrow_mut().divergence_install = privacy::ScriptInstall::NotWanted;
         return;
     };
     let core = webview.webview();
     let source_wide: Vec<u16> = source.encode_utf16().chain(std::iter::once(0)).collect();
+    state.borrow_mut().divergence_install = privacy::ScriptInstall::Pending;
+    let remember = Rc::clone(state);
+    let tell = proxy.clone();
     let handler =
-        AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(|hr, _script_id| {
-            if hr.is_err() {
+        AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(move |hr, _script_id| {
+            remember.borrow_mut().divergence_install = if hr.is_err() {
                 diag(
                     "divergence: registration REFUSED by the engine; \
                      documents in this tab read clean fingerprints",
                 );
-            }
+                privacy::ScriptInstall::Refused
+            } else {
+                privacy::ScriptInstall::Installed
+            };
+            // The status already sent said Pending; send the answer.
+            let _ = tell.send_event(UserEvent::TabStatusChanged);
             Ok(())
         }));
     let result = unsafe {
@@ -2078,6 +2381,7 @@ fn install_divergence_script(webview: &WebView, ephemeral: bool) {
         )
     };
     if result.is_err() {
+        state.borrow_mut().divergence_install = privacy::ScriptInstall::Refused;
         diag("divergence: AddScriptToExecuteOnDocumentCreated call failed; this tab reads clean fingerprints");
     }
 }
@@ -2146,8 +2450,8 @@ pub fn page_scrollbar_support() -> &'static str {
 /// `PostWebMessageAsJson` -- host into page, one direction, the same channel
 /// `fill_credential` uses -- and the registered script's listener swaps its
 /// sheet; and the registration is replaced for the NEXT document, by the
-/// remembered id, so a user who tries all nine accents does not leave nine
-/// registrations on the tab. A tab whose current document has no listener
+/// remembered id, so a user who tries every accent does not leave one
+/// registration per accent on the tab. A tab whose current document has no listener
 /// (a page that replaced `adoptedStyleSheets`, or one loaded before the
 /// engine honoured the registration) simply keeps its colour until it
 /// navigates; the message is dropped by the engine, not by us.
@@ -2742,6 +3046,15 @@ fn connect_request_interception(
                 let attached = core.add_WebResourceRequested(
                     &WebResourceRequestedEventHandler::create(Box::new(move |_sender, args| {
                         let Some(args) = args else {
+                            // Nothing can be answered or held without the
+                            // arguments. A kept tab cannot let the request
+                            // pass unrecorded: its boundary failed, so the
+                            // next start clears the kept profile in full and
+                            // the tab closes (code review round 6).
+                            if handler_state.borrow().profile == crate::kept_profile::ProfileKind::Kept {
+                                record_kept_obligation("!enforcement");
+                                let _ = proxy.send_event(UserEvent::KeptEnforcementFailed { tab_id, held: false });
+                            }
                             return Ok(());
                         };
                         // Nothing below may use `?` on a getter. Every one
@@ -2795,6 +3108,18 @@ fn connect_request_interception(
                         // `policy.block_ads`, so turning off ad blocking cannot
                         // silently turn off malware blocking -- the reason the
                         // two sets were kept separate in the first place.
+                        // A KEPT TAB'S LAST RESORT (kept_profile.rs), for
+                        // every refusal below that cannot be answered: hold
+                        // the request with a deferral that is never
+                        // completed and have the tab closed, which cancels
+                        // it; the next start clears the kept profile in full
+                        // either way (code review rounds 2 and 3).
+                        let kept_tab = handler_state.borrow().profile == crate::kept_profile::ProfileKind::Kept;
+                        let hold = || {
+                            let held = args.GetDeferral().map(std::mem::forget).is_ok();
+                            record_kept_obligation(if held { "!held" } else { "!enforcement" });
+                            let _ = proxy.send_event(UserEvent::KeptEnforcementFailed { tab_id, held });
+                        };
                         let malicious = uri
                             .as_deref()
                             .and_then(privacy::host_of)
@@ -2819,6 +3144,9 @@ fn connect_request_interception(
                                 // The request is about to leave. Say so rather
                                 // than let a failed synthesis read as a block.
                                 diag(&format!("request: FAILED to refuse {host}; it will proceed"));
+                                if kept_tab {
+                                    hold();
+                                }
                             }
                             return Ok(());
                         }
@@ -2877,6 +3205,106 @@ fn connect_request_interception(
                             )
                         };
                         trace_request(&decision, uri.as_deref(), websocket);
+                        // THE KEPT PROFILE'S BOUNDARY (kept_profile.rs). Asked
+                        // only of an ALLOWED document request, so a move never
+                        // turns a refusal into a navigation (plan review
+                        // 2026-10-13, R-018). In a kept tab it fails closed: a
+                        // site that is not kept loads only as a provable
+                        // subframe, and the tab's own page on one is refused
+                        // here, before the request leaves, and opened in an
+                        // ordinary tab instead (R-015). A placeholder answers
+                        // the move, marked as PATANYX's own like the held page,
+                        // so no capture takes it for the site's document.
+                        // A kept tab also treats a request whose context
+                        // could not be read as a possible document, and an
+                        // unreadable address in one as refused (R-022).
+                        let maybe_document = is_document || (kept_tab && context.is_none());
+                        if maybe_document && matches!(decision, privacy::RequestDecision::Allow) {
+                            if kept_tab && uri.is_none() {
+                                let text = HSTRING::from("Blocked by PATANYX");
+                                let headers = HSTRING::from("");
+                                let refused = environment
+                                    .CreateWebResourceResponse(None, 403, PCWSTR(text.as_ptr()), PCWSTR(headers.as_ptr()))
+                                    .and_then(|response| args.SetResponse(&response));
+                                if refused.is_err() {
+                                    hold();
+                                }
+                                return Ok(());
+                            }
+                            if let Some(request_uri) = uri.as_deref() {
+                                let kept = crate::kept_profile::kept_hosts();
+                                let verdict = handler_state.borrow_mut().profile_verdict(
+                                    request_uri,
+                                    nav_url.as_deref(),
+                                    &kept,
+                                    kept_profile_supported(),
+                                );
+                                let refuse = |placeholder: bool| -> windows::core::Result<()> {
+                                    let nonce = crate::adlist_consent::held_nonce();
+                                    if placeholder && !nonce.is_empty() {
+                                        use windows::Win32::UI::Shell::SHCreateMemStream;
+                                        // SAFETY: COM interop; the stream owns a copy
+                                        // of the bytes and outlives the call.
+                                        let stream = unsafe {
+                                            SHCreateMemStream(Some(crate::kept_profile::MOVED_PLACEHOLDER_HTML.as_bytes()))
+                                        }
+                                        .ok_or_else(|| windows::core::Error::from(windows::Win32::Foundation::E_FAIL))?;
+                                        let text = HSTRING::from("OK");
+                                        let headers = HSTRING::from(format!(
+                                            "Content-Type: text/html; charset=utf-8\r\nX-PATANYX-Held: {nonce}"
+                                        ));
+                                        let response = environment.CreateWebResourceResponse(
+                                            Some(&stream),
+                                            200,
+                                            PCWSTR(text.as_ptr()),
+                                            PCWSTR(headers.as_ptr()),
+                                        )?;
+                                        return args.SetResponse(&response);
+                                    }
+                                    let text = HSTRING::from("Blocked by PATANYX");
+                                    let headers = HSTRING::from("");
+                                    let response = environment.CreateWebResourceResponse(
+                                        None,
+                                        403,
+                                        PCWSTR(text.as_ptr()),
+                                        PCWSTR(headers.as_ptr()),
+                                    )?;
+                                    args.SetResponse(&response)
+                                };
+                                match verdict {
+                                    privacy::ProfileVerdict::Pass => {}
+                                    privacy::ProfileVerdict::Refuse => {
+                                        if refuse(false).is_err() {
+                                            diag("profile: FAILED to refuse a document outside kept storage");
+                                            if kept_tab {
+                                                hold();
+                                            }
+                                        }
+                                        return Ok(());
+                                    }
+                                    privacy::ProfileVerdict::Move(url) => {
+                                        // The method of THIS request, not
+                                        // the last navigation's guess (R-027).
+                                        let method = args
+                                            .Request()
+                                            .ok()
+                                            .and_then(|request| {
+                                                let mut raw = PWSTR::null();
+                                                request.Method(&mut raw).ok().map(|()| take_pwstr(raw))
+                                            })
+                                            .unwrap_or_default();
+                                        let _ = proxy.send_event(UserEvent::ProfileCrossing { tab_id, url, method });
+                                        if refuse(true).is_err() && refuse(false).is_err() {
+                                            diag("profile: FAILED to refuse a page moving between profiles");
+                                            if kept_tab {
+                                                hold();
+                                            }
+                                        }
+                                        return Ok(());
+                                    }
+                                }
+                            }
+                        }
 
                         // THE HELD PAGE. A refused DOCUMENT request that is
                         // the top-level document the user navigated to gets
@@ -3021,6 +3449,11 @@ fn connect_request_interception(
                             Ok(()) => {
                                 if reason.confirms_freeze() && st.confirm_freeze_block() {
                                     diag("freeze: CONFIRMED - engine accepted a synthesized 403 while frozen");
+                                    // The toolbar read "Freezing..." until
+                                    // something else redrew it, which on a
+                                    // quiet tab could be minutes (seen on the
+                                    // 1.0.7 VM). Same wake as unix's.
+                                    let _ = proxy.send_event(UserEvent::TabStatusChanged);
                                 }
                             }
                             // The 403 never happened, so the request went
@@ -3028,11 +3461,15 @@ fn connect_request_interception(
                             // stops saying it now. This is the downgrade
                             // the old backend could not issue at all.
                             Err(error) => {
+                                if kept_tab {
+                                    hold();
+                                }
                                 st.freeze_block_failed(uri.as_deref());
                                 diag(&format!(
                                     "req BLOCK FAILED ({error}) for {} - request went out; enforcement marked failed",
                                     uri.as_deref().unwrap_or("<unreadable>")
                                 ));
+                                let _ = proxy.send_event(UserEvent::TabStatusChanged);
                             }
                         }
                         Ok(())
@@ -3066,6 +3503,8 @@ fn connect_request_interception(
         }
         Err((step, error)) => {
             st.interception = privacy::InterceptionState::Failed(step);
+            // A kept tab with no interception is rebuilt in the ordinary
+            // profile before its first page (state.rs build_tab, R-035).
             let call = match step {
                 privacy::InterceptionFailure::AddFilter => "AddWebResourceRequestedFilter",
                 privacy::InterceptionFailure::AttachHandler => "add_WebResourceRequested",
@@ -3196,6 +3635,7 @@ fn connect_navigation_events(
     webview: &WebView,
     state: Rc<RefCell<TabState>>,
     proxy: &EventLoopProxy<UserEvent>,
+    id: u64,
 ) {
     let record = state.clone();
     use webview2_com::{
@@ -3213,6 +3653,7 @@ fn connect_navigation_events(
         // here because the closure outlives this scope; the COM pointer is
         // refcounted, so this is a reference, not a second webview.
         let navigating = core.clone();
+        let ads_proxy = proxy.clone();
         let starting = core.add_NavigationStarting(
             &NavigationStartingEventHandler::create(Box::new(move |_sender, args| {
                 // The document being navigated to, for the local-network
@@ -3226,6 +3667,36 @@ fn connect_navigation_events(
                 starting_state
                     .borrow_mut()
                     .on_load_started(nav_url.as_deref());
+                // "ALLOW ADS AND TRACKERS ON THIS TAB" ENDS HERE when this
+                // top-level hop -- a first hop or a redirect, both raise this
+                // event -- leaves the site it was given for. Synchronously,
+                // and BEFORE the hop's document request reaches the request
+                // handler, which reads the restored policy for that request
+                // and every one after it.
+                //
+                // Whether or not this navigation is cancelled afterwards: a
+                // cancel WebView2 did not honour was measured on this event
+                // (see the malicious check below), and ending an allowance
+                // for a navigation that then does not happen is the safe way
+                // to be wrong. An address that cannot be read ends it too.
+                // The malicious check is untouched by any of this and still
+                // runs below and in the request handler.
+                let ended = starting_state
+                    .borrow_mut()
+                    .end_ads_allowance_unless_same_site(nav_url.as_deref().unwrap_or(""));
+                if ended {
+                    // Remembered so its completion can tell whether the page
+                    // the allowance was for is still on screen (a download, a
+                    // cancel); its next reload then skips the cache (round 2,
+                    // R-002; AppState::on_ads_allowance_page_kept).
+                    let ending = args.as_ref().and_then(|a| {
+                        let mut nav_id: u64 = 0;
+                        a.NavigationId(&mut nav_id).ok().map(|()| nav_id)
+                    });
+                    starting_state.borrow_mut().note_allowance_ended_by(ending);
+                    sync_youtube_script_on(&navigating, &starting_state, &ads_proxy, None);
+                    let _ = ads_proxy.send_event(UserEvent::AdsAllowanceEnded { tab_id: id });
+                }
                 // MALICIOUS-HOST BLOCKING, ENFORCED HERE TOO.
                 //
                 // Measured on real Windows hardware 2026-07-29: the shared
@@ -3362,7 +3833,15 @@ fn connect_navigation_events(
                                 }
                             }
                         }
+                    } else {
+                        // A target that cannot be read leaves the kept
+                        // boundary unable to prove any frame until the
+                        // next document commits (code review round 4).
+                        starting_state.borrow_mut().toplevel.on_navigation_unreadable();
                     }
+                } else {
+                    // No arguments at all: the same (code review round 5).
+                    starting_state.borrow_mut().toplevel.on_navigation_unreadable();
                 }
                 Ok(())
             })),
@@ -3531,9 +4010,16 @@ fn connect_navigation_events(
                     }
                     None => (None, true),
                 };
-                state
+                let page_kept = state
                     .borrow_mut()
                     .on_top_level_navigation_completed(nav_id, success);
+                if page_kept {
+                    let (replacing, document) = {
+                        let st = state.borrow();
+                        (st.replacement_pending(), st.current_document())
+                    };
+                    let _ = nav_proxy.send_event(UserEvent::AdsAllowancePageKept { tab_id: id, replacing, document });
+                }
 
                 // The args used to be discarded. They carry the engine's own
                 // verdict on this navigation, which is the only evidence the
@@ -3591,6 +4077,9 @@ fn connect_navigation_events(
     } else {
         SettingState::Failed
     };
+    if ok {
+        record.borrow_mut().toplevel.on_top_level_tracking_registered();
+    }
 }
 
 /// Observes certificate errors. Detection informs, never obstructs: the
@@ -4179,13 +4668,21 @@ pub fn forget_all_cookies(webview: &WebView) -> bool {
 /// explicitly: current WebView2 documents it under DOM storage, but it has a
 /// standalone bit and it is the storage class behind the field defect, so a
 /// future hierarchy change cannot silently drop it. DISK_CACHE is the HTTP
-/// cache, which is outside ALL_SITE. We deliberately do NOT select Settings,
-/// DownloadHistory, BrowsingHistory, GeneralAutofill, PasswordAutosave or
-/// AllProfile: those are browser/profile records, not state a site may carry
-/// into the next session. In particular, Settings can contain permission and
-/// other deliberate settings; a site-data reset must not rewrite them. PATANYX's
-/// own camera/microphone/location/notification grants are separately
-/// session-only (`SetSavesInProfile(false)`).
+/// cache, which is outside ALL_SITE. BROWSING_HISTORY and DOWNLOAD_HISTORY
+/// are selected too. They used to be left out as "profile records, not site
+/// state", but the engine writes every top-level address and every download's
+/// address into them in plain text, PATANYX never shows or uses either, and
+/// nothing else ever cleared them. Measured on the 1.0.7 Windows VM before
+/// this change: the ordinary profile's history held three days of visits
+/// across many starts, and its download history held addresses that PATANYX
+/// itself keeps only inside the vault. We deliberately do NOT select
+/// Settings, GeneralAutofill, PasswordAutosave or AllProfile. Settings can
+/// contain permission and other deliberate settings; a site-data reset must
+/// not rewrite them. Autofill and password saving are switched off on each
+/// tab's profile and read back (see the Profile6 block above), so they hold
+/// nothing to clear. PATANYX's own camera, microphone, location
+/// and notification grants are separately session-only
+/// (`SetSavesInProfile(false)`).
 ///
 /// ASYNC WITHOUT THE RACE. The first caller starts ClearBrowsingData and stays
 /// blank. Later tab builders see the shared gate in `Waiting` and also stay
@@ -4193,67 +4690,166 @@ pub fn forget_all_cookies(webview: &WebView) -> bool {
 /// posts SessionWipeFinished, which releases their queued initial URLs. A
 /// slow clear therefore never blocks construction or the event loop, but no
 /// first navigation can consume the half-cleared profile.
-/// The wipe for a profile that has sites the user asked to keep.
+/// KEPT SITES (kept_profile.rs). MAIN is cleared in full at every start,
+/// with no exceptions: kept sites do not live in it. The site-by-site clear
+/// that used to run here when any site was kept could not be complete (the
+/// engine has no list of origins with storage) and was removed with the kept
+/// profile's arrival (release-108-notes/messenger-keep/FINDINGS.md).
 ///
-/// Returns TRUE when it has taken ownership of the wipe (the caller must then
-/// wait for `SessionWipeFinished`), and FALSE when it could not start, in
-/// which case the caller runs the ordinary profile-wide clear instead. There
-/// is deliberately no third answer: a partial clear that reported success
-/// would be the one outcome worse than not having the feature.
-///
-/// HOW MUCH THIS REACHES, stated plainly because it is a privacy control and
-/// the panel copy has to match it. Origins are discovered from the COOKIE
-/// JAR, which is the only enumerable index WebView2 offers. For each origin
-/// that is not exempt, its cookies are deleted and CDP's
-/// `Storage.clearDataForOrigin` is asked to remove its storage. An origin
-/// that holds site data but set NO cookie is therefore not enumerated and its
-/// data survives. That is a real gap against the profile-wide clear, it is
-/// the price of having exceptions at all on this engine, and it is written
-/// into the panel rather than left for someone to discover.
-fn begin_selective_session_wipe(
+/// KEPT gets a cookie cleanup at each start (`begin_kept_cookie_cleanup`), or
+/// the same full clear when a site that was kept is not any more and the
+/// folder could not be removed at launch, both begun at start from a hidden
+/// web view (`begin_kept_profile_start`). Each profile has its own gate and
+/// its own completion event, so each profile's tabs wait for their own clear.
+fn begin_new_session_wipe(
     webview: &WebView,
     proxy: &EventLoopProxy<UserEvent>,
-    exempt: &[String],
+    kind: crate::kept_profile::ProfileKind,
 ) -> bool {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2CookieList, ICoreWebView2Profile2, ICoreWebView2_13, ICoreWebView2_2,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
-    };
-    use webview2_com::{ClearBrowsingDataCompletedHandler, GetCookiesCompletedHandler};
-    use windows::core::{Interface, HSTRING, PCWSTR};
     use wry::WebViewExtWindows;
 
-    let core = webview.webview();
-    let exempt: Vec<String> = exempt.to_vec();
+    match super::enter_session_wipe(kind) {
+        super::SessionWipeEntry::Ready => return false,
+        super::SessionWipeEntry::Waiting => return true,
+        super::SessionWipeEntry::Start => {}
+    }
+    if kind == crate::kept_profile::ProfileKind::Kept
+        && !super::kept_full_clear_due()
+        && begin_kept_cookie_cleanup(webview, proxy)
+    {
+        return true;
+    }
+    clear_whole_profile(&webview.webview(), proxy, kind);
+    true
+}
+
+/// ClearBrowsingData over the whole profile behind `core`, the complete clear.
+/// Every exit finishes `kind`'s gate and posts its completion, so no tab of
+/// that profile waits forever. A successful clear of KEPT also reports
+/// itself, so the record of sites owed a clear can be retired (R-016).
+fn clear_whole_profile(
+    core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    proxy: &EventLoopProxy<UserEvent>,
+    kind: crate::kept_profile::ProfileKind,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2Profile2, ICoreWebView2_13,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_BROWSING_HISTORY,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DOWNLOAD_HISTORY,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS,
+    };
+    use webview2_com::ClearBrowsingDataCompletedHandler;
+    use windows::core::Interface;
+
+    // A kept clear that did not happen is owed at the next start, like
+    // one whose cache part failed (code review round 8).
+    let owe = |proxy: &EventLoopProxy<UserEvent>| {
+        if kind == crate::kept_profile::ProfileKind::Kept {
+            owe_kept_clear(proxy, "!clear-failed");
+        }
+    };
+    let finish = |proxy: &EventLoopProxy<UserEvent>| {
+        owe(proxy);
+        super::finish_session_wipe(kind);
+        let _ = proxy.send_event(UserEvent::SessionWipeFinished(kind));
+    };
     unsafe {
-        let Ok(v2) = core.cast::<ICoreWebView2_2>() else {
-            diag("session: no ICoreWebView2_2; cannot honour kept sites, falling back to the full clear");
-            return false;
+        let Ok(v13) = core.cast::<ICoreWebView2_13>() else {
+            diag("session: no ICoreWebView2_13; cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history were NOT cleared");
+            return finish(proxy);
         };
-        let Ok(manager) = v2.CookieManager() else {
-            diag("session: no cookie manager; cannot honour kept sites, falling back to the full clear");
-            return false;
+        let Ok(profile) = v13.Profile() else {
+            diag("session: could not reach the profile; cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history were NOT cleared");
+            return finish(proxy);
+        };
+        let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() else {
+            diag("session: no ICoreWebView2Profile2; cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history were NOT cleared");
+            return finish(proxy);
         };
 
         let done_proxy = proxy.clone();
-        let core_for_cdp = core.clone();
+        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
+            if let Err(error) = result {
+                diag(&format!(
+                    "session: ClearBrowsingData FAILED ({error}); cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history were NOT cleared"
+                ));
+                if kind == crate::kept_profile::ProfileKind::Kept {
+                    owe_kept_clear(&done_proxy, "!clear-failed");
+                }
+            } else {
+                diag("session: cleared cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history from the previous session");
+                if kind == crate::kept_profile::ProfileKind::Kept {
+                    let _ = done_proxy.send_event(UserEvent::KeptProfileCleared);
+                }
+            }
+            super::finish_session_wipe(kind);
+            let _ = done_proxy.send_event(UserEvent::SessionWipeFinished(kind));
+            Ok(())
+        }));
+        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_BROWSING_HISTORY
+            | COREWEBVIEW2_BROWSING_DATA_KINDS_DOWNLOAD_HISTORY;
+        if let Err(error) = profile2.ClearBrowsingData(kinds, &handler) {
+            diag(&format!(
+                "session: ClearBrowsingData could not start ({error}); cookies, DOM storage, service workers, Cache Storage, HTTP cache, and browsing and download history were NOT cleared"
+            ));
+            finish(proxy);
+        }
+    }
+}
+
+/// KEPT's ordinary start: delete every cookie that `retain_kept_cookie` does
+/// not keep (the cookie manager's list is complete, unlike storage), then the
+/// HTTP cache, which carries no identity, and the engine's browsing and
+/// download history, which nothing reads. Storage stays: only kept sites ever
+/// load as a tab's page in this profile, and what they embed is partitioned
+/// under them.
+///
+/// TRUE when it took the wipe; FALSE when it could not start, and the caller
+/// clears the whole kept profile instead. Any failure after it started, an
+/// unreadable cookie included, also clears the whole kept profile: a cookie
+/// that cannot be judged is never kept by default.
+fn begin_kept_cookie_cleanup(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) -> bool {
+    use crate::kept_profile::ProfileKind;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2CookieList, ICoreWebView2Profile2, ICoreWebView2_13, ICoreWebView2_2,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_BROWSING_HISTORY, COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+        COREWEBVIEW2_BROWSING_DATA_KINDS_DOWNLOAD_HISTORY,
+    };
+    use webview2_com::{take_pwstr, ClearBrowsingDataCompletedHandler, GetCookiesCompletedHandler};
+    use windows::core::{Interface, PCWSTR, PWSTR};
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let kept = crate::kept_profile::kept_hosts();
+    unsafe {
+        let Ok(v2) = core.cast::<ICoreWebView2_2>() else {
+            diag("kept profile: no ICoreWebView2_2; clearing the whole kept profile");
+            return false;
+        };
+        let Ok(manager) = v2.CookieManager() else {
+            diag("kept profile: no cookie manager; clearing the whole kept profile");
+            return false;
+        };
+        let done_proxy = proxy.clone();
+        let core_for_clear = core.clone();
         let manager_for_delete = manager.clone();
         let handler = GetCookiesCompletedHandler::create(Box::new(
             move |result, list: Option<ICoreWebView2CookieList>| {
-                // Anything unexpected here has already cost us the full clear
-                // (it did not run), so the only safe move is to run it now.
                 let recover = |why: &str| {
-                    diag(&format!(
-                        "session: kept-sites clear could not enumerate cookies ({why}); running the FULL clear instead"
-                    ));
-                    full_profile_clear(&core_for_cdp, &done_proxy);
+                    diag(&format!("kept profile: cookie cleanup failed ({why}); clearing the whole kept profile"));
+                    clear_whole_profile(&core_for_clear, &done_proxy, ProfileKind::Kept);
                 };
-                if result.is_err() {
-                    recover("GetCookies failed");
+                if let Err(error) = result {
+                    recover(&error.to_string());
                     return Ok(());
                 }
                 let Some(list) = list else {
-                    recover("GetCookies returned no list");
+                    recover("no cookie list");
                     return Ok(());
                 };
                 let mut count = 0u32;
@@ -4261,209 +4857,72 @@ fn begin_selective_session_wipe(
                     recover("cookie list has no count");
                     return Ok(());
                 }
-
-                // Delete every cookie whose host the user did not keep, and
-                // remember its host so its storage can go too.
-                let mut hosts: Vec<String> = Vec::new();
+                let mut deleted = 0u32;
                 for i in 0..count {
-                    let Ok(cookie) = list.GetValueAtIndex(i) else { continue };
-                    let mut raw = windows::core::PWSTR::null();
-                    if cookie.Domain(&mut raw).is_err() || raw.is_null() {
+                    let Ok(cookie) = list.GetValueAtIndex(i) else {
+                        recover("a cookie could not be read");
+                        return Ok(());
+                    };
+                    let mut raw = PWSTR::null();
+                    if cookie.Domain(&mut raw).is_err() {
+                        recover("a cookie's domain could not be read");
+                        return Ok(());
+                    }
+                    let domain = take_pwstr(raw);
+                    if crate::kept_profile::retain_kept_cookie(&kept, &domain) {
                         continue;
                     }
-                    let domain = raw.to_string().unwrap_or_default();
-                    let domain = domain.trim_start_matches('.').to_ascii_lowercase();
-                    if domain.is_empty() || crate::prefs::wipe_exempts(&exempt, &domain) {
-                        continue;
+                    if manager_for_delete.DeleteCookie(&cookie).is_err() {
+                        recover("a cookie could not be deleted");
+                        return Ok(());
                     }
-                    let _ = manager_for_delete.DeleteCookie(&cookie);
-                    if !hosts.iter().any(|h| h == &domain) {
-                        hosts.push(domain);
-                    }
+                    deleted += 1;
                 }
-
-                // Storage, per origin, over CDP: ClearBrowsingData has no
-                // origin argument, and this is the only call that does.
-                for host in &hosts {
-                    for scheme in ["https", "http"] {
-                        let params = HSTRING::from(format!(
-                            "{{\"origin\":\"{scheme}://{host}\",\"storageTypes\":\"all\"}}"
-                        ));
-                        // `w!` rather than HSTRING::from: a compile-time UTF-16
-                        // literal is embedded in the binary and can be checked
-                        // for there, which a string built at runtime cannot.
-                        // Verifying the shipped artifact matters more than
-                        // usual here -- this call is the storage half of a
-                        // privacy control, and its absence would be silent.
-                        let _ = core_for_cdp.CallDevToolsProtocolMethod(
-                            windows::core::w!("Storage.clearDataForOrigin"),
-                            PCWSTR(params.as_ptr()),
-                            None,
-                        );
-                    }
-                }
-
-                diag(&format!(
-                    "session: kept {} site(s); cleared cookies and storage for {} other origin(s)",
-                    exempt.len(),
-                    hosts.len()
-                ));
-
-                // The HTTP cache carries no identity and has no exceptions,
-                // so it is cleared wholesale either way.
-                if let Ok(v13) = core_for_cdp.cast::<ICoreWebView2_13>() {
-                    if let Ok(profile) = v13.Profile() {
-                        if let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() {
-                            let end_proxy = done_proxy.clone();
-                            let cache_handler =
-                                ClearBrowsingDataCompletedHandler::create(Box::new(move |_| {
-                                    super::finish_session_wipe();
-                                    let _ = end_proxy.send_event(UserEvent::SessionWipeFinished);
-                                    Ok(())
-                                }));
-                            if profile2
-                                .ClearBrowsingData(
-                                    COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
-                                    &cache_handler,
-                                )
-                                .is_ok()
-                            {
-                                return Ok(());
-                            }
+                diag(&format!("kept profile: deleted {deleted} cookie(s) of sites that are not kept"));
+                let end = |proxy: &EventLoopProxy<UserEvent>| {
+                    super::finish_session_wipe(ProfileKind::Kept);
+                    let _ = proxy.send_event(UserEvent::SessionWipeFinished(ProfileKind::Kept));
+                };
+                let started = (|| -> Option<()> {
+                    let profile2 = core_for_clear
+                        .cast::<ICoreWebView2_13>()
+                        .ok()?
+                        .Profile()
+                        .ok()?
+                        .cast::<ICoreWebView2Profile2>()
+                        .ok()?;
+                    let cache_proxy = done_proxy.clone();
+                    let cache_handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
+                        // A cache that could not be cleared is cleared in
+                        // full at the next start (R-034).
+                        if result.is_err() {
+                            owe_kept_clear(&cache_proxy, "!cache");
                         }
-                    }
+                        super::finish_session_wipe(ProfileKind::Kept);
+                        let _ = cache_proxy.send_event(UserEvent::SessionWipeFinished(ProfileKind::Kept));
+                        Ok(())
+                    }));
+                    // The cache and the engine's browsing and download history:
+                    // neither is what keeps a kept site signed in, and the
+                    // history is a plain-text record of every address (see
+                    // KIND SELECTION above `clear_whole_profile`).
+                    let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE
+                        | COREWEBVIEW2_BROWSING_DATA_KINDS_BROWSING_HISTORY
+                        | COREWEBVIEW2_BROWSING_DATA_KINDS_DOWNLOAD_HISTORY;
+                    profile2.ClearBrowsingData(kinds, &cache_handler).ok()
+                })();
+                if started.is_none() {
+                    // The cookies are done; the cache could not be asked,
+                    // so the next start clears the profile in full (R-034).
+                    owe_kept_clear(&done_proxy, "!cache");
+                    end(&done_proxy);
                 }
-                super::finish_session_wipe();
-                let _ = done_proxy.send_event(UserEvent::SessionWipeFinished);
                 Ok(())
             },
         ));
-
         if manager.GetCookies(PCWSTR::null(), &handler).is_err() {
-            diag("session: GetCookies could not start; falling back to the full clear");
+            diag("kept profile: GetCookies could not start; clearing the whole kept profile");
             return false;
-        }
-    }
-    true
-}
-
-/// The profile-wide clear, used by the selective path when it has already
-/// taken the wipe and then cannot finish it honestly.
-fn full_profile_clear(core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2, proxy: &EventLoopProxy<UserEvent>) {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Profile2, ICoreWebView2_13, COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS,
-    };
-    use webview2_com::ClearBrowsingDataCompletedHandler;
-    use windows::core::Interface;
-
-    let end = |proxy: &EventLoopProxy<UserEvent>| {
-        super::finish_session_wipe();
-        let _ = proxy.send_event(UserEvent::SessionWipeFinished);
-    };
-    unsafe {
-        let Ok(v13) = core.cast::<ICoreWebView2_13>() else { return end(proxy) };
-        let Ok(profile) = v13.Profile() else { return end(proxy) };
-        let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() else { return end(proxy) };
-        let done = proxy.clone();
-        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |_| {
-            super::finish_session_wipe();
-            let _ = done.send_event(UserEvent::SessionWipeFinished);
-            Ok(())
-        }));
-        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE
-            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS
-            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE;
-        if profile2.ClearBrowsingData(kinds, &handler).is_err() {
-            end(proxy);
-        }
-    }
-}
-
-fn begin_new_session_wipe(
-    webview: &WebView,
-    proxy: &EventLoopProxy<UserEvent>,
-) -> bool {
-    use webview2_com::Microsoft::Web::WebView2::Win32::{
-        ICoreWebView2Profile2, ICoreWebView2_13,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
-        COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS,
-    };
-    use webview2_com::ClearBrowsingDataCompletedHandler;
-    use windows::core::Interface;
-    use wry::WebViewExtWindows;
-
-    match super::enter_session_wipe() {
-        super::SessionWipeEntry::Ready => return false,
-        super::SessionWipeEntry::Waiting => return true,
-        super::SessionWipeEntry::Start => {}
-    }
-
-    let finish = |proxy: &EventLoopProxy<UserEvent>| {
-        super::finish_session_wipe();
-        let _ = proxy.send_event(UserEvent::SessionWipeFinished);
-    };
-
-    // SITES THE USER ASKED TO KEEP.
-    //
-    // Empty is the default and the whole of the old behaviour: fall straight
-    // through to the profile-wide clear below, unchanged. A non-empty list
-    // cannot use that call at all -- `ClearBrowsingData` takes kinds, not
-    // origins, so there is no "everything except these" to ask for.
-    //
-    // FAILS CLOSED, and that is the load-bearing property. The selective path
-    // enumerates the cookie jar and clears each non-exempt origin itself. If
-    // ANY part of that cannot be done -- no cookie manager, an enumeration
-    // that errors, a runtime too old -- it does not press on having cleared
-    // some of it. It returns false and the full wipe below runs instead. A
-    // user who asked to keep one site must never get a silently half-cleared
-    // profile while the panel says the session was cleaned.
-    let exempt = crate::prefs::load().wipe_exempt_hosts;
-    if !exempt.is_empty() && begin_selective_session_wipe(webview, proxy, &exempt) {
-        return true;
-    }
-
-    let core = webview.webview();
-    unsafe {
-        let Ok(v13) = core.cast::<ICoreWebView2_13>() else {
-            diag("session: no ICoreWebView2_13; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
-            finish(proxy);
-            return true;
-        };
-        let Ok(profile) = v13.Profile() else {
-            diag("session: could not reach the profile; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
-            finish(proxy);
-            return true;
-        };
-        let Ok(profile2) = profile.cast::<ICoreWebView2Profile2>() else {
-            diag("session: no ICoreWebView2Profile2; cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared");
-            finish(proxy);
-            return true;
-        };
-
-        let done_proxy = proxy.clone();
-        let handler = ClearBrowsingDataCompletedHandler::create(Box::new(move |result| {
-            if let Err(error) = result {
-                diag(&format!(
-                    "session: ClearBrowsingData FAILED ({error}); cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared"
-                ));
-            } else {
-                diag("session: cleared cookies, DOM storage, service workers, Cache Storage, and HTTP cache from the previous session");
-            }
-            super::finish_session_wipe();
-            let _ = done_proxy.send_event(UserEvent::SessionWipeFinished);
-            Ok(())
-        }));
-        let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_ALL_SITE
-            | COREWEBVIEW2_BROWSING_DATA_KINDS_SERVICE_WORKERS
-            | COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE;
-        if let Err(error) = profile2.ClearBrowsingData(kinds, &handler) {
-            diag(&format!(
-                "session: ClearBrowsingData could not start ({error}); cookies, DOM storage, service workers, Cache Storage, and HTTP cache were NOT cleared"
-            ));
-            finish(proxy);
         }
     }
     true
@@ -4480,13 +4939,21 @@ fn begin_new_session_wipe(
 /// content webviews), so blocked-ad containers are NOT hidden on Windows.
 /// Network-level blocking -- the part that stops data leaving the machine --
 /// works identically on both backends.
-pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
+///
+/// `policy` is the BASE: the preset at build, the browser-wide policy rebased
+/// onto this tab afterwards. What is put in force is that base with this
+/// tab's ads allowance laid over it (`TabState::apply_base_policy`), and that
+/// is what is returned, so no caller can apply a policy that forgot the
+/// allowance.
+pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) -> TabPolicy {
     use wry::WebViewExtWindows;
-    {
+    let policy = {
         let mut st = view.state.borrow_mut();
-        st.policy = policy.clone();
-        st.freeze.set_auto(policy.freeze_after_load);
-    }
+        let effective = st.apply_base_policy(policy);
+        st.freeze.set_auto(effective.freeze_after_load);
+        effective
+    };
+    let policy = &policy;
     // The engine's answer, not our request. `st.policy` above is what the user
     // asked for; this is whether it is in force. They used to be the same
     // write, which is how a failed setter left the tab running script while
@@ -4519,7 +4986,84 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
     } else {
         SettingState::Failed
     };
-    sync_youtube_script(webview, &view.state, None);
+    sync_youtube_script(webview, &view.state, &view.proxy, None);
+    policy.clone()
+}
+
+// ---- "Allow ads and trackers on this tab" ---------------------------------
+//
+// On WebView2 the request handler reads `TabState::policy` on every request,
+// so the whole engine side of the switch is that policy plus the YouTube
+// script registration. The malicious-site check runs in the same handler
+// BEFORE the policy is consulted and reads nothing this touches.
+
+/// Turns the allowance on for `site` (refused for a Strict Tab and where the
+/// tab blocks nothing). Any ad-list exception on the tab goes with it: the
+/// allowance already covers that host.
+pub fn allow_ads_on_tab(webview: &WebView, view: &TabView, site: String) -> Result<TabPolicy, &'static str> {
+    let policy = {
+        let mut st = view.state.borrow_mut();
+        let policy = st.grant_ads_allowance(site)?;
+        st.set_adlist_override(None);
+        policy
+    };
+    sync_youtube_script(webview, &view.state, &view.proxy, None);
+    Ok(policy)
+}
+
+/// Ends the allowance, if there is one, and puts blocking back. Returns
+/// whether there was one.
+pub fn end_ads_allowance(webview: &WebView, view: &TabView) -> bool {
+    let ended = view.state.borrow_mut().end_ads_allowance();
+    if ended {
+        sync_youtube_script(webview, &view.state, &view.proxy, None);
+    }
+    ended
+}
+
+/// Ends the allowance if `url` is on another site. Returns whether it ended.
+pub fn end_ads_allowance_if_leaving(webview: &WebView, view: &TabView, url: &str) -> bool {
+    let ended = view.state.borrow_mut().end_ads_allowance_unless_same_site(url);
+    if ended {
+        sync_youtube_script(webview, &view.state, &view.proxy, None);
+    }
+    ended
+}
+
+/// Nothing to do here: NavigationStarting ends the allowance for every
+/// top-level navigation, the browser's own included, before its request.
+pub fn end_ads_allowance_before_navigation(_webview: &WebView, _view: &TabView, _url: &str) {}
+
+pub fn ads_allowed_site(view: &TabView) -> Option<String> {
+    view.state.borrow().ads_allowed_site().map(str::to_string)
+}
+
+/// The policy in force in this tab, the allowance included.
+pub fn tab_policy(view: &TabView) -> TabPolicy {
+    view.state.borrow().policy.clone()
+}
+
+/// Always ready: the request handler needs nothing loaded to stop blocking
+/// for one tab, and the malicious-site check covers every request anyway.
+pub fn ads_allow_ready() -> bool {
+    true
+}
+
+/// WebView2 refuses malicious hosts per request, subresources included, so
+/// there is no overlap filter to build here.
+pub fn ad_overlap_wanted() -> bool {
+    false
+}
+
+pub fn on_ad_overlap_failed() {}
+
+/// What this tab blocks without its allowance (the allowance's base policy).
+pub fn ads_base_blocking(view: &TabView) -> bool {
+    view.state.borrow().ads_base_policy().block_ads
+}
+
+pub fn on_ad_overlap_computed(_hosts: Vec<String>, _proxy: &EventLoopProxy<UserEvent>) -> bool {
+    false
 }
 
 /// Brings this tab's YouTube ad script in line with
@@ -4528,32 +5072,45 @@ pub fn apply_policy(webview: &WebView, view: &TabView, policy: &TabPolicy) {
 /// opened or reloaded afterwards, which is what the switch's note says. The
 /// script checks the host itself: WebView2 cannot scope a registration.
 ///
-/// `settled`: at tab build, the tab's first page waits for this answer
+/// `settle`: at tab build, the tab's first page waits for this answer
 /// (`TabState::initial_navigation_ready`), so the completion handler sends the
 /// same release event the local-network guard does; the guard's overdue timer
 /// also releases a registration that is never answered.
 fn sync_youtube_script(
     webview: &WebView,
     state: &Rc<RefCell<TabState>>,
-    settled: Option<(EventLoopProxy<UserEvent>, u64)>,
+    proxy: &EventLoopProxy<UserEvent>,
+    settle: Option<u64>,
+) {
+    use wry::WebViewExtWindows;
+    sync_youtube_script_on(&webview.webview(), state, proxy, settle);
+}
+
+/// `sync_youtube_script` for a caller that holds the COM interface rather
+/// than the wry handle: NavigationStarting, where an ads allowance ends.
+fn sync_youtube_script_on(
+    core: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2,
+    state: &Rc<RefCell<TabState>>,
+    proxy: &EventLoopProxy<UserEvent>,
+    settle: Option<u64>,
 ) {
     use webview2_com::AddScriptToExecuteOnDocumentCreatedCompletedHandler;
-    use wry::WebViewExtWindows;
 
-    let core = webview.webview();
+    let core = core.clone();
     let step = state.borrow().youtube_script_step();
     match step {
         privacy::YoutubeScriptStep::Nothing => return,
         privacy::YoutubeScriptStep::Remove => {
-            let id = state.borrow().youtube_script_id.clone();
-            if let Some(id) = id {
-                // The id is forgotten only once the engine confirms the
-                // removal; a refused removal keeps it, so the next change of
-                // the switch can try again (final review YT R-005).
-                if remove_document_script(&core, &id, "YouTube ads") {
-                    state.borrow_mut().youtube_script_id = None;
-                }
-            }
+            // Every copy the engine holds goes; an id is forgotten only once
+            // the engine confirms its removal, so a refused one stays listed
+            // and the next change of the switch tries again (final review YT
+            // R-005, review 2026-10-12 R-001).
+            let ids = state.borrow().youtube_script_ids.clone();
+            let kept: Vec<String> = ids
+                .into_iter()
+                .filter(|id| !remove_document_script(&core, id, "YouTube ads"))
+                .collect();
+            state.borrow_mut().youtube_script_ids = kept;
             return;
         }
         privacy::YoutubeScriptStep::Add => {}
@@ -4565,7 +5122,7 @@ fn sync_youtube_script(
         .collect();
     let remember = Rc::clone(state);
     let core_for_handler = core.clone();
-    let settled_for_handler = settled.clone();
+    let tell = proxy.clone();
     let handler = AddScriptToExecuteOnDocumentCreatedCompletedHandler::create(Box::new(
         move |hr, script_id| {
             {
@@ -4573,23 +5130,25 @@ fn sync_youtube_script(
                 st.youtube_script_adding = false;
                 if hr.is_err() {
                     diag("YouTube ads: registration REFUSED by the engine; YouTube shows its ads in this tab");
-                } else if !st.policy.block_youtube_ads || st.youtube_script_id.is_some() {
+                } else if !st.policy.block_youtube_ads || !st.youtube_script_ids.is_empty() {
                     // Switched off meanwhile, or a second copy after the
                     // overdue timer let a re-add through: keep at most one.
+                    // A copy the engine will not remove is still running, so
+                    // it is listed rather than forgotten.
                     drop(st);
                     if !remove_document_script(&core_for_handler, &script_id, "YouTube ads") {
-                        let mut st = remember.borrow_mut();
-                        if st.youtube_script_id.is_none() {
-                            st.youtube_script_id = Some(script_id);
-                        }
+                        remember.borrow_mut().youtube_script_ids.push(script_id);
                     }
                 } else {
-                    st.youtube_script_id = Some(script_id);
+                    st.youtube_script_ids.push(script_id);
                 }
             }
-            if let Some((proxy, id)) = &settled_for_handler {
-                let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(*id));
+            if let Some(id) = settle {
+                let _ = tell.send_event(UserEvent::LocalNetworkGuardSettled(id));
             }
+            // Whatever the engine said reaches the toolbar and panels now,
+            // not at the next navigation (review 2026-10-12, R-002).
+            let _ = tell.send_event(UserEvent::TabStatusChanged);
             Ok(())
         },
     ));
@@ -4599,9 +5158,10 @@ fn sync_youtube_script(
     if result.is_err() {
         state.borrow_mut().youtube_script_adding = false;
         diag("YouTube ads: AddScriptToExecuteOnDocumentCreated call failed; YouTube shows its ads in this tab");
-        if let Some((proxy, id)) = &settled {
-            let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(*id));
+        if let Some(id) = settle {
+            let _ = proxy.send_event(UserEvent::LocalNetworkGuardSettled(id));
         }
+        let _ = proxy.send_event(UserEvent::TabStatusChanged);
     }
 }
 
@@ -6154,6 +6714,58 @@ pub fn note_app_navigation(view: &TabView, url: &str) {
     view.state.borrow_mut().note_app_navigation(url);
 }
 
+/// Whether another top-level navigation is about to replace this tab's page
+/// (`TabState::replacement_pending`).
+pub fn replacement_pending(view: &TabView) -> bool {
+    view.state.borrow().replacement_pending()
+}
+
+/// The document on screen (`TabState::current_document`).
+pub fn current_document(view: &TabView) -> Option<u64> {
+    view.state.borrow().current_document()
+}
+
+/// Whether a reload without the cache failed since last asked.
+pub fn take_bypass_reload_failed(view: &TabView) -> bool {
+    view.state.borrow_mut().take_bypass_reload_failed()
+}
+
+/// Reload without the cache (the engine's Ctrl+F5), for where ad and tracker
+/// blocking has just come back for the tab. A plain reload lets the page take
+/// a script it fetched while blocking was off from the tab's own memory cache,
+/// which never reaches the request handler: measured 2026-10-12 on WebView2
+/// 155, a plain reload and a same-site link both ran a cached tracker script
+/// after the per-tab switch went off, while a reload that skipped the cache
+/// blocked it, and the same-site link after that blocked it too.
+///
+/// The engine answers the call later. A failure is recorded on the tab
+/// (`TabState::note_bypass_reload_failed`) and the next reload skips the cache
+/// in its place (round 2, R-001). It does not reload on its own: by then the
+/// user may be answering a prompt or going somewhere else (round 6, R-003).
+pub fn reload_bypassing_cache(webview: &WebView, view: &TabView) -> Result<(), ()> {
+    use webview2_com::CallDevToolsProtocolMethodCompletedHandler;
+    use wry::WebViewExtWindows;
+    let core = webview.webview();
+    let state = view.state.clone();
+    let handler = CallDevToolsProtocolMethodCompletedHandler::create(Box::new(
+        move |error_code, _result| {
+            if let Err(error) = &error_code {
+                diag(&format!("reload without the cache FAILED ({error}); the next reload skips the cache"));
+                state.borrow_mut().note_bypass_reload_failed();
+            }
+            Ok(())
+        },
+    ));
+    unsafe {
+        core.CallDevToolsProtocolMethod(
+            windows::core::w!("Page.reload"),
+            windows::core::w!("{\"ignoreCache\":true}"),
+            &handler,
+        )
+    }
+    .map_err(|_| ())
+}
+
 /// The navigation just announced with `note_app_navigation` did not start.
 pub fn forget_app_navigation(view: &TabView) {
     view.state.borrow_mut().forget_expected_navigation();
@@ -6261,6 +6873,11 @@ pub fn freeze_phase(view: &TabView) -> FreezePhase {
     view.state.borrow().freeze.phase()
 }
 
+/// Frozen by the user's click, which a reload does not lift.
+pub fn manually_frozen(view: &TabView) -> bool {
+    view.state.borrow().freeze.is_manually_frozen()
+}
+
 /// The hosts the tab's freeze lets through, for the panel's "Allowed" rows.
 pub fn freeze_allowed_hosts(view: &TabView) -> Vec<String> {
     view.state.borrow().freeze.overrides()
@@ -6308,6 +6925,33 @@ pub fn script_setting(view: &TabView) -> &'static str {
     view.state.borrow().script_setting.as_str()
 }
 
+/// What the engine did with this tab's Fingerprint Divergence script: the
+/// completion handler's answer, Pending until it arrives.
+pub fn divergence_install(view: &TabView) -> privacy::ScriptInstall {
+    view.state.borrow().divergence_install
+}
+
+/// What the engine did with this tab's YouTube ad script. The engine's id
+/// for the registration is the evidence; see `TabState::youtube_install`.
+pub fn youtube_ads_install(view: &TabView) -> privacy::ScriptInstall {
+    view.state.borrow().youtube_install()
+}
+
+/// Whether the ENGINE runs script in this tab right now, read back from
+/// WebView2's own settings rather than from the policy the tab was given.
+/// `None` when the settings cannot be read. For checks (the smoke run) that
+/// must not trust our own record of what was asked.
+pub fn engine_script_enabled(webview: &WebView) -> Option<bool> {
+    use wry::WebViewExtWindows;
+    // SAFETY: COM property getters; a failure is reported as None.
+    unsafe {
+        let settings = webview.webview().Settings().ok()?;
+        let mut on = windows::core::BOOL::default();
+        settings.IsScriptEnabled(&mut on).ok()?;
+        Some(on.as_bool())
+    }
+}
+
 pub fn fingerprint_probe_reporting(view: &TabView) -> &'static str {
     view.state.borrow().fingerprint_probe_reporting.as_str()
 }
@@ -6316,6 +6960,15 @@ pub fn fingerprint_probe_reporting(view: &TabView) -> &'static str {
 /// a probe run (or a future panel) can tell "no handler was ever registered"
 /// apart from "registered, but the block is not sticking" -- two failures
 /// that look identical from the outside and need completely different fixes.
+/// Whether a kept tab's boundary can work: requests intercepted and
+/// top-level navigations tracked (kept_profile.rs). A kept tab without
+/// both is never used (state.rs build_tab).
+pub fn kept_boundary_ready(view: &TabView) -> bool {
+    let st = view.state.borrow();
+    matches!(st.interception, privacy::InterceptionState::Registered { .. })
+        && st.navigation_tracking == SettingState::Applied
+}
+
 pub fn interception_state(view: &TabView) -> &'static str {
     view.state.borrow().interception.as_str()
 }
@@ -7062,6 +7715,43 @@ fn write_window_accent(
 /// title-bar re-apply.
 pub fn window_is_maximized(hosts: &Hosts) -> bool {
     hosts.window.is_maximized()
+}
+
+/// The window has no title bar on Windows; the chrome draws its controls
+/// (window_frame.rs, main.rs).
+pub fn custom_window_frame() -> bool {
+    true
+}
+
+/// One title-bar action from the chrome. Close is AppState's (it ends the
+/// event loop). Drag and resize hand the press to the system's own move and
+/// size loops, so snapping and the minimum size behave as with a real
+/// title bar; a resize from the top band does nothing while maximized.
+pub fn window_control(
+    hosts: &Hosts,
+    action: crate::window_frame::WindowAction,
+) -> Result<(), &'static str> {
+    use crate::window_frame::{ResizeEdge, WindowAction};
+    use tao::window::ResizeDirection;
+    let window = &hosts.window;
+    match action {
+        WindowAction::Minimize => window.set_minimized(true),
+        WindowAction::Maximize => window.set_maximized(!window.is_maximized()),
+        WindowAction::Drag => window.drag_window().map_err(|_| "window_failed")?,
+        WindowAction::Resize(edge) => {
+            if window.is_maximized() {
+                return Ok(());
+            }
+            let direction = match edge {
+                ResizeEdge::North => ResizeDirection::North,
+                ResizeEdge::NorthWest => ResizeDirection::NorthWest,
+                ResizeEdge::NorthEast => ResizeDirection::NorthEast,
+            };
+            window.drag_resize_window(direction).map_err(|_| "window_failed")?
+        }
+        WindowAction::Close => return Err("bad_args"),
+    }
+    Ok(())
 }
 
 /// The deferred re-apply after a maximize or restore.

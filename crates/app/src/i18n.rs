@@ -111,6 +111,11 @@ pub mod keys {
     pub const CHROME_ENGINE_FLOOR_EVERGREEN: &str = "chrome-engine-floor-evergreen";
     pub const CHROME_ENGINE_FLOOR_BODY_RESTART: &str = "chrome-engine-floor-body-restart";
     pub const CHROME_FULLSCREEN_NOTICE: &str = "chrome-fullscreen-notice";
+    pub const CHROME_DUPLICATE_SITE_BODY: &str = "chrome-duplicate-site-body";
+    pub const CHROME_KEEP_OFFER_BODY: &str = "chrome-keep-offer-body";
+    pub const CHROME_KEEP_MOVED: &str = "chrome-keep-moved";
+    pub const CHROME_KEEP_FORM_NOT_MOVED: &str = "chrome-keep-form-not-moved";
+    pub const CHROME_KEEP_LOOP_STOPPED: &str = "chrome-keep-loop-stopped";
     pub const ENGINE_WINDOW_TITLE: &str = "engine-window-title";
     pub const ENGINE_WINDOW_BODY: &str = "engine-window-body";
     pub const ENGINE_WINDOW_ACTION: &str = "engine-window-action";
@@ -121,6 +126,11 @@ pub mod keys {
     pub const ENGINE_WINDOW_OPEN_UPDATER: &str = "engine-window-open-updater";
     pub const ENGINE_WINDOW_COPY: &str = "engine-window-copy";
     pub const ENGINE_WINDOW_CLOSE: &str = "engine-window-close";
+    pub const SANDBOX_WINDOW_TITLE: &str = "sandbox-window-title";
+    pub const SANDBOX_WINDOW_BODY: &str = "sandbox-window-body";
+    pub const SANDBOX_WINDOW_CAUSE: &str = "sandbox-window-cause";
+    pub const SANDBOX_WINDOW_DETAIL: &str = "sandbox-window-detail";
+    pub const SANDBOX_WINDOW_CLOSE: &str = "sandbox-window-close";
 
     /// Every key, for the coverage checks. A constant added above and
     /// forgotten here fails `every_key_resolves` the moment nothing else
@@ -139,6 +149,11 @@ pub mod keys {
         CHROME_ENGINE_FLOOR_EVERGREEN,
         CHROME_ENGINE_FLOOR_BODY_RESTART,
         CHROME_FULLSCREEN_NOTICE,
+        CHROME_DUPLICATE_SITE_BODY,
+        CHROME_KEEP_MOVED,
+        CHROME_KEEP_FORM_NOT_MOVED,
+        CHROME_KEEP_LOOP_STOPPED,
+        CHROME_KEEP_OFFER_BODY,
         ENGINE_WINDOW_TITLE,
         ENGINE_WINDOW_BODY,
         ENGINE_WINDOW_ACTION,
@@ -149,6 +164,11 @@ pub mod keys {
         ENGINE_WINDOW_OPEN_UPDATER,
         ENGINE_WINDOW_COPY,
         ENGINE_WINDOW_CLOSE,
+        SANDBOX_WINDOW_TITLE,
+        SANDBOX_WINDOW_BODY,
+        SANDBOX_WINDOW_CAUSE,
+        SANDBOX_WINDOW_DETAIL,
+        SANDBOX_WINDOW_CLOSE,
     ];
 }
 
@@ -337,13 +357,39 @@ mod tests {
     }
 
     #[test]
+    fn the_duplicate_site_body_names_the_site_and_nothing_else() {
+        // The site is the only argument, and it is isolated like every other
+        // placeable, so a right-to-left domain cannot reorder the sentence.
+        let l10n = english();
+        let mut args = Args::default();
+        args.set("site", "google.com");
+        assert_eq!(
+            l10n.resolve(keys::CHROME_DUPLICATE_SITE_BODY, &args),
+            "\u{2068}google.com\u{2069} is already open in another tab."
+        );
+    }
+
+    #[test]
+    fn the_keep_offer_names_the_site_and_says_what_keeping_changes() {
+        // The site is the only argument, isolated like every placeable.
+        // The sentence must say where the site goes: its own storage, which
+        // stays on the computer between sessions (kept_profile.rs).
+        let l10n = english();
+        let mut args = Args::default();
+        args.set("site", "messenger.com");
+        let body = l10n.resolve(keys::CHROME_KEEP_OFFER_BODY, &args);
+        assert!(body.contains("\u{2068}messenger.com\u{2069}"), "{body}");
+        assert!(body.contains("its own storage"), "{body}");
+    }
+
+    #[test]
     fn the_resolver_body_composes_for_both_producers() {
         // The banner names the resolver the user chose, says what is broken,
         // and says how to get online; the fallback name reads as language.
         let l10n = english();
         assert_eq!(
             crate::resolver_probe::banner_body(&l10n, "quad9"),
-            "PATANYX cannot reach \u{2068}Quad9\u{2069}, which you chose to resolve the sites you visit, so pages will not load until it can. This usually means the network is blocking it, which is common on hotel, airport and cafe WiFi before you sign in. It can also mean the connection is down, or a VPN is still reconnecting. To get online here: open DNS in the toolbar, choose System, and restart PATANYX. That sends your lookups to this network instead of to \u{2068}Quad9\u{2069}, so change it back when you leave."
+            "PATANYX cannot reach \u{2068}Quad9\u{2069}, which you chose to resolve the sites you visit, so pages will not load until it can. This usually means the network is blocking it, which is common on hotel, airport and cafe WiFi before you sign in. It can also mean the connection is down, or a VPN is still reconnecting. To get online here: open DNS in the toolbar (under Network, if that group is folded), choose System, and restart PATANYX. That sends your lookups to this network instead of to \u{2068}Quad9\u{2069}, so change it back when you leave."
         );
         assert!(crate::resolver_probe::banner_body(&l10n, "system")
             .contains("cannot reach \u{2068}your DNS service\u{2069}, which you chose"));

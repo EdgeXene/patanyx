@@ -1,4 +1,4 @@
-# PATANYX ad and tracker rules: Tracking -- 116381 hosts.
+# PATANYX ad and tracker rules: Tracking -- 116380 hosts.
 # Regenerate with scripts/build-adlist.sh. Retrieved 2026-09-01.
 #
 # Source: ShadowWhisperer -- https://github.com/ShadowWhisperer/BlockLists --
@@ -23194,7 +23194,6 @@ consent.cx3-forum.de
 consent.cx30-forum.de
 consent.cx60forum.de
 consent.da-oben.de
-consent.dailymotion.com
 consent.danisch.de
 consent.darts1.de
 consent.dasgelbeforum.net

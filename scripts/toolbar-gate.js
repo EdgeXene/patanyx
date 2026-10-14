@@ -157,7 +157,16 @@ const MUST_BE_VISIBLE = [
   ["btn-chat", "chat, in the builds that have it"],
   ["btn-bookmark", "bookmarking the current page"],
   ["btn-library", "bookmarks and downloads"],
-  ["btn-about", "version, licence and third-party notices"],
+  ["btn-main-menu", "the menu holding Reader View, print, integrity, updates and about"],
+];
+// Controls that live in the main menu since 1.0.7: the real button stays in
+// the toolbar under `in-menu` and the named proxy clicks it. Reachability,
+// not visibility, is what this gate holds for these: see the menu checks.
+const IN_MENU = [
+  ["btn-reader", "menu-reader", "Reader View"],
+  ["btn-about", "menu-about", "version, licence and third-party notices"],
+  ["btn-integrity", "menu-integrity", "page integrity"],
+  ["btn-update", "menu-update", "updates"],
 ];
 
 const fireChrome = (event, data) => global.window.__rb_event({ event, data });
@@ -401,9 +410,9 @@ check("every feature control is in the toolbar", () => {
         id +
         " (" +
         what +
-        ") is not in the toolbar. Every control is meant to be visible " +
-        "without opening anything; a gate that only checked `.hidden` on the " +
-        "element would not notice it had moved.",
+        ") is not in the toolbar. Every control outside the Menu is meant " +
+        "to be on the toolbar (folded or not); a gate that only checked " +
+        "`.hidden` on the element would not notice it had moved.",
     );
   }
 });
@@ -517,13 +526,18 @@ check("every accent swatch names its colour to a screen reader", () => {
     "teal",
     "gray",
     "purple",
+    "orange",
+    "mint green",
+    "gold",
+    "lavender",
+    "copper",
   ];
   const swatches = [
     ...html.matchAll(/<button\b([^>]*\bclass="[^"]*theme-swatch[^"]*"[^>]*)>/g),
   ];
   assert(
-    swatches.length === 9,
-    "expected nine accent swatches, found " + swatches.length,
+    swatches.length === 14,
+    "expected fourteen accent swatches, found " + swatches.length,
   );
   for (const [, attrs] of swatches) {
     const id = (attrs.match(/id="([a-z0-9_-]+)"/) || [])[1] || "(no id)";
@@ -879,20 +893,23 @@ check("nothing can hide a control behind a disclosure", () => {
   // The property that actually matters, and the reason the previous version of
   // this file existed. "Every control is in the toolbar" would stay true if
   // somebody nested a sheet inside the toolbar and filled it.
-  for (const [id, what] of [
-    ["menu-sheet", "an overflow sheet"],
-    ["btn-menu", "a hamburger"],
-  ]) {
+  //
+  // 1.0.7 brought a menu back DELIBERATELY, and this is the gate changing for
+  // it rather than being routed around: the sealed-sheet markup stays banned,
+  // and what replaces the ban for the four controls that moved is the
+  // reachability check below -- the proxy exists, clicking it opens the real
+  // panel, and Escape closes one layer at a time.
+  for (const [id, what] of [["menu-sheet", "an overflow sheet"]]) {
     assert(
       !html.includes('id="' + id + '"'),
       "#" +
         id +
         " (" +
         what +
-        ") is back in index.html. The layout exists so every control is " +
-        "visible without opening anything -- if an overflow menu is genuinely " +
-        "wanted again, this gate is the thing to change deliberately, not to " +
-        "route around.",
+        ") is back in index.html. A sealed sheet makes reachability " +
+        "assertions vacuous; the Menu that replaced it is held to the " +
+        "reachability checks below. A new overflow surface is a change to " +
+        "this gate, made deliberately, not a way around it.",
     );
   }
   assert(
@@ -901,8 +918,177 @@ check("nothing can hide a control behind a disclosure", () => {
   );
 });
 
+check("every control in the menu is reachable through it", async () => {
+  for (const [id, proxy, what] of IN_MENU) {
+    assert(
+      TOOLBAR_SRC.includes('id="' + id + '"') || id === "btn-update",
+      "#" + id + " (" + what + ") left the toolbar markup; its handlers and ids are written there",
+    );
+    assert(
+      html.includes('id="' + proxy + '"') && html.includes('data-proxy-for="' + id + '"'),
+      "#" + proxy + " does not proxy #" + id + " (" + what + ") in the markup",
+    );
+    // The markup's pairing and the table chrome.js acts on must agree.
+    assert(
+      chromeJs.includes('["' + proxy + '", "' + id + '"]'),
+      "MENU_ENTRIES in chrome.js does not pair #" + proxy + " with #" + id,
+    );
+  }
+  const menu = global.$("main-menu");
+  const button = global.$("btn-main-menu");
+  assert(menu.hidden === true, "the menu is open before anything pressed it");
+  // A panel stays open under the menu, and Escape peels one layer per press.
+  global.$("btn-vault")._fire("click");
+  await flush();
+  assert(global.$("vault-panel").hidden === false, "setup: the vault did not open");
+  button._fire("click");
+  await flush();
+  assert(menu.hidden === false, "the menu did not open");
+  assert(button.getAttribute("aria-expanded") === "true", "the button does not say it is expanded");
+  assert(global.$("vault-panel").hidden === false, "opening the menu closed the open panel");
+  assert(global.document.body.classList.contains("menu-open"), "body does not wear menu-open");
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+  assert(menu.hidden === true || menu.classList.contains("menu-closing"), "Escape did not close the menu");
+  assert(global.$("vault-panel").hidden === false, "one Escape closed the menu AND the panel");
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+  // A proxy opens the real panel: About through the menu.
+  button._fire("click");
+  await flush();
+  global.$("menu-about")._fire("click");
+  await flush();
+  assert(global.$("about-panel").hidden === false, "the About proxy did not open the About panel");
+  assert(menu.hidden === true || menu.classList.contains("menu-closing"), "choosing an entry left the menu open");
+  // Escape from that panel returns the keyboard to the VISIBLE menu button,
+  // not to the hidden About pill. The stub's focus() is a no-op, so the
+  // button gets one that records the call, as other gates give a notice a
+  // working remove().
+  let focused = false;
+  button.focus = () => {
+    focused = true;
+  };
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+  assert(global.$("about-panel").hidden === true, "Escape did not close the panel opened through the menu");
+  assert(focused, "focus did not return to the menu button after a proxied panel closed");
+  // Print asks Rust, through the one element that does it.
+  global.rbCalls.length = 0;
+  global.$("menu-print")._fire("click");
+  await flush();
+  assert(global.rbCalls.some((c) => c.cmd === "page_print"), "the Print entry sent no page_print");
+});
+
+check("the menu settles every press and Tab before the panel under it", async () => {
+  // Review round 2, R-001 and R-002. A press on an entry used to reach the
+  // panel's dismissal handler as "outside the panel" and close the panel
+  // under the menu (running its onClose) before the entry's click arrived.
+  const menu = global.$("main-menu");
+  const button = global.$("btn-main-menu");
+  const vault = global.$("vault-panel");
+  const menuGone = () => menu.hidden === true || menu.classList.contains("menu-closing");
+  const inMenu = { closest: (sel) => (sel.includes("#main-menu") ? menu : null) };
+  if (vault.hidden) global.$("btn-vault")._fire("click");
+  await flush();
+  assert(vault.hidden === false, "setup: the vault did not open");
+  // The whole sequence a pointer makes: the press, then the click.
+  button._fire("click");
+  await flush();
+  global.fireDocument("mousedown", { target: inMenu });
+  global.$("menu-print")._fire("click");
+  await flush();
+  assert(vault.hidden === false, "a press on a menu entry closed the panel under the menu");
+  // A press outside closes the menu and only the menu.
+  button._fire("click");
+  await flush();
+  assert(!menuGone(), "setup: the menu did not open");
+  global.fireDocument("mousedown", {});
+  await flush();
+  assert(menuGone(), "a press outside the menu did not close it");
+  assert(vault.hidden === false, "one press outside closed the menu AND the panel");
+  // Tab closes the menu rather than walking into the panel behind it.
+  button._fire("click");
+  await flush();
+  let prevented = false;
+  global.fireDocument("keydown", { key: "Tab", preventDefault: () => (prevented = true) });
+  await flush();
+  assert(menuGone() && prevented, "Tab in the menu did not close it");
+  assert(vault.hidden === false, "Tab in the menu closed the panel");
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+});
+
+check("every entry for a moved control reaches its real button", async () => {
+  // Round 2, R-009: the markup and the table were checked, but only About
+  // and Print were ever pressed.
+  const button = global.$("btn-main-menu");
+  for (const [id, proxy, what] of IN_MENU) {
+    const real = global.$(id);
+    const entry = global.$(proxy);
+    button._fire("click");
+    await flush();
+    if (!real) {
+      // Built at runtime by a script this harness does not load (update.js):
+      // with no button there is no entry.
+      assert(entry.hidden === true, "#" + proxy + " shows with no #" + id + " to press");
+      global.fireDocument("keydown", { key: "Escape" });
+      await flush();
+      continue;
+    }
+    let hits = 0;
+    real.addEventListener("click", () => {
+      hits += 1;
+    });
+    entry._fire("click");
+    await flush();
+    assert(hits === 1, "#" + proxy + " (" + what + ") did not press #" + id);
+    // Whatever opened, close it.
+    global.fireDocument("keydown", { key: "Escape" });
+    await flush();
+    global.fireDocument("keydown", { key: "Escape" });
+    await flush();
+  }
+});
+
+check("an entry that only acts gives the keyboard back to the menu button", async () => {
+  // Round 2, R-003: Save as PDF opens no panel, so keeping focus "for the
+  // panel" left it on an entry that was disappearing.
+  const button = global.$("btn-main-menu");
+  let focused = false;
+  button.focus = () => {
+    focused = true;
+  };
+  button._fire("click");
+  await flush();
+  focused = false;
+  global.rbCalls.length = 0;
+  global.$("menu-save-pdf")._fire("click");
+  await flush();
+  assert(global.rbCalls.some((c) => c.cmd === "page_save_pdf"), "Save as PDF sent nothing");
+  assert(focused, "focus did not return to the menu button after an entry that opens no panel");
+});
+
+check("Customize toolbar never closes an open Theme panel", async () => {
+  // Round 2, R-011: the entry clicked the Theme button, which TOGGLES, so
+  // with Theme already open it closed it.
+  const theme = global.$("theme-panel");
+  if (theme.hidden) global.$("btn-theme")._fire("click");
+  await flush();
+  assert(theme.hidden === false, "setup: Theme did not open");
+  global.$("btn-main-menu")._fire("click");
+  await flush();
+  global.$("menu-customize")._fire("click");
+  await flush();
+  assert(theme.hidden === false, "Customize toolbar closed the Theme panel it should show");
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+});
+
 check("nothing in the toolbar is a button that does nothing", () => {
-  for (const [id, what] of MUST_BE_VISIBLE) {
+  for (const [id, what] of MUST_BE_VISIBLE.concat(IN_MENU.map(([id, , what]) => [id, what]))) {
+    // Updates and Integrity are built by update.js and integrity.js, which
+    // this chrome.js-only harness does not load; their own gates click them.
+    if ((id === "btn-update" || id === "btn-integrity") && !global.$(id)) continue;
     // btn-chat is exempt HERE and nowhere else. This harness loads chrome.js
     // only, which is what a public build evaluates, and in that build the chat
     // button is correctly inert and correctly hidden -- chat.js binds it and

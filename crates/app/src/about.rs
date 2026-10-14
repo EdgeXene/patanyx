@@ -148,8 +148,10 @@ type Feature = (&'static str, &'static str, &'static str);
 // the user can DO, and the two platforms do not offer the same thing. The
 // per-address exception is a WebView2 feature. On WebKitGTK the engine
 // enforces with a compiled content filter and there is no way to except one
-// host from it for one tab, so the only route past the list is the browser
-// wide switch, which is a different promise and has to be described as one.
+// host from it for one tab, so the routes past the list are the browser wide
+// switch and, since 1.0.7, allowing ads and trackers in one tab for the site
+// it is on. Both are different promises from an exception for one address,
+// and have to be described as what they are.
 //
 // A single sentence covering both would be false on one of them, which is the
 // exact defect this file already carries a fix for one row further down.
@@ -160,8 +162,9 @@ const F_ADS: Feature = (
     "Ads and trackers are blocked from the first time you open \
      PATANYX, and one switch turns it off. Some pages you actually want end up \
      on the list. You can open one for that address in that tab, and it closes \
-     behind you instead of becoming a permanent exception. A blocked request \
-     never leaves your computer, so nobody has a record of it.",
+     behind you instead of becoming a permanent exception. You can also allow \
+     ads and trackers in one tab until it goes to another site or closes. A \
+     blocked request never leaves your computer, so nobody has a record of it.",
 );
 #[cfg(not(windows))]
 const F_ADS: Feature = (
@@ -169,7 +172,8 @@ const F_ADS: Feature = (
     "Automatic",
     "Ads and trackers are blocked from the first time you open \
      PATANYX, and one switch turns it off. Some pages you actually want end up \
-     on the list. On Linux that switch is the only way past it, and it applies \
+     on the list. On Linux you can allow ads and trackers in one tab until it \
+     goes to another site or closes, or turn that switch off, which applies \
      to every site until you turn it back on. A blocked request never leaves \
      your computer, so nobody has a record of it.",
 );
@@ -244,8 +248,11 @@ const F_LEDGER: Feature = (
 const F_FREEZE: Feature = (
     "Tab Freeze",
     "On demand",
-    "One click and the tab stops sending anything until you let it go \
-     again. Handy when a page will not stop chattering in the background.",
+    "One click stops the tab from making new network requests until you \
+     unfreeze it. Connections it already has open are not closed. To let a \
+     page reach a host it needs, allow that host in the Tab Activity panel; \
+     the exception covers that host alone, not names under it, and lasts \
+     until the tab closes.",
 );
 // Windows only, and the tag says so, because WebKitGTK has no encrypted-DNS
 // support of any kind -- the resolver control is hidden outright on Linux
@@ -318,7 +325,11 @@ const F_VAULT: Feature = (
      recovery key when you set \
      the vault up, shown once, and it is the only way in if you forget your \
      passphrase. Keep it safe: a lost recovery key cannot be reissued. \
-     If your vault has no recovery key at all, the Backup tab makes you one. The vault locks \
+     If your vault has no recovery key at all, the Backup tab makes you one. \
+     The Backup tab can also save your vault and Library, without download \
+     records, as one encrypted export that opens only with its own \
+     passphrase, not your recovery key. You choose where it is saved, and \
+     PATANYX does not send it anywhere. The vault locks \
      itself after five minutes of nothing happening. Typing anywhere counts, \
      so it will not lock while you are working, and you get a countdown and \
      an \"I'm still here\" button a minute before. Five minutes can be 15, 30 \
@@ -359,8 +370,9 @@ const F_BOOKMARKS: Feature = (
 const F_READER: Feature = (
     "Reader View",
     "On demand",
-    "Press F9, or Reader View in the toolbar, to read the article on the \
-     current page as plain text, without the menus, ads and pop-ups around it. \
+    "Press F9, or open the Menu and choose Reader View, to read the article \
+     on the current page as plain text, without the site menus, ads and \
+     pop-ups around it. \
      It uses the copy of the page this tab already received, so it loads \
      nothing new. Images are left out and their captions stay. A page built \
      entirely by scripts has no text for it to show.",
@@ -371,11 +383,38 @@ const F_READER: Feature = (
 const F_TAB_GROUPS: Feature = (
     "Tab Groups",
     "On demand",
-    "Right-click a tab, or use Groups in the toolbar, to put tabs in a named, \
-     colored group that stays together in the tab strip and folds away with \
-     one click. Groups last until you close PATANYX. To keep one, shelve it: \
+    "Right-click a tab, or use Groups in the toolbar (under Tabs, if that \
+     group is folded), to put tabs in a named, colored group that stays \
+     together in the tab strip and folds away with one click. Groups last until you close PATANYX. To keep one, shelve it: \
      its tabs close, the group goes to your encrypted Library, and restoring \
      the shelf brings it back.",
+);
+// Checkable against code: the rules are in duplicate_site.rs (registrable
+// domain; only sites the user opens; dismissals in memory only, never saved);
+// the switch is prefs.duplicate_site_notice in the Theme panel's "Tabs"
+// section. Free, like every everyday convenience.
+const F_ALREADY_OPEN: Feature = (
+    "Already Open",
+    "Automatic",
+    "Open a site that another tab already has open, and PATANYX offers to \
+     switch to that tab or close the new one. Dismiss stops it for that site \
+     until PATANYX closes, and the sites you dismiss are never saved. One \
+     switch in the Theme panel turns it off.",
+);
+// Checkable against the Theme panel (en.ftl chrome-scheme-*, chrome-accent-*,
+// chrome-texture-*, chrome-pack-*). Free permanently: theme packs left the
+// Premium list for good (see PREMIUM below), so this tag never says Premium.
+// A new scheme, accent, texture or preset changes the counts and names here.
+const F_THEMES: Feature = (
+    "Themes",
+    "On demand; free",
+    "The Theme panel changes how PATANYX looks. Choose the chrome colors \
+     (Dark, White, Black, Graphite, Midnight or Paper), an accent color and \
+     a texture (Glow, Grain or Stripes), or start from one of eight presets; \
+     all of them are free. The fourteen accent colors are PATANYX \
+     Original, Ion, Sardonyx, Aether, Chloris, Elektron, Thalassa, Lithos, \
+     Porphyra, Pyrrhos, Minthe, Chrysos, Iris and Chalkos. Changes show at \
+     once.",
 );
 const F_TUNNEL: Feature = (
     "Private Tunnel",
@@ -555,6 +594,8 @@ fn features() -> Vec<Feature> {
         F_BOOKMARKS,
         F_READER,
         F_TAB_GROUPS,
+        F_ALREADY_OPEN,
+        F_THEMES,
         F_TUNNEL,
         F_OCR,
         F_INTEGRITY,
@@ -618,7 +659,13 @@ const LIMITS: &[(&str, &str)] = &[
         "Before the first page opens, a new PATANYX session clears the last \
          session's cookies, site storage, service workers, and caches. Those \
          bytes can still sit on disk after PATANYX closes until the next \
-         launch clears them, so this is not secure deletion.",
+         launch clears them, so this is not secure deletion. On Windows, \
+         sites you keep in the privacy panel are the exception: their own \
+         storage, including what other sites store while embedded in their \
+         pages, stays on disk from one session to the next. A start deletes \
+         only the cache and other sites' cookies there, unless it owes a \
+         full clear of every kept site, as it does after you stop keeping \
+         one.",
     ),
 ];
 
@@ -660,17 +707,19 @@ const PREMIUM_HEAD: &str = "Free and Premium";
 /// is what makes this permanent: theme packs can never be sold. That is the
 /// point of writing it here rather than only in a changelog. If the pack is
 /// ever to earn money, it has to be NEW accents and NEW schemes on top of
-/// these, which the wording deliberately leaves room for -- "all nine" and
-/// "all three" are counts of what ships today, not a promise about a tenth.
+/// these, which the wording deliberately leaves room for -- the counts are
+/// of what ships today, not a promise about the next one. (1.0.7 added five
+/// accents, three schemes, presets and textures, all free: the counts moved
+/// to fourteen and six, and nothing was taken out of the free tier.)
 /// TWO VARIANTS, one per compiled build, because this string names what
 /// payment unlocks IN THIS BINARY. The four contact features exist only
 /// where the `chat` feature does (ipc.rs answers `unsupported` without it),
 /// so the public build must not list them as unlockable, and the Nabu-X
 /// build must not tell its user they are absent.
 #[cfg(not(feature = "chat"))]
-const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, and checking an image for text before you share it all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nPrivate chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact are not in this build. They are compiled into a separate Nabu-X build, which is also a free download, and ask for the same license inside it.\n\nThe built-in tunnel is free, and so is how this browser looks: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
+const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, and checking an image for text before you share it all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nPrivate chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact are not in this build. They are compiled into a separate Nabu-X build, which is still in development and not available to download yet. Once it is available, it will ask for the same license.\n\nThe built-in tunnel is free, and so is how this browser looks: all fourteen accent colors, all six chrome color schemes, the presets and textures, and how the toolbar is arranged. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
 #[cfg(feature = "chat")]
-const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, checking an image for text before you share it, private chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nThe built-in tunnel is free, and so is how this browser looks: all nine accent colors, all three chrome color schemes, and where the toolbar sits. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
+const PREMIUM: &str = "PATANYX Premium is on sale at patanyx.net/premium/: one payment for a fixed term, no account, nothing that renews. Its features are in this build already. The tab pack (searching across every open tab, the tab switcher, and batch tab actions), reading the text you drag a box around, the archive of pages you chose to keep, checking an image for text before you share it, private chat, checking a page with a contact, and comparing a downloaded file or a changed page with a contact all unlock once your token is in the vault and this device is activated: one request to EdgeXene when you paste it (a request that cannot connect is repeated once, straight away), tried once more at each unlock until it succeeds, up to five devices per term, and offline after that. Fingerprint Divergence is FREE PERMANENTLY, on by default, and does not join Premium; turning its noise off for named sites is free with it. Reading a written recovery key off a photograph stays free: it exists to get you back into your vault.\n\nThe built-in tunnel is free, and so is how this browser looks: all fourteen accent colors, all six chrome color schemes, the presets and textures, and how the toolbar is arranged. Every other protection on this page is free. Features designated as part of the free tier will remain free forever.\n\nPATANYX carries affiliate placements on four panels. They are labeled Affiliate partner where they appear, and PATANYX may earn a commission if you use one.\n\nA Premium license activates on up to five devices. When you paste the token, PATANYX makes one request to EdgeXene to activate that device (repeating it once, straight away, if it cannot connect), tries once more at each unlock until that succeeds, and every unlock after that is checked offline by your own copy of the browser. Releasing a device frees its slot, and this device stays released until you choose Activate again.";
 
 /// Sponsorship is a THIRD business-model path, not a way around the standing
 /// Premium rule above and not an affiliate placement. Keep the negations
@@ -1094,6 +1143,10 @@ mod tests {
         let lowered = all_copy().to_lowercase();
         for banned in [
             "sends nothing",
+            // A freeze blocks NEW requests and closes no open connection,
+            // and an allowed host gets through (compliance review of Allow
+            // while frozen).
+            "stops sending anything",
             "no telemetry",
             "zero telemetry",
             "completely private",
@@ -1194,9 +1247,71 @@ mod tests {
                 && lowered.contains("site storage")
                 && lowered.contains("until the next launch clears them")
                 && lowered.contains("not secure deletion"),
-            "the About copy must state both the complete site-data reset and \
+            "the About copy must state both the start-up site-data reset and \
              its between-session on-disk limit"
         );
+    }
+
+    #[test]
+    fn the_themes_entry_names_every_accent_in_the_theme_panel() {
+        // The entry lists the accents by name, so a new or renamed accent in
+        // the Theme panel must reach it: the names are read from the panel's
+        // own strings (each swatch title is "Name: color").
+        let ftl = include_str!("chrome/i18n/locales/en.ftl");
+        let names: Vec<&str> = ftl
+            .lines()
+            .filter(|line| line.starts_with("chrome-accent-") && line.contains("-title = "))
+            .filter_map(|line| line.split(" = ").nth(1))
+            .filter_map(|value| value.split(':').next())
+            .collect();
+        assert_eq!(names.len(), 14, "the entry says fourteen accent colors");
+        assert!(F_THEMES.2.contains("fourteen accent colors"));
+        for name in names {
+            assert!(F_THEMES.2.contains(name), "the Themes entry lost the accent {name:?}");
+        }
+        assert!(features().contains(&F_THEMES), "the Themes entry is listed");
+        // The chrome colors and textures by name, the presets by count.
+        let values = |prefix: &str, suffix: &str| -> Vec<&str> {
+            ftl.lines()
+                .filter(|line| line.starts_with(prefix) && line.contains(suffix))
+                .filter_map(|line| line.split(" = ").nth(1))
+                .collect()
+        };
+        let schemes = values("chrome-scheme-", "-button = ");
+        assert_eq!(schemes.len(), 6, "the entry names six chrome colors");
+        let textures: Vec<&str> = values("chrome-texture-", "-button = ")
+            .into_iter()
+            .filter(|name| *name != "None")
+            .collect();
+        assert_eq!(textures.len(), 3, "the entry names three textures");
+        for name in schemes.iter().chain(textures.iter()) {
+            assert!(F_THEMES.2.contains(name), "the Themes entry lost {name:?}");
+        }
+        assert_eq!(values("chrome-pack-", "-span = ").len(), 8, "the entry says eight presets");
+        assert!(F_THEMES.2.contains("eight presets"));
+    }
+
+    #[test]
+    fn the_vault_export_sentence_keeps_its_qualifiers() {
+        // The encrypted export is a second file the person saves. The entry
+        // must not let it read as a way back into a vault whose passphrase is
+        // forgotten (only the recovery key is), nor let download records read
+        // as travelling with it (they stay on the computer), nor promise more
+        // than "PATANYX does not send it": the file goes wherever the person
+        // puts it. Compliance review of the backup copy, 2026-10-13.
+        let body = F_VAULT.2;
+        for needed in [
+            "without download records",
+            "opens only with its own passphrase, not your recovery key",
+            "PATANYX does not send it anywhere",
+            "it is the only way in if you forget your passphrase",
+        ] {
+            assert!(body.contains(needed), "the PATANYX Vault entry lost {needed:?}");
+        }
+        let lowered = body.to_lowercase();
+        for banned in ["export never leaves", "backup never leaves", "recover your vault from"] {
+            assert!(!lowered.contains(banned), "the PATANYX Vault entry claims {banned:?}");
+        }
     }
 
     #[test]
@@ -1425,13 +1540,20 @@ mod tests {
                 "the Linux row describes an exception ending, but none is ever \
                  granted here: {body:?}"
             );
+            // Since 1.0.7 there are two routes, and the row names both with
+            // their reach: one tab until it goes to another site or closes,
+            // or every site until the switch goes back on. "Only way past
+            // it" was true until the per-tab switch shipped.
             assert!(
-                body.contains("only way past it")
-                    && body.contains("applies \
-     to every site"),
-                "the Linux row does not say the switch is the only route and \
-                 that it is browser-wide, so a user would expect a per-site \
-                 option that does not exist: {body:?}"
+                body.contains("in one tab until it goes to another site or closes")
+                    && body.contains("applies to every site"),
+                "the Linux row does not name both routes past the list with \
+                 how far each reaches: {body:?}"
+            );
+            assert!(
+                !body.contains("only way past it"),
+                "the Linux row still calls the browser-wide switch the only \
+                 route, which the per-tab switch made false: {body:?}"
             );
         }
 

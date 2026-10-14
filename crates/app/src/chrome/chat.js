@@ -167,10 +167,10 @@
 
   /// Paint the count on the chat pill.
   ///
-  /// One place now: the pill sits in the toolbar's second row and is always
-  /// visible, so there is no menu button that needs to relay the number on its
-  /// behalf. That relay existed only because the entry was hidden inside a
-  /// sheet, which is the arrangement this layout replaced.
+  /// One place: the pill's own badge. When the Tools group is folded the
+  /// pill is hidden, and chrome.js relays the count instead (a dot on the
+  /// folded Tools button, and the number on Chat's entry in its menu), by
+  /// reading this badge; nothing here needs to know about folds.
   // Async for the aria-label's count arg; the badge itself is numbers only
   // and stays sync. Strictly-newest: paints race their resolve.
   let unreadGen = 0;

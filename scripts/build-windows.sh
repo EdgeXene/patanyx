@@ -90,8 +90,41 @@ CFG_FLAGS="-C control-flow-guard=yes -C link-arg=/guard:cf"
 # triple from the artifact along with the path.
 SYSROOT="$(rustc --print sysroot)"
 REMAP="--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=/cargo --remap-path-prefix=$PWD=/build --remap-path-prefix=${SYSROOT}=/rust"
-export RUSTFLAGS="${RUSTFLAGS:-} $CFG_FLAGS $REMAP"
-echo "hardening: control-flow-guard on, build paths remapped"
+# THE C RUNTIME, and why it is split in two.
+#
+# Every exe this script produced until 2026-10-11 imported VCRUNTIME140.dll and
+# VCRUNTIME140_1.dll. Those are NOT part of Windows: a machine that never
+# installed a Visual C++ based program has no such file, and the exe then
+# fails to load with STATUS_DLL_NOT_FOUND. Measured 2026-10-11 on a clean
+# Windows 11 Enterprise evaluation VM with the public 1.0.6 exe: opened from
+# Explorer, Windows shows "The code execution cannot proceed because
+# VCRUNTIME140.dll was not found. Reinstalling the program may fix this
+# problem." and then the same for VCRUNTIME140_1.dll, and reinstalling
+# PATANYX does not fix it. Started from a scheduled task there is no message
+# at all.
+#
+# +crt-static links vcruntime into the exe (libcmt.lib, libvcruntime.lib), so
+# that import disappears. It would ALSO link the Universal CRT statically
+# (libucrt.lib), and that combination aborts at startup with 0xC0000409 under
+# Control Flow Guard: the static UCRT in the Windows SDK records its
+# address-taken functions in sections named .gfids$x, the LLVM linker
+# (lld-link, which cargo-xwin uses) reads only .gfids$y, so the UCRT's own
+# initializers never enter the guard table and the UCRT's first guarded call,
+# __acrt_execute_initializers, fails the check (minidump, fail-fast code 10,
+# GUARD_ICALL_CHECK_FAILURE; same with -C control-flow-guard=nochecks, so it
+# is not our code). Dropping CFG is not an option (see above).
+#
+# So the UCRT stays DYNAMIC: /NODEFAULTLIB:libucrt.lib ucrt.lib replaces the
+# static UCRT with the import library for ucrtbase.dll, which has shipped as a
+# Windows component since Windows 10 (the api-ms-win-crt-* forwarders; the
+# WebView2 runtime this browser needs requires Windows 10 anyway). Verified
+# 2026-10-11: an exe built this way starts on the VM with the VC++
+# redistributable uninstalled, with CFG on, shows its window and completes a
+# TLS exchange. check-windows-pe.py below asserts the resulting import set and
+# the CFG metadata on the shipped exe.
+CRT_FLAGS="-C target-feature=+crt-static -C link-arg=/NODEFAULTLIB:libucrt.lib -C link-arg=ucrt.lib"
+export RUSTFLAGS="${RUSTFLAGS:-} $CFG_FLAGS $CRT_FLAGS $REMAP"
+echo "hardening: control-flow-guard on, vcruntime static (UCRT dynamic), build paths remapped"
 
 FEATURES="${FEATURES-}"
 if [ -n "$FEATURES" ]; then
@@ -224,5 +257,11 @@ if [ "$(stat -c %s "$exe")" -lt $((30 * 1024 * 1024)) ]; then
   exit 1
 fi
 echo "ocr weights are compiled into the binary"
+
+# Runtime linkage and CFG, read from the PE headers of the artifact: no
+# vcruntime DLL import, the UCRT forwarders present, GUARD_CF with a real
+# function table and instrumented indirect calls in our code (the bit alone
+# can be set by the linker on code that was never instrumented).
+python3 -I scripts/check-windows-pe.py "$exe"
 
 echo "WINDOWS BUILD OK"

@@ -84,7 +84,7 @@ pub const MAX_PEER_HASH_CHARS: usize = 128;
 /// cannot bloat the encrypted payload.
 pub const MAX_NOTE_CHARS: usize = 2000;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VaultData {
     pub schema: u32,
     #[serde(default)]
@@ -184,6 +184,27 @@ pub struct VaultData {
     /// Cleared by the release landing, or by that device activating again.
     #[serde(default)]
     pub release_pending: Option<ReleasedDevice>,
+}
+
+/// COUNTS ONLY, by hand. A derived `Debug` printed every password, note body,
+/// per-contact key, the chat identity secret and the tunnel's private key: one
+/// `{:?}` in a log line, a panic message or a failed test assertion, and all of
+/// it is in the output. What a reader of a diagnostic needs is the shape.
+impl std::fmt::Debug for VaultData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VaultData")
+            .field("schema", &self.schema)
+            .field("credentials", &self.credentials.len())
+            .field("notes", &self.notes.len())
+            .field("contacts", &self.contacts.contacts.len())
+            .field("chat_identity", &self.chat_identity.is_some())
+            .field("tunnel", &self.tunnel.is_some())
+            .field("licence", &self.licence.is_some())
+            .field("activation", &self.activation.len())
+            .field("released_devices", &self.released_devices.len())
+            .field("release_pending", &self.release_pending.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// One device's Premium activation receipt (schema 7). Vault-owned, like
@@ -728,12 +749,13 @@ mod schema_guard_tests {
              6 `licence`, 5 `tunnel`, and schema 4's `origin` was nested \
              inside `credentials`; see credential_entry_keys_are_pinned_to_the_schema"
         );
-        // The marker must never print: VaultData derives Debug.
+        // The marker must never print. VaultData's Debug prints counts only,
+        // so the device id cannot reach a log line or a failed assertion.
         let mut with_marker = VaultData::default();
         with_marker.released_devices = vec![ReleasedDevice("ab".repeat(16))];
         let printed = format!("{with_marker:?}");
         assert!(
-            !printed.contains(&"ab".repeat(16)) && printed.contains("<redacted>"),
+            !printed.contains(&"ab".repeat(16)) && printed.contains("released_devices: 1"),
             "the released device id leaked through Debug: {printed}"
         );
     }

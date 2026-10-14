@@ -7,7 +7,7 @@ use serde_json::{json, Value};
 use std::io::Write;
 use std::path::Path;
 
-use patanyx_store::{Store, StoreError};
+use patanyx_store::{BackupError, Store, StoreError};
 use patanyx_vault::{ExportError, Vault, VaultError};
 
 use crate::state::AppState;
@@ -140,6 +140,8 @@ fn counts_as_presence(cmd: &str) -> bool {
             | "resolver_status"
             // The boot-time engine-floor question; the browser asking itself.
             | "engine_status"
+            // A reopened Backup pane asking how a running job is doing.
+            | "backup_job_status"
             | "store_status"
             | "vault_status"
             | "chat_status"
@@ -927,6 +929,28 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({ "id": id }))
         }
 
+        // The Guide and the Premium guide, from About, BY NAME: the chrome
+        // never holds either address (site_pages.rs says why). Same tab
+        // ceiling as tab_new, checked before anything is resolved or built
+        // (plan review 2026-10-13, R-002).
+        // The chrome's title-bar controls on Windows (window_frame.rs). An
+        // unknown action is refused, never guessed at.
+        "window_control" => {
+            let action =
+                crate::window_frame::WindowAction::from_args(args).ok_or("bad_args")?;
+            state.window_control(action)?;
+            Ok(json!({}))
+        }
+
+        "site_page_open" => {
+            if state.tabs.len() >= crate::state::MAX_TABS {
+                return Err("bad_args");
+            }
+            let url = crate::site_pages::destination_for(args)?;
+            let id = state.new_tab(&url, true)?;
+            Ok(json!({ "id": id }))
+        }
+
         // Open a NAMED url under a NAMED storage posture, in the foreground or
         // behind. This is what the right-click menu needs and what nothing
         // else could express: `tab_new` always switches and always uses the
@@ -973,6 +997,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let dest = state.save_active_page_as_pdf()?;
             Ok(json!({ "path": dest }))
         }
+        // The menu's Print entry and the palette: the same native print UI
+        // Ctrl+P opens (main.rs, Shortcut::Print). Nothing to report back; a
+        // missing print path says so itself through a toast in state.rs.
+        "page_print" => {
+            state.print_active_tab();
+            Ok(json!({}))
+        }
         "tab_close" => {
             let id = args.get("id").and_then(Value::as_u64).ok_or("bad_args")?;
             state.close_tab(id)?;
@@ -985,6 +1016,54 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             state.click_tab(id)?;
             Ok(json!({}))
         }
+        // The duplicate-site notice's three buttons. NOT `tab_switch` or
+        // `tab_close`: those act on whatever id they are given, and a click
+        // queued behind a navigation would land on a tab the notice no longer
+        // describes. This names the NOTICE, and Rust checks that it is still
+        // the current one and still true before anything happens. No tab id
+        // and no site cross from the chrome.
+        "duplicate_site_action" => {
+            let notice_id = args
+                .get("notice_id")
+                .and_then(Value::as_u64)
+                .ok_or("bad_args")?;
+            let choice = args
+                .get("choice")
+                .and_then(Value::as_str)
+                .and_then(crate::duplicate_site::Choice::parse)
+                .ok_or("bad_args")?;
+            state.duplicate_site_action(notice_id, choice)
+        }
+        "duplicate_notice_set" => {
+            let enabled = args
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.duplicate_site_notice = enabled;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            state.set_duplicate_notice_enabled(enabled);
+            Ok(json!({ "enabled": enabled }))
+        }
+        "duplicate_notice_get" => Ok(json!({
+            "enabled": crate::prefs::load().duplicate_site_notice,
+        })),
+        // The chrome's own motion switch. Same chrome-only shape as the
+        // toolbar labels: saved here, worn by chrome.js as a data attribute
+        // the stylesheet keys its duration tokens on, no engine ack.
+        "motion_set" => {
+            let reduce = args
+                .get("reduce")
+                .and_then(Value::as_bool)
+                .ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.reduce_motion = reduce;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "reduce": reduce }))
+        }
+        "motion_get" => Ok(json!({
+            "reduce": crate::prefs::load().reduce_motion,
+        })),
         "tab_reorder" => {
             let ids: Vec<u64> = args
                 .get("ids")
@@ -1316,6 +1395,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
         "vault_create" => {
+            crate::backup_job::refuse_if_running(state)?;
             let passphrase = arg_str(args, "passphrase")?;
             // The recovery key is returned exactly once and never recoverable
             // afterwards, so it goes straight to the UI to be shown and written
@@ -1342,6 +1422,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({ "recovery_key": recovery.to_printable() }))
         }
         "vault_unlock" => {
+            crate::backup_job::refuse_if_running(state)?;
             let passphrase = arg_str(args, "passphrase")?;
             let mut vault = Vault::unlock(&state.vault_path, passphrase).map_err(vault_code)?;
             // Unlocking a pre-slots vault migrates it and mints a recovery key
@@ -1378,6 +1459,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // the vault was gone despite the user having done exactly what they
         // were told.
         "vault_unlock_recovery" => {
+            crate::backup_job::refuse_if_running(state)?;
             let key = arg_str(args, "recovery_key")?;
             let recovery =
                 patanyx_vault::RecoveryKey::parse(key).map_err(|_| "bad_recovery_key")?;
@@ -1798,7 +1880,12 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             //
             // The cost is the page's in-flight state, which is why the panel
             // warns to save first (decided 2026-08-06).
-            let _ = state.history_reload();
+            let reloaded = state.history_reload();
+            // A revocation must end a running stream even when the reload
+            // cannot run: the page goes blank instead (code review round 7).
+            if reloaded.is_err() && cmd == "permission_revoke" {
+                let _ = state.end_active_document();
+            }
             // Reply with the fresh status so the panel re-renders from the
             // table rather than from what it assumes the toggle did.
             Ok(state.permission_status())
@@ -1969,6 +2056,10 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // to register offers no control instead of a broken one. The same
             // shape as every other capability in this list.
             "page_translation": crate::platform::translate_channel_supported(),
+            // Windows: the window has no title bar and the chrome draws the
+            // controls (window_frame.rs). Linux keeps its desktop's bar.
+            "window_frame": crate::platform::custom_window_frame(),
+            "window_maximized": state.window_maximized_now(),
             "translucent_overlay": crate::platform::translucent_overlay_supported(),
             // Whether the page draws OVER the chrome, which decides how far a
             // modal card may extend. On Windows with the lift armed the
@@ -1990,6 +2081,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // offered, per the standing rule that a control the platform
             // cannot honour is explained or hidden, never shown and inert.
             "sidebar": crate::platform::sidebar_supported(),
+            // The menu's Print and Save as PDF show only where these are true.
+            "print": crate::platform::print_supported(),
+            "save_pdf": crate::platform::save_pdf_supported(),
             // The saved placement, handed over with the capabilities rather
             // than fetched separately. Both are needed before the first
             // paint, and one round trip is the difference between a Left
@@ -2087,6 +2181,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             }))
         }
         "vault_export_encrypted" => {
+            crate::backup_job::refuse_if_running(state)?;
             let dest = arg_str(args, "dest")?;
             let passphrase = arg_str(args, "passphrase")?;
             // An empty export passphrase would "work" and produce a file that
@@ -2094,25 +2189,37 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if dest.is_empty() || passphrase.is_empty() {
                 return Err("bad_args");
             }
-            // BOOKMARKS TRAVEL WITH THE VAULT; downloads deliberately do not.
-            // A bookmark is something the user chose to keep and would expect
-            // to find on a new machine. A download record is browsing history
-            // -- what they fetched and when -- and carrying that into a backup
-            // file, then onto another machine, is a copy of their history
-            // nobody asked for.
+            // THE WHOLE LIBRARY TRAVELS WITH THE VAULT; download records
+            // deliberately do not. Everything the person chose to keep
+            // (bookmarks and their folders, shelved tab groups and their
+            // notes, Deep Recall pages, page snapshots, their pictures, and
+            // per-site exceptions) is something they would expect to find on a
+            // new machine. A download record is browsing history -- what they
+            // fetched and when -- and carrying that into a backup file, then
+            // onto another machine, is a copy of their history nobody asked
+            // for. An import keeps the importing computer's own instead.
             //
-            // Serialised here rather than in the vault crate: that crate does
-            // not know what a bookmark is and must not learn, or it ends up
-            // depending on the store it is meant to be independent of. It
-            // takes opaque bytes and seals them.
-            let carried = state
-                .store
-                .as_ref()
-                .and_then(|store| serde_json::to_vec(store.bookmarks()).ok());
-            unlocked(state)?
-                .export_encrypted_with(Path::new(dest), passphrase, carried.as_deref())
-                .map_err(export_code)?;
-            Ok(json!({}))
+            // The Library is serialized in `vault_backup`, not in the vault
+            // crate: that crate does not know what a bookmark is and must not
+            // learn, or it ends up depending on the store it is meant to be
+            // independent of. It takes opaque sections and seals them.
+            //
+            // A Library this build could not import back is a refusal, in an
+            // Ok reply so the item in the way can travel with its code;
+            // nothing is written.
+            // Written on a worker (`backup_job`): the answer is the job, and
+            // the result arrives once, in `backup_finished`, with the same
+            // JSON this call used to return.
+            crate::backup_job::start_export(
+                state,
+                std::path::PathBuf::from(dest),
+                zeroize::Zeroizing::new(passphrase.to_string()),
+            )
+        }
+        "backup_job_status" => Ok(crate::backup_job::status(state)),
+        "backup_job_cancel" => {
+            let job = args.get("job").and_then(Value::as_u64).ok_or("bad_args")?;
+            crate::backup_job::cancel(state, job)
         }
         "vault_export_plaintext" => {
             let dest = arg_str(args, "dest")?;
@@ -2129,12 +2236,48 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 .map_err(export_code)?;
             Ok(json!({}))
         }
+        // Which kind of backup a file is, read from its first bytes without
+        // a passphrase, so the import form can warn BEFORE an older backup
+        // (vault and bookmarks only) replaces a whole Library. Answers only
+        // for a PATANYX backup; any other file is `bad_export`, as an import
+        // of it would be.
+        "vault_import_inspect" => {
+            let src = arg_str(args, "src")?;
+            if src.is_empty() {
+                return Err("bad_args");
+            }
+            let version = patanyx_vault::backup_file_version(Path::new(src)).map_err(export_code)?;
+            Ok(json!({
+                "version": version,
+                "whole_library": version == patanyx_vault::BACKUP_VERSION,
+                "older": matches!(version, 0x01 | 0x02),
+            }))
+        }
         "vault_import" => {
+            crate::backup_job::refuse_if_running(state)?;
             let src = arg_str(args, "src")?;
             let passphrase = arg_str(args, "passphrase")?;
             let new_passphrase = arg_str(args, "new_passphrase")?;
             if src.is_empty() {
                 return Err("bad_args");
+            }
+            // A whole-Library backup (version 4) runs as a job
+            // (`backup_job`): the answer is the job; the backup is read and
+            // its Library built aside on one worker, then committed in
+            // journaled steps on another, and the result arrives once, in
+            // `backup_finished`, with the JSON this call used to return.
+            // Versions 1 and 2 carry the vault and bookmarks only, and keep
+            // the path below.
+            if matches!(
+                patanyx_vault::backup_file_version(Path::new(src)),
+                Ok(patanyx_vault::BACKUP_VERSION)
+            ) {
+                return crate::backup_job::start_import(
+                    state,
+                    std::path::PathBuf::from(src),
+                    zeroize::Zeroizing::new(passphrase.to_string()),
+                    zeroize::Zeroizing::new(new_passphrase.to_string()),
+                );
             }
             // AN IMPORT REPLACES THE LIBRARY, so it takes the Library lock
             // before anything is touched (final review, R-001): another
@@ -2152,6 +2295,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             //
             let dest = state.vault_path.clone();
             let marker = state.library_replace_marker();
+            // Read before the closure below drops a live vault: both outcomes
+            // owe that vault's session an ending.
+            let had_live_vault = state.vault.is_some();
             let mut import_started = false;
             let imported = replace_library(&marker, || {
                 import_started = true;
@@ -2161,6 +2307,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 // fails, this closure is never entered and the current
                 // profile stays attached as well as unchanged on disk.
                 state.vault = None;
+                // The vault may be replaced from here on: an activation answer
+                // still in flight for it must not land in the imported one.
+                state.vault_epoch += 1;
                 // The Library too, unconditionally. It used to be detached
                 // only inside restore_bookmarks, which returns early when the
                 // export carries no bookmarks, so an import over an unlocked
@@ -2178,6 +2327,15 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                     if import_started && code == "library_replace_refused" && marker.exists() {
                         state.detach_store_unreplaced();
                     }
+                    // The live vault was closed for a replacement that then
+                    // failed. Lock the session properly, so nothing derived
+                    // from the closed vault (the licence session, Premium
+                    // output, the chat transport) outlives it, and the chrome
+                    // is told it is locked instead of showing it open while
+                    // every vault command answers not_unlocked.
+                    if import_started && had_live_vault && state.vault.is_none() {
+                        state.lock_vault();
+                    }
                     // A refused import that took the Library lock itself
                     // leaves no Library for it to protect: give it back
                     // (final review round 2, R-002).
@@ -2192,6 +2350,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // would be the wrong trade.
             // Read before the move: the reply names it.
             let retained_copies = vault.import_retained_leftovers();
+            // The replaced vault's session ends here, as a lock would end it;
+            // the imported vault's begins below, as an unlock would begin it.
+            if had_live_vault {
+                state.end_vault_session();
+            }
             state.vault = Some(vault);
             let library = finish_library_replacement(state, new_passphrase);
             let restored = restore_bookmarks(state, carried.as_deref());
@@ -2203,8 +2366,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // and NO Library, and the previous profile's file still on disk
             // for its old passphrase to reattach (review of pentest F-005).
             // An import is a profile replacement; the old file goes.
-            #[cfg(feature = "chat")]
-            crate::chat_panel::on_vault_unlocked(state);
+            start_imported_vault_session(state);
             Ok(json!({
                 "recovery_key": recovery.to_printable(),
                 // Vault-shaped files beside the vault that the import could
@@ -2234,6 +2396,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // that did NOT happen is an error, so the form can say which
         // passphrase works now.
         "vault_change_passphrase" => {
+            // It rewrites the vault and the Library together, so never under a
+            // backup that reads or replaces them.
+            crate::backup_job::refuse_if_running(state)?;
             let current = arg_str(args, "current")?;
             let new = arg_str(args, "new")?;
             let library_file_exists = Store::exists(&state.store_path);
@@ -2257,6 +2422,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // opens with the vault from then on. Offered only while the unlock
         // recorded exactly this failure.
         "store_repair_passphrase" => {
+            crate::backup_job::refuse_if_running(state)?;
             let library_passphrase = arg_str(args, "library_passphrase")?;
             let current = arg_str(args, "current")?;
             if state.vault.is_none() {
@@ -2489,10 +2655,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mut p = crate::prefs::load();
             p.page_theme = theme;
             crate::prefs::save(&p).map_err(|_| "io")?;
-            let applied = state
-                .active_webview()
-                .map(|webview| crate::platform::apply_page_theme(webview, theme))
-                .unwrap_or(false);
+            let applied = state.apply_page_theme_everywhere(theme);
             Ok(json!({ "theme": theme.as_str(), "applied": applied }))
         }
         "page_theme_get" => Ok(json!({
@@ -2570,6 +2733,21 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // via a data attribute, exactly like the accent and the scheme. No
         // engine involvement, so no ack to carry -- inventing an `applied`
         // field here would claim a confirmation nobody asked the engine for.
+        // Toolbar folds (1.0.7): which groups show as one button. Known ids
+        // only, each once, in row order (prefs::normalize_toolbar_groups);
+        // the reply is what was stored, and chrome.js wears the reply.
+        "toolbar_folded_set" => {
+            let groups = args.get("groups").and_then(Value::as_array).ok_or("bad_args")?;
+            let folded =
+                crate::prefs::normalize_toolbar_groups(groups.iter().filter_map(Value::as_str));
+            let mut p = crate::prefs::load();
+            p.toolbar_folded = folded.clone();
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "groups": folded }))
+        }
+        "toolbar_folded_get" => Ok(json!({
+            "groups": crate::prefs::load().toolbar_folded,
+        })),
         "toolbar_labels_set" => {
             let mode =
                 crate::prefs::ToolbarLabels::parse(arg_str(args, "mode")?).ok_or("bad_args")?;
@@ -2628,6 +2806,20 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
 
         "chrome_scheme_get" => Ok(json!({
             "scheme": crate::prefs::load().chrome_scheme.as_str(),
+        })),
+        // Chrome texture (1.0.7): same shape as the scheme pair, chrome-only,
+        // worn via data-texture. No native readout paints it, so nothing
+        // else to re-colour.
+        "chrome_texture_set" => {
+            let texture =
+                crate::prefs::ChromeTexture::parse(arg_str(args, "texture")?).ok_or("bad_args")?;
+            let mut p = crate::prefs::load();
+            p.chrome_texture = texture;
+            crate::prefs::save(&p).map_err(|_| "io")?;
+            Ok(json!({ "texture": texture.as_str() }))
+        }
+        "chrome_texture_get" => Ok(json!({
+            "texture": crate::prefs::load().chrome_texture.as_str(),
         })),
 
         // Background update download: the pref behind the panel checkbox.
@@ -2703,11 +2895,30 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 .ok_or("bad_args")?;
             let mut p = crate::prefs::load();
             if !p.wipe_exempt_hosts.iter().any(|h| h == &host) {
-                p.wipe_exempt_hosts.push(host);
+                p.wipe_exempt_hosts.push(host.clone());
                 p.wipe_exempt_hosts.sort();
             }
+            // Recorded in the kept profile's ledger before the site can load
+            // there, so a later removal is always owed a clear. Only the
+            // process that holds the kept profile writes the ledger; another
+            // one only edits the list, and the next start records the site.
+            if crate::platform::kept_enabled()
+                && !crate::kept_profile::entries_of(&crate::kept_profile::read_ledger()).contains(&host)
+            {
+                crate::kept_profile::record(&host).map_err(|_| "io")?;
+            }
             crate::prefs::save(&p).map_err(|_| "io")?;
-            Ok(json!({ "hosts": p.wipe_exempt_hosts, "supported": true }))
+            let reopened = state.keep_list_changed(&p.wipe_exempt_hosts, Some(&host));
+            // Whether a new tab can use kept storage this session: when it
+            // cannot, the site is kept from the next start (code review
+            // round 6).
+            let available = crate::platform::kept_profile_supported();
+            Ok(json!({
+                "hosts": p.wipe_exempt_hosts,
+                "supported": true,
+                "reopened": reopened,
+                "available": available,
+            }))
         }
         "wipe_exempt_remove" => {
             if !cfg!(windows) {
@@ -2717,6 +2928,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mut p = crate::prefs::load();
             p.wipe_exempt_hosts.retain(|h| h != &host);
             crate::prefs::save(&p).map_err(|_| "io")?;
+            state.keep_list_changed(&p.wipe_exempt_hosts, None);
             Ok(json!({ "hosts": p.wipe_exempt_hosts, "supported": true }))
         }
 
@@ -2809,7 +3021,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 "host": host,
                 "enabled_globally": crate::prefs::load().fingerprint_noise,
                 "off_for_this_site": off_here,
-                "registered": state.active_divergence_registered(),
+                // The engine's answer for the tab as built (review R-003).
+                // `registered` stays for the proof line's older reader; it
+                // is true only for an install the engine confirmed.
+                "install": state.active_divergence_install().as_str(),
+                "registered": state.active_divergence_install() == crate::platform::ScriptInstall::Installed,
                 "surfaces": ["canvas", "audio", "WebGL/Graphics", "element measurement"],
             }))
         }
@@ -3090,7 +3306,25 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             if !is_valid_host(host) {
                 return Err("bad_args");
             }
-            state.allow_site_active_tab(host)
+            // Which tab's rows the host was picked from. Required: without it
+            // a click on a row drawn for one tab could land on another.
+            let tab = args.get("tab").and_then(Value::as_u64).ok_or("bad_args")?;
+            state.allow_site_active_tab(host, tab)
+        }
+        // "Allow ads and trackers on this tab". Named by TAB ID, like the
+        // held-page banner's arms, because the panel renders from an async
+        // status push and a tab switch can land between the paint and the
+        // click. The site is NOT an argument: it is read from the tab's own
+        // address inside `set_tab_ads_allowed`, so nothing the chrome sends
+        // can choose what is allowed. Counts as presence (the default): it is
+        // a click.
+        "tab_ads_allow" => {
+            let tab_id = arg_u64(args, "tab_id")?;
+            let allowed = args
+                .get("allowed")
+                .and_then(Value::as_bool)
+                .ok_or("bad_args")?;
+            state.set_tab_ads_allowed(tab_id, allowed)
         }
         "tab_ledger" => state.active_ledger(),
         // Takes no arguments on purpose. The host it acts on is read fresh
@@ -3272,7 +3506,9 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({ "name": name }))
         }
         "bookmark_folder_rename" => {
-            let from = patanyx_store::normalize_folder_name(arg_str(args, "from")?)?;
+            // An existing folder is named by the rule for names the store
+            // holds; the NEW name keeps the strict rule for creating one.
+            let from = patanyx_store::existing_folder_name(arg_str(args, "from")?)?;
             let to = patanyx_store::normalize_folder_name(arg_str(args, "to")?)?;
             let renamed = store_open(state)?
                 .rename_folder(&from, &to)
@@ -3282,7 +3518,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // Deleting a folder UNFILES its bookmarks; it never deletes them.
         // The store method carries the same guarantee (and a test pins it).
         "bookmark_folder_delete" => {
-            let name = patanyx_store::normalize_folder_name(arg_str(args, "name")?)?;
+            let name = patanyx_store::existing_folder_name(arg_str(args, "name")?)?;
             let deleted = store_open(state)?
                 .delete_folder(&name)
                 .map_err(store_code)?;
@@ -3348,7 +3584,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // bookmark itself are untouched.
         "bookmark_folder_unfile" => {
             let id = arg_str(args, "id")?.to_string();
-            let folder = patanyx_store::normalize_folder_name(arg_str(args, "folder")?)?;
+            let folder = patanyx_store::existing_folder_name(arg_str(args, "folder")?)?;
             match store_open(state)?
                 .unfile_bookmark(&id, &folder)
                 .map_err(store_code)?
@@ -3756,6 +3992,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // vault until the user types a passphrase, by which time this process
         // has exited and the kernel has released the lock.
         "tunnel_apply_restart" => {
+            crate::backup_job::refuse_if_running(state)?;
             // Store first, exactly as shelf_create does: a session must never
             // be shelved on the strength of a write that cannot happen.
             store_open(state)?;
@@ -4045,10 +4282,17 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             Ok(json!({}))
         }
         // The feature-videos banner: asked once at chrome boot (passive, see
-        // counts_as_presence), and answered by Watch or Not now.
-        "tutorial_seen_get" => Ok(json!({ "seen": crate::prefs::tutorial_seen() })),
+        // counts_as_presence), and answered by Watch or Not now. `keep_video`
+        // says whether this build has the Kept Sites video (Windows), which
+        // its own 1.0.7 banner announces once, `keep_seen` whether that one
+        // was answered.
+        "tutorial_seen_get" => Ok(json!({
+            "seen": crate::prefs::tutorial_seen(),
+            "keep_seen": crate::prefs::keep_video_seen(),
+            "keep_video": crate::tutorial::video_base64("keep-sites").is_some(),
+        })),
         // One feature video by name, base64 (tutorial.rs). Names outside the
-        // three are refused.
+        // list are refused.
         "tutorial_video" => {
             let name = arg_str(args, "name")?;
             crate::tutorial::video_base64(name)
@@ -4104,7 +4348,14 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             }
             tab.blocked_pending.borrow_mut().take();
             tab.allow_malicious_host(&host);
-            tab.load_url(&format!("https://{host}/")).ok();
+            let started = tab.load_url(&format!("https://{host}/")).is_ok();
+            // Open anyway is the user choosing this site, so it counts for
+            // the duplicate-site notice (code review 2026-10-07, R-021);
+            // marked only once the load has started, so a load that never
+            // began leaves no mark for the page's next navigation (R-019).
+            if started {
+                state.note_user_navigation(tab_id);
+            }
             Ok(json!({ "allowed": host }))
         }
 
@@ -4296,7 +4547,11 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // replaces the running binary. Gated on Phase::Ready in the updater,
         // and the staged bytes are re-hashed against the signed manifest
         // there before anything is moved.
-        "update_apply" => crate::updater::apply_staged(&state.proxy()),
+        // Applying an update quits; never under a running backup.
+        "update_apply" => {
+            crate::backup_job::refuse_if_running(state)?;
+            crate::updater::apply_staged(&state.proxy())
+        }
 
         // Takes effect on the NEXT check, not this build's environment --
         // unlike DNS, the channel is read fresh from prefs every time a
@@ -4347,6 +4602,38 @@ fn smoke_reopen_vault(state: &mut AppState) -> Result<(), String> {
 
 fn smoke_step(state: &mut AppState, cmd: &str, args: Value) -> Result<Value, String> {
     handle(state, cmd, &args).map_err(|e| format!("{cmd}: {e}"))
+}
+
+/// A command that answers with a job (`backup_job`): started, run to its end
+/// on this thread, and its `backup_finished` result returned as the command's
+/// own answer would have been. A command that answered directly is returned
+/// as it is.
+fn smoke_job(state: &mut AppState, cmd: &str, args: Value) -> Result<Value, String> {
+    let started = smoke_step(state, cmd, args)?;
+    let Some(job) = started.get("job").and_then(Value::as_u64) else {
+        return Ok(started);
+    };
+    let finished = crate::backup_job::drive_to_end(state)
+        .ok_or_else(|| format!("{cmd}: job {job} never finished"))?;
+    if finished["job"] != json!(job) {
+        return Err(format!("{cmd}: another job finished: {finished}"));
+    }
+    if finished["ok"] == json!(true) {
+        Ok(finished["data"].clone())
+    } else {
+        Err(format!("{cmd}: {}", finished["error"]))
+    }
+}
+
+/// Temporary files an export may have left beside `dest`.
+fn smoke_temp_files(dest: &Path) -> usize {
+    let Some(dir) = dest.parent() else { return 0 };
+    std::fs::read_dir(dir).map_or(0, |entries| {
+        entries
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .count()
+    })
 }
 
 /// Records a download and archives a page with a picture: the two things
@@ -4763,7 +5050,29 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
         .ok_or("vault path has no parent")?
         .join("smoke-migration.rbx");
     let export_str = export_path.to_string_lossy().into_owned();
-    smoke_step(
+    // THE WHOLE LIBRARY TRAVELS, so the Library is given one of every kind
+    // first, and what it holds is recorded to compare against after the
+    // import: the records, every picture's pixels, and this computer's own
+    // download records, which stay out of the file but are kept on import.
+    let (library_before, pictures_before, downloads_before) = smoke_fill_every_kind(state)?;
+    // STOPPED AT ONCE, an export leaves nothing: no file at the destination
+    // and no temporary file beside it.
+    let stopped_path = export_path.with_file_name("smoke-stopped.rbx");
+    let started = smoke_step(
+        state,
+        "vault_export_encrypted",
+        json!({ "dest": stopped_path.to_string_lossy(), "passphrase": export_pass }),
+    )?;
+    let job = started["job"].as_u64().ok_or("the export did not start a job")?;
+    smoke_step(state, "backup_job_cancel", json!({ "job": job }))?;
+    let stopped = crate::backup_job::drive_to_end(state).ok_or("the stopped export never finished")?;
+    if stopped["error"] != json!("backup_cancelled") || stopped["stopped_by"] != json!("person") {
+        return Err(format!("the stopped export did not report its stop: {stopped}"));
+    }
+    if stopped_path.exists() || smoke_temp_files(&stopped_path) > 0 {
+        return Err("a stopped export left a file behind".into());
+    }
+    let exported = smoke_job(
         state,
         "vault_export_encrypted",
         json!({ "dest": export_str, "passphrase": export_pass }),
@@ -4771,6 +5080,10 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     if !export_path.is_file() {
         return Err("vault_export_encrypted wrote nothing".into());
     }
+    if exported["library_included"] != json!(true) || !exported["refused"].is_null() {
+        return Err(format!("the export left the Library out: {exported}"));
+    }
+    smoke_no_download_in_backup(&export_path, export_pass, &downloads_before)?;
 
     // IMPORT OVER A LIVE VAULT REPLACES IT. This used to assert the opposite
     // -- that import refused while a vault existed -- and that refusal is why
@@ -4781,7 +5094,108 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     //
     // Driven while the vault is UNLOCKED, which is the dangerous shape: a live
     // vault holding an open file that is about to be replaced underneath it.
-    let imported = smoke_step(
+    // STOPPED WHILE READING, an import changes nothing: the live vault is
+    // still open and its Library still holds exactly what it held. Nor does it
+    // move the vault epoch, so an activation answer for this vault still lands.
+    let epoch_before = state.vault_epoch;
+    let started = smoke_step(
+        state,
+        "vault_import",
+        json!({ "src": export_str, "passphrase": export_pass, "new_passphrase": new_pass }),
+    )?;
+    let job = started["job"].as_u64().ok_or("the import did not start a job")?;
+    smoke_step(state, "backup_job_cancel", json!({ "job": job }))?;
+    let stopped = crate::backup_job::drive_to_end(state).ok_or("the stopped import never finished")?;
+    if stopped["error"] != json!("backup_cancelled") {
+        return Err(format!("the stopped import did not report its stop: {stopped}"));
+    }
+    if state.vault.is_none() {
+        return Err("a stopped import closed the live vault".into());
+    }
+    smoke_library_matches(state, &library_before, &pictures_before, &downloads_before)
+        .map_err(|e| format!("a stopped import changed the live Library: {e}"))?;
+    if state.vault_epoch != epoch_before {
+        return Err("a stopped import moved the vault epoch".into());
+    }
+
+    // A LOCK DURING THE COMMIT waits for it, then locks: the import completes,
+    // its result carries the new recovery key, and the vault is locked after.
+    let import_args = json!({ "src": export_str, "passphrase": export_pass, "new_passphrase": new_pass });
+    smoke_step(state, "vault_import", import_args.clone())?;
+    crate::backup_job::drive_step(state);
+    if !crate::backup_job::committing(state) {
+        return Err("the import did not reach its commit".into());
+    }
+    smoke_step(state, "vault_lock", json!({}))?;
+    if !crate::backup_job::committing(state) {
+        return Err("a lock ended an import's commit".into());
+    }
+    let finished = crate::backup_job::drive_to_end(state).ok_or("the import under a lock never finished")?;
+    if finished["ok"] != json!(true) || finished["lock_follows"] != json!(true) {
+        return Err(format!("the import under a lock did not complete: {finished}"));
+    }
+    // The key would never be shown, so it never leaves Rust: the chrome is
+    // told it was lost instead.
+    if !finished["data"]["recovery_key"].is_null() || finished["data"]["key_lost"] != json!(true) {
+        return Err(format!("a recovery key that could not be shown was sent anyway: {finished}"));
+    }
+    if state.vault.is_some() {
+        return Err("a lock asked for during the commit was lost".into());
+    }
+    // A commit moved the epoch: an activation answer for the vault it
+    // replaced is dropped when it arrives.
+    if state.vault_epoch == epoch_before {
+        return Err("a committed import did not move the vault epoch".into());
+    }
+    if crate::activation::answer_belongs(Some(epoch_before), state.vault_epoch) {
+        return Err("an activation answer from before the import would still land".into());
+    }
+    smoke_step(state, "vault_unlock", json!({ "passphrase": new_pass }))?;
+
+    // AN IDLE DEADLINE THAT PASSED DURING THE COMMIT is not forgotten: the
+    // result is shown, recovery key included, and the idle lock's one-minute
+    // countdown starts at once, as it always warns before it locks.
+    let autolock_before = state.autolock_secs;
+    smoke_step(state, "vault_autolock_set", json!({ "seconds": 300 }))?;
+    smoke_step(state, "vault_import", import_args.clone())?;
+    crate::backup_job::drive_step(state);
+    if !crate::backup_job::committing(state) {
+        return Err("the second import did not reach its commit".into());
+    }
+    state.last_activity = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(600))
+        .ok_or("smoke: the clock cannot go 10 minutes back")?;
+    let finished = crate::backup_job::drive_to_end(state).ok_or("the idle import never finished")?;
+    if finished["ok"] != json!(true)
+        || finished["lock_follows"] != json!(false)
+        || finished["data"]["recovery_key"].as_str().unwrap_or("").is_empty()
+    {
+        return Err(format!("the idle import did not complete with its key shown: {finished}"));
+    }
+    if state.vault.is_none() {
+        return Err("an idle import locked with no countdown".into());
+    }
+    if finished["data"]["idle_warning"] != json!(true) {
+        return Err("the chrome was not told the countdown started".into());
+    }
+    let warns_at = state.autolock_deadline().ok_or("an idle deadline passed during the commit was forgotten")?;
+    if warns_at > std::time::Instant::now() + std::time::Duration::from_secs(1) {
+        return Err("the idle countdown did not start when the commit ended".into());
+    }
+    // The warning comes first: the idle check now warns and keeps the vault
+    // open, and the lock is still most of a minute away.
+    state.check_autolock();
+    if state.vault.is_none() {
+        return Err("the idle lock came with no countdown".into());
+    }
+    let locks_at = state.autolock_deadline().ok_or("the countdown lost its lock")?;
+    if locks_at < std::time::Instant::now() + std::time::Duration::from_secs(50) {
+        return Err("the idle lock would follow with no time to answer the countdown".into());
+    }
+    smoke_step(state, "vault_autolock_set", json!({ "seconds": autolock_before }))?;
+    state.touch();
+
+    let imported = smoke_job(
         state,
         "vault_import",
         json!({ "src": export_str, "passphrase": export_pass, "new_passphrase": new_pass }),
@@ -4820,16 +5234,263 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     if marks["items"][0]["url"] != json!(CARRIED_URL) {
         return Err("the carried bookmark is not the one that was exported".into());
     }
-    // Downloads deliberately do NOT travel: a download record is browsing
-    // history, and carrying it into a backup file and onto another machine is
-    // a copy of the user's history nobody asked for. Asserted rather than
-    // trusted, because "we did not serialise it" is exactly the kind of claim
-    // that survives a refactor as a comment and stops being true.
-    let downloads = smoke_step(state, "download_list", json!({}))?;
-    if downloads["items"].as_array().map(|a| a.len()).unwrap_or(0) != 0 {
-        return Err("downloads travelled with the export; they must not".into());
+    if imported["library"] != json!("replaced") {
+        return Err(format!("the imported Library did not open: {imported}"));
     }
+    // Every other kind came back too, ids, notes and pixels included. Download
+    // records never traveled (checked in the file above); THIS computer's
+    // own are kept, re-signed under the imported Library's key, so they must
+    // still be here and still verify.
+    smoke_library_matches(state, &library_before, &pictures_before, &downloads_before)?;
+
+    // A DOWNLOAD FINISHING MID-IMPORT is held, then recorded into the
+    // imported Library: never into the one being replaced, where it would be
+    // lost.
+    let parked = export_path.with_file_name("smoke-parked-download.bin");
+    std::fs::write(&parked, b"finished while an import ran").map_err(|e| format!("parked file: {e}"))?;
+    let parked_name = "smoke-parked-download.bin";
+    smoke_step(
+        state,
+        "vault_import",
+        json!({ "src": export_str, "passphrase": export_pass, "new_passphrase": new_pass }),
+    )?;
+    state.record_download_provenance("https://smoke.example/parked.bin", Some(&parked.to_string_lossy()), true);
+    if state
+        .store
+        .as_ref()
+        .is_some_and(|store| store.downloads().iter().any(|d| d.filename == parked_name))
+    {
+        return Err("a download was recorded into the Library being replaced".into());
+    }
+    let finished = crate::backup_job::drive_to_end(state).ok_or("the import with a parked download never finished")?;
+    if finished["ok"] != json!(true) {
+        return Err(format!("the import with a parked download failed: {finished}"));
+    }
+    let store = state.store.as_ref().ok_or("the imported Library is not open")?;
+    let record = store
+        .downloads()
+        .iter()
+        .find(|d| d.filename == parked_name)
+        .ok_or("a download finished mid-import was lost")?;
+    if !store.verify_download(&record.id).map_err(|e| format!("verify_download: {e}"))? {
+        return Err("a parked download record does not verify in the imported Library".into());
+    }
+    let _ = std::fs::remove_file(&parked);
     let _ = std::fs::remove_file(&export_path);
+    Ok(())
+}
+
+/// Gives the open Library one of every kind a backup carries (a download
+/// record and a Deep Recall page with a picture, a folder, a tab group with a
+/// note, a page snapshot with a picture, a site exception) beside the bookmark
+/// the smoke already made, then returns what it holds: its records,
+/// every picture's pixels by id, and its download records as (id, address).
+type SmokeLibrary = (
+    patanyx_store::LibraryBackup,
+    Vec<(String, Vec<u8>)>,
+    Vec<(String, String)>,
+);
+
+fn smoke_fill_every_kind(state: &mut AppState) -> Result<SmokeLibrary, String> {
+    let store = state
+        .store
+        .as_mut()
+        .ok_or("smoke: the Library is not open before the export")?;
+    let bookmark = store
+        .bookmarks()
+        .first()
+        .map(|b| b.id.clone())
+        .ok_or("smoke: no bookmark to export")?;
+    // A download record, to keep out of the file and keep on this computer,
+    // and a Deep Recall page with a picture.
+    smoke_fill_library(store)?;
+    store
+        .create_folder("smoke folder")
+        .map_err(|e| format!("create_folder: {e}"))?;
+    let shelf = store
+        .add_shelf_grouped(
+            "Smoke".into(),
+            vec![patanyx_store::ShelfTab {
+                title: "shelved".into(),
+                url: "https://shelved.example/".into(),
+            }],
+            None,
+        )
+        .map_err(|e| format!("add_shelf_grouped: {e}"))?;
+    store
+        .set_shelf_note(&shelf.id, "smoke note")
+        .map_err(|e| format!("set_shelf_note: {e}"))?;
+    let digest = patanyx_integrity::digest(b"<p>smoke snapshot</p>")
+        .map_err(|e| format!("digest: {e}"))?;
+    store
+        .save_page_snapshot_with_picture(&bookmark, digest, "smoke snapshot", b"snapshot pixels", "visible area")
+        .map_err(|e| format!("save_page_snapshot_with_picture: {e}"))?;
+    store
+        .set_divergence_override("smoke.example", patanyx_store::DivergenceLevel::Off)
+        .map_err(|e| format!("set_divergence_override: {e}"))?;
+    if store.downloads().is_empty() {
+        return Err("smoke: no download record to keep out of the backup".into());
+    }
+    let records = store.library_backup();
+    let mut pictures = Vec::new();
+    for id in store.backup_picture_ids() {
+        let pixels = store
+            .backup_picture(&id)
+            .map_err(|e| format!("backup_picture: {e}"))?;
+        pictures.push((id, pixels.to_vec()));
+    }
+    if !records.archive.iter().any(|r| r.has_picture)
+        || !records.page_snapshots.iter().any(|s| s.has_picture)
+    {
+        return Err("smoke: the Library holds no picture of each kind".into());
+    }
+    let downloads = store
+        .downloads()
+        .iter()
+        .map(|d| (d.id.clone(), d.url.clone()))
+        .collect();
+    Ok((records, pictures, downloads))
+}
+
+/// No download address of this Library is anywhere in the decrypted backup.
+fn smoke_no_download_in_backup(
+    path: &Path,
+    passphrase: &str,
+    downloads: &[(String, String)],
+) -> Result<(), String> {
+    let mut reader =
+        patanyx_vault::BackupReader::open(path, passphrase, crate::vault_backup::section_limits())
+            .map_err(|e| format!("open the backup: {e}"))?;
+    let mut pictures = 0;
+    while let Some(section) = reader
+        .next_section()
+        .map_err(|e| format!("read the backup: {e}"))?
+    {
+        for (_, url) in downloads {
+            let needle = url.as_bytes();
+            if section.body.windows(needle.len()).any(|w| w == needle) {
+                return Err(format!(
+                    "a download address is in the backup's {:?} section",
+                    section.kind
+                ));
+            }
+        }
+        if section.kind == patanyx_vault::SectionKind::Picture {
+            pictures += 1;
+        }
+    }
+    reader.finish().map_err(|e| format!("finish the backup: {e}"))?;
+    if pictures < 2 {
+        return Err(format!("the backup carries {pictures} pictures, expected both kinds"));
+    }
+    Ok(())
+}
+
+/// The open Library holds exactly what `smoke_fill_every_kind` recorded, and
+/// this computer's download records are still there and still verify.
+fn smoke_library_matches(
+    state: &AppState,
+    before: &patanyx_store::LibraryBackup,
+    pictures: &[(String, Vec<u8>)],
+    downloads: &[(String, String)],
+) -> Result<(), String> {
+    let store = state
+        .store
+        .as_ref()
+        .ok_or("smoke: the imported Library is not open")?;
+    let after = store.library_backup();
+    let ids = |backup: &patanyx_store::LibraryBackup| {
+        (
+            backup.bookmarks.iter().map(|b| b.id.clone()).collect::<Vec<_>>(),
+            backup.shelves.iter().map(|s| (s.id.clone(), s.note.clone())).collect::<Vec<_>>(),
+            backup.archive.iter().map(|r| r.id.clone()).collect::<Vec<_>>(),
+            backup.page_snapshots.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+            backup.divergence_overrides.iter().map(|o| o.host.clone()).collect::<Vec<_>>(),
+        )
+    };
+    if ids(&after) != ids(before) || after.bookmark_folders != before.bookmark_folders {
+        return Err(format!("the imported Library differs: {after:?}, exported {before:?}"));
+    }
+    for (id, pixels) in pictures {
+        let restored = store
+            .backup_picture(id)
+            .map_err(|e| format!("a restored picture: {e}"))?;
+        if &restored[..] != pixels.as_slice() {
+            return Err(format!("picture {id} came back different"));
+        }
+    }
+    let kept: Vec<(String, String)> = store
+        .downloads()
+        .iter()
+        .map(|d| (d.id.clone(), d.url.clone()))
+        .collect();
+    if kept != downloads {
+        return Err(format!(
+            "this computer's download records were not kept: {} before, {} after",
+            downloads.len(),
+            kept.len()
+        ));
+    }
+    for (id, _) in downloads {
+        if !store
+            .verify_download(id)
+            .map_err(|e| format!("verify_download: {e}"))?
+        {
+            return Err("a kept download record no longer verifies".into());
+        }
+    }
+    Ok(())
+}
+
+/// Smoke-test only: a browser-wide Privacy switch must not loosen an OPEN
+/// Strict Tab. Read from the ENGINE's own script setting, not from the policy
+/// this build recorded: the defect this guards is that the record and the
+/// engine were both set to the wrong value.
+pub fn smoke_strict_tab_sequence(state: &mut AppState) -> Result<(), String> {
+    let id = state
+        .new_quarantine_tab()
+        .map_err(|e| format!("new_quarantine_tab: {e}"))?;
+    let engine_script = |state: &AppState| {
+        state
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| crate::platform::engine_script_enabled(&tab.webview))
+    };
+    match engine_script(state) {
+        Some(Some(false)) => {}
+        other => {
+            return Err(format!(
+                "a new Strict Tab's engine script setting is {other:?}, expected off"
+            ))
+        }
+    }
+    // "Allow ads and trackers on this tab" is refused in a Strict Tab, through
+    // the real dispatch surface, before anything about the page is consulted.
+    match handle(state, "tab_ads_allow", &json!({ "tab_id": id, "allowed": true })) {
+        Err("ads_strict_tab") => {}
+        other => {
+            return Err(format!(
+                "tab_ads_allow in a Strict Tab answered {other:?}, expected ads_strict_tab"
+            ))
+        }
+    }
+    // Flip a browser-wide switch the way the Privacy panel does, then put it
+    // back. Either write used to copy the browser-wide policy, JavaScript on,
+    // onto every open tab.
+    let original = state.privacy.block_youtube_ads;
+    smoke_step(state, "privacy_set", json!({ "block_youtube_ads": !original }))?;
+    smoke_step(state, "privacy_set", json!({ "block_youtube_ads": original }))?;
+    match engine_script(state) {
+        Some(Some(false)) => {}
+        other => {
+            return Err(format!(
+                "a browser-wide Privacy switch changed an open Strict Tab's engine script setting to {other:?}"
+            ))
+        }
+    }
+    smoke_step(state, "tab_close", json!({ "id": id }))?;
+    println!("SMOKE strict: an open Strict Tab kept script off across a browser-wide Privacy switch");
     Ok(())
 }
 
@@ -6214,8 +6875,39 @@ pub fn smoke_readout_sequence(state: &mut AppState) -> Result<(), String> {
     Ok(())
 }
 
+/// Smoke-test only: the Tab Activity probe reading, for a tab the production
+/// build path made, through the dispatcher arm the panel itself calls.
+///
+/// Every Linux tab once said "the page-reporting channel did not register"
+/// directly under counts that had arrived through that channel: wry had
+/// already registered the handler name, so ours was refused
+/// (`connect_fingerprint_probe_messages`). No test without a real content tab
+/// on the real engine could see it, and this is the one that has both.
+///
+/// A profile with Fingerprint Divergence switched off reads "disabled", which
+/// says nothing about the channel, so it is reported as skipped rather than
+/// passed. CI starts from a fresh profile, where the pref defaults on, and
+/// ci-trixie greps for `PROBES ok`, so a skip there still fails the gate.
+pub fn smoke_probe_channel_sequence(state: &mut AppState) -> Result<(), String> {
+    let reading = smoke_step(state, "fingerprint_probe_activity", json!({}))?;
+    match (reading["status"].as_str(), reading["status_text"].as_str()) {
+        (Some("active"), Some("")) => {
+            println!("PROBES ok");
+            Ok(())
+        }
+        (Some("disabled"), _) => {
+            println!("PROBES skipped: Fingerprint Divergence is off in this profile");
+            Ok(())
+        }
+        _ => Err(format!(
+            "Tab Activity probe reading on a fresh content tab is {} ({})",
+            reading["status"], reading["status_text"]
+        )),
+    }
+}
+
 fn unlocked(state: &mut AppState) -> Result<&mut Vault, &'static str> {
-    state.vault.as_mut().ok_or("not_unlocked")
+    state.vault_for_write()
 }
 
 fn arg_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, &'static str> {
@@ -6465,6 +7157,92 @@ fn replace_library<T>(
     }
 }
 
+/// What a whole-Library import reports. The recovery key is in it exactly
+/// once, as at creation; the same JSON whether it ran in the call or as a job.
+pub(crate) fn import_result_json(
+    recovery: &patanyx_vault::RecoveryKey,
+    retained_copies: usize,
+    summary: &patanyx_store::RestoreSummary,
+    library: &str,
+    library_included: bool,
+    library_was_closed: bool,
+) -> Value {
+    json!({
+        "recovery_key": recovery.to_printable(),
+        "retained_copies": retained_copies,
+        "bookmarks": summary.bookmarks,
+        "library": library,
+        "library_included": library_included,
+        "restored": {
+            "bookmarks": summary.bookmarks,
+            "folders": summary.folders,
+            "tab_groups": summary.shelves,
+            "deep_recall_pages": summary.archive_pages,
+            "snapshots": summary.snapshots,
+            "pictures": summary.pictures,
+            "site_exceptions": summary.site_exceptions,
+            "downloads_kept": summary.downloads_kept,
+            "downloads_dropped": summary.downloads_dropped,
+            "downloads_not_kept_library_closed": library_was_closed,
+        },
+    })
+}
+
+/// What an unlock starts, started for a vault an import has just installed.
+/// Shared by both kinds of import, so neither can drift from the other.
+pub(crate) fn start_imported_vault_session(state: &mut AppState) {
+    #[cfg(feature = "chat")]
+    crate::chat_panel::on_vault_unlocked(state);
+    // As vault_unlock does: a tunnel the imported vault enables starts
+    // now, instead of the engine refusing every page through the
+    // parked proxy until the next lock and unlock. Idempotent: a
+    // tunnel already running keeps running, as across a lock.
+    crate::tunnel_control::on_vault_unlocked(state);
+    // Evaluated as an unlock evaluates a vault: the IMPORTED vault's
+    // licence record decides Premium (not the session of the vault it
+    // replaced), and a release it left unresolved is finished. NOT
+    // activation::replay_pending: a result parked while locked belongs
+    // to the session of the vault this import replaced, so it is
+    // dropped here. Kept, it suppressed the imported vault's own retry
+    // and was replayed into it at the next unlock (review 2026-10-12,
+    // R-002). A dropped answer costs one retry; the server is
+    // idempotent per device.
+    state.pending_activation_event = None;
+    crate::licence_control::on_vault_unlocked(state);
+    crate::activation::finish_pending_release(state);
+}
+
+/// The import form's code for why a whole-Library import stopped.
+pub(crate) fn import_code(error: crate::vault_backup::ImportError) -> &'static str {
+    use crate::vault_backup::ImportError;
+    // A full disk while the Library is being built aside surfaces through the
+    // store's own error, and is still a full disk.
+    let full = |error: &StoreError| {
+        matches!(error, StoreError::Io(io) if io.kind() == std::io::ErrorKind::StorageFull)
+    };
+    match error {
+        ImportError::Store(ref error) | ImportError::Library(BackupError::Store(ref error))
+            if full(error) =>
+        {
+            "disk_full"
+        }
+        ImportError::Backup(error) => export_code(error),
+        // Written by a newer PATANYX: the person is told to update.
+        ImportError::Library(BackupError::NewerSchema(_)) => "export_version_unreadable",
+        ImportError::Library(BackupError::OverLimit(_)) => "import_over_limit",
+        ImportError::Library(BackupError::Store(error)) | ImportError::Store(error) => {
+            store_code(error)
+        }
+        ImportError::Library(BackupError::BadSchema | BackupError::Invalid(_)) => "bad_export",
+        ImportError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull => "disk_full",
+        ImportError::Io(_) => "io",
+        ImportError::EarlierUnfinished => "import_earlier_unfinished",
+        // Stopped before anything live changed, with leftovers the next open
+        // removes: said so, never reported as a clean stop.
+        ImportError::StoppedLeavingFiles => "backup_cancelled_cleanup_pending",
+    }
+}
+
 /// Complete the Library half after the imported vault has committed. The
 /// marker remains in place until the previous Store is durably absent; a
 /// removal failure therefore blocks that Store across unlock and restart.
@@ -6488,6 +7266,11 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
         state.detach_store_unreplaced();
         return "not_replaced";
     }
+    // Anything a whole-Library import staged belongs to a vault that has just
+    // been replaced. Left behind, its journal would keep this new, empty
+    // Library shut. If it cannot be removed, the open below stays shut
+    // (`library_import_unfinished`) rather than guessing.
+    let _ = crate::vault_backup::discard(&state.store_path);
     state.open_store(Some(passphrase));
     if state.store.is_some() {
         "replaced"
@@ -6611,22 +7394,50 @@ fn restore_bookmarks(state: &mut AppState, carried: Option<&[u8]>) -> usize {
     if bookmarks.is_empty() {
         return 0;
     }
-    let Some(store) = state.store.as_mut() else {
+    let Ok(store) = state.store_for_write() else {
         return 0;
     };
     store.replace_bookmarks(bookmarks).unwrap_or(0)
 }
 
-fn export_code(error: ExportError) -> &'static str {
+/// What an export reports: its counts, or the refusal and the item in the
+/// way. The same JSON whether it ran in the call or as a job.
+pub(crate) fn export_outcome_json(outcome: crate::vault_backup::ExportOutcome) -> Value {
+    match outcome {
+        crate::vault_backup::ExportOutcome::Written(summary) => json!({
+            "library_included": summary.library_included,
+            "bookmarks": summary.bookmarks,
+            "folders": summary.folders,
+            "tab_groups": summary.tab_groups,
+            "deep_recall_pages": summary.deep_recall_pages,
+            "snapshots": summary.snapshots,
+            "pictures": summary.pictures,
+            "site_exceptions": summary.site_exceptions,
+            "pictures_left_out": summary.pictures_left_out,
+        }),
+        crate::vault_backup::ExportOutcome::Refused(refusal) => json!({
+            "refused": refusal.code,
+            "item": refusal.item,
+            "bookmark_limit": patanyx_store::MAX_BOOKMARKS,
+        }),
+    }
+}
+
+pub(crate) fn export_code(error: ExportError) -> &'static str {
     match error {
         ExportError::AuthFailed => "export_auth_failed",
         ExportError::BadExport(_) => "bad_export",
+        // A real backup from another PATANYX version: the person is told to
+        // update, never that the file is broken.
+        ExportError::UnreadableVersion(_) => "export_version_unreadable",
         ExportError::PlaintextNotConfirmed => "export_not_confirmed",
         ExportError::TargetIsLiveVault => "target_is_vault",
         ExportError::PlaintextMayRemain => "export_plaintext_may_remain",
+        ExportError::Cancelled => "backup_cancelled",
         // Wrapped vault errors (import refusing to overwrite, i/o inside a
         // vault save after import) reuse the vault vocabulary unchanged.
         ExportError::Vault(inner) => vault_code(inner),
+        ExportError::Io(error) if error.kind() == std::io::ErrorKind::StorageFull => "disk_full",
         ExportError::Io(_) => "io",
     }
 }
@@ -6832,7 +7643,15 @@ fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize, b
             continue;
         }
         match state.new_tab(&entry.url, opened_ids.is_empty()) {
-            Ok(tab) => opened_ids.push(tab),
+            Ok(tab) => {
+                // Every restored tab is one the USER reopened, the ones
+                // behind the first as much as the first, so each counts for
+                // the duplicate-site notice when it is selected. new_tab
+                // marks only the foreground one (code review 2026-10-07,
+                // R-020).
+                state.note_user_navigation(tab);
+                opened_ids.push(tab);
+            }
             Err(_) => break,
         }
     }
@@ -6858,6 +7677,10 @@ fn restore_shelf_tabs(state: &mut AppState, id: &str) -> Result<(usize, usize, b
 fn store_open(state: &mut AppState) -> Result<&mut Store, &'static str> {
     if state.vault.is_none() {
         return Err("not_unlocked");
+    }
+    // The Library is being replaced: nothing written to it now would survive.
+    if crate::backup_job::importing(state) {
+        return Err("backup_in_progress");
     }
     // Resolved BEFORE the mutable borrow below: reading it inside the `None`
     // arm would borrow `state` immutably while `as_mut` still holds it.
@@ -8184,6 +9007,9 @@ mod tests {
             include_str!("download_compare.rs"),
             include_str!("reader_view.rs"),
             include_str!("tab_groups.rs"),
+            // The export and import job refuses and answers with codes of its
+            // own (a command run under it, a stop past the commit).
+            include_str!("backup_job.rs"),
         ];
         let mut missing: Vec<&str> = Vec::new();
         let mut checked: Vec<&str> = Vec::new();
@@ -9084,6 +9910,111 @@ mod passphrase_change_tests {
             .find("return Err(code);")
             .expect("the import's refusal moved");
         assert!(release < refused, "the lock is given back after the refusal returns");
+    }
+
+    /// An import over a LIVE vault owes that vault's session an ending either
+    /// way. A failed one used to drop the vault and nothing else: no
+    /// `vault_locked` for the chrome, and the licence session, Premium output
+    /// and the chat transport outlived the closed vault. A successful one kept
+    /// the replaced vault's licence session and never evaluated the imported
+    /// vault's own licence. The arm needs a whole AppState, so the order is
+    /// checked in the source, like the Library lock above.
+    #[test]
+    fn an_import_over_a_live_vault_ends_its_session_either_way() {
+        let source = include_str!("ipc.rs");
+        let arm = source
+            .find("\"vault_import\" => {")
+            .expect("the import arm was renamed");
+        let end = arm
+            + source[arm..]
+                .find("\"vault_change_passphrase\" => {")
+                .expect("the arm after the import moved");
+        let body = &source[arm..end];
+        let at = |needle: &str, why: &str| body.find(needle).unwrap_or_else(|| panic!("{why}"));
+        let had = at(
+            "let had_live_vault = state.vault.is_some();",
+            "the import no longer reads whether a vault was live",
+        );
+        let closure = at("replace_library(&marker", "the import no longer replaces the Library");
+        assert!(had < closure, "had_live_vault must be read before the closure drops the vault");
+
+        // Failure: lock properly, guarded by "the closure ran over a live vault",
+        // before the refusal returns.
+        let failed = at("Err(code) => {", "the import's failure branch moved");
+        let lock = failed
+            + body[failed..]
+                .find("state.lock_vault();")
+                .expect("a failed import over a live vault no longer locks the session");
+        let refused = failed
+            + body[failed..]
+                .find("return Err(code);")
+                .expect("the import's refusal moved");
+        assert!(lock < refused, "the session is locked after the refusal returns");
+        assert!(
+            body[failed..lock].contains("if import_started && had_live_vault && state.vault.is_none() {"),
+            "the lock lost its guard"
+        );
+
+        // Success: the replaced session ends before the imported vault is
+        // installed, and the imported vault is evaluated as an unlock would.
+        let ends = at(
+            "state.end_vault_session();",
+            "a successful import no longer ends the replaced vault's session",
+        );
+        let install = at("state.vault = Some(vault);", "the imported vault is no longer installed");
+        assert!(refused < ends && ends < install, "the old session must end before the new vault goes in");
+        let starts = at(
+            "start_imported_vault_session(state);",
+            "the imported vault's session is no longer started",
+        );
+        assert!(install < starts, "the unlock hooks run against the new vault");
+        assert!(
+            !body.contains("crate::activation::replay_pending(state);"),
+            "an import must not replay a result parked for the vault it replaced"
+        );
+        assert_imported_session_hooks_in_order();
+    }
+
+    /// The body of `fn <signature>` in this file, up to the next top-level
+    /// function.
+    fn body_of_fn(signature: &str) -> &'static str {
+        let source = include_str!("ipc.rs");
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("{signature} was renamed"));
+        let end = start + 1 + source[start + 1..].find("\nfn ").expect("a function follows");
+        &source[start..end]
+    }
+
+    /// The hooks both kinds of import share: the imported vault is evaluated
+    /// as an unlock evaluates one, and a result parked for the vault it
+    /// replaced is dropped, never replayed into it.
+    fn assert_imported_session_hooks_in_order() {
+        let body = body_of_fn("fn start_imported_vault_session(");
+        let at = |needle: &str, why: &str| body.find(needle).unwrap_or_else(|| panic!("{why}"));
+        let tunnel = at(
+            "crate::tunnel_control::on_vault_unlocked(state);",
+            "a tunnel the imported vault enables is no longer started",
+        );
+        let dropped = at(
+            "state.pending_activation_event = None;",
+            "an import keeps a result parked for the vault it replaced",
+        );
+        let licence = at(
+            "crate::licence_control::on_vault_unlocked(state);",
+            "the imported vault's licence is no longer evaluated",
+        );
+        let release = at(
+            "crate::activation::finish_pending_release(state);",
+            "an unresolved release in the imported vault is no longer finished",
+        );
+        assert!(tunnel < licence, "the tunnel starts before the licence is evaluated");
+        assert!(dropped < licence, "dropped before the imported vault is evaluated");
+        assert!(licence < release, "the release is finished for the new vault");
+        assert!(
+            !body.contains("crate::activation::replay_pending(state);"),
+            "an import must not replay a result parked for the vault it replaced"
+        );
     }
 
     /// The repair prompt is offered only for `store_passphrase_mismatch`, so a

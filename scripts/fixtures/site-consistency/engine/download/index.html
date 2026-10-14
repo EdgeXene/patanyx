@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Download PATANYX</title>
+  </head>
+  <body>
+    <!-- Fixture for scripts/site-consistency-gate-test.sh. The Linux card and
+         the WebKitGTK section below are copied from the 1.0.6 download page
+         (same visible text; only the line breaks differ), where the gate
+         failed with "shows version 2.54.0": that number is the engine's
+         version, not a PATANYX release. Must pass. -->
+    <main>
+      <div class="dl-card">
+        <h3>Linux</h3>
+        <span class="dl-meta">PATANYX &middot; 53.8 MB &middot; x86-64</span>
+        <span class="dl-note">
+          Needs WebKitGTK 2.54.0 or newer (<a href="#webkitgtk">how to get it</a
+          >). After downloading, mark the file executable:
+          <code>chmod +x PATANYX</code>. Keep it in a folder you own, such as
+          your home folder, so it can update itself. Already have 1.0.5 or
+          older? Open Updates in PATANYX and restart when 1.0.6 is ready, or
+          replace your old file with this download. Your vault, bookmarks and
+          settings stay where they are.
+        </span>
+        <a class="dl-btn" href="/dl/PATANYX">Download for Linux</a>
+        <code class="hash"
+          >sha256
+          e4308ec1f76061771d29fe8cb44b5b95efeb56b10887086980e7f47408173037</code
+        >
+      </div>
+      <div class="webkitgtk" id="webkitgtk">
+        <h2>Getting WebKitGTK 2.54</h2>
+        <p>
+          PATANYX on Linux shows pages with your system's web engine, WebKitGTK.
+          Version 2.54.0 fixes security bugs a web page can trigger, so PATANYX
+          needs it.
+        </p>
+      </div>
+    </main>
+  </body>
+</html>

@@ -1,6 +1,8 @@
 //! The feature videos (1.0.5): three silent screen recordings of Reader View,
-//! Tab Groups and Side by Side, made from the 1.0.5 build on a fictional test
-//! site and compiled into the browser, so watching one contacts nobody.
+//! Tab Groups and Side by Side, made on a fictional test site and compiled
+//! into the browser, so watching one contacts nobody. Tab Groups and Side by
+//! Side come from the 1.0.5 build; Reader View was re-recorded from a 1.0.7
+//! build, because 1.0.7 moved its toolbar button into the Menu.
 //!
 //! HOW THEY REACH THE PLAYER. The chrome asks for one by name over its IPC
 //! (`tutorial_video`) and plays the bytes from a `blob:` URL. Not from a
@@ -13,15 +15,22 @@
 //! WebM/VP9: the one format both engines decode with only their declared
 //! dependencies (WebView2 natively; WebKitGTK through
 //! gstreamer1.0-plugins-good, which Debian's libwebkit2gtk-4.1-0 Depends on).
+//!
+//! 1.0.7 adds one on Windows only: Kept Sites, recorded from the 1.0.7 build
+//! on a Windows 11 VM against a fictional site served on that machine's
+//! loopback. Keeping sites exists only there (kept_profile.rs), so the
+//! Linux binary carries neither the video nor a way to ask for it.
 
-const VIDEOS: [(&str, &[u8]); 3] = [
+const VIDEOS: &[(&str, &[u8])] = &[
     ("reader-view", include_bytes!("chrome/tutorial/reader-view.webm")),
     ("tab-groups", include_bytes!("chrome/tutorial/tab-groups.webm")),
     ("side-by-side", include_bytes!("chrome/tutorial/side-by-side.webm")),
+    #[cfg(windows)]
+    ("keep-sites", include_bytes!("chrome/tutorial/keep-sites.webm")),
 ];
 
 /// The named video, base64-encoded for the IPC reply, or None for any name
-/// that is not exactly one of the three.
+/// that is not exactly one of them.
 pub fn video_base64(name: &str) -> Option<String> {
     VIDEOS
         .iter()
@@ -66,8 +75,10 @@ mod tests {
     }
 
     #[test]
-    fn only_the_three_videos_are_served_and_they_are_webm() {
-        for (name, bytes) in VIDEOS {
+    fn only_the_listed_videos_are_served_and_they_are_webm() {
+        assert_eq!(VIDEOS.len(), if cfg!(windows) { 4 } else { 3 });
+        assert_eq!(video_base64("keep-sites").is_some(), cfg!(windows), "Kept Sites is Windows only");
+        for &(name, bytes) in VIDEOS {
             assert!(bytes.len() > 10_000, "{name} is suspiciously small");
             assert!(bytes.starts_with(&[0x1A, 0x45, 0xDF, 0xA3]), "{name} is not a WebM/Matroska file");
             let b64 = video_base64(name).expect(name);

@@ -1139,7 +1139,7 @@ pub fn ipc_relay_set(state: &mut AppState, args: &Value) -> Result<Value, &'stat
     let held = held_identity_hashes(state);
     let draft = parse_relay_settings(args, RELAY_COMPILED, |h| held.iter().any(|x| x == h))?;
     {
-        let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+        let vault = state.vault_for_write()?;
         vault.set_chat_relay_settings(draft).map_err(vault_code)?;
     }
     if state.chat.online {
@@ -1191,7 +1191,7 @@ pub fn ipc_identity(state: &mut AppState, args: &Value) -> Result<Value, &'stati
 /// announces NOTHING.
 pub fn ipc_identity_create(state: &mut AppState) -> Result<Value, &'static str> {
     let (secret, minted) = {
-        let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+        let vault = state.vault_for_write()?;
         match vault.chat_identity() {
             Some(secret) => (secret, false),
             None => {
@@ -1225,7 +1225,7 @@ pub fn ipc_contact_note(state: &mut AppState, args: &Value) -> Result<Value, &'s
         .and_then(Value::as_str)
         .ok_or("bad_args")?;
     let note = args.get("note").and_then(Value::as_str).unwrap_or("");
-    let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+    let vault = state.vault_for_write()?;
     vault.set_contact_note(contact_id, note).map_err(vault_code)?;
     Ok(json!({}))
 }
@@ -1258,7 +1258,7 @@ pub fn ipc_contacts(state: &mut AppState) -> Result<Value, &'static str> {
 pub fn ipc_contact_add(state: &mut AppState, args: &Value) -> Result<Value, &'static str> {
     let label = parse_label(args)?;
     let peer_hash = parse_peer_hash(args)?;
-    let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+    let vault = state.vault_for_write()?;
     // Fresh keypair for THIS contact only: the hash number the user reads to
     // this person is the fingerprint of this key and of no other contact's.
     let identity = Identity::generate();
@@ -1290,7 +1290,7 @@ pub fn ipc_contact_remove(state: &mut AppState, args: &Value) -> Result<Value, &
             identity_from_secret(contact.our_secret).fingerprint(),
         )
     };
-    let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+    let vault = state.vault_for_write()?;
     vault.delete_contact(contact_id).map_err(vault_code)?;
     if let Some(transport) = state.chat.transport.as_ref() {
         // Revocation: the fingerprint stops being announced and every session
@@ -1309,7 +1309,7 @@ pub fn ipc_contact_remove(state: &mut AppState, args: &Value) -> Result<Value, &
             identity_hash: None,
             ..settings
         };
-        let vault = state.vault.as_mut().ok_or("not_unlocked")?;
+        let vault = state.vault_for_write()?;
         vault.set_chat_relay_settings(updated).map_err(vault_code)?;
         emit(state, "chat_relay_state", relay_json(state));
     }
@@ -1470,6 +1470,11 @@ pub fn ipc_accept_tab(state: &mut AppState, args: &Value) -> Result<Value, &'sta
     // page they have not looked at yet. (Was a Note inferring this from
     // `tab_new`; confirmed against `AppState::new_tab`.)
     let id = state.new_tab(url, false)?;
+    // The user confirmed this link, so it is a site THEY opened and counts
+    // for the duplicate-site notice when they select the tab. new_tab marks
+    // only foreground tabs; this one is background on purpose (code review
+    // 2026-10-07, R-020). The peer chose the address, not when it opens.
+    state.note_user_navigation(id);
     Ok(json!({ "id": id }))
 }
 

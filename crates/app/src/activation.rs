@@ -557,6 +557,13 @@ pub struct ActivationEvent {
     pub release: Option<Result<bool, CallFailure>>,
 }
 
+/// Whether a worker's answer belongs to the vault open now: the call started in
+/// this vault epoch, or its epoch is unknown (an answer from before this was
+/// recorded). An import that may have replaced the vault moves the epoch.
+pub(crate) fn answer_belongs(started_in: Option<u64>, now: u64) -> bool {
+    started_in.is_none_or(|epoch| epoch == now)
+}
+
 /// Deliver a result that arrived while the vault was locked. Called right
 /// after the unlock-time evaluation, so the licence check inside
 /// `handle_event` sees the session the result belongs to.
@@ -573,6 +580,16 @@ pub fn replay_pending(state: &mut AppState) {
 /// releasing the same device twice is what the server calls idempotent.
 pub fn finish_pending_release(state: &mut AppState) -> bool {
     if !release_is_pending_here(state) {
+        return false;
+    }
+    // One call at a time, as start_activation already insists. A second
+    // start here (an import, or an unlock, while an earlier call is still
+    // out) made remember_worker JOIN that unfinished network thread on the
+    // event loop, freezing the window until it timed out, and the earlier
+    // call's answer then cleared the in-flight flag of this one (review
+    // 2026-10-12, R-005). Nothing is lost by waiting: the vault keeps the
+    // release recorded, and the next unlock asks again.
+    if crate::licence_control::activation_in_flight() {
         return false;
     }
     start_release_call(state)
@@ -629,6 +646,9 @@ pub fn start_activation(state: &AppState) -> bool {
         return false;
     };
     crate::licence_control::mark_activation_in_flight();
+    // The answer is for the vault open now; an import that replaces it moves
+    // the epoch, and the answer is then dropped (`handle_event_from`).
+    state.activation_epoch.set(Some(state.vault_epoch));
     let proxy = state.proxy();
     let handle = std::thread::spawn(move || {
         let outcome = activate_blocking(&record.token_text, &device_id);
@@ -688,7 +708,7 @@ pub fn start_release(state: &mut AppState) -> bool {
         return false;
     };
     let here = hex_encode_16(&device_id);
-    let Some(vault) = state.vault.as_mut() else {
+    let Ok(vault) = state.vault_for_write() else {
         return false;
     };
     if vault.begin_release(&here).is_err() {
@@ -713,6 +733,7 @@ pub fn start_release_call(state: &AppState) -> bool {
         return false;
     };
     crate::licence_control::mark_activation_in_flight();
+    state.activation_epoch.set(Some(state.vault_epoch));
     let proxy = state.proxy();
     let handle = std::thread::spawn(move || {
         let result = release_blocking(&record.token_text, &device_id);
@@ -743,11 +764,23 @@ pub fn handle_event(state: &mut AppState, event: ActivationEvent) {
 fn handle_event_from(state: &mut AppState, event: ActivationEvent, from_worker: bool) {
     if from_worker {
         crate::licence_control::clear_activation_in_flight();
+        // Started for a vault an import has since begun to replace: its
+        // receipt and release markers belong to that vault, and the licence
+        // id alone cannot tell the two apart. Dropped; the next unlock or
+        // activation asks again, and the server answers the same device the
+        // same way.
+        if !answer_belongs(state.activation_epoch.take(), state.vault_epoch) {
+            return;
+        }
     }
     // Vault locked meanwhile: KEEP the result for the next unlock rather
     // than drop it. The licence check below cannot run now (the session is
     // gone with the lock) and runs at replay instead.
-    if state.vault.is_none() {
+    // An import replacing the vault counts as locked here: its answer is
+    // kept, and replayed only if the original vault is still the one open
+    // when the import ends (a stop); an import that commits drops it, as it
+    // always has, since it belongs to the replaced vault's session.
+    if state.vault.is_none() || crate::backup_job::importing(state) {
         // ACTIVATION results only. A release result needs no in-memory
         // parking: the vault already records that this device is being
         // released, so the next unlock retries the call whatever happens
@@ -764,7 +797,7 @@ fn handle_event_from(state: &mut AppState, event: ActivationEvent, from_worker: 
     if !still_same_licence {
         return;
     }
-    let Some(vault) = state.vault.as_mut() else {
+    let Ok(vault) = state.vault_for_write() else {
         return;
     };
     match event.kind {
@@ -893,9 +926,10 @@ pub fn import_receipt(state: &mut AppState, receipt_text: &str) -> &'static str 
     // Snapshot the records so a receipt that does not verify at evaluation can
     // be rolled back cleanly -- the vault must not keep a receipt Premium won't
     // honour.
-    let previous = match state.vault.as_mut() {
-        Some(vault) => vault.activation_records(),
-        None => return "locked",
+    let previous = match state.vault_for_write() {
+        Ok(vault) => vault.activation_records(),
+        Err("backup_in_progress") => return "backup_in_progress",
+        Err(_) => return "locked",
     };
     let mut records: Vec<patanyx_vault::ActivationRecord> = previous
         .iter()
@@ -911,13 +945,13 @@ pub fn import_receipt(state: &mut AppState, receipt_text: &str) -> &'static str 
     while records.len() > 5 {
         records.remove(0);
     }
-    match state.vault.as_mut() {
-        Some(vault) => {
+    match state.vault_for_write() {
+        Ok(vault) => {
             if vault.set_activation_records(records).is_err() {
                 return "vault_io";
             }
         }
-        None => return "locked",
+        Err(code) => return if code == "backup_in_progress" { code } else { "locked" },
     }
 
     // The one and only judge: the unlock-time evaluation, run from the vault.
@@ -930,7 +964,7 @@ pub fn import_receipt(state: &mut AppState, receipt_text: &str) -> &'static str 
         // an earlier release of it is over, like every other activation --
         // including one still parked for retry, which would otherwise delete
         // this receipt at the next unlock.
-        if let Some(vault) = state.vault.as_mut() {
+        if let Ok(vault) = state.vault_for_write() {
             if vault.clear_released_device_if(&device_id_hex).is_err()
                 || vault.clear_release_pending_if(&device_id_hex).is_err()
             {
@@ -943,7 +977,7 @@ pub fn import_receipt(state: &mut AppState, receipt_text: &str) -> &'static str 
 
     // Rejected: restore what was there and re-evaluate, so a bad paste leaves
     // no trace and cannot displace a receipt that was already valid.
-    if let Some(vault) = state.vault.as_mut() {
+    if let Ok(vault) = state.vault_for_write() {
         let _ = vault.set_activation_records(previous);
     }
     crate::licence_control::on_vault_unlocked(state);
@@ -965,6 +999,21 @@ fn refusal_code(code: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A pending release is not started while another call is out: a
+    /// second worker made remember_worker join the unfinished one on the
+    /// event loop (review 2026-10-12, R-005).
+    #[test]
+    fn a_pending_release_waits_for_the_call_already_out() {
+        let source = include_str!("activation.rs");
+        let start = source.find("pub fn finish_pending_release(").expect("finish_pending_release");
+        let body = &source[start..start + source[start..].find("\n}\n").expect("end")];
+        let guard = body
+            .find("if crate::licence_control::activation_in_flight() {")
+            .expect("finish_pending_release no longer waits for the call already out");
+        let call = body.find("start_release_call(state)").expect("start_release_call");
+        assert!(guard < call, "the in-flight check must come before the call");
+    }
 
     /// The token-safety line of the reachability fallback: a connect failure
     /// retries direct (that is how a stale corporate proxy on a home network is

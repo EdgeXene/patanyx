@@ -62,16 +62,102 @@ impl SessionWipeGate {
     pub fn finish(&self) {
         self.0.store(Self::FINISHED, Ordering::SeqCst);
     }
+
+    /// Whether the clear has completed (or was finished by a failure path).
+    #[cfg_attr(windows, allow(dead_code))]
+    pub fn is_finished(&self) -> bool {
+        self.0.load(Ordering::SeqCst) == Self::FINISHED
+    }
 }
 
 static SESSION_WIPE: SessionWipeGate = SessionWipeGate::new();
+/// The kept profile's own start-up clear (kept_profile.rs). A separate
+/// gate: each profile's tabs wait for their own profile's clear and are
+/// released by it alone (plan review 2026-10-13, R-017).
+static KEPT_SESSION_WIPE: SessionWipeGate = SessionWipeGate::new();
 
-pub(crate) fn enter_session_wipe() -> SessionWipeEntry {
-    SESSION_WIPE.enter()
+fn wipe_gate(kind: crate::kept_profile::ProfileKind) -> &'static SessionWipeGate {
+    match kind {
+        crate::kept_profile::ProfileKind::Main => &SESSION_WIPE,
+        crate::kept_profile::ProfileKind::Kept => &KEPT_SESSION_WIPE,
+    }
 }
 
-pub(crate) fn finish_session_wipe() {
-    SESSION_WIPE.finish();
+pub(crate) fn enter_session_wipe(kind: crate::kept_profile::ProfileKind) -> SessionWipeEntry {
+    wipe_gate(kind).enter()
+}
+
+pub(crate) fn finish_session_wipe(kind: crate::kept_profile::ProfileKind) {
+    wipe_gate(kind).finish();
+}
+
+/// Whether `kind`'s start-up clear has completed. WebKitGTK's first-page
+/// gate asks this directly, because a tab can now also be released by its
+/// ad and tracker filters landing, and that must never release a page ahead
+/// of the clear.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn session_wipe_finished(kind: crate::kept_profile::ProfileKind) -> bool {
+    wipe_gate(kind).is_finished()
+}
+
+/// The whole kept profile is owed a clear at this start (a site that was
+/// kept is not any more) and removing its folder at launch did not work, so
+/// the first kept tab's gate clears it with the engine instead.
+static KEPT_FULL_CLEAR_DUE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process may use the kept profile at all: only the sole
+/// running PATANYX (an exclusive lock at start), and only once its
+/// admitted record was saved (code review 2026-10-13, R-024, R-025).
+static KEPT_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process holds the kept profile (the exclusive lock at
+/// start). It may then clean it even with kept browsing off (code review
+/// round 8).
+static KEPT_SOLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_kept_sole(sole: bool) {
+    KEPT_SOLE.store(sole, Ordering::SeqCst);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn kept_sole() -> bool {
+    KEPT_SOLE.load(Ordering::SeqCst)
+}
+
+pub(crate) fn set_kept_enabled(enabled: bool) {
+    KEPT_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn kept_enabled() -> bool {
+    KEPT_ENABLED.load(Ordering::SeqCst)
+}
+
+/// The kept profile's ledger (kept_profile.rs), beside its folder.
+pub fn kept_ledger_path_for(vault_path: &Path) -> PathBuf {
+    vault_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join("WebView2-kept.ledger")
+}
+
+/// The kept profile's lock: the sole running PATANYX holds it exclusively
+/// for its whole life (main.rs), so a second process cannot take it and
+/// leaves the kept profile and its ledger alone.
+pub fn kept_profile_lock_path_for(vault_path: &Path) -> PathBuf {
+    vault_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join("WebView2-kept.lock")
+}
+
+pub(crate) fn set_kept_full_clear_due(due: bool) {
+    KEPT_FULL_CLEAR_DUE.store(due, Ordering::SeqCst);
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn kept_full_clear_due() -> bool {
+    KEPT_FULL_CLEAR_DUE.load(Ordering::SeqCst)
 }
 
 /// Issues a tab's first navigation with the same first-party marker used by
@@ -164,7 +250,7 @@ mod session_wipe_tests {
     }
 
     #[test]
-    fn windows_mask_is_site_data_and_cache_not_profile_records() {
+    fn windows_mask_is_site_data_cache_and_history_not_settings() {
         // windows.rs is cfg-excluded on this Linux test host, so inspect the
         // exact expression passed to ClearBrowsingData. This is a compile-time
         // tripwire for a privacy-sensitive Windows-only mask, not a substitute
@@ -178,22 +264,44 @@ mod session_wipe_tests {
             "the startup reset must not regress to the cookie-only primitive"
         );
         let mask = between(function, "let kinds =", "if let Err(error)");
-        for required in ["ALL_SITE", "SERVICE_WORKERS", "DISK_CACHE"] {
+        // The engine's browsing and download history are plain-text records of
+        // every address, which nothing in PATANYX reads; measured holding
+        // three days of visits on the 1.0.7 Windows VM before they were added.
+        for required in [
+            "ALL_SITE",
+            "SERVICE_WORKERS",
+            "DISK_CACHE",
+            "BROWSING_HISTORY",
+            "DOWNLOAD_HISTORY",
+        ] {
             assert!(mask.contains(required), "Windows wipe lost {required}");
         }
-        for excluded in [
-            "SETTINGS",
-            "DOWNLOAD_HISTORY",
-            "BROWSING_HISTORY",
-            "GENERAL_AUTOFILL",
-            "PASSWORD_AUTOSAVE",
-            "ALL_PROFILE",
-        ] {
+        for excluded in ["SETTINGS", "GENERAL_AUTOFILL", "PASSWORD_AUTOSAVE", "ALL_PROFILE"] {
             assert!(
                 !mask.contains(excluded),
                 "Windows wipe unexpectedly includes profile record {excluded}"
             );
         }
+    }
+
+    #[test]
+    fn windows_kept_start_also_clears_the_engine_history() {
+        // KEPT's ordinary start keeps site storage but must not keep the
+        // engine's address records either: same reason as the full clear.
+        let source = include_str!("windows.rs");
+        let function = between(source, "fn begin_kept_cookie_cleanup(", "\n}\n");
+        let mask = between(
+            function,
+            "let kinds = COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE",
+            "profile2.ClearBrowsingData(kinds",
+        );
+        for required in ["BROWSING_HISTORY", "DOWNLOAD_HISTORY"] {
+            assert!(mask.contains(required), "the kept start lost {required}");
+        }
+        assert!(
+            !mask.contains("ALL_SITE"),
+            "the kept start must keep the kept sites' storage"
+        );
     }
 
     #[test]
@@ -980,6 +1088,19 @@ pub fn chrome_covers_window(left: i32, right: i32, arrangement: ChromeLayout) ->
 /// and a future backend that cannot do it needs somewhere to say so.
 pub fn sidebar_supported() -> bool {
     true
+}
+
+/// Whether this backend can open the native print dialog, and whether it can
+/// write the page as a PDF (1.0.7, for the menu's Print and Save as PDF).
+/// WebView2 has both; WebKitGTK as built here has neither, which is why
+/// unix.rs `show_print_ui` and `save_page_as_pdf` answer false. Asked through
+/// `chrome_caps` under the same rule as `sidebar_supported`: a control the
+/// platform cannot honour is hidden, never shown and failing.
+pub fn print_supported() -> bool {
+    cfg!(windows)
+}
+pub fn save_pdf_supported() -> bool {
+    cfg!(windows)
 }
 
 /// Chrome UI origin. WebKitGTK serves custom protocols at their real
@@ -2790,6 +2911,17 @@ pub const CHROME_RESERVED_HOST: &str = "rbchrome.localhost";
 /// directory. Named for what a user finds inside it if they look.
 #[allow(dead_code)]
 pub const BROWSING_PROFILE_DIR_NAME: &str = "WebView2";
+
+/// The kept sites' own user-data folder (kept_profile.rs), beside the
+/// browsing profile so the two are never one folder.
+pub const KEPT_PROFILE_DIR_NAME: &str = "WebView2-kept";
+
+pub fn kept_profile_dir_for(vault_path: &Path) -> PathBuf {
+    vault_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join(KEPT_PROFILE_DIR_NAME)
+}
 
 /// Where the persistent browsing profile belongs: beside the vault.
 ///

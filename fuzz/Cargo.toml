@@ -39,6 +39,7 @@ libfuzzer-sys = "0.4"
 patanyx-chat = { path = "../crates/chat" }
 patanyx-update = { path = "../crates/update" }
 patanyx-licence = { path = "../crates/licence" }
+patanyx-vault = { path = "../crates/vault" }
 
 [[bin]]
 name = "chat_wire_decode"
@@ -83,3 +84,9 @@ test = false
 doc = false
 
 [workspace]
+
+[[bin]]
+name = "backup_records"
+path = "fuzz_targets/backup_records.rs"
+test = false
+doc = false

@@ -40,10 +40,26 @@ pub struct ForgetAllCopy {
     pub cancel: &'static str,
 }
 
-/// The browser-wide control's wording. Pure and constant: there is no state
-/// this copy varies with, and the day it grows one, it grows a parameter
-/// here rather than a branch in the chrome.
-pub fn forget_all_copy() -> ForgetAllCopy {
+/// The browser-wide control's wording. Pure: the one state it varies with is
+/// whether any site is kept (kept_profile.rs). Kept sites live in their own
+/// storage and are not cleared by this, so the copy says so then (code
+/// review 2026-10-13, R-029).
+pub fn forget_all_copy(sites_kept: bool) -> ForgetAllCopy {
+    if sites_kept {
+        return ForgetAllCopy {
+            intro: "Clears cookies for every site except the ones you keep, not just the one \
+                    you are looking at. Sites you are signed in to will sign you out, except \
+                    the ones you keep.",
+            warning: "This clears cookies for every site except the ones you keep. It does not \
+                      reach kept sites' own storage, so cookies there stay, including those of \
+                      sites they embed and of any site you stopped keeping, which go at the next \
+                      start. Your saved passwords, bookmarks, history and site settings are left \
+                      alone. This cannot be undone.",
+            button: "Clear cookies for all sites",
+            confirm: "Yes, clear them all",
+            cancel: "Cancel",
+        };
+    }
     ForgetAllCopy {
         intro: "Clears cookies for every site, not just the one you are looking at. \
                 Sites you are signed in to will sign you out.",
@@ -82,8 +98,12 @@ pub fn unavailable_intro() -> &'static str {
 /// Returned by the COMMAND, not by the status payload, so it can only appear
 /// after the engine reported success -- the same discipline as the per-site
 /// result line, which is written from the reply rather than from the click.
-pub fn cleared_line() -> &'static str {
-    "Cookies cleared for every site."
+pub fn cleared_line(sites_kept: bool) -> &'static str {
+    if sites_kept {
+        "Cookies cleared for every site except the ones you keep."
+    } else {
+        "Cookies cleared for every site."
+    }
 }
 
 #[cfg(test)]
@@ -93,14 +113,18 @@ mod tests {
     /// Every string this module hands the chrome, for the checks that have to
     /// hold across all of them.
     fn all_strings() -> Vec<&'static str> {
-        let c = forget_all_copy();
+        let c = forget_all_copy(false);
+        let k = forget_all_copy(true);
         vec![
             c.intro,
             c.warning,
             c.button,
             c.confirm,
             c.cancel,
-            cleared_line(),
+            cleared_line(false),
+            k.intro,
+            k.warning,
+            cleared_line(true),
             // The unavailable sentence is user-facing copy like the rest, so
             // the overclaim and em-dash checks below must see it too.
             unavailable_intro(),
@@ -109,7 +133,7 @@ mod tests {
 
     #[test]
     fn the_wording_is_pinned() {
-        let c = forget_all_copy();
+        let c = forget_all_copy(false);
         assert_eq!(
             c.intro,
             "Clears cookies for every site, not just the one you are looking at. Sites \
@@ -123,7 +147,13 @@ mod tests {
         assert_eq!(c.button, "Clear cookies for all sites");
         assert_eq!(c.confirm, "Yes, clear them all");
         assert_eq!(c.cancel, "Cancel");
-        assert_eq!(cleared_line(), "Cookies cleared for every site.");
+        assert_eq!(cleared_line(false), "Cookies cleared for every site.");
+        // With a site kept, every sentence that says "every site" names the
+        // exception.
+        let k = forget_all_copy(true);
+        for line in [k.intro, k.warning, cleared_line(true)] {
+            assert!(line.contains("except the ones you keep"), "{line}");
+        }
         assert_eq!(
             unavailable_intro(),
             "Clearing cookies from inside PATANYX is not available on this platform in \
@@ -186,7 +216,7 @@ mod tests {
     /// thing the user takes from it.
     #[test]
     fn the_warning_names_what_is_left_alone() {
-        let warning = forget_all_copy().warning.to_lowercase();
+        let warning = forget_all_copy(false).warning.to_lowercase();
         for kept in ["passwords", "bookmarks", "history", "site settings"] {
             assert!(
                 warning.contains(kept),

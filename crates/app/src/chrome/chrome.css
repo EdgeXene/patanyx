@@ -6,6 +6,46 @@
   padding: 0;
 }
 
+/* MOTION. Every transition and animation in this file takes its duration from
+   these tokens, so one switch quiets all of it: the system's reduced-motion
+   setting and the browser's own Reduce motion switch (html[data-motion], from
+   the Theme panel) both set the durations to zero. chrome.js reads the same
+   answer through prefersReducedMotion() for the timings it keeps in JS (the
+   tab slide, the panel close). The gate (scripts/motion-gate.js) refuses a
+   duration written as a literal anywhere else in this file.
+   On `html`, not `:root`: theme-contrast-gate.py reads the `:root` blocks as
+   the colour axes. */
+html {
+  --motion-fast: 120ms;
+  --motion-base: 150ms;
+  --motion-ease: cubic-bezier(0.2, 0, 0, 1);
+}
+@media (prefers-reduced-motion: reduce) {
+  html {
+    --motion-fast: 0ms;
+    --motion-base: 0ms;
+  }
+}
+html[data-motion="reduce"] {
+  --motion-fast: 0ms;
+  --motion-base: 0ms;
+}
+
+/* Hover and focus change colour smoothly instead of snapping. Colour only:
+   nothing here moves, so a button under the pointer stays where it was. */
+button.small,
+.nav-btn,
+.feature-btn,
+.tab-chip,
+.theme-swatch,
+.toggle-row {
+  transition:
+    background-color var(--motion-fast) var(--motion-ease),
+    border-color var(--motion-fast) var(--motion-ease),
+    color var(--motion-fast) var(--motion-ease),
+    box-shadow var(--motion-fast) var(--motion-ease);
+}
+
 html,
 body {
   height: 100%;
@@ -134,15 +174,30 @@ body {
 #tabs.tab-dragging {
   cursor: grabbing;
 }
+/* A new chip fades in rather than popping. Only on insertion: chips are kept
+   across repaints (tabChipsById), so a title change does not replay it.
+   Opacity ONLY: a drag writes an inline transform the moment it starts, and
+   an animation on transform would own that property for its first 120 ms and
+   leave a brand-new chip ignoring the pointer (review 2026-10-12, R-004). */
+.tab-chip {
+  animation: chip-in var(--motion-fast) ease-out;
+}
+@keyframes chip-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
 /* Neighbors slide aside during a drag, and every chip slides into place
    after a drop, a keyboard move or a close. The dragged chip itself has no
-   transition: it is wherever the pointer is. Same 150ms as TAB_SLIDE_MS in
-   chrome.js. */
-@media (prefers-reduced-motion: no-preference) {
-  #tabs.tab-dragging .tab-chip:not(.dragging),
-  #tabs.tab-settling .tab-chip {
-    transition: transform 150ms cubic-bezier(0.2, 0, 0, 1);
-  }
+   transition: it is wherever the pointer is. --motion-base is the same 150ms
+   as TAB_SLIDE_MS in chrome.js, and zero under Reduce motion, where
+   prefersReducedMotion() makes chrome.js skip the slide too. */
+#tabs.tab-dragging .tab-chip:not(.dragging),
+#tabs.tab-settling .tab-chip {
+  transition: transform var(--motion-base) var(--motion-ease);
 }
 .tab-chip.active {
   background: var(--sf-strip-a); /* merges into the toolbar below */
@@ -180,6 +235,83 @@ body {
   padding: 4px 11px;
   margin-bottom: 5px;
   border-radius: 8px;
+}
+
+/* THE WINDOW FRAME ON WINDOWS (1.0.7): index.html says what each part is.
+   The drag area keeps a fixed share of the strip that no tab takes. The
+   controls sit flush in the window's top-right corner, over the strip's
+   padding, at the size Windows uses for its own. */
+#window-drag {
+  flex: 0 0 56px;
+  align-self: stretch;
+}
+#window-controls {
+  display: flex;
+  align-self: flex-start;
+  margin: -7px -8px 0 0;
+}
+#window-controls[hidden],
+#window-resize[hidden] {
+  display: none;
+}
+.win-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 46px;
+  height: 32px;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  color: var(--tx);
+}
+.win-btn:hover {
+  background: var(--sf-raised);
+}
+/* Close turns red on hover, as the system's own does, in every scheme. */
+#win-close:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+.win-btn svg {
+  width: 10px;
+  height: 10px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1;
+}
+html[data-window-maximized="on"] #win-max .win-icon-max,
+html:not([data-window-maximized="on"]) #win-max .win-icon-restore {
+  display: none;
+}
+/* The top edge's resize band, over everything in the strip; corners resize
+   diagonally. A maximized window has no edge to drag. */
+#window-resize {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: 4px;
+  z-index: 3;
+  display: flex;
+}
+html[data-window-maximized="on"] #window-resize {
+  display: none;
+}
+#window-resize-nw,
+#window-resize-ne {
+  flex: 0 0 8px;
+}
+#window-resize-nw {
+  cursor: nwse-resize;
+}
+#window-resize-ne {
+  cursor: nesw-resize;
+}
+#window-resize-n {
+  flex: 1;
+  cursor: ns-resize;
 }
 
 #toolbar {
@@ -225,12 +357,14 @@ body {
    height takes a full row of zero thickness; the `gap` above supplies the
    space between the two rows.
 
-   ABOVE the break: the address bar, and the three things reached most often --
-   bookmark, quarantine and About. BELOW it: state and everything else, filled
-   from the right.
+   ABOVE the break: the address bar, bookmark, quarantine and the Menu.
+   BELOW it: the shield and the freeze chip, then four groups (Network, Tabs,
+   Saved, Tools), filled from the right.
 
-   The pills all live on that second row so every one of them is visible
-   without opening anything, which is why this browser has no overflow menu. */
+   Since 1.0.7 not everything is visible without opening anything: Reader
+   View, About, Integrity and Updates live in the Menu, and each group can
+   fold into one button, by the user's choice or on a narrow window. The
+   shield and the freeze chip never fold. */
 .toolbar-break {
   flex-basis: 100%;
   height: 0;
@@ -257,12 +391,29 @@ body {
    page. The body must also go transparent in that mode or its own opaque
    background repaints exactly the cover the lift removed; the strip and
    toolbar carry their own opaque backgrounds and are unaffected. */
-body.modal-open::after {
+body::after {
   content: "";
   position: fixed;
   inset: 0;
   background: var(--sf-scrim);
   z-index: 30;
+  /* Always present and faded rather than toggled: it fades in with the card
+     and out with it (body.modal-closing, set for the close fade), and with
+     no panel open it is invisible and lets every click through. */
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--motion-fast) var(--motion-ease);
+}
+body.modal-open::after {
+  opacity: 1;
+  pointer-events: auto;
+  /* Stated here as well as above: platform/mod.rs pins the stacking order
+     (banner 35 over scrim 30 under panel 40) by reading THIS block. */
+  z-index: 30;
+}
+body.modal-open.modal-closing::after {
+  opacity: 0;
+  pointer-events: none;
 }
 body.translucent-backdrop.modal-open {
   background: transparent;
@@ -306,7 +457,22 @@ body.translucent-backdrop.modal-open::before {
      reaches into this band. */
   z-index: 33;
 }
-body.translucent-backdrop.modal-open::after {
+/* Not under solid-backdrop: that WebKitGTK fallback needs an opaque repaint
+   (see below), and a menu must not take it away (round 3, R-005). */
+body.translucent-backdrop.menu-open:not(.solid-backdrop) {
+  background: transparent;
+}
+body.translucent-backdrop.menu-open:not(.solid-backdrop)::before {
+  content: "";
+  position: fixed;
+  left: 0;
+  right: 0;
+  top: 0;
+  height: var(--chrome-closed-px, 148px);
+  background: var(--sf-strip-a);
+  z-index: 33;
+}
+body.translucent-backdrop::after {
   background: rgba(13, 14, 18, 0.62);
 }
 /* WebKitGTK WITHOUT COMPOSITING paints a translucent repaint over its own
@@ -315,17 +481,253 @@ body.translucent-backdrop.modal-open::after {
    2026-10-07). The page is not visible through the backdrop in that mode
    anyway, so the backdrop goes solid there: an opaque repaint overwrites. Set
    from chrome_caps.solid_backdrop. */
-body.translucent-backdrop.solid-backdrop.modal-open::after {
+body.translucent-backdrop.solid-backdrop::after {
   background: var(--sf-scrim);
+  /* No fade either: this backend paints a translucent repaint over its own
+     previous pixels (see above), so a scrim at 40% would show the old card. */
+  transition: none;
 }
 
 /* The strip stays above the scrim and stays clickable, so a feature button can
    switch panels directly instead of forcing a close-then-open. The dismissal
    handler in chrome.js exempts these two for the same reason. */
 body.modal-open #tabstrip,
-body.modal-open #toolbar {
+body.modal-open #toolbar,
+body.menu-open #tabstrip,
+body.menu-open #toolbar {
   position: relative;
   z-index: 50;
+}
+
+/* THE MAIN MENU (1.0.7). Four pills moved out of the rows and into a menu
+   under the strip; their buttons stay in the header under `in-menu` so that
+   update.js's append, every handler and every gate id keep working, and the
+   menu's entries proxy clicks to them. The layer is fixed below the measured
+   strip like a panel, at the right where its button is, above the card (40)
+   and below the strip (50). It fades like a card; `menu-closing` is the
+   120ms out, hidden after. */
+.feature-btn.in-menu {
+  display: none;
+}
+/* Clear of the Right rail (z 50, which would cover its right edge), and no
+   taller than the window below it: a short window scrolls the menu rather
+   than clipping its last rows (review round 2, R-007, R-006). */
+#main-menu {
+  top: calc(var(--chrome-strip-px, var(--chrome-closed-px, 148px)) + 4px);
+  right: calc(var(--chrome-right-px, 0px) + 8px);
+  max-height: calc(100vh - var(--chrome-strip-px, var(--chrome-closed-px, 148px)) - 16px);
+}
+/* A folded group's menu opens at its pill: below it on the top strip,
+   beside it on a rail. chrome.js measures the pill and sets the three
+   custom properties (CSSOM, which the CSP allows). */
+#group-menu {
+  top: var(--menu-top, calc(var(--chrome-strip-px, 148px) + 4px));
+  left: var(--menu-left, 8px);
+  max-height: calc(100vh - var(--menu-top, 152px) - 12px);
+}
+:root[data-toolbar-placement="right"] #group-menu {
+  left: auto;
+  right: var(--menu-right, 8px);
+}
+.menu-layer {
+  position: fixed;
+  z-index: 45;
+  overflow-y: auto;
+  min-width: 220px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--sf-panel);
+  border: 1px solid var(--ln-strong);
+  border-radius: 12px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.5);
+  animation: menu-in var(--motion-fast) ease-out;
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.menu-layer.menu-closing {
+  opacity: 0;
+  pointer-events: none;
+  animation: none;
+  transition: opacity var(--motion-fast) var(--motion-ease);
+}
+.menu-entry {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--tx);
+  font: inherit;
+  cursor: pointer;
+  transition:
+    background-color var(--motion-fast) var(--motion-ease),
+    color var(--motion-fast) var(--motion-ease);
+}
+.menu-entry:hover,
+.menu-entry:focus-visible {
+  background: var(--sf-btn-hover);
+  color: var(--tx-bright);
+  outline: none;
+}
+.menu-entry:disabled {
+  color: var(--tx-faint);
+  cursor: default;
+}
+/* A proxy mirrors the real button's state: pressed (its panel is open),
+   warning (Updates has one waiting), locked (a premium feature). */
+.menu-entry[aria-checked="true"] {
+  color: var(--accent-text);
+}
+.menu-entry.is-warning .menu-entry-label::after {
+  content: "";
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  margin-left: 8px;
+  border-radius: 50%;
+  background: var(--st-warn);
+  vertical-align: middle;
+}
+.menu-key {
+  font: inherit;
+  font-size: 11px;
+  color: var(--tx-dim);
+}
+/* A locked Premium entry says so where its shortcut was (1.0.7). The tag
+   shows only while the entry carries .premium-locked, which
+   applyPremiumState sets and a licence removes. */
+.menu-premium-tag {
+  display: none;
+  font-size: 11px;
+  color: var(--tx-dim);
+}
+.menu-entry.premium-locked .menu-premium-tag {
+  display: inline;
+}
+.menu-entry.premium-locked .menu-key {
+  display: none;
+}
+
+/* TOOLBAR GROUPS (1.0.7). A group's pill shows only while the group is
+   folded, and its buttons hide while it is; both keyed on html[data-folded],
+   a space-separated list chrome.js writes from the saved folds plus any the
+   window's width forced. !important for the same reason as the global
+   [hidden] rule: .feature-btn sets display, and a later layout rule must not
+   bring a folded button back. A button that is hidden for its own reason
+   (Fill with nothing to fill, Chat in a public build) stays hidden either
+   way. */
+.feature-btn.group-pill {
+  display: none !important;
+}
+html[data-folded~="network"] .feature-btn[data-group="network"] {
+  display: none !important;
+}
+html[data-folded~="network"] .feature-btn.group-pill[data-group-pill="network"] {
+  display: flex !important;
+}
+html[data-folded~="tabs"] .feature-btn[data-group="tabs"] {
+  display: none !important;
+}
+html[data-folded~="tabs"] .feature-btn.group-pill[data-group-pill="tabs"] {
+  display: flex !important;
+}
+html[data-folded~="saved"] .feature-btn[data-group="saved"] {
+  display: none !important;
+}
+html[data-folded~="saved"] .feature-btn.group-pill[data-group-pill="saved"] {
+  display: flex !important;
+}
+html[data-folded~="tools"] .feature-btn[data-group="tools"] {
+  display: none !important;
+}
+html[data-folded~="tools"] .feature-btn.group-pill[data-group-pill="tools"] {
+  display: flex !important;
+}
+.group-pill .chev {
+  width: 10px;
+  height: 10px;
+  margin-left: -2px;
+}
+/* Something inside has a count waiting (Chat's unread messages). */
+.feature-btn.group-pill.has-badge::after {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
+  flex: none;
+}
+/* Read by a screen reader, drawn by nothing. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+#fold-choices {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 14px;
+  margin-top: 10px;
+}
+.fold-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* BANNERS SLIDE OPEN. The band under the toolbar used to appear in one frame
+   and shove the page down by its full height in the same frame. The height
+   now grows over --motion-base (max-height, which includes the padding under
+   border-box), the strip's ResizeObserver sees every frame of it, and the
+   page follows (scheduleChromeSync in chrome.js). CSS alone: an animation
+   restarts whenever an element goes from display:none to displayed, so the
+   ten show sites in chrome.js need no change, and a banner that was already
+   showing and merely grew (a late string) does not animate. Same sweep by
+   ROLE and child combinator as the modal rule below, plus the find bar,
+   which rides the same height sync. 128px is above any banner's height at
+   the widths this chrome runs at (two wrapped lines and a button row are
+   under 90): the growth is linear in the max-height, so a 52px banner
+   finishes its slide early rather than clipped, and a banner taller than
+   the cap (a narrow window, a long translation) reaches its last rows with
+   a small step at the end. Hidden is still instant. */
+body > [role="alert"]:not([hidden]),
+body > [role="status"]:not([hidden]),
+body > [role="search"]:not([hidden]) {
+  animation: banner-in var(--motion-base) var(--motion-ease);
+}
+@keyframes banner-in {
+  from {
+    max-height: 0;
+    opacity: 0;
+    overflow: hidden;
+  }
+  to {
+    max-height: 128px;
+    opacity: 1;
+    overflow: hidden;
+  }
 }
 
 /* BANNERS STAY READABLE WHILE A PANEL IS OPEN.
@@ -415,23 +817,30 @@ body.modal-open > [role="search"] {
   color: var(--tx-bright);
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  /* The card is centred with a translate, so its keyframe has to carry that
-     translate on every frame -- a plain translateY would fight the centring
-     and snap the card to the left as the animation began. */
-  .panel-modal {
-    animation: card-in 120ms ease-out;
+/* The card is centred with a translate, so its keyframe has to carry that
+   translate on every frame -- a plain translateY would fight the centring
+   and snap the card to the left as the animation began. Zero duration under
+   Reduce motion (the tokens at the top of this file). */
+.panel-modal {
+  animation: card-in var(--motion-fast) ease-out;
+}
+@keyframes card-in {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-4px);
   }
-  @keyframes card-in {
-    from {
-      opacity: 0;
-      transform: translateX(-50%) translateY(-4px);
-    }
-    to {
-      opacity: 1;
-      transform: translateX(-50%) translateY(0);
-    }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
   }
+}
+/* The way out: chrome.js keeps the card in the document for the fade's
+   length (beginPanelClose), then hides it. No clicks reach a fading card. */
+.panel-modal.panel-closing {
+  opacity: 0;
+  pointer-events: none;
+  animation: none;
+  transition: opacity var(--motion-fast) var(--motion-ease);
 }
 
 /* SHARED SHAPE. The radii below are the whole difference between this chrome
@@ -854,6 +1263,38 @@ body.loading #url {
 #confirm-overlay[hidden] {
   display: none;
 }
+#confirm-overlay:not([hidden]) {
+  animation: fade-in var(--motion-fast) ease-out;
+}
+#confirm-overlay:not([hidden]) #confirm-card {
+  animation: pop-in var(--motion-fast) ease-out;
+}
+/* Out: chrome.js keeps the dialog shown for the fade's length under
+   .closing, then hides it (hideConfirm). */
+#confirm-overlay.closing {
+  opacity: 0;
+  pointer-events: none;
+  animation: none;
+  transition: opacity var(--motion-fast) var(--motion-ease);
+}
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+@keyframes pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
 #confirm-card {
   background: var(--sf-card);
   border: 1px solid var(--ln-soft);
@@ -922,6 +1363,27 @@ body.loading #url {
   font-weight: 600;
   color: var(--tx);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  /* In on insertion; out under [data-out], which chrome.js sets for the
+     fade's length before removing the node (toast()). */
+  animation: toast-in var(--motion-fast) ease-out;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.toast[data-out] {
+  opacity: 0;
+  transform: translateY(-4px);
+  pointer-events: none;
+  transition:
+    opacity var(--motion-fast) var(--motion-ease),
+    transform var(--motion-fast) var(--motion-ease);
 }
 /* The ONLY part of a notification that takes clicks. Everything else stays
    `pointer-events: none` so a notice cannot swallow a click aimed at the
@@ -960,6 +1422,35 @@ body.loading #url {
      and `overflow-wrap` breaks the token rather than the layout. */
   min-width: 0;
   overflow-wrap: anywhere;
+}
+/* A notice that asks for a choice (the duplicate-site notice): the sentence
+   on its own line, the buttons on the next, right-aligned. Three buttons
+   beside a sentence do not fit the 520px card without squeezing the text. */
+.toast.has-actions {
+  flex-wrap: wrap;
+}
+.toast-actions {
+  /* Like .toast-close, the only parts that take clicks; the card itself
+     stays `pointer-events: none` over the toolbar. */
+  flex: 1 0 100%;
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.toast-action {
+  pointer-events: auto;
+  padding: 3px 9px;
+  background: var(--sf-sunken);
+  border: 1px solid var(--ln);
+  border-radius: 3px;
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.toast-action:hover,
+.toast-action:focus-visible {
+  border-color: var(--accent);
 }
 
 .toast.error {
@@ -1581,6 +2072,14 @@ textarea {
 /* Success counterpart to `.error` above, and matched to it deliberately --
  * same size, same reserved height -- so a status line does not shift the
  * layout when it flips between the two. */
+/* A running export or import. No animation or transition: the bar moves
+   only as work is reported, so Reduce motion has nothing to stop. */
+.backup-progress progress {
+  width: 100%;
+  height: 8px;
+  accent-color: var(--accent);
+}
+
 .ok {
   color: var(--st-ok);
   font-size: 12px;
@@ -1837,6 +2336,15 @@ textarea {
 .form-buttons {
   display: flex;
   gap: 6px;
+}
+/* About's first row holds four buttons since 1.0.7 (the tour, the videos
+   and the two guides). On a narrow window each label used to wrap onto two
+   lines inside its button; the row wraps whole buttons instead. */
+#about-panel > .form-buttons {
+  flex-wrap: wrap;
+}
+#about-panel > .form-buttons > button {
+  white-space: nowrap;
 }
 
 /* Recovery key: shown once, transcribed by hand from the screen onto paper, so
@@ -3824,7 +4332,9 @@ textarea {
    happen via the pref but can via a stale webview cache -- the chrome
    renders byte-identically to before. chrome.js sets
    documentElement.dataset.theme from the chrome_theme pref at boot and on
-   change; the three blocks below are the whole selectable set.
+   change; the accent blocks below are the whole selectable set, and the
+   contrast gate (scripts/theme-contrast-gate.py) checks every one of them
+   against every scheme.
 
    Contrast reasoning is stated per theme, and every value was checked by
    machine (WCAG ratio >= the default theme's ratio for the same pair, on
@@ -3966,13 +4476,64 @@ textarea {
   --accent-tag: #b49aef;
 }
 
+/* Pyrrhos (orange). Added 1.0.7; same seven-rung ladder, same machine-checked bars. */
+:root[data-theme="tangerine"] {
+  --accent: #ff7a3d;
+  --accent-bright: #ff955f;
+  --accent-choice-bg: #3f2619;
+  --accent-choice-border: #b85a2a;
+  --accent-choice-text: #ffe1d2;
+  --accent-text: #ffcdb5;
+  --accent-tag: #f0a07a;
+}
+/* Minthe (mint green). Added 1.0.7; same seven-rung ladder, same machine-checked bars. */
+:root[data-theme="mint"] {
+  --accent: #5de0a1;
+  --accent-bright: #7fe9b6;
+  --accent-choice-bg: #163a2b;
+  --accent-choice-border: #2f9e6e;
+  --accent-choice-text: #d6f8e8;
+  --accent-text: #b8f2d6;
+  --accent-tag: #8fdbb8;
+}
+/* Chrysos (gold). Added 1.0.7; same seven-rung ladder, same machine-checked bars. */
+:root[data-theme="gold"] {
+  --accent: #e6c650;
+  --accent-bright: #f0d46e;
+  --accent-choice-bg: #3a3214;
+  --accent-choice-border: #a88f2a;
+  --accent-choice-text: #fff1bd;
+  --accent-text: #ffe9a3;
+  --accent-tag: #e8d07a;
+}
+/* Iris (lavender). Added 1.0.7; same seven-rung ladder, same machine-checked bars. */
+:root[data-theme="lavender"] {
+  --accent: #c4a7ff;
+  --accent-bright: #d2bbff;
+  --accent-choice-bg: #3a3060;
+  --accent-choice-border: #8d78c8;
+  --accent-choice-text: #f2ecff;
+  --accent-text: #e8deff;
+  --accent-tag: #cdbcf2;
+}
+/* Chalkos (copper). Added 1.0.7; same seven-rung ladder, same machine-checked bars. */
+:root[data-theme="copper"] {
+  --accent: #d9915a;
+  --accent-bright: #e6a876;
+  --accent-choice-bg: #3c2a1c;
+  --accent-choice-border: #a8683a;
+  --accent-choice-text: #fbe6d6;
+  --accent-text: #f5cfb0;
+  --accent-tag: #e0b08a;
+}
 /* Accent picker in the settings panel. Same row-of-small-buttons treatment
    as the resolver and idle-timeout pickers (the row layout comes from the
    shared #theme-choices selector above); the selected swatch reuses
    button.small.active, so the chosen state follows the theme like every
    other chosen state and no new selection styling exists. The swatch dot
    previews a theme you are NOT on, so its colour is hardcoded per theme --
-   keep these nine in step with the --accent values above. */
+   keep them in step with the --accent values above: theme-packs-gate.js
+   fails on a dot that differs from its accent. */
 .theme-swatch {
   display: inline-flex;
   align-items: center;
@@ -4014,6 +4575,21 @@ textarea {
 }
 .theme-swatch[data-theme-choice="purple"] .swatch {
   background: #8c5bff;
+}
+.theme-swatch[data-theme-choice="tangerine"] .swatch {
+  background: #ff7a3d;
+}
+.theme-swatch[data-theme-choice="mint"] .swatch {
+  background: #5de0a1;
+}
+.theme-swatch[data-theme-choice="gold"] .swatch {
+  background: #e6c650;
+}
+.theme-swatch[data-theme-choice="lavender"] .swatch {
+  background: #c4a7ff;
+}
+.theme-swatch[data-theme-choice="copper"] .swatch {
+  background: #d9915a;
 }
 /* ---- end accent themes ---- */
 /* ---- chrome schemes ----------------------------------------------------
@@ -4258,6 +4834,211 @@ textarea {
   --tx-find-dim: #969eac;
 }
 
+/* Graphite scheme: Dark lifted one step toward grey and warmed, with Black's
+   brighter text ladder so the dim rungs clear the tinted strip. States inherit Dark's. */
+:root[data-scheme="graphite"] {
+  color-scheme: dark;
+  --sf-body: #262628;
+  --sf-sunken: #212123;
+  --sf-tabstrip: #28282b;
+  --sf-strip: #2e2e32;
+  --sf-card: #2f2f34;
+  --sf-raised: #35353b;
+  --sf-panel: #29292c;
+  --sf-row: #2e2e33;
+  --sf-row-hover: #333339;
+  --sf-btn: #3a3a3f;
+  --sf-btn-alt: #3a3a40;
+  --sf-btn-hover: #44444b;
+  --sf-btn-active: #4e4e55;
+  --sf-chipx-hover: #424249;
+  --sf-item: #2f2f33;
+  --sf-scrim: #242427;
+  --sf-ro: #1f1f22;
+  --sf-code: #252428;
+  --sf-findbar: #2f3238;
+  --sf-find-input: #232427;
+  --sf-find-btn: #393d46;
+  --sf-find-btn-hover: #424753;
+  --sf-when: #28282c;
+  --ln: #49494f;
+  --ln-soft: #3b3b41;
+  --ln-soft2: #3b3b40;
+  --ln-input: #424248;
+  --ln-strong: #43434b;
+  --ln-btn: #595963;
+  --ln-card: #494951;
+  --ln-code: #494850;
+  --ln-msg: #3f3f46;
+  --ln-item: #3d3d43;
+  --tx-bright: #f2f2f6;
+  --tx: #e4e4e9;
+  --tx-dim: #a6a7b1;
+  --tx-faint: #9a9ba5;
+  --tx-dim2: #a5a6ae;
+  --tx-chip: #b4b5bd;
+  --tx-chip-hover: #d4d5dd;
+  --tx-chipx: #8a8b96;
+  --tx-max: #fafafc;
+  --tx-head: #ececf1;
+  --tx-soft: #ced0d8;
+  --tx-body: #babbc5;
+  --tx-note: #c4c5cf;
+  --tx-title: #eeeef3;
+  --tx-empty: #777881;
+  --tx-code: #f2f2f8;
+  --tx-find: #e1e4ea;
+  --tx-find-dim: #969eac;
+  --native-option-bg: var(--sf-sunken);
+  --native-option-text: var(--tx-bright);
+}
+
+/* Midnight scheme: Black pulled toward deep blue. Text from Black, states from Dark. */
+:root[data-scheme="midnight"] {
+  color-scheme: dark;
+  --sf-body: #0a0e20;
+  --sf-sunken: #14182d;
+  --sf-tabstrip: #0f1327;
+  --sf-strip: #171b31;
+  --sf-card: #1a1e34;
+  --sf-raised: #20243b;
+  --sf-panel: #12162b;
+  --sf-row: #181c32;
+  --sf-row-hover: #1f233a;
+  --sf-btn: #242840;
+  --sf-btn-alt: #242841;
+  --sf-btn-hover: #2d314a;
+  --sf-btn-active: #353953;
+  --sf-chipx-hover: #2a2e47;
+  --sf-item: #1a1e35;
+  --sf-scrim: #14182e;
+  --sf-ro: #101429;
+  --sf-code: #12162c;
+  --sf-findbar: #181c33;
+  --sf-find-input: #13192f;
+  --sf-find-btn: #232b46;
+  --sf-find-btn-hover: #2c3655;
+  --sf-when: #161a30;
+  --ln: #30344e;
+  --ln-soft: #262a42;
+  --ln-soft2: #262a43;
+  --ln-input: #2e324c;
+  --ln-strong: #343854;
+  --ln-btn: #3e425f;
+  --ln-card: #30344f;
+  --ln-code: #303450;
+  --ln-msg: #292d47;
+  --ln-item: #272b44;
+  --tx-bright: #f2f2f6;
+  --tx: #e4e4e9;
+  --tx-dim: #a6a7b1;
+  --tx-faint: #9a9ba5;
+  --tx-dim2: #a5a6ae;
+  --tx-chip: #b4b5bd;
+  --tx-chip-hover: #d4d5dd;
+  --tx-chipx: #8a8b96;
+  --tx-max: #fafafc;
+  --tx-head: #ececf1;
+  --tx-soft: #ced0d8;
+  --tx-body: #babbc5;
+  --tx-note: #c4c5cf;
+  --tx-title: #eeeef3;
+  --tx-empty: #777881;
+  --tx-code: #f2f2f8;
+  --tx-find: #e1e4ea;
+  --tx-find-dim: #969eac;
+}
+
+/* Paper scheme: White warmed and dimmed to an off-white, its text warmed to match,
+   and White's light-tuned states copied in (left out, a scheme block inherits
+   Dark's pale-on-dark states, which vanish on paper). */
+:root[data-scheme="paper"] {
+  color-scheme: light;
+  --sf-body: #f4efe6;
+  --sf-sunken: #e6e1db;
+  --sf-tabstrip: #e1dcd6;
+  --sf-strip: #ece7e0;
+  --sf-card: #e8e3dd;
+  --sf-raised: #e1dcd7;
+  --sf-panel: #efeae3;
+  --sf-row: #eae5df;
+  --sf-row-hover: #ded9d4;
+  --sf-btn: #dbd6d2;
+  --sf-btn-alt: #dbd6d3;
+  --sf-btn-hover: #d1ccca;
+  --sf-btn-active: #c7c2c1;
+  --sf-chipx-hover: #d7d2cf;
+  --sf-item: #e8e3de;
+  --sf-scrim: #ddd8d3;
+  --sf-ro: #e3ded9;
+  --sf-code: #e5e0db;
+  --sf-findbar: #e5e0db;
+  --sf-find-input: #e9e4de;
+  --sf-find-btn: #d9d6d3;
+  --sf-find-btn-hover: #cdcbcb;
+  --sf-when: #e7e2dc;
+  --ln: #beb9b8;
+  --ln-soft: #d1ccc9;
+  --ln-soft2: #d1ccca;
+  --ln-input: #b9b4b4;
+  --ln-strong: #ada8a9;
+  --ln-btn: #9d989c;
+  --ln-card: #bbb6b6;
+  --ln-code: #bbb6b7;
+  --ln-msg: #c5c0bf;
+  --ln-item: #c9c4c2;
+  --tx-bright: #1f1b1a;
+  --tx: #2a2626;
+  --tx-dim: #5f5c60;
+  --tx-faint: #676468;
+  --tx-dim2: #646164;
+  --tx-chip: #524f52;
+  --tx-chip-hover: #3e3b3e;
+  --tx-chipx: #737074;
+  --tx-max: #14100e;
+  --tx-head: #242020;
+  --tx-soft: #474447;
+  --tx-body: #4e4b4f;
+  --tx-note: #494649;
+  --tx-title: #221e1e;
+  --tx-empty: #817e82;
+  --tx-code: #1b1716;
+  --tx-find: #2e2d2d;
+  --tx-find-dim: #60646c;
+  --st-ok: #1d6b38;
+  --st-ok-alt: #2a7a30;
+  --st-ok-cred: #1d7a44;
+  --st-ok-msg: #2f7a2f;
+  --st-ok-strong: #2f7a45;
+  --st-ok-dim: #cce4d2;
+  --st-ok-bg: #e8f4ec;
+  --st-ok-bg-text: #1d4a2e;
+  --st-ok-badge-text: #0f3d20;
+  --st-warn: #8a6a10;
+  --st-warn-border: #c8a94e;
+  --st-warn-bg: #faf3dc;
+  --st-warn-text: #6a5210;
+  --st-warn-strong: #574208;
+  --st-warn-border2: #d8c690;
+  --st-warn-border3: #d0bc80;
+  --st-warn-bg2: #f7f0dd;
+  --st-err: #a03030;
+  --st-err-strong: #b03535;
+  --st-err-bg: #f5dcdc;
+  --st-err-hover: #f3e0e0;
+  --st-err-border: #d89a9a;
+  --st-err-text: #a03838;
+  --st-err-border2: #d09090;
+  --st-err-bg2: #f0dada;
+  --st-err-text2: #7a2525;
+  --st-err-plain: #b02f2f;
+  --st-link: #2f6ad0;
+  --st-msg-out-bg: #dce8f8;
+  --st-msg-out-border: #a8c4e8;
+  --st-upd-bg: #e2ecf6;
+  --st-upd-text: #2f4a66;
+}
+
 /* White-scheme accent families. On white, "bright" means DEEPER (it marks
    the active tab edge against a near-white strip), choice backgrounds are
    light tints and every text rung is dark-on-light. The green family here
@@ -4357,6 +5138,283 @@ textarea {
   --accent-choice-text: #3a1f80;
   --accent-text: #5028a8;
   --accent-tag: #54389e;
+}
+
+/* Paper takes the White accent families as they are: the same dark-on-light
+   ladders read on an off-white surface, and the contrast gate holds every
+   pair. Generated from the White blocks above; keep them in step. */
+:root[data-scheme="paper"] {
+  --accent: #2f6fe0;
+  --accent-bright: #1f5ac8;
+  --accent-choice-bg: #dce8ff;
+  --accent-choice-border: #88aade;
+  --accent-choice-text: #173a70;
+  --accent-text: #1d4a90;
+  --accent-tag: #3a5f9e;
+}
+:root[data-scheme="paper"][data-theme="violet"] {
+  --accent: #6a3fd8;
+  --accent-bright: #5930c0;
+  --accent-choice-bg: #e9e1fb;
+  --accent-choice-border: #af97e0;
+  --accent-choice-text: #3a2080;
+  --accent-text: #4a28a8;
+  --accent-tag: #5c3f9e;
+}
+:root[data-scheme="paper"][data-theme="blood_red"] {
+  --accent: #c22f2f;
+  --accent-bright: #a82525;
+  --accent-choice-bg: #fbe0e0;
+  --accent-choice-border: #d89090;
+  --accent-choice-text: #701818;
+  --accent-text: #8f1f1f;
+  --accent-tag: #953333;
+}
+:root[data-scheme="paper"][data-theme="sky"] {
+  --accent: #0077b8;
+  --accent-bright: #0067a2;
+  --accent-choice-bg: #dcf0fb;
+  --accent-choice-border: #7fbcd8;
+  --accent-choice-text: #00476e;
+  --accent-text: #005a8a;
+  --accent-tag: #20668a;
+}
+:root[data-scheme="paper"][data-theme="green"] {
+  --accent: #1e7d32;
+  --accent-bright: #186a28;
+  --accent-choice-bg: #ddf2e0;
+  --accent-choice-border: #8cc89a;
+  --accent-choice-text: #124a1e;
+  --accent-text: #176028;
+  --accent-tag: #2a6a3a;
+}
+:root[data-scheme="paper"][data-theme="amber"] {
+  --accent: #9a6b00;
+  --accent-bright: #835a00;
+  --accent-choice-bg: #faeed2;
+  --accent-choice-border: #d0aa50;
+  --accent-choice-text: #5c3f00;
+  --accent-text: #7a5500;
+  --accent-tag: #7a5a10;
+}
+:root[data-scheme="paper"][data-theme="teal"] {
+  --accent: #0e7a6e;
+  --accent-bright: #0a685e;
+  --accent-choice-bg: #d8f2ef;
+  --accent-choice-border: #7cc4bc;
+  --accent-choice-text: #084a42;
+  --accent-text: #0c5f56;
+  --accent-tag: #1a6a60;
+}
+:root[data-scheme="paper"][data-theme="slate"] {
+  --accent: #4a6076;
+  --accent-bright: #3d5062;
+  --accent-choice-bg: #e4e9ef;
+  --accent-choice-border: #a2b2c2;
+  --accent-choice-text: #2a3a4a;
+  --accent-text: #3a4c5e;
+  --accent-tag: #4a5a6a;
+}
+:root[data-scheme="paper"][data-theme="purple"] {
+  --accent: #6f42d8;
+  --accent-bright: #5f35c2;
+  --accent-choice-bg: #e8e0fb;
+  --accent-choice-border: #b09ae2;
+  --accent-choice-text: #3a1f80;
+  --accent-text: #5028a8;
+  --accent-tag: #54389e;
+}
+
+/* The 1.0.7 accents on the two light schemes: darker ladders, as above. */
+:root[data-scheme="white"][data-theme="tangerine"] {
+  --accent: #c04a10;
+  --accent-bright: #a63e0c;
+  --accent-choice-bg: #fbe3d6;
+  --accent-choice-border: #e09c78;
+  --accent-choice-text: #6a2a08;
+  --accent-text: #8a3a0c;
+  --accent-tag: #8f4a22;
+}
+:root[data-scheme="paper"][data-theme="tangerine"] {
+  --accent: #c04a10;
+  --accent-bright: #a63e0c;
+  --accent-choice-bg: #fbe3d6;
+  --accent-choice-border: #e09c78;
+  --accent-choice-text: #6a2a08;
+  --accent-text: #8a3a0c;
+  --accent-tag: #8f4a22;
+}
+:root[data-scheme="white"][data-theme="mint"] {
+  --accent: #1b7a4e;
+  --accent-bright: #166840;
+  --accent-choice-bg: #dcf3e8;
+  --accent-choice-border: #8ccfb0;
+  --accent-choice-text: #0f4a2e;
+  --accent-text: #166040;
+  --accent-tag: #246a48;
+}
+:root[data-scheme="paper"][data-theme="mint"] {
+  --accent: #1b7a4e;
+  --accent-bright: #166840;
+  --accent-choice-bg: #dcf3e8;
+  --accent-choice-border: #8ccfb0;
+  --accent-choice-text: #0f4a2e;
+  --accent-text: #166040;
+  --accent-tag: #246a48;
+}
+:root[data-scheme="white"][data-theme="gold"] {
+  --accent: #8a6a00;
+  --accent-bright: #735700;
+  --accent-choice-bg: #f9f0d0;
+  --accent-choice-border: #d2b84e;
+  --accent-choice-text: #5a4400;
+  --accent-text: #6e5400;
+  --accent-tag: #7a5e10;
+}
+:root[data-scheme="paper"][data-theme="gold"] {
+  --accent: #8a6a00;
+  --accent-bright: #735700;
+  --accent-choice-bg: #f9f0d0;
+  --accent-choice-border: #d2b84e;
+  --accent-choice-text: #5a4400;
+  --accent-text: #6e5400;
+  --accent-tag: #7a5e10;
+}
+:root[data-scheme="white"][data-theme="lavender"] {
+  --accent: #6a4fc8;
+  --accent-bright: #5a40b2;
+  --accent-choice-bg: #ece6fb;
+  --accent-choice-border: #b6a5e4;
+  --accent-choice-text: #3a2a7a;
+  --accent-text: #4e38a0;
+  --accent-tag: #5a4a9e;
+}
+:root[data-scheme="paper"][data-theme="lavender"] {
+  --accent: #6a4fc8;
+  --accent-bright: #5a40b2;
+  --accent-choice-bg: #ece6fb;
+  --accent-choice-border: #b6a5e4;
+  --accent-choice-text: #3a2a7a;
+  --accent-text: #4e38a0;
+  --accent-tag: #5a4a9e;
+}
+:root[data-scheme="white"][data-theme="copper"] {
+  --accent: #9a4f1e;
+  --accent-bright: #844218;
+  --accent-choice-bg: #f6e4d6;
+  --accent-choice-border: #d8a07a;
+  --accent-choice-text: #5a2e10;
+  --accent-text: #733a14;
+  --accent-tag: #7a4a2a;
+}
+:root[data-scheme="paper"][data-theme="copper"] {
+  --accent: #9a4f1e;
+  --accent-bright: #844218;
+  --accent-choice-bg: #f6e4d6;
+  --accent-choice-border: #d8a07a;
+  --accent-choice-text: #5a2e10;
+  --accent-text: #733a14;
+  --accent-tag: #7a4a2a;
+}
+
+/* TEXTURES (1.0.7). A chrome-only background drawn over the strip, the
+   toolbar and the panel cards, worn as html[data-texture]; pages never see
+   it, so the accent exposure a page already has does not widen. Gradients
+   only: the CSP allows no data: images. Each texture's strongest alpha is a
+   token here because theme-contrast-gate.py reads it and checks every text
+   pair on the textured surfaces against the surface composited with white
+   and with black at that alpha (both extremes of what a texture can paint),
+   and theme-packs-gate.js caps the tokens at 0.06. A texture without a
+   token is a texture the gates cannot see: add the token with the rule. */
+:root {
+  --texture-alpha-glow: 0.06;
+  --texture-alpha-grain: 0.04;
+  --texture-alpha-stripes: 0.03;
+}
+/* The glow leaves the toolbar row alone: an accent at 6% over --sf-strip-a
+   takes --tx-dim under its 4.5:1 bar for the bright accents (green, gold,
+   mint), and the contrast gate reads exactly which surfaces each texture
+   rule names, so this is the rule that keeps it green, not a gate
+   exemption. */
+/* ON THE CARDS, THE TEXTURE IS A PSEUDO-ELEMENT. The panels paint their own
+   surface through id rules (#vault-panel, #privacy-panel, ... { background:
+   var(--sf-panel) }), and an id outranks any attribute-and-class selector, so
+   a texture written as the card's background-image was reset to none on
+   every card but the Theme panel's (review round 1, R-001). ::before is a
+   box of its own that no id rule touches: it fills the card, sits above the
+   card's background and under its content (z-index -1 inside the card's own
+   stacking context), and takes no clicks. */
+html[data-texture] .panel-modal::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: -1;
+}
+html[data-texture="glow"] #tabstrip,
+html[data-texture="glow"] .panel-modal::before {
+  background-image: radial-gradient(
+    ellipse at 0 0,
+    color-mix(in srgb, var(--accent) calc(var(--texture-alpha-glow) * 100%), transparent),
+    transparent 65%
+  );
+}
+html[data-texture="grain"] #tabstrip,
+html[data-texture="grain"] #toolbar,
+html[data-texture="grain"] .panel-modal::before {
+  background-image: repeating-linear-gradient(
+    0deg,
+    rgb(128 128 128 / var(--texture-alpha-grain)) 0 1px,
+    transparent 1px 3px
+  );
+}
+html[data-texture="stripes"] #tabstrip,
+html[data-texture="stripes"] #toolbar,
+html[data-texture="stripes"] .panel-modal::before {
+  background-image: repeating-linear-gradient(
+    135deg,
+    rgb(128 128 128 / var(--texture-alpha-stripes)) 0 1px,
+    transparent 1px 9px
+  );
+}
+
+/* THEME PACK CARDS. A pack is a preset of scheme + accent + texture kept in
+   chrome.js (THEME_PACKS); the card previews the pack's strip colour and
+   accent through two custom properties chrome.js sets on the card from the
+   pack's preview values (CSSOM, which the CSP allows). Those values are
+   copies of this stylesheet's --sf-strip and --accent for the pack's pair,
+   and theme-packs-gate.js fails on a copy that drifts. The chosen card
+   reuses button.small.active like every other picker. */
+.pack-card {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.pack-preview {
+  width: 28px;
+  height: 18px;
+  border-radius: 4px;
+  border: 1px solid var(--ln);
+  background: var(--pack-bg, var(--sf-strip));
+  position: relative;
+  flex: none;
+}
+.pack-preview .pack-dot {
+  position: absolute;
+  left: 4px;
+  bottom: 4px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--pack-accent, var(--accent));
+}
+#pack-cards,
+#texture-buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0 6px;
 }
 
 /* ---- the accent frame --------------------------------------------------

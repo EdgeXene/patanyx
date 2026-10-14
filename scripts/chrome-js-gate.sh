@@ -345,15 +345,34 @@ fi
 # code it no longer reaches.
 # The feature videos (1.0.5): the one-time banner, the video panel and the
 # way back from About, proven against each defect the gate guards.
+# Every plant must fail with the gate's own FAILED line: a plant whose
+# anchor drifted exits 2 before any check runs, which a loop reading only
+# the exit code took for a caught defect (plan review 2026-10-13).
 if [ -f scripts/tutorial-gate.js ]; then
   node scripts/tutorial-gate.js
-  for plant in banners marker tour-first stale dedup abandoned sticky-error recover attribution reset focus pause; do
-    if PATANYX_TUTORIAL_PLANT=$plant node scripts/tutorial-gate.js >/dev/null 2>&1; then
-      echo "GATE FAIL: tutorial-gate.js passed with the '$plant' defect" >&2
-      echo "  planted; its checks no longer reach the code they guard" >&2
+  for plant in $(PATANYX_TUTORIAL_LIST_PLANTS=1 node scripts/tutorial-gate.js); do
+    if plant_out="$(PATANYX_TUTORIAL_PLANT="$plant" node scripts/tutorial-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^TUTORIAL GATE FAILED'; then
+      echo "GATE FAIL: tutorial-gate.js did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
       exit 1
     fi
     echo "  ok  tutorial-gate.js catches the planted '$plant' defect"
+  done
+fi
+# The ledger's "Allow while frozen" never sent anything until 1.0.5: the
+# variable it reads was never assigned and nothing clicked the button. The
+# gate clicks it, binds its rows to their tab, and is proven able to fail
+# against each defect it guards.
+if [ -f scripts/ledger-allow-gate.js ]; then
+  node scripts/ledger-allow-gate.js
+  for plant in active owner stale-click label optimistic wording; do
+    if PATANYX_LEDGER_PLANT=$plant node scripts/ledger-allow-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: ledger-allow-gate.js passed with the '$plant' defect" >&2
+      echo "  planted; its checks no longer reach the code they guard" >&2
+      exit 1
+    fi
+    echo "  ok  ledger-allow-gate.js catches the planted '$plant' defect"
   done
 fi
 
@@ -493,6 +512,108 @@ if [ -f scripts/onboarding-gate.js ]; then
   node scripts/onboarding-gate.js
 else
   echo "  (no onboarding gate in this tree)"
+fi
+
+echo
+echo "=== gate 1j2: the Guide and Premium Guide buttons in About ==="
+# Each opens one fixed patanyx.net page in a new tab, closing About first so
+# the page gets the keyboard (plan review 2026-10-13, R-001). Every planted
+# defect must turn the gate red with its own FAILED line: a plant whose anchor
+# drifted makes the gate throw before any check runs, which also exits
+# non-zero and would pass a loop that only read the exit code.
+if [ -f scripts/about-links-gate.js ]; then
+  if ! grep -q 'id="about-guide"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/about-links-gate.js exists but index.html has no" >&2
+    echo "  #about-guide; the buttons were removed and this gate would vanish" >&2
+    exit 1
+  fi
+  node scripts/about-links-gate.js
+  for plant in $(PATANYX_ABOUT_LINKS_LIST_PLANTS=1 node scripts/about-links-gate.js); do
+    if plant_out="$(PATANYX_ABOUT_LINKS_PLANT="$plant" node scripts/about-links-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^ABOUT LINKS GATE FAILED'; then
+      echo "GATE FAIL: about-links-gate did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  (every planted defect was caught)"
+else
+  echo "  (no About links gate in this tree)"
+fi
+
+echo
+echo "=== gate 1j3: Find, Find across tabs and Image check in the Menu ==="
+# Find closes an open panel before searching (plan review 2026-10-13,
+# R-003); the two Premium entries render locked without a licence and do
+# nothing while locked; Image check is offered only
+# with OCR. Every plant must fail with the gate's own FAILED line.
+if [ -f scripts/menu-extras-gate.js ]; then
+  if ! grep -q 'id="menu-find-tabs"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/menu-extras-gate.js exists but index.html has no" >&2
+    echo "  #menu-find-tabs; the entries were removed and this gate would vanish" >&2
+    exit 1
+  fi
+  node scripts/menu-extras-gate.js
+  for plant in $(PATANYX_MENU_EXTRAS_LIST_PLANTS=1 node scripts/menu-extras-gate.js); do
+    if plant_out="$(PATANYX_MENU_EXTRAS_PLANT="$plant" node scripts/menu-extras-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^MENU EXTRAS GATE FAILED'; then
+      echo "GATE FAIL: menu-extras-gate did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  (every planted defect was caught)"
+else
+  echo "  (no Menu extras gate in this tree)"
+fi
+
+echo
+echo "=== gate 1j4: the window frame on Windows (no title bar) ==="
+# The strip is the title bar on Windows: controls, drag, double press,
+# resize band; none of it on Linux, where a double-click on the empty strip
+# still opens a tab. Every plant must fail with the gate's own FAILED line.
+if [ -f scripts/window-frame-gate.js ]; then
+  if ! grep -q 'id="window-controls"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/window-frame-gate.js exists but index.html has no" >&2
+    echo "  #window-controls; the frame was removed and this gate would vanish" >&2
+    exit 1
+  fi
+  node scripts/window-frame-gate.js
+  for plant in $(PATANYX_WINDOW_FRAME_LIST_PLANTS=1 node scripts/window-frame-gate.js); do
+    if plant_out="$(PATANYX_WINDOW_FRAME_PLANT="$plant" node scripts/window-frame-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^WINDOW FRAME GATE FAILED'; then
+      echo "GATE FAIL: window-frame-gate did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  (every planted defect was caught)"
+else
+  echo "  (no window frame gate in this tree)"
+fi
+
+echo
+echo "=== gate 1j5: the keep-this-site offer for Messenger ==="
+# Keep sends exactly the keep-list command for the site Rust named; Not now
+# sends nothing; one offer at a time. Every plant must fail by name.
+if [ -f scripts/keep-offer-gate.js ]; then
+  if ! grep -q 'case "keep_site_offer":' "$CHROME/chrome.js"; then
+    echo "GATE FAIL: scripts/keep-offer-gate.js exists but chrome.js has no" >&2
+    echo "  keep_site_offer handler; the offer was removed and this gate would vanish" >&2
+    exit 1
+  fi
+  node scripts/keep-offer-gate.js
+  for plant in $(PATANYX_KEEP_OFFER_LIST_PLANTS=1 node scripts/keep-offer-gate.js); do
+    if plant_out="$(PATANYX_KEEP_OFFER_PLANT="$plant" node scripts/keep-offer-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^KEEP OFFER GATE FAILED'; then
+      echo "GATE FAIL: keep-offer-gate did not fail a check with the '$plant' defect planted" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  (every planted defect was caught)"
+else
+  echo "  (no keep offer gate in this tree)"
 fi
 
 echo
@@ -750,6 +871,24 @@ else
 fi
 
 echo
+echo "=== gate 1n1: the duplicate-site notice ==="
+# Its buttons must name the NOTICE, never a tab or a site, so Rust can refuse
+# a stale click; and it must outlast both the 15 s timer and a pile of
+# ordinary notices, because it asks for a choice. The rules about WHEN it
+# shows are Rust's (duplicate_site.rs). Same guard shape as the gates above.
+if [ -f scripts/duplicate-site-gate.js ]; then
+  if ! grep -q 'id="duplicate-notice"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/duplicate-site-gate.js exists but index.html has" >&2
+    echo "  no #duplicate-notice; the switch was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/duplicate-site-gate.js
+else
+  echo "  (no duplicate-site gate in this tree)"
+fi
+
+echo
 echo "=== gate 1n2: the held-page (ad and tracker list) banner ==="
 # Sixteen checks on consent, dismissal, tab switching and the Linux
 # no-override rendering. Passing when run by hand protected nothing: no
@@ -764,6 +903,32 @@ if [ -f scripts/adlist-banner-gate.js ]; then
   node scripts/adlist-banner-gate.js
 else
   echo "  (no adlist-banner gate in this tree)"
+fi
+
+echo
+echo "=== gate 1n2b: \"Allow ads and trackers on this tab\" ==="
+# The switch turns PATANYX's ad and tracker blocking OFF in one tab, so the
+# chrome must ask for exactly that tab, follow what Rust reports rather than
+# the click, say why it is disabled, and never let the shield or the receipt
+# read as blocking where it is off. Same guard shape as 1n/1n2, and the same
+# planted-defect loop as 1m3: every plant must turn the gate red.
+if [ -f scripts/tab-ads-allow-gate.js ]; then
+  if ! grep -q 'id="tab-ads-allow"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/tab-ads-allow-gate.js exists but index.html has" >&2
+    echo "  no #tab-ads-allow; the switch was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/tab-ads-allow-gate.js
+  for plant in $(PATANYX_ADS_LIST_PLANTS=1 node scripts/tab-ads-allow-gate.js); do
+    if PATANYX_ADS_PLANT="$plant" node scripts/tab-ads-allow-gate.js >/dev/null 2>&1; then
+      echo "GATE FAIL: planted defect '$plant' passed scripts/tab-ads-allow-gate.js" >&2
+      exit 1
+    fi
+  done
+  echo "  planted defects caught: $(PATANYX_ADS_LIST_PLANTS=1 node scripts/tab-ads-allow-gate.js | wc -l)"
+else
+  echo "  (no tab-ads-allow gate in this tree)"
 fi
 
 echo
@@ -1125,6 +1290,92 @@ if [ -f scripts/interception-ui-gate.js ]; then
   node scripts/interception-ui-gate.js
 else
   echo "  (no interception gate in this tree)"
+fi
+
+echo
+echo "=== gate 1u: motion tokens and the Reduce motion switch ==="
+# Every duration in chrome.css comes from the tokens on html, both the
+# system's reduced-motion setting and the browser's own switch zero them, and
+# the switch follows Rust's reply rather than the click. Planted-defect loop
+# as 1n2b: every plant must turn the gate red.
+if [ -f scripts/motion-gate.js ]; then
+  if ! grep -q 'id="reduce-motion"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/motion-gate.js exists but index.html has no" >&2
+    echo "  #reduce-motion; the switch was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/motion-gate.js
+  # Same rule as gate 1v: a plant counts only when a named check fails.
+  for plant in $(PATANYX_MOTION_LIST_PLANTS=1 node scripts/motion-gate.js); do
+    if plant_out="$(PATANYX_MOTION_PLANT="$plant" node scripts/motion-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^MOTION GATE FAIL'; then
+      echo "GATE FAIL: planted defect '$plant' did not fail a named check in scripts/motion-gate.js" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  planted defects caught: $(PATANYX_MOTION_LIST_PLANTS=1 node scripts/motion-gate.js | wc -l)"
+else
+  echo "  (no motion gate in this tree)"
+fi
+
+echo
+echo "=== gate 1v: theme presets, textures and swatch dots ==="
+# Every pack resolves to a real scheme, accent and texture; every card and
+# every swatch dot shows the stylesheet's own colour; every texture's alpha
+# is tokened and capped; picking a pack sends its three values and the
+# marking follows what the chrome wears. Planted-defect loop as 1u.
+if [ -f scripts/theme-packs-gate.js ]; then
+  if ! grep -q 'id="pack-cards"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/theme-packs-gate.js exists but index.html has no" >&2
+    echo "  #pack-cards; the Presets section was removed and this gate would" >&2
+    echo "  silently vanish" >&2
+    exit 1
+  fi
+  node scripts/theme-packs-gate.js
+  # CAUGHT means a named check failed, not that the gate crashed before its
+  # first check (round 1, R-005): the gate's own FAIL line is required.
+  for plant in $(PATANYX_PACKS_LIST_PLANTS=1 node scripts/theme-packs-gate.js); do
+    if plant_out="$(PATANYX_PACKS_PLANT="$plant" node scripts/theme-packs-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^THEME PACKS GATE FAIL'; then
+      echo "GATE FAIL: planted defect '$plant' did not fail a named check in scripts/theme-packs-gate.js" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  planted defects caught: $(PATANYX_PACKS_LIST_PLANTS=1 node scripts/theme-packs-gate.js | wc -l)"
+else
+  echo "  (no theme packs gate in this tree)"
+fi
+
+echo
+echo "=== gate 1w: toolbar groups, folds and the menus' state ==="
+# The group table, the markup, the stylesheet and prefs.rs agree; the shield
+# and the freeze chip are in no group; a fold follows Rust's reply; the
+# width's folds are never stored; a group's menu leaves the panel under it
+# open and returns the keyboard to a visible pill; folded pills and the menu
+# button carry the state inside them. A plant counts only when a named
+# check fails, as in 1u and 1v.
+if [ -f scripts/toolbar-groups-gate.js ]; then
+  if ! grep -q 'id="group-menu"' "$CHROME/index.html"; then
+    echo "GATE FAIL: scripts/toolbar-groups-gate.js exists but index.html has no" >&2
+    echo "  #group-menu; the groups were removed and this gate would silently" >&2
+    echo "  vanish" >&2
+    exit 1
+  fi
+  node scripts/toolbar-groups-gate.js
+  for plant in $(PATANYX_GROUPS_LIST_PLANTS=1 node scripts/toolbar-groups-gate.js); do
+    if plant_out="$(PATANYX_GROUPS_PLANT="$plant" node scripts/toolbar-groups-gate.js 2>&1)" ||
+      ! printf '%s\n' "$plant_out" | grep -q '^TOOLBAR GROUPS GATE FAIL'; then
+      echo "GATE FAIL: planted defect '$plant' did not fail a named check in scripts/toolbar-groups-gate.js" >&2
+      printf '%s\n' "$plant_out" | tail -5 >&2
+      exit 1
+    fi
+  done
+  echo "  planted defects caught: $(PATANYX_GROUPS_LIST_PLANTS=1 node scripts/toolbar-groups-gate.js | wc -l)"
+else
+  echo "  (no toolbar groups gate in this tree)"
 fi
 
 echo

@@ -148,8 +148,10 @@ check("the button is a toolbar pill and the panel is in the markup", () => {
     html.lastIndexOf("<button", at),
     html.indexOf(">", at),
   );
+  // The class LIST: since 1.0.7 the pill also wears in-menu (it lives in
+  // the main menu and the menu's Reader View entry clicks it).
   assert(
-    /class="feature-btn"/.test(tag),
+    /class="feature-btn(?: [\w-]+)*"/.test(tag),
     "#btn-reader must be a .feature-btn so toolbar-gate governs it",
   );
   assert(html.includes('<section id="reader-panel"'), "#reader-panel missing");

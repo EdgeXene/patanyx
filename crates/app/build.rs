@@ -163,7 +163,70 @@ fn main() {
         bytes.len()
     );
 
+    emit_malicious_beneath_ad_hosts(&text);
+
     build_psl();
+}
+
+/// The malicious-list entries that sit BENEATH an ad- or tracker-list host,
+/// written to OUT_DIR for `blocklist::ad_overlap`.
+///
+/// On Linux a tab where the user allowed ads and trackers drops the ad
+/// filters, and those filters were what blocked a malicious subresource such
+/// as `ad.example.com` when only `example.com` is on the ad list. The runtime
+/// list is hashed, so the app cannot find such entries itself; only this step,
+/// which has the plaintext, can (review 2026-10-12 of the per-tab switch,
+/// R-001). The ENTRIES are written, not their ad-list parent: keeping the
+/// parent blocked whole kept doubleclick.net blocked in an allowed tab over
+/// one tracking subdomain, which is most of what the switch exists to allow
+/// (compliance audit, same day). These names all sit under ad and tracker
+/// hosts, not the bank names that got a build quarantined, and the list is
+/// compiled only into the Linux build, the one backend that uses it. A list
+/// refreshed after release can add entries this cannot see; that residual is
+/// stated where the overlap is used.
+fn emit_malicious_beneath_ad_hosts(malicious_text: &str) {
+    let src = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("src");
+    let mut ad_hosts = std::collections::HashSet::new();
+    for name in ["adlist-ads.txt", "adlist-tracking.txt"] {
+        let path = src.join(name);
+        println!("cargo:rerun-if-changed={}", path.display());
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+        for host in text
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .filter_map(|line| line.split_whitespace().last())
+            .map(str::to_ascii_lowercase)
+            .filter(|host| acceptable(host))
+        {
+            ad_hosts.insert(host);
+        }
+    }
+    let mut beneath = std::collections::BTreeSet::new();
+    for malicious in malicious_text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .filter_map(|line| line.split_whitespace().last())
+        .map(str::to_ascii_lowercase)
+        .filter(|host| acceptable(host))
+    {
+        let mut rest = malicious.as_str();
+        // Strict ancestors only: an entry that is itself on the ad list is
+        // found at runtime (`malicious_overlap`).
+        while let Some(dot) = rest.find('.') {
+            rest = &rest[dot + 1..];
+            if ad_hosts.contains(rest) {
+                beneath.insert(malicious.clone());
+                break;
+            }
+        }
+    }
+    let out = PathBuf::from(std::env::var_os("OUT_DIR").unwrap()).join("malicious-beneath-ad-hosts.txt");
+    let body: Vec<&str> = beneath.iter().map(String::as_str).collect();
+    std::fs::write(&out, body.join("\n")).unwrap_or_else(|e| panic!("writing {}: {e}", out.display()));
+    println!("cargo:warning=malicious entries beneath ad-list hosts: {}", beneath.len());
 }
 
 /// Compiles the Public Suffix List into three sorted hash sets.

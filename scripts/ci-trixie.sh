@@ -6,22 +6,97 @@
 # compatible with the browser doing nothing of the sort. The final step runs
 # the real binary against the real engine and reads back what the engine says
 # about itself.
+#
+# THE LAST STEP NEEDS A CONTAINER IN WHICH BUBBLEWRAP CAN START, and a default
+# `docker run` is not one. From 1.0.6 every web page process runs inside
+# WebKitGTK's bubblewrap sandbox, and the release binary refuses to start where
+# that sandbox cannot (exit 4, crates/app/src/sandbox_check.rs; before 1.0.7 it
+# aborted with SIGTRAP). Measured 2026-10-11 in patanyx-ci:trixie-webkit2.54.0-floor
+# on a Debian 12 host (Docker 20.10, cgroup v2, AppArmor on), each case first
+# with a small bwrap command and then, where that passed, with the smoke test:
+#
+#   default, root                         bwrap: Creating new namespace failed: Operation not permitted
+#   root + SYS_ADMIN, seccomp/AppArmor    bwrap: loopback: Failed RTM_NEWADDR: No child processes
+#     unconfined (the 1.0.6 attempt)
+#   root + SYS_ADMIN + NET_ADMIN,         works; smoke OK
+#     seccomp/AppArmor unconfined
+#   --privileged, root                    works; smoke OK (every capability, no masking)
+#   uid 65534, default                    bwrap: No permissions to create a new namespace
+#   uid 65534, seccomp unconfined only    bwrap: Failed to make / slave: Permission denied
+#   uid 65534, seccomp/AppArmor           the small command passed, the engine's own bwrap
+#     unconfined                            failed: Can't mount proc on /proc (Docker masks
+#                                           parts of /proc, so a new proc mount is refused)
+#   uid 65534, seccomp/AppArmor and       works, no capability added; smoke OK with
+#     system paths unconfined               "SANDBOX measured=Applied"
+#
+# So the run is split in two, and only the step that runs the binary gets the
+# relaxed container: an ordinary user, no added capability, no network, the
+# source mounted read-only. The build and the test suites keep Docker's default
+# confinement, because they run every dependency's build script. Both halves,
+# from the host:
+#
+#   scripts/ci-trixie.sh --docker [image]     (default image below)
+#
+# which runs exactly these two:
+#
+#   docker run --rm -v "$PWD":/src -w /src -e CI_TRIXIE_PHASE=build IMAGE \
+#     bash scripts/ci-trixie.sh
+#   docker run --rm --network none --user 65534:65534 -e HOME=/tmp \
+#     --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+#     --security-opt systempaths=unconfined \
+#     -v "$PWD":/src:ro -w /src -e CI_TRIXIE_PHASE=runtime IMAGE bash scripts/ci-trixie.sh
+#
+# Run inside a container by hand, CI_TRIXIE_PHASE=build|runtime|all picks the
+# half (default all, as before). "all" in a default container now fails at the
+# last step with the sandbox message instead of SIGTRAP; that is the honest
+# result for a container where the browser cannot run.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+
+CI_TRIXIE_IMAGE_DEFAULT=patanyx-ci:trixie-webkit2.54.0-floor
+if [ "${1:-}" = "--docker" ]; then
+  image="${2:-$CI_TRIXIE_IMAGE_DEFAULT}"
+  echo "=== ci-trixie, build half: $image, default confinement ==="
+  docker run --rm -v "$PWD":/src -w /src -e CI_TRIXIE_PHASE=build "$image" \
+    bash scripts/ci-trixie.sh
+  echo
+  echo "=== ci-trixie, runtime half: $image, uid 65534, no network, source read-only ==="
+  docker run --rm --network none --user 65534:65534 -e HOME=/tmp \
+    --security-opt seccomp=unconfined --security-opt apparmor=unconfined \
+    --security-opt systempaths=unconfined \
+    -v "$PWD":/src:ro -w /src -e CI_TRIXIE_PHASE=runtime "$image" \
+    bash scripts/ci-trixie.sh
+  echo
+  echo "CI TRIXIE OK (build and runtime halves)"
+  exit 0
+fi
+
+PHASE="${CI_TRIXIE_PHASE:-all}"
+case "$PHASE" in
+  all|build|runtime) ;;
+  *) echo "CI_TRIXIE_PHASE must be all, build or runtime, not '$PHASE'" >&2; exit 2 ;;
+esac
 
 # Host artefacts were built against a different glibc and toolchain; sharing
 # target/ between host and container produces confusing rebuild churn.
 export CARGO_TARGET_DIR=target/trixie
 
-echo "=== environment ==="
+echo "=== environment (phase: $PHASE) ==="
 grep PRETTY_NAME /etc/os-release
 printf 'webkit2gtk-4.1  runtime : '; pkg-config --modversion webkit2gtk-4.1
+# The runtime half has no network, and rustup may want to sync the channel.
+if [ "$PHASE" != runtime ]; then
 printf 'rustc                   : '; rustc --version
 printf 'cargo                   : '; cargo --version
+fi
 
 echo
 echo "=== apt provenance (which repo the fixed engine came from) ==="
 apt-cache policy libwebkit2gtk-4.1-0 2>/dev/null | sed -n '1,5p' || true
+
+# Everything from here to the release build is the build half. Not indented,
+# so that this split did not rewrite every line below.
+if [ "$PHASE" != runtime ]; then
 
 echo
 echo "=== tests ==="
@@ -109,7 +184,7 @@ python3 ./scripts/check-cargo-sources.py
 # The literal is deliberate and moves by hand with every Cargo bump (release
 # procedure step 1). Deriving it from Cargo.toml would reduce the release-identity check
 # to comparing Cargo.toml with itself; 1.0.1 shipped with this still at 1.0.0.
-EXPECTED_VERSION=1.0.6 ./scripts/check-version.sh
+EXPECTED_VERSION=1.0.7 ./scripts/check-version.sh
 # The About panel names every third-party package compiled into the binary, and
 # that list is a checked-in file. Add a dependency without regenerating it and
 # the browser confidently attributes a set of software it is no longer built
@@ -134,18 +209,36 @@ RUNS="${DELIVERY_PROBE_RUNS:-5}" ./scripts/chat-delivery-probe.sh
 echo
 echo "=== release build ==="
 cargo build --release --locked
+fi  # end of the build half
+
+if [ ! -x "$CARGO_TARGET_DIR/release/patanyx" ]; then
+  echo "GATE FAIL: no release binary at $CARGO_TARGET_DIR/release/patanyx; run the build half first" >&2
+  exit 1
+fi
 
 # The suite above must exercise the real session-and-activation gate. An
 # unlocked build can pass every positive Premium test while proving nothing
 # about that rule, which is the same false-green shape the planted-defect gate
 # exists to prevent. Check the exact release artifact that smoke runs next;
 # the compile-time warning is mandatory in every premium-unlocked binary.
-unlocked_marker="UNLOCKED TEST BUILD: Premium forced on; no licence checked"
-if strings -a "$CARGO_TARGET_DIR/release/patanyx" | grep -F "$unlocked_marker" >/dev/null; then
-  echo "GATE FAIL: ci-trixie built premium-unlocked; licence-gate results are invalid" >&2
+#
+# The marker comes from the one list in forbidden-build-markers.py. This line
+# used to spell it "no licence checked" while the binary says "no license
+# checked", so it matched nothing and this check could never fail. The same
+# list also refuses a chat build, which is not the public build either. Markers
+# only: this is a plain cargo build, not the remapped release build, so its
+# panic paths name this machine's cargo home by design.
+if ! python3 -I ./scripts/forbidden-build-markers.py --markers-only "$CARGO_TARGET_DIR/release/patanyx"; then
+  echo "GATE FAIL: ci-trixie built a non-public variant; licence-gate results are invalid" >&2
   exit 1
 fi
 echo "licence gate: real session/activation build (premium-unlocked absent)"
+
+if [ "$PHASE" = build ]; then
+  echo
+  echo "CI TRIXIE BUILD HALF OK (the runtime half has not run)"
+  exit 0
+fi
 
 echo
 echo "=== the gate that matters: run it, ask the engine ==="
@@ -158,12 +251,20 @@ export WEBKIT_DISABLE_COMPOSITING_MODE=1
 # No PATANYX_ALLOW_OLD_ENGINE here on purpose: on a correct image the release
 # binary must start WITHOUT an override. If it exits 2, the image is serving a
 # below-floor engine and the whole point of Debian 13 has been lost.
+smoke_rc=0
 out="$(xvfb-run -a --server-args="-screen 0 1280x900x24" \
-        "$CARGO_TARGET_DIR/release/patanyx" --smoke-test 2>&1)" || {
+        "$CARGO_TARGET_DIR/release/patanyx" --smoke-test 2>&1)" || smoke_rc=$?
+if [ "$smoke_rc" -ne 0 ]; then
   echo "$out"
-  echo "GATE FAIL: release binary refused to start or crashed" >&2
+  if [ "$smoke_rc" -eq 4 ]; then
+    echo "GATE FAIL: the web page sandbox cannot start in this container (exit 4)." >&2
+    echo "  Run this half the way 'scripts/ci-trixie.sh --docker' does; the" >&2
+    echo "  measured docker flags are in the header of this script." >&2
+  else
+    echo "GATE FAIL: release binary refused to start or crashed" >&2
+  fi
   exit 1
-}
+fi
 echo "$out" | grep -E "ENGINE|SMOKE" || true
 
 engine_line="$(echo "$out" | grep '^ENGINE ' || true)"
@@ -245,5 +346,20 @@ echo "$out" | grep -q '^SMOKE tabs:' || {
   exit 1
 }
 
+# Tab Activity's probe reading on a real content tab
+# (ipc::smoke_probe_channel_sequence). Linux shipped saying "the
+# page-reporting channel did not register" under counts that had arrived
+# through it, because wry holds the handler name first; only a real tab on the
+# real engine shows that. `PROBES skipped` (Divergence off in the profile) is
+# not a pass: this run's profile is fresh and the pref defaults on.
+echo "$out" | grep -q '^PROBES ok$' || {
+  echo "GATE FAIL: the fingerprint probe channel did not pass its live check" >&2
+  exit 1
+}
+
 echo
-echo "CI TRIXIE OK"
+if [ "$PHASE" = runtime ]; then
+  echo "CI TRIXIE RUNTIME HALF OK"
+else
+  echo "CI TRIXIE OK"
+fi

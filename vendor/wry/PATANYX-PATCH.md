@@ -84,3 +84,9 @@ context passes through before a WebView exists on it, so the call lives there.
 Runtime dependency: bubblewrap (`bwrap`) and `xdg-dbus-proxy`, which
 libwebkit2gtk-4.1 already depends on in Debian. The browser reads the state
 back per tab (`EngineSettings::sandbox`).
+
+Where the system does not let bubblewrap start (a default Docker container, a
+system that refuses unprivileged user namespaces), the engine aborts the browser
+with SIGTRAP. From 1.0.7 `crates/app/src/sandbox_check.rs` tests this before
+any window exists and refuses with a window that says so; it never starts the
+browser without the sandbox.

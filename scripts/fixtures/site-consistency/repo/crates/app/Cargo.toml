@@ -1,0 +1,6 @@
+# Fixture for scripts/site-consistency-gate-test.sh: the version the fixture
+# pages are judged against. Fixed on purpose, so the test does not move with
+# every release; the gate reads only this line from it.
+[package]
+name = "patanyx"
+version = "1.0.6"

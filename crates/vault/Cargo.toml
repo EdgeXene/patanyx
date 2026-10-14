@@ -6,7 +6,11 @@ edition = "2021"
 
 [dependencies]
 argon2 = "0.5"
-chacha20poly1305 = "0.10"
+# `stream`: the backup file (version 4) is sealed as a STREAM of 1 MiB
+# segments (aead::stream), so a backup carrying the Library's pictures is
+# never held whole in memory. A feature of the crate already here; it adds
+# no new crate to the build.
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
 # Recovery-key slots derive with HKDF rather than Argon2: the input is already
 # 256 random bits, so a slow KDF would cost the owner time and buy nothing.
 hkdf = "0.12"
@@ -21,3 +25,9 @@ thiserror = "2"
 # other dependencies, so this adds nothing new to the build.
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# `fuzz_read_sealed` exists only under `--cfg fuzzing`, which cargo-fuzz sets
+# for its own builds. It is a compiler setting, not a feature, so no
+# `--features` passed to a release build can switch it on.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

@@ -13,9 +13,20 @@
 // Plus: About opens the panel whatever the banner's answer, each topic asks
 // for its own video by name, and a failed video shows the error line.
 //
-// Three boots, because the banner is decided once, at boot: CASE=main (tour
+// Kept Sites (1.0.7, Windows only: Rust says keep_video). The same banner
+// announces it once, also to people who answered the 1.0.5 banner:
+//   - only with the video (never on Linux)                  [keep-on-linux]
+//   - after a 1.0.5 answer, on upgrade                      [keep-upgrade-hidden]
+//   - with its own text, not the 1.0.5 one                  [keep-text]
+//   - and keeps it through a language refill                [keep-refill]
+//   - Watch opens the Kept Sites video                      [keep-topic]
+//   - its topic button only where the video is              [keep-button-linux]
+//
+// Boots, because the banner is decided once, at boot: CASE=main (tour
 // already seen, banner not yet answered), CASE=tour (first run), CASE=seen
-// (answered). The main run starts the other two as child processes.
+// (answered), CASE=requests; and on Windows CASE=keep (1.0.5 answered,
+// 1.0.7 not: the upgrade), keep-fresh, keep-seen and keep-tour. The main
+// run starts the others as child processes.
 //
 // Run: node scripts/tutorial-gate.js   (or via scripts/chrome-js-gate.sh)
 const fs = require("fs");
@@ -68,9 +79,32 @@ if (PLANT === "banners") {
   plant('    "video[controls]",\n', "");
 } else if (PLANT === "pause") {
   plant('if (video && typeof video.pause === "function") video.pause();', "");
+} else if (PLANT === "keep-on-linux") {
+  plant('        if (keepVideo && data.keep_seen === false) topic = "keep-sites";\n', '        if (data.keep_seen === false) topic = "keep-sites";\n');
+} else if (PLANT === "keep-upgrade-hidden") {
+  plant("        if (!data) return;\n        keepVideo", "        if (!data || data.seen === true) return;\n        keepVideo");
+} else if (PLANT === "keep-text") {
+  plant("        tutorialBannerTopic = topic;\n        applyTutorialBannerText();\n", "        tutorialBannerTopic = topic;\n");
+} else if (PLANT === "keep-refill") {
+  plant("  rebuildOnLocaleFill(applyTutorialBannerText);\n", "");
+} else if (PLANT === "keep-topic") {
+  plant("    tutorialTopic = tutorialBannerTopic;\n", "");
+} else if (PLANT === "keep-button-linux") {
+  plant('        $("tutorial-topic-keep").hidden = !keepVideo;\n', '        $("tutorial-topic-keep").hidden = false;\n');
 } else if (PLANT) {
   console.error("unknown PATANYX_TUTORIAL_PLANT: " + PLANT);
   process.exit(2);
+}
+if (process.env.PATANYX_TUTORIAL_LIST_PLANTS) {
+  console.log(
+    [
+      "banners", "marker", "tour-first", "stale", "dedup", "abandoned",
+      "sticky-error", "recover", "attribution", "reset", "focus", "pause",
+      "keep-on-linux", "keep-upgrade-hidden", "keep-text", "keep-refill",
+      "keep-topic", "keep-button-linux",
+    ].join("\n"),
+  );
+  process.exit(0);
 }
 
 const checks = [];
@@ -86,8 +120,21 @@ const $ = (id) => global.document.getElementById(id);
 const calls = (cmd) => global.rbCalls.filter((c) => c.cmd === cmd);
 
 // What Rust answers: the tour and the banner per case, and a video.
-global.rbResolve.onboarding_seen_get = { seen: CASE !== "tour" };
-global.rbResolve.tutorial_seen_get = { seen: CASE === "seen" };
+global.rbResolve.onboarding_seen_get = {
+  seen: CASE !== "tour" && CASE !== "keep-tour",
+};
+// What Rust answers (ipc.rs tutorial_seen_get): keep_video is false on
+// Linux, where the Kept Sites video is not compiled in, true on Windows.
+global.rbResolve.tutorial_seen_get = {
+  main: { seen: false, keep_seen: false, keep_video: false },
+  tour: { seen: false, keep_seen: false, keep_video: false },
+  seen: { seen: true, keep_seen: true, keep_video: false },
+  requests: { seen: false, keep_seen: false, keep_video: false },
+  keep: { seen: true, keep_seen: false, keep_video: true },
+  "keep-fresh": { seen: false, keep_seen: false, keep_video: true },
+  "keep-seen": { seen: true, keep_seen: true, keep_video: true },
+  "keep-tour": { seen: false, keep_seen: false, keep_video: true },
+}[CASE];
 global.rbResolve.tutorial_video = {
   data: Buffer.from("not really a webm").toString("base64"),
 };
@@ -102,6 +149,8 @@ URL.createObjectURL = (blob) => {
 new Function(chromeJs)();
 
 const banner = () => $("tutorial-banner");
+const bannerTitle = () => String($("tutorial-banner-title").textContent);
+const KEEP_TITLE = "New in 1.0.7: PATANYX offers to keep Messenger signed in between sessions";
 const panelOpen = () => $("tutorial-panel").hidden === false;
 const video = () => $("tutorial-video");
 
@@ -131,6 +180,12 @@ if (CASE === "main") {
       assert(banner().hidden === false, "banner not shown");
     },
   );
+
+  check("on Linux it is the 1.0.5 banner, and there is no Kept Sites topic", async () => {
+    // The stub DOM keeps no markup text, so: the 1.0.7 text was never written.
+    assert(bannerTitle() !== KEEP_TITLE, "the Kept Sites text on Linux");
+    assert($("tutorial-topic-keep").hidden === true, "Kept Sites topic shown without its video");
+  });
 
   check(
     "Watch remembers the answer, hides the banner and opens the panel",
@@ -245,7 +300,7 @@ if (CASE === "main") {
   });
 
   // The two other boots, run as their own processes.
-  for (const other of ["tour", "seen", "requests"]) {
+  for (const other of ["tour", "seen", "requests", "keep", "keep-fresh", "keep-seen", "keep-tour"]) {
     check("boot case: " + other, async () => {
       const r = spawnSync(process.execPath, [__filename], {
         env: Object.assign({}, process.env, { PATANYX_TUTORIAL_CASE: other }),
@@ -327,6 +382,74 @@ if (CASE === "main") {
     await flush();
     assert($("tutorial-error").hidden === true, "error kept after the video loaded");
     global.rbResolve.tutorial_video = answer;
+  });
+} else if (CASE === "keep") {
+  check("on Windows an upgrade from a 1.0.5 answer announces Kept Sites", async () => {
+    await flush();
+    assert(banner().hidden === false, "no banner after a 1.0.5 answer");
+    assert(bannerTitle() === KEEP_TITLE, "banner title: " + bannerTitle());
+    assert($("tutorial-topic-keep").hidden === false, "Kept Sites topic hidden");
+  });
+  check("a language refill keeps the Kept Sites text", async () => {
+    const messages = {};
+    for (const attr of ["data-msg", "data-msg-title", "data-msg-placeholder", "data-msg-aria-label", "data-msg-alt"]) {
+      for (const node of global.document.querySelectorAll("[" + attr + "]")) {
+        const k = node.getAttribute(attr);
+        if (k) messages[k.replace(/\./g, "-")] = "[XA]";
+      }
+    }
+    messages["chrome-js-tutorial-keep-banner-title"] = "[XA] keep title";
+    messages["chrome-js-tutorial-keep-banner-body"] = "[XA] keep body";
+    global.window.__rb_event({ event: "ui_locale_fill", data: { generation: 7, locale: "en-XA", messages } });
+    await flush();
+    assert(bannerTitle() === "[XA] keep title", "after the refill the title is " + bannerTitle());
+    assert(String($("tutorial-banner-body").textContent) === "[XA] keep body", "body not kept");
+  });
+  check("Watch opens the Kept Sites video and remembers the answer", async () => {
+    global.rbCalls.length = 0;
+    $("tutorial-banner-watch")._fire("click");
+    await flush();
+    assert(banner().hidden === true, "banner still shown");
+    assert(calls("tutorial_seen_set").length === 1, "answer not remembered");
+    assert(panelOpen(), "panel not open");
+    const asked = calls("tutorial_video");
+    assert(asked.length === 1 && asked[0].args.name === "keep-sites", "video request: " + JSON.stringify(asked));
+    assert($("tutorial-topic-keep").getAttribute("aria-pressed") === "true", "Kept Sites topic not pressed");
+    assert(
+      String($("tutorial-steps").children[0].textContent).startsWith("Open Messenger"),
+      "steps: " + String($("tutorial-steps").children[0].textContent),
+    );
+  });
+} else if (CASE === "keep-fresh") {
+  check("a fresh Windows install gets the Kept Sites banner only, and Not now answers it", async () => {
+    await flush();
+    assert(banner().hidden === false, "no banner");
+    assert(bannerTitle() === KEEP_TITLE, "banner title: " + bannerTitle());
+    global.rbCalls.length = 0;
+    $("tutorial-banner-later")._fire("click");
+    await flush();
+    assert(banner().hidden === true, "banner still shown after Not now");
+    assert(calls("tutorial_seen_set").length === 1, "Not now did not remember the answer");
+    assert(!panelOpen(), "Not now opened the panel");
+  });
+} else if (CASE === "keep-seen") {
+  check("on Windows an answered banner stays away; About shows the Kept Sites topic", async () => {
+    await flush();
+    assert(banner().hidden === true, "banner shown again");
+    $("about-videos")._fire("click");
+    await flush();
+    assert(panelOpen(), "About did not open the panel");
+    assert($("tutorial-topic-keep").hidden === false, "Kept Sites topic hidden");
+  });
+} else if (CASE === "keep-tour") {
+  check("on a Windows first run the Kept Sites banner waits for the tour", async () => {
+    await flush();
+    assert($("onboarding-panel").hidden === false, "tour not open");
+    assert(banner().hidden === true, "banner shown over the tour");
+    $("onboarding-done")._fire("click");
+    await flush();
+    assert(banner().hidden === false, "banner not shown after the tour");
+    assert(bannerTitle() === KEEP_TITLE, "banner title: " + bannerTitle());
   });
 } else if (CASE === "seen") {
   check(

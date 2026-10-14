@@ -47,6 +47,7 @@ mod toplevel_request;
 /// Searching the personal archive: which archived pages answer a query, and
 /// what each row shows. Pure logic over records the store owns.
 mod archive;
+mod backup_job;
 /// Known-malicious hosts, refused in the navigation handler. Present in every
 /// build: this is the protection for users who change no settings.
 mod blocklist;
@@ -66,6 +67,9 @@ mod cookie_control;
 /// that has one.
 #[cfg(feature = "chat")]
 mod download_compare;
+/// "This site is already open in another tab": when the notice shows, which
+/// tab it names, and whether a click on it may still act.
+mod duplicate_site;
 mod engine_advisory;
 /// The message catalog and its resolver: every user-facing string in the
 /// chrome and in Rust comes from here, so a second locale is a file rather
@@ -74,6 +78,8 @@ mod i18n;
 /// Debug-only in-product isolation battery; see the module header.
 #[cfg(debug_assertions)]
 mod isolation_probe;
+mod keep_offer;
+mod kept_profile;
 /// Debug-only in-product proof of the translation reply channel; see the
 /// module header. Unix-only for now: it exercises the WebKitGTK parked-reply
 /// mechanism, and the Windows half of the seam is a different mechanism that
@@ -90,6 +96,9 @@ mod detect;
 /// The "your system needs a newer web engine" window (Linux, strict builds).
 #[cfg(target_os = "linux")]
 mod engine_window;
+/// The "could not start its web page sandbox" window (Linux).
+#[cfg(target_os = "linux")]
+mod sandbox_check;
 mod find;
 /// Page fullscreen (a video's "full screen" button): the decisions.
 mod fullscreen;
@@ -120,6 +129,7 @@ mod schedule;
 mod shelf;
 mod shortcuts;
 mod side_by_side;
+mod site_pages;
 mod sponsorship;
 mod state;
 mod tutorial;
@@ -131,6 +141,13 @@ mod tunnel_control;
 /// Signed update checking. Verification is `patanyx-update`; this is the
 /// fetch, decide and prompt layer around it.
 mod updater;
+/// The Vault backup: the vault and the whole Library in one encrypted file,
+/// and the journaled import that replaces both.
+mod vault_backup;
+mod window_frame;
+
+/// Set on a replacement started by this binary (updater.rs `relaunch`).
+pub(crate) const RELAUNCH_ENV: &str = "PATANYX_RELAUNCHED";
 
 use std::borrow::Cow;
 use std::thread;
@@ -151,22 +168,51 @@ use state::AppState;
 /// only `EventLoopProxy` clones (`Send`) plus Copy data — keep it that way.
 enum UserEvent {
     Ipc(String),
+    /// An encrypted export or a whole-Library import running on a worker:
+    /// its progress is due, or its result is in the mailbox (`backup_job`).
+    BackupJob(backup_job::Bell),
     /// The once-per-process engine-profile wipe has completed (successfully
     /// or not), so tabs held blank behind it may issue their initial
     /// navigation. Failure still releases them; the platform diagnostic says
     /// plainly which data were NOT cleared instead of turning an unavailable
     /// privacy primitive into a browser that never loads.
-    SessionWipeFinished,
-    /// A tab's freeze changed without a navigation or an IPC call (Linux: the
-    /// GTK auto-freeze timer froze it, or its freeze filter failed to
-    /// install). Re-sends the toolbar status; without it the freeze chip read
-    /// "Live" on a frozen tab until something else happened to push one.
-    #[cfg_attr(windows, allow(dead_code))]
-    FreezeStatusChanged,
+    /// A profile's start-up clear settled (kept_profile.rs: each profile
+    /// releases only its own tabs).
+    SessionWipeFinished(kept_profile::ProfileKind),
+    /// The kept profile was cleared in full; the record of sites owed a
+    /// clear can be retired.
+    KeptProfileCleared,
+    /// A tab's page belongs in the other profile and was refused there;
+    /// AppState decides whether it opens in a tab of the right profile.
+    /// Something in the kept profile could not be enforced or cleared; the
+    /// next start clears it in full (kept_profile.rs).
+    KeptClearOwed(String),
+    /// A kept tab's boundary could not answer a request. `held` is whether
+    /// the request was held back instead; the tab is closed either way.
+    KeptEnforcementFailed {
+        tab_id: u64,
+        held: bool,
+    },
+    ProfileCrossing {
+        tab_id: u64,
+        url: String,
+        method: String,
+    },
+    /// A tab's status changed without a navigation or an IPC call. Linux:
+    /// the GTK auto-freeze timer froze it, or its freeze filter failed to
+    /// install; without this the freeze chip read "Live" on a frozen tab
+    /// until something else happened to push one. Windows: the engine
+    /// answered a script registration after the call that asked had already
+    /// reported Pending (review 2026-10-12, R-002). Re-sends the status.
+    TabStatusChanged,
     /// The engine answered tab N's WebSocket guard registration (Windows):
     /// its first page may be released.
     #[cfg_attr(not(windows), allow(dead_code))]
     LocalNetworkGuardSettled(u64),
+    /// A tab's bundled ad and tracker filters finished loading (WebKitGTK):
+    /// first pages held for them are looked at again.
+    #[cfg_attr(windows, allow(dead_code))]
+    BundledFiltersSettled,
     /// The engine has not answered it in time (Windows): recorded as Failed,
     /// and the first page is released anyway.
     #[cfg_attr(not(windows), allow(dead_code))]
@@ -230,6 +276,9 @@ enum UserEvent {
     /// Raised by the tunnel's "Apply and restart", which needs a new process
     /// because the engine reads the proxy setting only at startup.
     QuitForRelaunch,
+    /// The chrome's own Close button (window_frame.rs, Windows only).
+    /// Ends the loop the same way the system close does.
+    CloseWindow,
     /// The engine zoomed a tab on keys this process never receives.
     ZoomFactorChanged(u64, f64),
     /// A tab's page entered (true) or left (false) element fullscreen, as
@@ -398,6 +447,35 @@ enum UserEvent {
     /// force and is reported, never swallowed -- a protection that silently
     /// stopped refreshing is the failure mode this channel exists to avoid.
     BlocklistRefreshed(Result<(u64, usize), String>),
+    /// Tab N's "Allow ads and trackers on this tab" ended inside an engine
+    /// handler, because the tab's top-level document went to another site.
+    /// Blocking is already back in that tab by the time this is sent; this is
+    /// how AppState and the chrome hear of it.
+    AdsAllowanceEnded {
+        tab_id: u64,
+    },
+    /// Windows: the navigation that ended tab N's allowance never replaced
+    /// the page (it became a download or was cancelled), so the page loaded
+    /// with ads allowed is still on screen and its next reload must skip the
+    /// cache (`TabState::on_top_level_navigation_completed`).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    AdsAllowancePageKept {
+        tab_id: u64,
+        /// Another top-level navigation is about to replace the page
+        /// (`TabState::replacement_pending`).
+        replacing: bool,
+        /// The document the repair is for (`TabState::current_document`).
+        document: Option<u64>,
+    },
+    /// The hosts on both the ad and tracker lists and the malicious-site list
+    /// in force (`blocklist::ad_overlap`), computed on a worker. WebKitGTK
+    /// compiles them into the filter an allowed tab keeps.
+    #[cfg_attr(windows, allow(dead_code))]
+    AdOverlapComputed { request: u64, hosts: Option<Vec<String>> },
+    /// That filter compiled, or failed to: the switch's availability changed
+    /// and the open tabs' allowances may have to end. WebKitGTK only.
+    #[cfg_attr(windows, allow(dead_code))]
+    AdOverlapSettled,
     /// A scheduled update check finished. Carries the updater's own status
     /// snapshot; the chrome decides whether it is worth showing.
     UpdateChecked(serde_json::Value),
@@ -618,6 +696,49 @@ fn with_asset_revision(html: &str) -> String {
         .replace(".css\"", &format!(".css?v={rev}\""))
 }
 
+/// The saved look, written onto `<html>` before the chrome's first paint
+/// (1.0.7). chrome.js wears these attributes too, but only once its first
+/// IPC replies arrive, so a user on any accent but the default saw the
+/// default flash first. Written here they are in the document the engine
+/// parses, and the stylesheet keys on them from the first frame.
+///
+/// Each attribute is written exactly as chrome.js's wear function writes it,
+/// and left out exactly where that function deletes it, so defaults produce
+/// the document byte for byte. The toolbar PLACEMENT is not written: a side
+/// layout needs the buttons moved into the rail, which only chrome.js does,
+/// and an attribute saying "left" over buttons still in the top row would be
+/// a first frame the layout code then measures wrongly.
+fn with_boot_attributes(html: &str, p: &prefs::Prefs) -> String {
+    let mut attrs = String::new();
+    let mut put = |name: &str, value: &str| {
+        attrs.push_str(&format!(" data-{name}=\"{value}\""));
+    };
+    if p.chrome_theme != prefs::ChromeTheme::Default {
+        put("theme", p.chrome_theme.as_str());
+    }
+    if p.chrome_scheme != prefs::ChromeScheme::Dark {
+        put("scheme", p.chrome_scheme.as_str());
+    }
+    if p.chrome_texture != prefs::ChromeTexture::Plain {
+        put("texture", p.chrome_texture.as_str());
+    }
+    if p.reduce_motion {
+        put("motion", "reduce");
+    }
+    if p.toolbar_labels == prefs::ToolbarLabels::Hide {
+        put("toolbar-labels", "hide");
+    }
+    // Known ids only, each once: the prefs reader normalizes them, so
+    // nothing here can carry a quote or anything else into the markup.
+    if !p.toolbar_folded.is_empty() {
+        put("folded", &p.toolbar_folded.join(" "));
+    }
+    if attrs.is_empty() {
+        return html.to_string();
+    }
+    html.replacen("<html lang=\"en\">", &format!("<html lang=\"en\"{attrs}>"), 1)
+}
+
 fn serve_translator(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static, [u8]>> {
     if request.uri().path().starts_with("/pack/") {
         return match serve_translator_pack(request.uri().path()) {
@@ -736,7 +857,10 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
                 .header("Content-Type", "text/html; charset=utf-8")
                 .header("Content-Security-Policy", CSP)
                 .header(NO_STORE.0, NO_STORE.1)
-                .body(Cow::Owned(with_asset_revision(INDEX_HTML).into_bytes()))
+                .body(Cow::Owned(
+                    with_boot_attributes(&with_asset_revision(INDEX_HTML), &prefs::load())
+                        .into_bytes(),
+                ))
                 .expect("chrome html response");
         }
         "/chrome.css" => ("text/css; charset=utf-8", CHROME_CSS.as_bytes()),
@@ -1240,6 +1364,14 @@ fn main() {
         std::process::exit(if starts { 0 } else { 3 });
     }
 
+    // The child half of the web page sandbox check (sandbox_check.rs): this
+    // binary, started by itself, loading one empty page with the engine's
+    // sandbox on. Never run by a person; no profile, no visible window.
+    #[cfg(target_os = "linux")]
+    if std::env::args().any(|arg| arg == sandbox_check::CHECK_FLAG) {
+        std::process::exit(sandbox_check::child());
+    }
+
     let smoke_mode = std::env::args().any(|arg| arg == "--smoke-test");
     enforce_engine_floor();
     // Before the first webview exists, so the line lands ahead of WebView2's
@@ -1282,12 +1414,144 @@ fn main() {
         return;
     }
 
+    // The web page sandbox check: after a pending update has had its chance
+    // to install (a release that fixes a wrong refusal must be able to reach
+    // this machine; release review 2026-10-12, R-001) and before anything
+    // that could start a web process. Refuses, with a window, where the
+    // system will not let the engine's web page sandbox start; it never
+    // starts the browser without it.
+    #[cfg(target_os = "linux")]
+    sandbox_check::enforce(smoke_mode);
+
+    // KEPT SITES (kept_profile.rs). The request handlers read the keep-list
+    // from memory, so it is loaded before any webview exists. A site kept
+    // since the kept profile was last cleared and not kept any more means
+    // that profile is owed a complete clear: its folder is removed now,
+    // before an environment over it exists, and if that cannot be done the
+    // start clears it with the engine instead, from a hidden kept web view.
+    //
+    // ONLY THE SOLE RUNNING PATANYX uses the kept profile: it takes the kept
+    // profile's lock EXCLUSIVELY and holds it for its whole life, so a second
+    // process cannot take it and leaves the kept profile and its ledger alone
+    // (code review round 2, R-036). And only once every kept site is in the
+    // ledger: a site is recorded before it can load there (R-037).
+    if cfg!(windows) {
+        let p = prefs::load();
+        kept_profile::set_kept_hosts(&p.wipe_exempt_hosts);
+        let vault_path = patanyx_vault::Vault::default_path();
+        kept_profile::set_ledger_path(platform::kept_ledger_path_for(&vault_path));
+        let lock_path = platform::kept_profile_lock_path_for(&vault_path);
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .ok();
+        // A replacement started by "Restart and update now" or the tunnel's
+        // "Apply and restart" waits for the process it replaces to let go,
+        // which it does as it exits; a second PATANYX started by hand does
+        // not wait (compliance audit 2026-10-13).
+        let replacing = std::env::var_os(RELAUNCH_ENV).is_some();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let sole = lock.as_ref().is_some_and(|file| loop {
+            if file.try_lock().is_ok() {
+                break true;
+            }
+            if !replacing || std::time::Instant::now() >= deadline {
+                break false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        let mut enabled = sole;
+        if sole {
+            let read = kept_profile::read_ledger();
+            let mut entries = kept_profile::entries_of(&read);
+            kept_profile::set_markers_at_start(
+                entries.iter().filter(|e| e.starts_with('!')).cloned().collect(),
+            );
+            let folder_exists = platform::kept_profile_dir_for(&vault_path).exists();
+            // A ledger this start cannot write is not trusted either: an
+            // obligation raised while it could be neither written nor
+            // removed is in no record (code review round 7).
+            let untrusted = folder_exists && !kept_profile::ledger_writable();
+            if untrusted
+                || kept_profile::kept_start_from(&read, folder_exists, &p.wipe_exempt_hosts)
+                    == kept_profile::KeptStart::FullClear
+            {
+                // The engine processes of a PATANYX that just exited can hold
+                // the folder for a moment; a few tries before falling back.
+                let removed = (0..30).any(|attempt| {
+                    if attempt > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    platform::remove_kept_profile_folder()
+                });
+                if removed {
+                    entries = p.wipe_exempt_hosts.clone();
+                    kept_profile::set_markers_at_start(Vec::new());
+                    if kept_profile::write_ledger(&entries).is_err() {
+                        enabled = false;
+                    }
+                } else {
+                    // Owed, durably, before the ledger can look clean: this
+                    // start's clear retires it when it completes (code
+                    // review round 3, R-045). Every marker in the ledger
+                    // now predates that clear, including the one `record`
+                    // writes for a ledger it could not read (round 4), so
+                    // the clear retires them all.
+                    if kept_profile::record("!owed-clear").is_err() {
+                        enabled = false;
+                    }
+                    let mut owed = kept_profile::markers_at_start();
+                    owed.push("!owed-clear".to_string());
+                    for entry in kept_profile::entries_of(&kept_profile::read_ledger()) {
+                        if entry.starts_with('!') && !owed.contains(&entry) {
+                            owed.push(entry);
+                        }
+                    }
+                    kept_profile::set_markers_at_start(owed);
+                    platform::set_kept_full_clear_due(true);
+                }
+            }
+            // Every site kept now may load in the kept profile this session,
+            // so it is recorded now, before it can (a site kept before the
+            // ledger existed was not).
+            for host in &p.wipe_exempt_hosts {
+                if !entries.contains(host) && kept_profile::record(host).is_err() {
+                    enabled = false;
+                }
+            }
+            // Only recorded hosts are kept in memory (R-046).
+            kept_profile::set_kept_hosts(&kept_profile::admit(&p.wipe_exempt_hosts));
+        }
+        if let Some(file) = lock {
+            // Held, exclusively when this is the sole PATANYX, for the life
+            // of the process.
+            Box::leak(Box::new(file));
+        }
+        platform::set_kept_sole(sole);
+        platform::set_kept_enabled(enabled);
+    }
+
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
 
-    let window = WindowBuilder::new()
+    let builder = WindowBuilder::new()
         .with_title(window_title())
         .with_window_icon(app_icon())
-        .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 780.0))
+        .with_inner_size(tao::dpi::LogicalSize::new(1100.0, 780.0));
+    // NO TITLE BAR ON WINDOWS (1.0.7), for the room it gives the page. The chrome draws
+    // the window controls in the tab strip and lends its empty space as the
+    // drag area (window_frame.rs). With the undecorated shadow tao removes
+    // WS_CAPTION only: snapping, the shadow and the side and bottom resize
+    // borders stay the system's. The title and icon still name the window
+    // on the taskbar and in Alt+Tab. Linux keeps its desktop's title bar.
+    #[cfg(windows)]
+    let builder = {
+        use tao::platform::windows::WindowBuilderExtWindows;
+        builder.with_decorations(false).with_undecorated_shadow(true)
+    };
+    let window = builder
         .build(&event_loop)
         .expect("failed to create main window");
 
@@ -1406,6 +1670,12 @@ fn main() {
     // measured from startup, not from the first event to arrive.
     let mut schedule = schedule::Schedule::new(std::time::Instant::now());
     let mut app = AppState::new(chrome, hosts, proxy.clone(), smoke_mode);
+    // The hosts an allowed tab must still refuse on WebKitGTK, worked out from
+    // the list in force before anyone can tick the switch. Until it arrives
+    // the switch says it is not ready rather than allowing without them.
+    if platform::ad_overlap_wanted() {
+        blocklist::ad_overlap_in_background(&proxy);
+    }
     // The full-loop self-test needs its own heartbeat: the translation poller
     // only runs while a translation is in flight, and the first click has not
     // happened yet. Debug builds only, and only when explicitly armed.
@@ -1438,6 +1708,20 @@ fn main() {
     // BEFORE first paint would be ideal, but the profile only exists with
     // a webview; the first navigation is what shows it either way.
     let boot_theme = prefs::load().page_theme;
+    // The ordinary profile's start-up clear begins here, whatever the first
+    // tab turns out to be (code review 2026-10-13, R-023).
+    platform::begin_main_profile_wipe(app.chrome(), &app.proxy());
+    // The kept profile's start-up clear (the cookie and cache cleanup, or a
+    // full clear owed at this start whose folder could not be removed) and
+    // its permission reset run now, from a hidden web view in that profile,
+    // not whenever a kept tab happens to be opened: the start is what the
+    // Privacy panel says cleans it (compliance audit 2026-10-13; code
+    // review round 5). The permission reset is also the backstop for the
+    // one at exit, which the engine may not finish once the event loop has
+    // stopped (round 4). Kept tabs wait for the clear.
+    if platform::kept_full_clear_due() || (platform::kept_enabled() && kept_profile::holds_kept_data()) {
+        platform::begin_kept_profile_start(&app.hosts, &app.proxy());
+    }
     if app.new_tab(&start_url, true).is_err() {
         eprintln!(
             "PATANYX: the web engine could not create the first tab.\n  \
@@ -1544,18 +1828,36 @@ fn main() {
                 // for the process already waiting at its unlock screen.
                 *control_flow = ControlFlow::Exit;
             }
+            // A running backup is asked first: an export or an uncommitted
+            // import is stopped and the window closes when it has (or after a
+            // grace period); during an import's commit the close is held,
+            // because closing then loses the one-time recovery key. A second
+            // close always closes (`backup_job::hold_close`).
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                if backup_job::hold_close(&mut app) {
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(UserEvent::CloseWindow) => {
+                if backup_job::hold_close(&mut app) {
+                    *control_flow = ControlFlow::Exit;
+                }
+            }
+            Event::UserEvent(UserEvent::BackupJob(bell)) => {
+                let _ = backup_job::on_bell(&mut app, bell);
             }
             // Child-webview geometry is manual on Windows; GTK repacks on
             // its own, so relayout() is a no-op there.
             Event::WindowEvent {
                 event: WindowEvent::Resized(_),
                 ..
-            } => app.relayout(),
+            } => {
+                app.relayout();
+                app.note_window_state();
+            }
             Event::WindowEvent {
                 event: WindowEvent::ScaleFactorChanged { .. },
                 ..
@@ -1593,9 +1895,11 @@ fn main() {
                     let result = ipc::smoke_vault_sequence(&mut app)
                         .and_then(|()| ipc::smoke_licence_sequence(&mut app))
                         .and_then(|()| ipc::smoke_tab_sequence(&mut app))
+                        .and_then(|()| ipc::smoke_strict_tab_sequence(&mut app))
                         .and_then(|()| ipc::smoke_partner_sequence(&mut app))
                         .and_then(|()| ipc::smoke_sponsorship_sequence(&mut app))
-                        .and_then(|()| ipc::smoke_readout_sequence(&mut app));
+                        .and_then(|()| ipc::smoke_readout_sequence(&mut app))
+                        .and_then(|()| ipc::smoke_probe_channel_sequence(&mut app));
                     match result {
                         Ok(()) => {
                             app.smoke_second_ping_requested = true;
@@ -1631,13 +1935,22 @@ fn main() {
             Event::UserEvent(UserEvent::FullscreenNoticeEnd(generation)) => {
                 app.on_fullscreen_notice_end(generation)
             }
-            Event::UserEvent(UserEvent::SessionWipeFinished) => {
-                app.finish_session_wipe()
+            Event::UserEvent(UserEvent::SessionWipeFinished(kind)) => {
+                app.finish_session_wipe(kind)
             }
-            Event::UserEvent(UserEvent::FreezeStatusChanged) => app.emit_tab_status(),
+            Event::UserEvent(UserEvent::KeptProfileCleared) => app.on_kept_profile_cleared(),
+            Event::UserEvent(UserEvent::KeptClearOwed(why)) => app.on_kept_clear_owed(&why),
+            Event::UserEvent(UserEvent::KeptEnforcementFailed { tab_id, held }) => {
+                app.on_kept_enforcement_failed(tab_id, held)
+            }
+            Event::UserEvent(UserEvent::ProfileCrossing { tab_id, url, method }) => {
+                app.on_profile_crossing(tab_id, url, method)
+            }
+            Event::UserEvent(UserEvent::TabStatusChanged) => app.emit_tab_status(),
             Event::UserEvent(UserEvent::LocalNetworkGuardSettled(id)) => {
                 app.on_local_network_guard_settled(id)
             }
+            Event::UserEvent(UserEvent::BundledFiltersSettled) => app.on_bundled_filters_settled(),
             Event::UserEvent(UserEvent::LocalNetworkGuardOverdue(id)) => {
                 app.on_local_network_guard_overdue(id)
             }
@@ -1839,6 +2152,24 @@ fn main() {
                     Err(why) => serde_json::json!({ "ok": false, "detail": why }),
                 };
                 app.emit("blocklist_refreshed", data);
+                // A refresh that went through may have made an ad-list host
+                // malicious. The overlap is worked out again from the list now
+                // in force; an unchanged overlap changes nothing.
+                if outcome.is_ok() && platform::ad_overlap_wanted() {
+                    blocklist::ad_overlap_in_background(&app.proxy());
+                }
+            }
+            Event::UserEvent(UserEvent::AdsAllowanceEnded { tab_id }) => {
+                app.on_ads_allowance_ended(tab_id);
+            }
+            Event::UserEvent(UserEvent::AdsAllowancePageKept { tab_id, replacing, document }) => {
+                app.on_ads_allowance_page_kept(tab_id, replacing, document);
+            }
+            Event::UserEvent(UserEvent::AdOverlapComputed { request, hosts }) => {
+                app.on_ad_overlap_computed(request, hosts);
+            }
+            Event::UserEvent(UserEvent::AdOverlapSettled) => {
+                app.on_ad_overlap_settled();
             }
             Event::UserEvent(UserEvent::UpdateChecked(status)) => {
                 // Pushed to the chrome rather than acted on here. Offering an
@@ -2087,7 +2418,23 @@ fn main() {
             // The platform pair both export this, so no `#[cfg]` here: it is a
             // no-op on unix, where no permission state is ever written.
             Event::LoopDestroyed => {
+                // A stopped export gets a moment to remove its temporary file.
+                backup_job::on_exit(&mut app);
                 platform::clear_persisted_permissions(app.chrome());
+                // The kept profile is a second profile with its own stored
+                // decisions (kept_profile.rs): a kept tab reaches it.
+                if let Some(kept_tab) = app
+                    .tabs
+                    .iter()
+                    .find(|t| t.profile == kept_profile::ProfileKind::Kept)
+                {
+                    platform::clear_persisted_permissions(&kept_tab.webview);
+                } else {
+                    platform::sweep_kept_permissions(&app.hosts, false);
+                }
+                // A ledger entry that could not be written earlier gets a
+                // last try (code review round 2, R-039).
+                app.retry_unrecorded_kept_entries();
                 #[cfg(feature = "chat")]
                 chat_panel::shutdown(&mut app);
             }
@@ -2230,6 +2577,57 @@ mod translator_origin_tests {
         };
         assert_eq!(norm(meta), norm(CSP), "index.html meta CSP and main.rs CSP differ");
         assert!(CSP.contains("media-src blob:"));
+    }
+
+    /// The saved look is in the served document (1.0.7): every attribute the
+    /// stylesheet keys on, written as chrome.js writes it, and nothing at
+    /// all for the defaults.
+    #[test]
+    fn the_served_chrome_wears_the_saved_look_from_its_first_frame() {
+        // One opening tag to write into, or the replacement does nothing.
+        assert_eq!(INDEX_HTML.matches("<html lang=\"en\">").count(), 1);
+        let plain = prefs::Prefs::default();
+        assert_eq!(with_boot_attributes(INDEX_HTML, &plain), INDEX_HTML);
+
+        let mut p = prefs::Prefs::default();
+        p.chrome_theme = prefs::ChromeTheme::Violet;
+        p.chrome_scheme = prefs::ChromeScheme::Paper;
+        p.chrome_texture = prefs::ChromeTexture::Grain;
+        p.reduce_motion = true;
+        p.toolbar_labels = prefs::ToolbarLabels::Hide;
+        p.toolbar_folded = vec!["network".into(), "tools".into()];
+        let served = with_boot_attributes(INDEX_HTML, &p);
+        assert!(served.contains(
+            "<html lang=\"en\" data-theme=\"violet\" data-scheme=\"paper\" \
+             data-texture=\"grain\" data-motion=\"reduce\" \
+             data-toolbar-labels=\"hide\" data-folded=\"network tools\">"
+        ));
+        // The placement stays chrome.js's: see with_boot_attributes.
+        assert!(!served.contains("data-toolbar-placement"));
+
+        // The names are the ones chrome.js wears and chrome.css keys on; a
+        // rename on either side would leave these attributes doing nothing.
+        for wear in [
+            "dataset.theme = name",
+            "dataset.scheme = name",
+            "dataset.texture = name",
+            "dataset.motion = \"reduce\"",
+            "dataset.toolbarLabels = mode",
+            "const want = folded.join(\" \");",
+            "dataset.folded = want",
+        ] {
+            assert!(CHROME_JS.contains(wear), "chrome.js no longer wears `{wear}`");
+        }
+        for key in [
+            ":root[data-theme=\"violet\"]",
+            ":root[data-scheme=\"paper\"]",
+            "html[data-texture=\"grain\"]",
+            "html[data-motion=\"reduce\"]",
+            ":root[data-toolbar-labels=\"hide\"]",
+            "html[data-folded~=\"tools\"]",
+        ] {
+            assert!(CHROME_CSS.contains(key), "chrome.css no longer keys on `{key}`");
+        }
     }
 
     /// Every response carries the policy, including the 404 -- the same rule

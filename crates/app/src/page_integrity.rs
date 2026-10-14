@@ -282,7 +282,7 @@ fn save_snapshot(
     if state.vault.is_none() {
         return Err("not_unlocked");
     }
-    let store = state.store.as_mut().ok_or("not_unlocked")?;
+    let store = state.store_for_write()?;
     match picture {
         Some((png, scope)) => store.save_page_snapshot_with_picture(
             bookmark_id,

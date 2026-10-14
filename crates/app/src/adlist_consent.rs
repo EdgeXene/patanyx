@@ -405,12 +405,19 @@ pub fn classify_load_failure(
 /// BUMPS IT TOO, not just grants: a grant compile that lands after the user
 /// left the consented host must be discarded, and if only grants advanced the
 /// counter it would be installed instead.
+///
+/// In use since 1.0.7 on WebKitGTK, for the process-wide compile of the filter
+/// a tab with ads allowed keeps (`unix.rs`, `AD_OVERLAP_GENERATION`): only the
+/// newest list's compile may become the one in force. That guard never
+/// closes, so `close` is exercised by the tests below alone.
+#[cfg_attr(windows, allow(dead_code))]
 #[derive(Debug, Default)]
 pub struct FilterGeneration {
     current: u64,
     alive: bool,
 }
 
+#[cfg_attr(windows, allow(dead_code))]
 impl FilterGeneration {
     pub fn new() -> Self {
         Self {
@@ -435,6 +442,7 @@ impl FilterGeneration {
     /// The tab is gone. Nothing may be installed into it again, ever, and this
     /// is separate from the counter because a wrapped counter could otherwise
     /// coincide with a stale token from a tab that no longer exists.
+    #[allow(dead_code)]
     pub fn close(&mut self) {
         self.alive = false;
     }

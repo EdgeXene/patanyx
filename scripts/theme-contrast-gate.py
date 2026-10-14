@@ -231,6 +231,98 @@ def main():
 
     failures = []
 
+    # TEXTURES (1.0.7). html[data-texture="<name>"] paints a gradient over
+    # the strip, the toolbar and the panel cards. Each texture's strongest
+    # alpha is a token on :root (--texture-alpha-<name>), and what it paints
+    # is read from its own rule: `rgb(R G B / var(--texture-alpha-<name>))`
+    # for a flat paint, or `color-mix(in srgb, var(--accent) calc(...))` for
+    # the accent. Every pair that lands on a textured surface is then also
+    # checked against that surface composited with each texture's paint at
+    # its alpha: what the texture actually does to the surface, at its
+    # strongest. (The plan review proposed white and black at the strongest
+    # alpha as the two extremes; that model fails the shipped Dark scheme's
+    # own --tx-dim for a white paint no texture uses, so the gate checks the
+    # real paints instead, and theme-packs-gate.js caps every alpha at 0.06
+    # so a texture cannot be turned up past what is checked here.) A texture
+    # rule without a token, or a token without a rule, is a failure: both
+    # mean a texture the gate cannot see.
+    TEXTURED = {"sf-strip-a", "sf-tabstrip-a", "sf-panel"}
+    alphas = {
+        name[len("texture-alpha-") :]: float(value)
+        for name, value in root.items()
+        if name.startswith("texture-alpha-")
+    }
+    if not alphas:
+        failures.append("no --texture-alpha-* token on :root; textures are not gated")
+    for name, alpha in alphas.items():
+        if alpha > 0.06:
+            failures.append(f"--texture-alpha-{name} = {alpha}: above the 0.06 cap")
+    # name -> "accent" or a hex paint, from the texture's own rule, and
+    # name -> the surface tokens the rule's selectors name (a texture that
+    # leaves the toolbar alone is not checked against the toolbar).
+    SURFACE_OF = {"#tabstrip": "sf-tabstrip-a", "#toolbar": "sf-strip-a", ".panel-modal": "sf-panel"}
+    paints = {}
+    surfaces = {}
+    # EXACT paint text, and nothing else in the rule may paint (review round
+    # 1, R-004: a prefix match let `* 1000%` through, and an extra opaque
+    # stop was never looked at). Whitespace is normalised before matching so
+    # a wrapped declaration reads the same as a one-line one. Round 2, R-008:
+    # a list of colour words could never be complete (`lime` and `yellow`
+    # passed), so what remains after the one paint is removed is held to an
+    # ALLOW-list of gradient syntax instead, and anything else fails.
+    GRADIENT_SYNTAX = re.compile(
+        r"background-image\s*:|(?:repeating-)?(?:linear|radial|conic)-gradient|"
+        r"\b(?:ellipse|circle|at|to|from|transparent|closest-side|closest-corner|"
+        r"farthest-side|farthest-corner|left|right|top|bottom|center)\b|"
+        r"-?\d*\.?\d+(?:px|deg|turn|%|em|rem)?|[(),;\s]",
+        re.I,
+    )
+    for m in re.finditer(r'((?:html\[data-texture="([\w-]+)"\][^{]*?,?\s*)+)\{([^{}]*)\}', src):
+        selectors, name, body = m.group(1), m.group(2), " ".join(m.group(3).split())
+        if "background-image" not in body:
+            # The shared ::before box (position, inset): not a paint rule.
+            continue
+        surfaces[name] = {SURFACE_OF[k] for k in SURFACE_OF if k in selectors}
+        if not surfaces[name]:
+            failures.append(f"texture {name}: its rule names no surface this gate knows")
+        accent_paint = (
+            f"color-mix(in srgb, var(--accent) calc(var(--texture-alpha-{name}) * 100%), transparent)"
+        )
+        flat = re.search(r"rgb\((\d+) (\d+) (\d+) / var\(--texture-alpha-" + name + r"\)\)", body)
+        if accent_paint in body:
+            paints[name] = "accent"
+            rest = body.replace(accent_paint, "")
+        elif flat:
+            paints[name] = "#%02x%02x%02x" % tuple(int(c) for c in flat.groups())
+            rest = body.replace(flat.group(0), "")
+        else:
+            failures.append(f"texture {name}: its rule paints nothing this gate can read")
+            continue
+        # One layer, painted once: the calculation composites one layer, so a
+        # second gradient or a repeated paint is paint it never sees (round
+        # 3, R-008).
+        layers = len(re.findall(r"-gradient\(", body))
+        uses = body.count(accent_paint) if paints[name] == "accent" else body.count(flat.group(0))
+        if layers != 1 or uses != 1:
+            failures.append(
+                f"texture {name}: {layers} gradient layers and {uses} uses of its paint; "
+                "this gate composites exactly one of each"
+            )
+        leftover = GRADIENT_SYNTAX.sub("", rest)
+        if leftover:
+            failures.append(
+                f"texture {name}: its rule says more than its one paint and gradient "
+                f"syntax ({leftover[:40]!r}), which this gate cannot check"
+            )
+    for name in alphas.keys() ^ paints.keys():
+        failures.append(f"texture {name}: has a token or a rule but not both")
+    max_alpha = max(alphas.values(), default=0.0)
+
+    def composite(bg, over, alpha):
+        return "#%02x%02x%02x" % tuple(
+            round(cb * (1 - alpha) + co * alpha) for cb, co in zip(rgb(bg), rgb(over))
+        )
+
     # The numeric pair matters only if native popup options actually consume
     # it, and the primary fix matters only if all three scheme selectors tell
     # the engine which kind of native widget to draw.
@@ -247,6 +339,13 @@ def main():
     ]:
         if not re.search(declaration, src, re.S):
             failures.append(f"{description} does not declare its color-scheme")
+    # Every scheme added later must say which kind of native widget to draw
+    # too; the three above are the named originals, this is the rule.
+    for scheme in schemes:
+        if "color-scheme" not in blocks.get(f':root[data-scheme="{scheme}"]', {}) and not re.search(
+            rf':root\[data-scheme="{scheme}"\]\s*\{{[^{{}}]*color-scheme:\s*(dark|light)\s*;', src, re.S
+        ):
+            failures.append(f"{scheme} scheme does not declare its color-scheme")
     option_rule = re.search(r"\boption\s*\{([^{}]*)\}", src, re.S)
     if not option_rule or not all(
         token in option_rule.group(1)
@@ -297,6 +396,21 @@ def main():
                         f"{where}: --{fg} {a} on --{bg} {b}"
                         f" = {r:.2f} (floor {floor:.2f})"
                     )
+                if bg in TEXTURED:
+                    for name, paint in paints.items():
+                        if name not in alphas or bg not in surfaces.get(name, ()):
+                            continue
+                        over = colour_of("accent", v, where) if paint == "accent" else paint
+                        if not over:
+                            continue
+                        bt = composite(b, over, alphas[name])
+                        rt = ratio(a, bt)
+                        if rt < floor - 0.005:
+                            failures.append(
+                                f"{where}: --{fg} {a} on --{bg} {b} under the "
+                                f"{name} texture ({bt}) = {rt:.2f}"
+                                f" (floor {floor:.2f})"
+                            )
             for fg, bg, was in RELATIVE:
                 a = colour_of(fg, v, where)
                 b = colour_of(bg, v, where)
@@ -333,7 +447,8 @@ def main():
         return 1
     print(
         f"THEME CONTRAST OK: {combos} scheme/accent combos, "
-        f"{len(PAIRS)} pairs + {len(RELATIVE)} no-regression checks each"
+        f"{len(PAIRS)} pairs + {len(RELATIVE)} no-regression checks each, "
+        f"textured surfaces at alpha {max_alpha}"
     )
     return 0
 

@@ -378,6 +378,11 @@ Rules, each enforced by `scripts/check-linux-feeds.py` (tested by
   that neither publishes the bridge nor proves /v1 unchanged, so nobody overwrites
   the bridge with a build old clients cannot run. A copy
   that was offline for months still gets the bridge first, then moves to `/v2`.
+- No feed may carry a build that is never published: each binary is scanned for
+  the chat and premium-unlocked markers and for unremapped build paths
+  (`/.cargo/`, `/.rustup/`), from the one list in
+  `scripts/forbidden-build-markers.py`. `--build-identity` cannot tell: a chat
+  build reports the same variant as the public one.
 - `/v2` Linux manifests are signed with `sign-all-linux-v2` (domain
   `PATANYX-UPDATE-MANIFEST-LINUX-V2`), never `sign-all`. No Linux build before
   1.0.6 can verify that domain, so a /v2 manifest served at the /v1 address (a

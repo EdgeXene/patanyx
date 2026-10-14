@@ -25,7 +25,8 @@
 //!   taken before a save overwrites it, oldest pruned first.
 //! - [`Vault::export_encrypted`] / [`Vault::import_encrypted`]: ciphertext
 //!   under a passphrase chosen for the export, for moving to another
-//!   machine. Import refuses to overwrite an existing vault.
+//!   machine. Import REPLACES the vault at the destination (the panel
+//!   warns first); whole-Library backups (version 4) are in `backup_v4`.
 //! - [`Vault::export_plaintext`]: the way out, deliberately awkward.
 //! - [`Vault::change_passphrase`]: re-wraps the passphrase slot only; the
 //!   contents and the recovery key are untouched.
@@ -48,6 +49,14 @@ use crate::{atomic_write, is_temp_name, open_new_temp, RecoveryKey, Vault, Vault
 // `format::decode_params` is private to that module, so it cannot be reused
 // from here without editing the provided file; hoisting both copies into
 // one pub(crate) constant set is left to the reviewer.
+/// The Argon2 bounds every export header is checked against BEFORE a key is
+/// derived. Shared by every export version.
+pub(crate) fn kdf_params_plausible(params: &KdfParams) -> bool {
+    (MIN_M_COST..=MAX_M_COST).contains(&params.m_cost)
+        && (MIN_T_COST..=MAX_T_COST).contains(&params.t_cost)
+        && (MIN_P_COST..=MAX_P_COST).contains(&params.p_cost)
+}
+
 const MIN_M_COST: u32 = 8;
 const MAX_M_COST: u32 = 1 << 20; // 1 GiB, in KiB
 const MIN_T_COST: u32 = 1;
@@ -89,6 +98,12 @@ pub enum ExportError {
     /// unsupported version, implausible KDF parameters, truncated file.
     #[error("file is not a PATANYX vault export: {0}")]
     BadExport(String),
+    /// A real PATANYX backup in a version this build does not read: one made
+    /// by a newer PATANYX, or version 3, which only an experimental build line
+    /// writes. Its own variant so the person is told to update, not that the
+    /// file is broken.
+    #[error("this backup was made by a different PATANYX version ({0:#04x}); update PATANYX, then import it")]
+    UnreadableVersion(u8),
     #[error(
         "plaintext export was not confirmed; the caller must pass \
          PLAINTEXT_EXPORT_CONFIRMATION verbatim"
@@ -101,6 +116,11 @@ pub enum ExportError {
     /// user chose.
     #[error("the plaintext export failed and its partial file could not be wiped")]
     PlaintextMayRemain,
+    /// The person stopped a backup (or a lock did) before it finished. An
+    /// export leaves no file behind and the destination untouched; an import
+    /// has changed nothing live.
+    #[error("the backup was stopped before it finished")]
+    Cancelled,
     #[error("vault error: {0}")]
     Vault(#[from] VaultError),
     #[error("i/o error: {0}")]
@@ -638,8 +658,13 @@ fn prune_backups(vault_path: &Path, max_backups: usize) -> Result<(), BackupErro
 // exactly one unlock method (the export passphrase), so the payload is
 // encrypted directly under the passphrase-derived key.
 
-const EXPORT_MAGIC: &[u8; 7] = b"RBVEXPT";
+pub(crate) const EXPORT_MAGIC: &[u8; 7] = b"RBVEXPT";
 const EXPORT_VERSION: u8 = 0x02;
+
+/// Largest version 1 or 2 file an import reads. Those versions are read whole
+/// into memory, and hold only a vault and its bookmarks; anything this large
+/// is not one, and must not make this build allocate whatever it claims.
+const LEGACY_IMPORT_MAX: u64 = 256 * 1024 * 1024;
 
 /// Version 1 exports carried a bare `VaultData`. Version 2 wraps it in
 /// [`ExportPayload`] so an export can also carry things that are not the
@@ -663,7 +688,35 @@ struct ExportPayload {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extra: Option<Vec<u8>>,
 }
-const EXPORT_HEADER_LEN: usize = 7 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN; // 60
+
+/// A version 2 export payload, held to the rule a vault file is held to
+/// (`Vault::parse_payload`): the vault's declared schema is read and decided on
+/// BEFORE the full structure is built, a newer schema is refused as newer (not
+/// damaged), a payload that declares none is refused, and an accepted vault is
+/// stamped with this build's schema, which is what it is saved as.
+fn parse_export_payload(plaintext: &[u8]) -> Result<(VaultData, Option<Vec<u8>>), VaultError> {
+    #[derive(serde::Deserialize)]
+    struct SchemaOnly {
+        #[serde(default)]
+        schema: u32,
+    }
+    #[derive(serde::Deserialize)]
+    struct Probe {
+        vault: SchemaOnly,
+    }
+    let probe: Probe = serde_json::from_slice(plaintext).map_err(|e| {
+        VaultError::BadFormat(format!("decrypted export is not a valid export payload: {e}"))
+    })?;
+    Vault::check_payload_schema(probe.vault.schema)?;
+    let payload: ExportPayload = serde_json::from_slice(plaintext).map_err(|e| {
+        VaultError::BadFormat(format!("decrypted export is not a valid export payload: {e}"))
+    })?;
+    let mut data = payload.vault;
+    data.schema = crate::model::SCHEMA_VERSION;
+    Ok((data, payload.extra))
+}
+
+pub(crate) const EXPORT_HEADER_LEN: usize = 7 + 1 + 4 + 4 + 4 + SALT_LEN + NONCE_LEN; // 60
 
 fn encode_export_header(
     params: &KdfParams,
@@ -695,12 +748,16 @@ fn decode_export_header(
     }
     // v1 and v2 are both accepted. A backup made before the format grew must
     // keep working; refusing it would mean the only copy of someone's
-    // credentials became unreadable because we added a field.
+    // credentials became unreadable because we added a field. Version 4 is
+    // read by `backup_v4::BackupReader`, never here; any other version is a
+    // real backup this build cannot read, and says so.
     if bytes[7] != EXPORT_VERSION && bytes[7] != EXPORT_VERSION_V1 {
-        return Err(ExportError::BadExport(format!(
-            "unsupported export version {:#04x}",
-            bytes[7]
-        )));
+        if bytes[7] == crate::backup_v4::BACKUP_VERSION {
+            return Err(ExportError::BadExport(
+                "a version 4 backup is read with BackupReader".into(),
+            ));
+        }
+        return Err(ExportError::UnreadableVersion(bytes[7]));
     }
     let params = KdfParams {
         m_cost: u32::from_le_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]),
@@ -710,10 +767,7 @@ fn decode_export_header(
     // Bounds BEFORE Argon2, for the same reason `format.rs` does it: the
     // header is only authenticated after derivation, so a tampered m_cost is
     // otherwise a denial of service.
-    if !(MIN_M_COST..=MAX_M_COST).contains(&params.m_cost)
-        || !(MIN_T_COST..=MAX_T_COST).contains(&params.t_cost)
-        || !(MIN_P_COST..=MAX_P_COST).contains(&params.p_cost)
-    {
+    if !kdf_params_plausible(&params) {
         return Err(ExportError::BadExport(format!(
             "implausible kdf parameters m={} t={} p={}",
             params.m_cost, params.t_cost, params.p_cost
@@ -800,7 +854,7 @@ fn refuse_live_vault(dest: &Path, vault: &Path) -> Result<(), ExportError> {
 /// resolves and the comparison is real. A refused export can leave the new
 /// empty folders behind; that is the cost of checking the path that will
 /// actually be written.
-fn prepare_export_dest(dest: &Path, vault: &Path) -> Result<(), ExportError> {
+pub(crate) fn prepare_export_dest(dest: &Path, vault: &Path) -> Result<(), ExportError> {
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
             fs::create_dir_all(parent)?;
@@ -1039,7 +1093,21 @@ impl Vault {
         export_passphrase: &str,
         new_vault_passphrase: &str,
     ) -> Result<(Vault, RecoveryKey, Option<Vec<u8>>), ExportError> {
-        let bytes = fs::read(src)?;
+        // Bounded on the handle actually read, not by the file's reported
+        // length: a device such as /dev/zero reports none, and a file can grow
+        // between a length check and the read.
+        let mut bytes = Vec::new();
+        {
+            use std::io::Read as _;
+            fs::File::open(src)?
+                .take(LEGACY_IMPORT_MAX + 1)
+                .read_to_end(&mut bytes)?;
+        }
+        if bytes.len() as u64 > LEGACY_IMPORT_MAX {
+            return Err(ExportError::BadExport(
+                "file too large for a version 1 or 2 export".into(),
+            ));
+        }
         let (params, salt, nonce) = decode_export_header(&bytes)?;
         if bytes.len() < EXPORT_HEADER_LEN + 16 {
             return Err(ExportError::BadExport(
@@ -1055,47 +1123,29 @@ impl Vault {
             &bytes[EXPORT_HEADER_LEN..],
         )
         .map_err(|_| ExportError::AuthFailed)?;
-        // v2 wraps the vault in an envelope; v1 was a bare VaultData. Try the
-        // envelope, fall back, so an older backup still opens.
-        let (data, extra) = match serde_json::from_slice::<ExportPayload>(&plaintext) {
-            Ok(payload) => (payload.vault, payload.extra),
-            Err(_) => (Vault::parse_payload(&plaintext)?, None),
+        // THE HEADER'S VERSION BYTE decides the payload's shape, not a guess at
+        // the JSON: a version 1 file holds a bare VaultData, a version 2 file
+        // wraps it with the carried bookmarks. (The wrapper and version 2
+        // arrived together, so no version 2 file was ever bare.) Both shapes
+        // go through the same schema rule an unlock applies. The wrapped path
+        // used to take `payload.vault` as it came: a backup made by a NEWER
+        // build was imported at its own schema with every field this build
+        // cannot name dropped, saved, and then refused at the next unlock as a
+        // vault from a newer version -- a lock-out from one's own data.
+        let (data, extra) = if bytes[7] == EXPORT_VERSION_V1 {
+            (Vault::parse_payload(&plaintext)?, None)
+        } else {
+            parse_export_payload(&plaintext)?
         };
         // `plaintext` (Zeroizing) wipes itself here.
 
-        // A destination that is a symbolic link would be replaced by NAME
-        // while the real file, and every copy beside it, stayed where the
-        // link pointed, under the retired passphrase. Refused outright.
-        if fs::symlink_metadata(dest).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(ExportError::Io(std::io::Error::other(
-                "the vault path is a symbolic link; import refused",
-            )));
-        }
-
-        let master = Zeroizing::new(crypto::random_bytes::<KEY_LEN>());
-        // `assemble` takes the destination's lock and writes nothing: from
-        // here on no other Vault can be saving into this directory, which is
-        // what makes the deletion below safe to do at all.
-        let mut vault = Vault::assemble(dest.to_path_buf(), master, params, data)?;
-        // EVERYTHING IN THE REPLACED VAULT IS LOST, which is what the import
-        // panel promises and what 1.0.5 did not do (security audit
-        // 2026-10-08): `save()` rotated the vault being replaced into
-        // `.bak-<stamp>`, so up to five copies stayed beside the new vault
-        // and the OLD passphrase opened every one of them. The copies go
-        // BEFORE anything is written, under the lock, while nothing has been
-        // replaced yet, so a removal that fails refuses the import with the
-        // old vault intact and the Library marker's transaction untouched.
-        let retained = discard_replaced_vault_leftovers(dest)?.retained;
-        let passphrase_slot =
-            vault.build_slot(SlotKind::Passphrase, new_vault_passphrase.as_bytes(), &[])?;
-        vault.push_slot(passphrase_slot);
-        let recovery = RecoveryKey::generate();
-        let recovery_slot = vault.build_slot(SlotKind::Recovery, recovery.as_bytes(), &[])?;
-        vault.push_slot(recovery_slot);
-        // No rotation: a backup taken here would be a copy of the vault being
-        // discarded, under its retired passphrase.
-        vault.save_inner(false)?;
-        vault.import_retained_leftovers = retained;
+        // One install path for every export version (`PendingImport::install`):
+        // a symlinked destination refused, the destination's lock taken, the
+        // replaced vault's rotated copies discarded BEFORE anything is
+        // written (security audit 2026-10-08), a new passphrase slot and a new
+        // recovery key, and no rotation of the vault being discarded.
+        let (vault, recovery) =
+            crate::backup_v4::PendingImport::new(params, data).install(dest, new_vault_passphrase)?;
         Ok((vault, recovery, extra))
     }
 
@@ -1293,7 +1343,15 @@ impl Vault {
         // Saved BEFORE the key is handed back. If the write fails the caller
         // gets an error and no key -- rather than a key the user writes down
         // that unlocks nothing, which is the worst of the available outcomes.
-        self.save()?;
+        //
+        // And the slot comes back OUT on failure. It used to stay in memory:
+        // `has_recovery()` then answered true for a key nobody holds, a retry
+        // was refused as "already exists", and the next ordinary save wrote
+        // the slot to disk for a key that was never shown to anyone.
+        if let Err(e) = self.save() {
+            self.pop_slot();
+            return Err(e);
+        }
         Ok(recovery)
     }
 
@@ -1329,6 +1387,26 @@ impl Vault {
 
 #[cfg(test)]
 mod tests {
+    /// An older-format import reads at most its limit from the handle it
+    /// opened, whatever the file reports: /dev/zero reports no length at all
+    /// and never ends.
+    #[cfg(unix)]
+    #[test]
+    fn an_older_import_stops_reading_at_its_limit() {
+        let dest = rekey_path("endless-source");
+        let refused = super::Vault::import_encrypted(
+            std::path::Path::new("/dev/zero"),
+            &dest,
+            "export passphrase",
+            "new passphrase",
+        );
+        assert!(
+            matches!(refused, Err(super::ExportError::BadExport(ref why)) if why.contains("too large")),
+            "{refused:?}"
+        );
+        assert!(!dest.exists());
+    }
+
     fn rekey_path(tag: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("patanyx-vault-rekey-{}-{tag}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -2201,6 +2279,38 @@ mod tests {
         assert!(vault.add_recovery("vault-pw").is_err());
     }
 
+    /// A recovery key whose save failed comes back out. It used to stay in
+    /// memory: the vault reported a recovery key nobody had been shown, a
+    /// retry was refused as one already existing, and the next ordinary save
+    /// wrote the abandoned slot to disk.
+    #[test]
+    fn a_recovery_key_whose_save_failed_is_taken_back_out() {
+        let dir = TestDir::new("addrec-save-fails");
+        let path = dir.path().join("v.rbv");
+        let mut vault = Vault::create_without_recovery(&path, "vault-pw").expect("create");
+        let on_disk = fs::read(&path).unwrap();
+
+        vault.fail_next_save_for_test();
+        assert!(vault.add_recovery("vault-pw").is_err(), "the injected save failure must surface");
+        assert!(!vault.has_recovery(), "no recovery key may be reported after a failed save");
+        assert_eq!(fs::read(&path).unwrap(), on_disk, "a failed save writes nothing");
+
+        // The next ordinary save must not carry the abandoned slot to disk.
+        vault
+            .add_credential("example.com", None, "alice", "pw", "")
+            .expect("an ordinary save");
+        drop(vault);
+        let reopened = Vault::unlock(&path, "vault-pw").expect("reopen");
+        assert!(!reopened.has_recovery(), "the abandoned slot reached the disk");
+        drop(reopened);
+
+        // And a retry works, with a key that opens the vault.
+        let mut vault = Vault::unlock(&path, "vault-pw").expect("reopen for the retry");
+        let key = vault.add_recovery("vault-pw").expect("a retry after the failure must work");
+        drop(vault);
+        Vault::unlock_with_recovery(&path, &key).expect("the retried key opens the vault");
+    }
+
     /// The plaintext export must contain passwords and NOT key material.
     ///
     /// It previously serialized `VaultData` wholesale, which emitted every
@@ -2536,6 +2646,131 @@ mod tests {
         // v1 carried nothing, and that is reported as nothing rather than as
         // an empty list -- the app uses the difference.
         assert!(carried.is_none());
+    }
+
+    /// An export file built by hand: the version byte and the decrypted body
+    /// are the test's to choose, everything else is what export writes, under
+    /// the cheap test KDF parameters and the passphrase "export-pw".
+    fn hand_built_export(
+        dir: &TestDir,
+        vault: &Vault,
+        name: &str,
+        version: u8,
+        plaintext: &[u8],
+    ) -> std::path::PathBuf {
+        let params = vault.kdf_params();
+        let salt: [u8; SALT_LEN] = crypto::random_bytes();
+        let nonce: [u8; NONCE_LEN] = crypto::random_bytes();
+        let key = crypto::derive_key(b"export-pw", &salt, &params).unwrap();
+        let mut header = encode_export_header(&params, &salt, &nonce);
+        header[7] = version;
+        let ciphertext = crypto::encrypt(&key, &nonce, &header, plaintext).unwrap();
+        let mut out = header.to_vec();
+        out.extend_from_slice(&ciphertext);
+        let path = dir.path().join(name);
+        fs::write(&path, &out).unwrap();
+        path
+    }
+
+    /// A version 2 body: the wrapper export writes, around `vault`.
+    fn wrapped(vault: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({ "vault": vault })).unwrap()
+    }
+
+    /// THE LOCK-OUT THIS CLOSES. A backup made by a NEWER build names its own
+    /// schema inside the version 2 wrapper. The import took it as it came,
+    /// dropped every field this build cannot name, saved, and the next unlock
+    /// refused the vault as one from a newer version. Now it is refused at
+    /// the import, as newer (not damaged), and the vault it would have
+    /// replaced is untouched.
+    #[test]
+    fn a_v2_export_from_a_newer_build_is_refused_and_the_current_vault_kept() {
+        let dir = TestDir::new("v2-newer");
+        let (source, _r) = create_test_vault(&dir, "source.rbv", "vault-pw");
+        let mut body = serde_json::to_value(source.data_ref()).unwrap();
+        body["schema"] = serde_json::json!(crate::model::SCHEMA_VERSION + 1);
+        body["a_field_this_build_has_never_heard_of"] = serde_json::json!({ "a": 1 });
+        let export = hand_built_export(&dir, &source, "newer.rbx", EXPORT_VERSION, &wrapped(body));
+
+        let (current, _r2) = create_test_vault(&dir, "current.rbv", "current-pw");
+        drop(current);
+        let dest = dir.path().join("current.rbv");
+        let before = fs::read(&dest).unwrap();
+        match Vault::import_encrypted(&export, &dest, "export-pw", "new-pw") {
+            Err(ExportError::Vault(VaultError::NewerVault { found, supported })) => {
+                assert_eq!(found, crate::model::SCHEMA_VERSION + 1);
+                assert_eq!(supported, crate::model::SCHEMA_VERSION);
+            }
+            Err(other) => panic!("must be refused as newer, not as {other}"),
+            Ok(_) => panic!("a newer export must be refused"),
+        }
+        assert_eq!(fs::read(&dest).unwrap(), before, "the current vault must be untouched");
+        Vault::unlock(&dest, "current-pw").expect("and still open with its own passphrase");
+    }
+
+    /// The same rule an unlock applies to a vault file: a body that declares
+    /// no schema is refused rather than guessed at.
+    #[test]
+    fn a_v2_export_that_declares_no_schema_is_refused() {
+        let dir = TestDir::new("v2-noschema");
+        let (source, _r) = create_test_vault(&dir, "source.rbv", "vault-pw");
+        let mut body = serde_json::to_value(source.data_ref()).unwrap();
+        body.as_object_mut().unwrap().remove("schema");
+        let export = hand_built_export(&dir, &source, "noschema.rbx", EXPORT_VERSION, &wrapped(body));
+        let dest = dir.path().join("imported.rbv");
+        match Vault::import_encrypted(&export, &dest, "export-pw", "new-pw") {
+            Err(ExportError::Vault(VaultError::BadFormat(why))) => {
+                assert!(why.contains("declares no schema"), "got {why}");
+            }
+            Err(other) => panic!("must be refused as declaring no schema, not as {other}"),
+            Ok(_) => panic!("an export with no schema must be refused"),
+        }
+        assert!(!dest.exists(), "a refused import writes no vault");
+    }
+
+    /// The header decides the body's shape. Version 2 and its wrapper arrived
+    /// together, so a bare body under a version 2 header is not a file this
+    /// product wrote, and it is refused instead of being read as version 1.
+    #[test]
+    fn a_v2_header_with_a_bare_body_is_refused() {
+        let dir = TestDir::new("v2-bare");
+        let (source, _r) = create_test_vault(&dir, "source.rbv", "vault-pw");
+        let bare = serde_json::to_vec(source.data_ref()).unwrap();
+        let export = hand_built_export(&dir, &source, "bare.rbx", EXPORT_VERSION, &bare);
+        let dest = dir.path().join("imported.rbv");
+        assert!(
+            Vault::import_encrypted(&export, &dest, "export-pw", "new-pw").is_err(),
+            "a version 2 header must not fall back to reading a bare body"
+        );
+        assert!(!dest.exists(), "a refused import writes no vault");
+    }
+
+    /// An older build's backup imports, and is stamped with THIS build's
+    /// schema, which is what the import saves it as (the read-old, write-new
+    /// rule of the vault file).
+    #[test]
+    fn an_older_v2_export_imports_at_this_builds_schema() {
+        let dir = TestDir::new("v2-older");
+        let (mut source, _r) = create_test_vault(&dir, "source.rbv", "vault-pw");
+        let id = source
+            .add_credential("old.example", None, "alice", "old-pw", "")
+            .unwrap();
+        let mut body = serde_json::to_value(source.data_ref()).unwrap();
+        body["schema"] = serde_json::json!(crate::model::SCHEMA_VERSION - 1);
+        let export = hand_built_export(&dir, &source, "older.rbx", EXPORT_VERSION, &wrapped(body));
+        let (imported, _r2, carried) = Vault::import_encrypted(
+            &export,
+            &dir.path().join("imported.rbv"),
+            "export-pw",
+            "new-pw",
+        )
+        .expect("an older export must import");
+        assert_eq!(imported.data_ref().schema, crate::model::SCHEMA_VERSION);
+        assert_eq!(
+            imported.get_credential(&id).map(|c| c.password.clone()),
+            Some("old-pw".to_string())
+        );
+        assert!(carried.is_none(), "this body carried nothing");
     }
 
     #[test]

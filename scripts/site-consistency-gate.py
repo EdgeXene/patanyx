@@ -390,6 +390,88 @@ def capability_self_test() -> list[str]:
             wrong.append(f'capability rules self-test: "{sentence}" {verdict}')
     return wrong
 
+
+# A VERSION CLAIM, not every dotted triple on the page. The download page also
+# states "Needs WebKitGTK 2.54.0 or newer", which is a dependency and nothing to
+# do with what PATANYX is at. A claim about our version is introduced by
+# "Version" or carries a `v` prefix; a dependency requirement does neither.
+VERSION_CLAIM = re.compile(r"\bv(\d+\.\d+\.\d+)\b|\bVersion\s+(\d+\.\d+\.\d+)\b")
+
+# ...EXCEPT THE ENGINE'S OWN "Version". The 1.0.6 download page added a
+# "Getting WebKitGTK 2.54" section that says "...your system's web engine,
+# WebKitGTK. Version 2.54.0 fixes security bugs a web page can trigger", and
+# this gate failed the live site with "shows version 2.54.0", which is the
+# engine, not a PATANYX release. Such a number is set aside only when BOTH hold:
+#
+#   1. The nearest product named before it, looking back through its own
+#      sentence and the one before, is the engine (WebKitGTK, WebKit,
+#      webkit2gtk, WebView2), not PATANYX. The previous sentence counts because
+#      the live line names the engine and then starts a new sentence with
+#      "Version". A product named AFTER the number is not read: the live
+#      sentence ends "so PATANYX needs it".
+#   2. Its MAJOR number is above PATANYX's own. Context alone would let a stale
+#      release hide behind an engine sentence ("PATANYX needs WebKitGTK.
+#      Version 1.0.5 adds tab groups"), so a number at or below PATANYX's major
+#      is always judged as a PATANYX version: every past release, 0.x and 1.x,
+#      stays caught. PATANYX is 1.x and WebKitGTK 2.x. When PATANYX reaches 2.0
+#      this excuse stops applying and the engine line fails again; that is the
+#      safe direction, and the moment to reword the page or this rule.
+_PRODUCT_NAME = re.compile(r"\b(patanyx|(?:lib)?webkit2?gtk|webkit|webview2)\b", re.I)
+
+
+def _major(version: str) -> int:
+    return int(version.split(".", 1)[0])
+
+
+def version_claims(text: str, shipping: str) -> set[str]:
+    """The PATANYX versions `text` states, engine versions set aside."""
+    claims: set[str] = set()
+    for match in VERSION_CLAIM.finditer(text):
+        found = match.group(1) or match.group(2)
+        before = text[max(0, match.start() - 200) : match.start()]
+        window = " ".join(_SENTENCE_END.split(before)[-2:])
+        names = _PRODUCT_NAME.findall(window)
+        engine_context = bool(names) and names[-1].lower() != "patanyx"
+        if engine_context and _major(found) > _major(shipping):
+            continue
+        claims.add(found)
+    return claims
+
+
+# Judged against known text before the site, with a fixed shipping version, so
+# an edit that starts excusing a stale release (or failing the engine line
+# again) fails this gate instead of passing quietly. (text, True if it must
+# fail while 1.0.6 ships.)
+VERSION_SELF_TEST_SHIPPING = "1.0.6"
+VERSION_SELF_TEST = (
+    # The 1.0.6 download page, verbatim (heading and paragraph, as visible text).
+    ("Getting WebKitGTK 2.54 PATANYX on Linux shows pages with your system's web "
+     "engine, WebKitGTK. Version 2.54.0 fixes security bugs a web page can "
+     "trigger, so PATANYX needs it.", False),
+    ("Needs WebKitGTK 2.54.0 or newer.", False),
+    ("Install WebKitGTK v2.54.0 from your system's updates.", False),
+    ("The WebView2 runtime updates itself. Version 141.0.3537 fixes it.", False),
+    ("PATANYX v1.0.6 for Linux.", False),
+    ("Version 1.0.6 is here.", False),
+    ("Download PATANYX Version 1.0.5 for Linux.", True),
+    ("Version 1.0.5 is here.", True),
+    ("PATANYX v0.9.62 needs WebKitGTK.", True),
+    ("PATANYX needs WebKitGTK. Version 1.0.5 adds tab groups.", True),
+    ("PATANYX needs WebKitGTK. Version 0.9.62 added the bridge.", True),
+    ("It needs WebKitGTK. PATANYX Version 2.54.0 is out.", True),
+)
+
+
+def version_self_test() -> list[str]:
+    wrong: list[str] = []
+    for text, must_fail in VERSION_SELF_TEST:
+        stale = version_claims(text, VERSION_SELF_TEST_SHIPPING) - {VERSION_SELF_TEST_SHIPPING}
+        if bool(stale) != must_fail:
+            verdict = "passed" if must_fail else f"failed with {', '.join(sorted(stale))}"
+            wrong.append(f'version rules self-test: "{text}" {verdict}')
+    return wrong
+
+
 # AMERICAN ENGLISH. Settled 2026-08-14, after "licence" and
 # "colours" reached the live site: the product is written in American English,
 # and a British spelling is a defect like any other stale claim.
@@ -517,26 +599,17 @@ def main() -> int:
     if version is None:
         warnings.append("could not read the version from Cargo.toml; version check skipped")
     else:
-        # A VERSION CLAIM, not every dotted triple on the page. The download
-        # page also states "Needs WebKitGTK 2.52.6 or newer", which is a
-        # dependency and nothing to do with what PATANYX is at. A claim about
-        # our version is introduced by "Version" or carries a `v` prefix; a
-        # dependency requirement does neither.
-        pattern = re.compile(r"\bv(\d+\.\d+\.\d+)\b|\bVersion\s+(\d+\.\d+\.\d+)\b")
+        # What counts as a version claim, and the engine versions it sets
+        # aside: VERSION_CLAIM and version_claims above.
+        failures.extend(version_self_test())
         for page in pages:
-            found_versions = {
-                m[0] or m[1] for m in pattern.findall(visible_text(raw[page]))
-            }
-            for found in found_versions:
+            for found in sorted(version_claims(visible_text(raw[page]), version)):
                 if found != version:
                     failures.append(
                         f"{name(page)}: shows version {found} in visible text, "
                         f"but {version} is being shipped"
                     )
-            stale = {
-                (m[0] or m[1])
-                for m in pattern.findall(comments(raw[page]))
-            } - {version}
+            stale = version_claims(comments(raw[page]), version) - {version}
             if stale:
                 warnings.append(
                     f"{name(page)}: HTML comments mention {', '.join(sorted(stale))} "

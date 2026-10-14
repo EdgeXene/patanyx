@@ -49,7 +49,10 @@
   const deleteProperty = Reflect.deleteProperty;
   const jsonParse = JSON.parse;
   const jsonStringify = JSON.stringify;
-  const call = Function.prototype.call;
+  // Captured once. `fn.call(...)` and `call.call(...)` look `call` up on
+  // Function.prototype at every use, where the page can replace it after
+  // this script starts; Reflect.apply is read here, before the page runs.
+  const apply = Reflect.apply;
   const Win = window;
   const nativeFetch = typeof Win.fetch === "function" ? Win.fetch : null;
   const NativeResponse =
@@ -106,7 +109,7 @@
   function onlyKey(o) {
     let found = null;
     for (const k in o) {
-      if (!hasOwn.call(o, k) || TRACKING.has(k)) continue;
+      if (!apply(hasOwn, o, [k]) || TRACKING.has(k)) continue;
       if (found !== null) return null;
       found = k;
     }
@@ -134,6 +137,14 @@
   // throws, a key that cannot be deleted, a frozen list, a structure too
   // large) throws before a single byte of the page's data has moved. Only a
   // complete plan is applied.
+  // A data property the rebuild can overwrite (and, for an element, cut
+  // off). Read through own properties only: a descriptor is a plain object
+  // and the page owns Object.prototype.
+  function isPlainSlot(d, mustConfigure) {
+    if (!d || !apply(hasOwn, d, ["value"]) || d.writable !== true) return false;
+    return !mustConfigure || d.configurable === true;
+  }
+
   function clean(root) {
     const deletions = []; // [object, key]
     const rebuilds = []; // [array, kept items]
@@ -152,20 +163,32 @@
         }
         if (kept.length !== node.length) {
           if (isFrozen(node) || isSealed(node)) throw new Error("fixed list");
+          // Every slot the rebuild writes or cuts off, and the length itself,
+          // must take the change, checked here before anything changes. A list
+          // with a fixed length or a fixed slot is neither frozen nor sealed,
+          // and the rebuild used to throw halfway through it, after the
+          // deletions had run (review 2026-10-12, R-004).
+          if (!isPlainSlot(getOwnPropertyDescriptor(node, "length"), false)) {
+            throw new Error("fixed length");
+          }
+          for (let j = 0; j < node.length; j++) {
+            const d = getOwnPropertyDescriptor(node, j);
+            if (d && !isPlainSlot(d, true)) throw new Error("fixed slot");
+          }
           rebuilds.push([node, kept]);
         }
       } else if (node && typeof node === "object") {
         const skip = new Set();
         for (let i = 0; i < AD_KEYS.length; i++) {
           const key = AD_KEYS[i];
-          if (!hasOwn.call(node, key)) continue;
+          if (!apply(hasOwn, node, [key])) continue;
           const d = getOwnPropertyDescriptor(node, key);
           if (!d || !d.configurable) throw new Error("fixed key");
           deletions.push([node, key]);
           skip.add(key);
         }
         for (const k in node) {
-          if (!hasOwn.call(node, k) || skip.has(k)) continue;
+          if (!apply(hasOwn, node, [k]) || skip.has(k)) continue;
           const v = node[k];
           if (v && typeof v === "object") stack.push(v);
         }
@@ -263,8 +286,8 @@
     const bodyFreeHeaders = (headers) => {
       if (!NativeHeaders || !headersDelete) return headers;
       const copy = new NativeHeaders(headers);
-      call.call(headersDelete, copy, "content-length");
-      call.call(headersDelete, copy, "content-encoding");
+      apply(headersDelete, copy, ["content-length"]);
+      apply(headersDelete, copy, ["content-encoding"]);
       return copy;
     };
     // A constructed Response has an empty url and type "default"; the page
@@ -282,7 +305,7 @@
           configurable: true,
           writable: true,
           value: function clone() {
-            return disguise(call.call(responseClone, replacement), original);
+            return disguise(apply(responseClone, replacement, []), original);
           },
         });
       } catch (_) {}
@@ -292,9 +315,10 @@
       try {
         if (!original || original.bodyUsed || original.status === 204)
           return original;
-        const text = await call.call(
+        const text = await apply(
           responseText,
-          call.call(responseClone, original),
+          apply(responseClone, original, []),
+          [],
         );
         const cleaned = cleanText(text);
         if (cleaned === null) return original;
@@ -317,7 +341,7 @@
       } catch (_) {
         target = "";
       }
-      const pending = call.call(nativeFetch, Win, input, init);
+      const pending = apply(nativeFetch, Win, [input, init]);
       if (!isDataEndpoint(target)) return pending;
       return pending.then(cleanResponse);
     };
@@ -343,9 +367,9 @@
     xhrResponse.get
   ) {
     const tracked = new WeakMap(); // xhr -> { done: cleaned text or null }
-    const readyStateOf = (xhr) => call.call(xhrReadyState.get, xhr);
+    const readyStateOf = (xhr) => apply(xhrReadyState.get, xhr, []);
     const typeOf = (xhr) =>
-      xhrResponseType ? call.call(xhrResponseType.get, xhr) : "";
+      xhrResponseType ? apply(xhrResponseType.get, xhr, []) : "";
     const isTextType = (t) => t === "" || t === "text";
     // Text replies: the cleaned text, computed once per request; undefined
     // means "use the native value".
@@ -355,7 +379,7 @@
       if (entry.text === undefined) {
         let cleaned = null;
         try {
-          cleaned = cleanText(call.call(xhrResponseText.get, xhr));
+          cleaned = cleanText(apply(xhrResponseText.get, xhr, []));
         } catch (_) {}
         entry.text = cleaned;
       }
@@ -365,7 +389,7 @@
     // Same object on every read, as natively; clean() changes nothing unless
     // its whole plan succeeds.
     const cleanedJson = (xhr) => {
-      const value = call.call(xhrResponse.get, xhr);
+      const value = apply(xhrResponse.get, xhr, []);
       const entry = tracked.get(xhr);
       if (entry && !entry.json && readyStateOf(xhr) === 4 && value && typeof value === "object") {
         entry.json = true;
@@ -386,7 +410,7 @@
             if (isDataEndpoint(url)) tracked.set(this, {});
             else tracked.delete(this);
           } catch (_) {}
-          return call.apply(xhrOpen, [this, ...arguments]);
+          return apply(xhrOpen, this, arguments);
         },
       });
       defineProperty(XHR.prototype, "responseText", {
@@ -399,7 +423,7 @@
             const cleaned = cleanedText(this);
             if (cleaned !== undefined) return cleaned;
           }
-          return call.call(xhrResponseText.get, this);
+          return apply(xhrResponseText.get, this, []);
         },
       });
       defineProperty(XHR.prototype, "response", {
@@ -410,10 +434,10 @@
           if (isTextType(t)) {
             const cleaned = cleanedText(this);
             if (cleaned !== undefined) return cleaned;
-            return call.call(xhrResponse.get, this);
+            return apply(xhrResponse.get, this, []);
           }
           if (t === "json") return cleanedJson(this);
-          return call.call(xhrResponse.get, this);
+          return apply(xhrResponse.get, this, []);
         },
       });
     } catch (_) {}
@@ -442,9 +466,9 @@
     try {
       const root = document.documentElement;
       if (!root) return false;
-      const style = call.call(createElement, document, "style");
+      const style = apply(createElement, document, ["style"]);
       style.textContent = CSS;
-      call.call(appendChild, root, style);
+      apply(appendChild, root, [style]);
       return true;
     } catch (_) {
       return true;

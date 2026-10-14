@@ -115,5 +115,112 @@ expect refuse "bridge mode in a later release (1.0.7) is refused" \
 expect ok     "a later release (1.0.7) with /v1 frozen passes" \
   --v2-manifest "$work/v2-7.json" --v2-beta-manifest "$work/v2b-7.json" --v2-binary "$strict7" "${FROZEN[@]}"
 
+# NON-PUBLIC BUILD MARKERS AND BUILD PATHS (1.0.6 review, R-001). A chat or
+# premium-unlocked build answers --build-identity exactly like the public one,
+# so only the bytes can tell. Each planted binary is a correct stand-in with
+# ONE line appended, and its manifest is rebuilt from it, so the marker is the
+# only thing wrong. A refusal for any other reason would not prove the scan, so
+# each case also requires the refusal to name what was planted.
+markers="$here/forbidden-build-markers.py"
+chat_marker="PATANYX-Nabu-X for "
+unlocked_marker="UNLOCKED TEST BUILD: Premium forced on; no license checked"
+
+# plant <from> <name> <line>: a copy of a stand-in with one more line.
+plant() {
+  local f="$work/$2"
+  cp "$1" "$f"
+  printf '# %s\n' "$3" >>"$f"
+  echo "$f"
+}
+
+expect_named() {  # expect_named <label> <text the refusal must contain> <args...>
+  local label="$1" want="$2"; shift 2
+  if python3 -I "$check" "$@" >"$work/out" 2>&1; then
+    echo "  FAIL $label: expected refuse, got ok"; fail=1
+  elif ! grep -qF -- "$want" "$work/out"; then
+    echo "  FAIL $label: refused, but not for \"$want\""; sed 's/^/       /' "$work/out"; fail=1
+  else
+    echo "  ok  $label"
+  fi
+}
+
+# planted_v2 <name> <line>: a /v2 run whose strict binary carries <line>.
+planted_v2() {
+  local bin; bin=$(plant "$strict" "$1" "$2")
+  manifest "$work/$1.json" "$bin" 2.54.0
+  P2=(--v2-manifest "$work/$1.json" --v2-beta-manifest "$work/$1.json" --v2-binary "$bin" "${FROZEN[@]}")
+}
+
+planted_v2 strict-chat "${chat_marker}Linux -- third-party software"
+expect_named "a chat build on /v2 is refused" "chat build marker" "${P2[@]}"
+planted_v2 strict-unlocked "PATANYX Browser -- $unlocked_marker"
+expect_named "a premium-unlocked build on /v2 is refused" "premium-unlocked build marker" "${P2[@]}"
+planted_v2 strict-cargo "/root/.cargo/registry/src/index.crates.io-0000/gtk-0.18.2/src/lib.rs"
+expect_named "a binary with a /.cargo/ build path is refused" "containing /.cargo/" "${P2[@]}"
+planted_v2 strict-rustup "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/src"
+expect_named "a binary with a /.rustup/ build path is refused" "containing /.rustup/" "${P2[@]}"
+# Negative control: the remapped forms and ad-list domains that merely contain
+# "cargo" are what a correct binary holds, and must pass.
+planted_v2 strict-clean "/cargo/registry/src/x.rs /rust/library/std/src/lib.rs ads.cargo.lt assets.cargoboard.com /build/crates/app"
+expect ok "remapped paths and cargo-like domains pass" "${P2[@]}"
+
+bridge_chat=$(plant "$bridge" bridge-chat "${chat_marker}Linux -- third-party software")
+manifest "$work/v1-chat.json" "$bridge_chat" 2.54.0
+expect_named "a chat build as the /v1 bridge is refused" "chat build marker" "${V2[@]}" \
+  --v1-manifest "$work/v1-chat.json" --v1-beta-manifest "$work/v1-chat.json" --v1-binary "$bridge_chat"
+
+echo "=== forbidden-build-markers.py ==="
+scan() {  # scan <want-exit> <label> <args...>
+  local want="$1" label="$2"; shift 2
+  python3 -I "$markers" "$@" >"$work/out" 2>&1; local got=$?
+  if [ "$got" = "$want" ]; then echo "  ok  $label"; else
+    echo "  FAIL $label: expected exit $want, got $got"; sed 's/^/       /' "$work/out"; fail=1; fi
+}
+scan 0 "a clean stand-in passes" "$strict"
+scan 1 "a chat marker is found" "$work/strict-chat"
+scan 1 "the unlocked marker is found" "$work/strict-unlocked"
+scan 1 "a /.cargo/ path is found" "$work/strict-cargo"
+scan 1 "a /.rustup/ path is found" "$work/strict-rustup"
+scan 0 "remapped paths and cargo-like domains are not findings" "$work/strict-clean"
+scan 1 "--markers-only still finds the unlocked marker" --markers-only "$work/strict-unlocked"
+scan 0 "--markers-only ignores build paths (a plain cargo build)" --markers-only "$work/strict-cargo"
+scan 1 "one marked file among clean ones fails the run" "$strict" "$work/strict-chat" "$bridge"
+scan 2 "a file that cannot be read is a refusal, not a pass" "$work/does-not-exist"
+scan 2 "no file at all is a usage error" --markers-only
+
+# PINS: the one list is only right while it matches what the code compiles in,
+# and while the two scripts that still keep their own copy agree with it.
+src="$here/.."
+pin() {  # pin <label> <condition...>
+  local label="$1"; shift
+  if "$@"; then echo "  ok  $label"; else echo "  FAIL $label"; fail=1; fi
+}
+listed() { python3 -I "$markers" --list | grep -qxF -- "$1$2$3"; }
+tab=$'\t'
+pin "the list carries the chat marker" listed chat "$tab" "$chat_marker"
+pin "the list carries the unlocked marker" listed premium-unlocked "$tab" "$unlocked_marker"
+pin "the list carries /.cargo/" listed path "$tab" /.cargo/
+pin "the list carries /.rustup/" listed path "$tab" /.rustup/
+pin "the unlocked marker is about.rs UNLOCKED_BUILD_MARKER" \
+  grep -qF "\"$unlocked_marker\";" "$src/crates/app/src/about.rs"
+for f in linux-chat windows-chat; do
+  pin "the chat marker opens attribution/$f.txt" \
+    sh -c 'case "$(head -1 "$1")" in "$2"*) exit 0 ;; esac; exit 1' _ \
+    "$src/crates/app/src/chrome/attribution/$f.txt" "$chat_marker"
+done
+for f in linux windows; do
+  pin "the chat marker is absent from the public attribution/$f.txt" \
+    sh -c '! grep -qF "$2" "$1"' _ "$src/crates/app/src/chrome/attribution/$f.txt" "$chat_marker"
+done
+# Every feature marker in the list, not the two named above: a marker added to
+# the list must be added to both copies too, or this fails.
+while IFS="$tab" read -r kind text; do
+  [ "$kind" = path ] && continue
+  for s in build-windows.sh build-flatpak.sh; do
+    pin "$s carries the $kind marker verbatim" grep -qF -- "$text" "$src/scripts/$s"
+  done
+done < <(python3 -I "$markers" --list)
+pin "build-windows.sh scans the same build paths" grep -qF "'/\.(cargo|rustup)/'" "$src/scripts/build-windows.sh"
+
 if [ "$fail" -ne 0 ]; then echo "LINUX FEEDS GATE FAILED"; exit 1; fi
 echo "LINUX FEEDS GATE OK"
