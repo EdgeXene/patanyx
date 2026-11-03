@@ -1233,6 +1233,17 @@ impl Tab {
         platform::note_app_navigation(&self.view, &self.url);
         if let Some(ticket) = self.adoption.take() {
             if platform::release_adoption(&self.webview, &self.view, ticket) {
+                // Handed over: until the page's request commits a document,
+                // what is on screen is the tab's empty first document, which
+                // the page that opened the tab can write into. So the tab
+                // names no address until a document commits (`on_url_changed`
+                // from the engine's ContentLoading), and a request that never
+                // commits leaves the tab blank under no address, never under
+                // one it did not load (2026-11-02: a Ctrl+clicked link left a
+                // blank tab showing the link's address). The caller tells the
+                // strip and the bar (`AppState::announce_address_if_moved`).
+                self.url.clear();
+                self.url.push_str("about:blank");
                 return false;
             }
             // Not handed over (the engine refused the hand-over, or the
@@ -3895,12 +3906,34 @@ impl AppState {
     /// page may now be released (`Tab::finish_initial_navigation` checks the
     /// rest). A tab already gone has nothing to release.
     pub fn on_local_network_guard_settled(&mut self, id: u64) {
-        if let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) {
-            let failed = tab.finish_initial_navigation();
-            if failed {
-                self.duplicate_sites.forget_user_navigation(id);
-            }
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return;
+        };
+        let shown = self.tabs[index].url.clone();
+        let failed = self.tabs[index].finish_initial_navigation();
+        if failed {
+            self.duplicate_sites.forget_user_navigation(id);
         }
+        self.announce_address_if_moved(index, &shown);
+    }
+
+    /// A tab's first page can take its address away (a page's request handed
+    /// over to it, `Tab::finish_initial_navigation`). The strip, and the bar
+    /// when it is the active tab, hear it now: waiting for the next commit
+    /// would leave the old address up for as long as the page takes, or for
+    /// good if it never commits.
+    fn announce_address_if_moved(&mut self, index: usize, shown: &str) {
+        let Some(tab) = self.tabs.get(index) else {
+            return;
+        };
+        if tab.url == shown {
+            return;
+        }
+        if index == self.active {
+            let (id, url) = (tab.id, tab.url.clone());
+            self.emit("url_changed", json!({ "url": url, "tab": id }));
+        }
+        self.emit_tabs_changed();
     }
 
     /// A tab's bundled ad and tracker filters finished loading (WebKitGTK).
@@ -3931,6 +3964,10 @@ impl AppState {
             // window and this tab loads the address itself, as any new tab
             // does when the timer fires (plan review, H2). A request waiting
             // only on the start-up clear is not the timer's business.
+            //
+            // So no request is handed over on this path, and the tab's address
+            // does not move: the guard that never answered keeps
+            // `registrations_answered` false.
             if tab.adoption.is_some() && !platform::registrations_answered(&tab.view) {
                 tab.adoption = None;
             }
@@ -8657,12 +8694,17 @@ impl AppState {
         // itself failing still ends here, with the page released) never
         // commits, so its tab's duplicate-site mark goes with it (R-019).
         // Only THIS profile's tabs: each waits for its own clear (R-017).
-        for tab in self.tabs.iter_mut().filter(|t| t.profile == kind) {
-            platform::note_session_wipe_finished(&tab.view);
-            let failed = tab.finish_initial_navigation();
-            if failed {
-                self.duplicate_sites.forget_user_navigation(tab.id);
+        for index in 0..self.tabs.len() {
+            if self.tabs[index].profile != kind {
+                continue;
             }
+            platform::note_session_wipe_finished(&self.tabs[index].view);
+            let shown = self.tabs[index].url.clone();
+            let failed = self.tabs[index].finish_initial_navigation();
+            if failed {
+                self.duplicate_sites.forget_user_navigation(self.tabs[index].id);
+            }
+            self.announce_address_if_moved(index, &shown);
         }
         let delayed_closes = self
             .tabs
@@ -8676,17 +8718,21 @@ impl AppState {
                 // tab stays, as an ordinary tab, still in its group, and the
                 // strip is told rather than left showing a close that did
                 // not happen (review round 2, R-005).
-                if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == id) {
-                    tab.close_after_session_wipe = false;
+                if let Some(index) = self.tabs.iter().position(|t| t.id == id) {
+                    self.tabs[index].close_after_session_wipe = false;
                     // Its first page was skipped above because the tab was
                     // closing; it is staying, so load it now (review round
                     // 3, R-005). Not ready yet on Windows: the guard's
                     // settle event finishes it, as for any pending tab.
-                    tab.initial_navigation_pending = true;
-                    let failed = tab.finish_initial_navigation();
+                    self.tabs[index].initial_navigation_pending = true;
+                    let shown = self.tabs[index].url.clone();
+                    let failed = self.tabs[index].finish_initial_navigation();
                     if failed {
                         self.duplicate_sites.forget_user_navigation(id);
                     }
+                    // A page's request handed over here takes the address
+                    // away like any other (fix review, R-002).
+                    self.announce_address_if_moved(index, &shown);
                 }
                 self.emit_tabs_changed();
             }
@@ -9940,12 +9986,34 @@ mod tests {
         let hand = body_of(include_str!("platform/privacy.rs"), "pub fn may_hand_over(&self)");
         assert!(hand.contains("self.profile == crate::kept_profile::ProfileKind::Main"));
         assert!(hand.contains("!standing.insecure"));
-        // A re-issue for the filter that fails sends nothing (round 2, R-001),
-        // whether or not a tracking parameter was stripped on the way (round
-        // 3, R-002): `replay` is decided before the strip.
-        assert!(nav.contains("Err(error) if replay => {"));
+        // `replay` is decided before the strip, so a tracked address is still
+        // the page's unfiltered request (round 3, R-002).
         let starting_body = &nav[nav.find("let hop = privacy::handover_hop(").expect("hop moved")..];
         assert!(before(starting_body, "let replay = hop == privacy::HandoverHop::Replay;", "crate::ipc::navigation_strip_target(&uri)"));
+        // A replayed hop is cancelled in NavigationStarting and owed, never
+        // re-issued from inside it: the engine dropped that re-issue on a
+        // Ctrl+clicked link and left a blank tab under the link's address
+        // (2026-11-02). Nothing unfiltered is sent: the cancel comes first.
+        let replay_arm = &starting_body[starting_body.find("if replay {").expect("replay arm moved")..];
+        let replay_arm = &replay_arm[..replay_arm.find("return Ok(());").expect("replay arm returns")];
+        assert!(before(replay_arm, "crate::ipc::navigation_strip_target(&uri).unwrap_or_else(|| uri.clone())", "st.defer_reissue(owed, clean, start)"));
+        assert!(before(replay_arm, "let cancelled = args.SetCancel(true);", "(Ok(()), Some(owed)) => st.defer_reissue(owed, clean, start)"));
+        // A cancel the engine refused sent the request as it is: it is never
+        // owed a second time (fix review, R-001).
+        let refused = &replay_arm[replay_arm.find("(Err(error), _) =>").expect("refused-cancel arm moved")..];
+        let refused = &refused[..refused.find("(Ok(()), Some(owed))").expect("arms reordered")];
+        assert!(!refused.contains("defer_reissue"), "a refused cancel must not be re-issued");
+        assert!(!replay_arm.contains("Navigate("), "the replay arm must not navigate from inside the event");
+        assert!(before(starting_body, "if replay {", "navigating.Navigate(target)"));
+        // ... and issued when ITS navigation finishes; a refused Navigate
+        // sends nothing (round 2, R-001).
+        let completed_body = &nav[nav.find("core.add_NavigationCompleted(").expect("moved")..];
+        assert!(before(completed_body, "state.borrow_mut().take_reissue(nav_id)", "reissuing.Navigate("));
+        // A navigation that succeeded was not cancelled and is not sent again
+        // (fix review, R-001).
+        assert!(before(completed_body, "if owed.is_some() && success {", "reissuing.Navigate("));
+        assert!(before(completed_body, "state.borrow_mut().expect_navigation(&url, start);", "reissuing.Navigate("));
+        assert!(completed_body.contains("state.borrow_mut().forget_expected_navigation();"));
         // A body-bearing hop the filter will not see is judged here, by the
         // filter's own decision (round 3, R-001), and an ad-list refusal
         // raises the held-page banner (round 4, R-002). The rules themselves
@@ -9973,16 +10041,13 @@ mod tests {
             "let unfiltered_first = starting_state.borrow().first_hop_unfiltered && {",
             "navigating.Navigate(target)"
         ));
-        assert!(before(
-            starting,
-            "starting_state.borrow_mut().first_hop_unfiltered = false;",
-            "navigating.Navigate(target)"
-        ));
+        assert!(before(starting, "st.first_hop_unfiltered = false;", "st.defer_reissue(owed, clean, start)"));
         // Every hop of that first navigation, redirects included, until one
         // is re-issued or the navigation completes.
         let completed = &nav[nav.find("core.add_NavigationCompleted(").expect("moved")..];
         assert!(completed.contains("state.borrow_mut().first_hop_unfiltered = false;"));
-        assert!(starting.contains("(!body_bearing)\n                                    .then(|| {"));
+        // A form's hop is never stripped: the strip re-issues as a GET.
+        assert!(starting.contains("(!body_bearing).then(|| crate::ipc::navigation_strip_target(&uri)).flatten()"));
         let hold = body_of(WINDOWS, "fn hold_new_window(");
         assert!(hold.contains("UserEvent::AdoptNewWindow"));
         assert!(!hold.contains("build_"), "a tab must not be built inside the engine event");
@@ -10059,6 +10124,61 @@ mod tests {
         assert!(before(navigate, "tab.retire_adoption();", "self.belongs_in_other_profile(tab, url)"));
         let retire = body_of(STATE, "fn retire_adoption(&mut self)");
         assert!(retire.contains("self.url.push_str(\"about:blank\");"));
+    }
+
+    /// A tab that received a page's request names no address until a
+    /// document commits: its empty first document is the page's to write
+    /// into, and a request that never commits must not leave the page's
+    /// address over it (2026-11-02, a Ctrl+clicked link). The bar and the
+    /// strip are told at once, on every path that can hand a request over.
+    #[test]
+    fn a_handed_over_tab_names_no_address_until_a_document_commits() {
+        let finish = body_of(STATE, "fn finish_initial_navigation(&mut self)");
+        let handed = &finish[finish.find("if platform::release_adoption(").expect("release moved")..];
+        let handed = &handed[..handed.find("return false;").expect("release arm returns")];
+        assert!(before(handed, "self.url.clear();", "self.url.push_str(\"about:blank\");"));
+        // `note_app_navigation` is given the page's address BEFORE the hand-
+        // over, so the page's own request keeps its standing.
+        assert!(before(finish, "platform::note_app_navigation(&self.view, &self.url);", "platform::release_adoption("));
+        // The overdue timer never hands a request over: it retires a held one
+        // before it runs the first page (`a_held_request_waits_for_answers_
+        // and_the_timer_retires_it`), so the address cannot move there.
+        let overdue = body_of(STATE, "pub fn on_local_network_guard_overdue(&mut self, id: u64)");
+        assert!(before(overdue, "tab.adoption = None;", "tab.finish_initial_navigation();"));
+        for caller in [
+            "pub fn on_local_network_guard_settled(&mut self, id: u64)",
+            "pub fn finish_session_wipe(&mut self, kind: crate::kept_profile::ProfileKind)",
+        ] {
+            let body = body_of(STATE, caller);
+            // Every first page this caller runs is announced, the refused-
+            // close recovery in finish_session_wipe included (fix review,
+            // R-002).
+            assert_eq!(
+                body.matches(".finish_initial_navigation();").count(),
+                body.matches("self.announce_address_if_moved(index, &shown);").count(),
+                "{caller}: a first page run without telling the bar"
+            );
+            assert!(
+                before(body, "let shown = self.tabs[index].url.clone();", ".finish_initial_navigation();"),
+                "{caller} must remember the address it showed"
+            );
+            assert!(
+                before(body, ".finish_initial_navigation();", "self.announce_address_if_moved(index, &shown);"),
+                "{caller} must tell the bar and the strip"
+            );
+        }
+        let announce = body_of(STATE, "fn announce_address_if_moved(&mut self, index: usize, shown: &str)");
+        assert!(announce.contains("self.emit(\"url_changed\", json!({ \"url\": url, \"tab\": id }));"));
+        assert!(announce.contains("self.emit_tabs_changed();"));
+    }
+
+    /// The bar and the strip hear a moved address with the same event a
+    /// commit sends, and nothing when it did not move.
+    #[test]
+    fn a_moved_address_is_announced_and_an_unmoved_one_is_not() {
+        let announce = body_of(STATE, "fn announce_address_if_moved(&mut self, index: usize, shown: &str)");
+        assert!(before(announce, "if tab.url == shown {\n            return;\n        }", "\"url_changed\""));
+        assert!(before(announce, "if index == self.active {", "\"url_changed\""));
     }
 
     /// A page's tab keeps the opener's preset and never its allowance, and a

@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.0.10" date="2026-11-02">
+      <description>
+        <p>This version fixes a security problem: in versions 0.9.60 through 1.0.8, a web page could make PATANYX close if you right-clicked a specially made link on it and chose "Copy link without known redirects or tracking parameters". Now the command copies the link and PATANYX stays open. The same command now also unwraps Bing search result links, and says tracking parameters were removed only when they were. On Windows, a link opened in a new tab with Ctrl+click or the middle mouse button could leave that tab blank while its address bar showed the link's address; the page now opens. Update as soon as you can.</p>
+      </description>
+    </release>
     <release version="1.0.8" date="2026-10-28">
       <description>
         <p>This version fixes security problems in the connections PATANYX makes for itself, such as update checks and Premium activation. They no longer accept certificates issued through the eight eMudhra intermediate certificate authorities whose private keys became known in October 2026, and emSign ECC Root CA - G3 is gone from PATANYX's built-in list of trusted roots. The TLS library they use includes four security fixes. This update does not change how the pages you visit are checked: the web engine does that. On Windows with WebView2 155.0.4283.62 or newer, Continue on Google Flights now opens the airline's page. Update as soon as you can.</p>

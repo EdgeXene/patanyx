@@ -1,7 +1,7 @@
 # Authenticode signing, and why it is not optional
 
 Now: Windows releases are Authenticode-signed through Azure Artifact Signing,
-except 1.0.8, a maintenance release published without the signature (installed
+except 1.0.8 and 1.0.10, which were published without the signature (installed
 copies verify their Ed25519-signed update manifest, never Authenticode). The
 text below was written while every binary was unsigned; its reasoning about
 downloads still holds.

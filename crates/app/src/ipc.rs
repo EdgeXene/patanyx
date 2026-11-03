@@ -365,9 +365,12 @@ pub fn strip_tracking_params(url: &str) -> String {
     let (base, query) = before_fragment.split_at(q_at);
     let query = &query[1..]; // drop the '?'
 
+    // Empty pairs (`a=1&&b=2`) are kept: they are bytes of the link, and
+    // dropping them made a link with no tracking parameter come back changed,
+    // so the toast said "tracking parameters removed" when none were
+    // (2026-11-02; every live Bing result link carries `!&&`).
     let kept: Vec<&str> = query
         .split('&')
-        .filter(|pair| !pair.is_empty())
         .filter(|pair| {
             let name = pair.split('=').next().unwrap_or("");
             !is_tracking_param(name)
@@ -588,8 +591,13 @@ fn decode_candidate(raw: &str, marker_prefix: bool) -> Option<String> {
             }
         }
     }
+    // `get`, never `&raw[2..]`: the marker is two ASCII characters only in a
+    // real Bing URL. A carrier that starts with a multi-byte character puts
+    // byte 2 inside it, and slicing there panicked on the event-loop thread
+    // (found by fuzzing, 2026-10-30). Such a carrier is no Bing payload, so
+    // it is tried as it is and fails the acceptance gate like any other.
     let b64_input = if marker_prefix && raw.len() > 2 {
-        &raw[2..]
+        raw.get(2..).unwrap_or(raw)
     } else {
         raw
     };
@@ -617,7 +625,12 @@ fn unwrap_once(url: &str) -> Option<String> {
         }
         let bing = *suffix == "bing.com";
         for pair in query.split('&') {
-            let (name, value) = pair.split_once('=')?;
+            // A pair with no `=` is skipped, never fatal: every live Bing
+            // result link starts `ck/a?!&&p=...&u=...`, and giving up on the
+            // bare `!` meant no Bing result was ever unwrapped (2026-11-02).
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
             if value.is_empty() {
                 continue;
             }
@@ -9337,7 +9350,7 @@ mod tests {
 
 #[cfg(test)]
 mod unwrap_redirect_tests {
-    use super::{clean_link, is_acceptable_destination, unwrap_redirect, LinkChange};
+    use super::{clean_link, is_acceptable_destination, strip_tracking_params, unwrap_redirect, LinkChange};
 
     /// The bug this pins is a CRASH, not a wrong answer. An earlier draft
     /// validated candidates with `candidate[..7]` after a byte-length check,
@@ -9539,6 +9552,49 @@ mod unwrap_redirect_tests {
             let url = format!("https://safelinks.protection.outlook.com/?url={value}");
             assert_eq!(unwrap_redirect(&url), url, "must not unwrap: {value}");
         }
+    }
+
+    /// Found by fuzzing on 2026-10-30. The engine hands "Copy
+    /// clean link" an ASCII, percent-encoded URL, but the FIRST unwrap decodes
+    /// it, so a page can nest a Bing click URL whose carrier starts with a
+    /// multi-byte character inside a Google redirect. The second pass then cut
+    /// Bing's two-character marker at byte 2, inside that character, and
+    /// panicked on the event-loop thread: one right-click and the browser was
+    /// gone. A carrier like that cannot be a Bing payload; it must simply not
+    /// unwrap.
+    #[test]
+    fn a_nested_bing_carrier_starting_with_a_multibyte_character_does_not_panic() {
+        let inner = "https://www.bing.com/ck/a?u=a\u{051E}HR0cHM6Ly9leGFtcGxlLm9yZy8&ntb=1";
+        let encoded: String = inner.bytes().map(|b| format!("%{b:02X}")).collect();
+        let outer = format!("https://www.google.com/url?q={encoded}");
+        assert!(outer.is_ascii(), "the engine's form of the link is ASCII");
+        assert_eq!(unwrap_redirect(&outer), inner, "one level unwraps, the bad carrier stops");
+        let (cleaned, _) = clean_link(&outer);
+        assert_eq!(cleaned, inner);
+    }
+
+    /// The shape every live Bing result link has (sampled 2026-11-02): a bare
+    /// `!` pair first, then an empty pair, then `p`, then the `u` carrier. The
+    /// bare pair must be skipped, not fatal; before this, no real Bing result
+    /// was ever unwrapped.
+    #[test]
+    fn a_live_bing_result_link_is_unwrapped() {
+        let bing = "https://www.bing.com/ck/a?!&&p=0123abcd&u=a1aHR0cHM6Ly9leGFtcGxlLm9yZy8&ntb=1";
+        assert_eq!(unwrap_redirect(bing), "https://example.org/");
+        let (out, change) = clean_link(bing);
+        assert_eq!(out, "https://example.org/");
+        assert_eq!(change, LinkChange::Unwrapped);
+    }
+
+    /// Empty pairs are bytes of the link: kept, and never counted as a
+    /// removed tracking parameter, so the toast tells the truth.
+    #[test]
+    fn empty_pairs_are_kept_and_are_not_a_strip() {
+        assert_eq!(strip_tracking_params("https://a.example/p?x=1&&y=2"), "https://a.example/p?x=1&&y=2");
+        assert_eq!(strip_tracking_params("https://a.example/p?x=1&&utm_source=n"), "https://a.example/p?x=1&");
+        let (out, change) = clean_link("https://bit.ly/abc?!&&n=1");
+        assert_eq!(out, "https://bit.ly/abc?!&&n=1");
+        assert_eq!(change, LinkChange::Unchanged, "nothing was removed, so nothing is claimed");
     }
 }
 

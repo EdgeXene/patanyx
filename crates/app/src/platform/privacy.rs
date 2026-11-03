@@ -1517,9 +1517,15 @@ pub struct TabState {
     /// handed over to this tab (new_window.rs), which WebView2 never shows to
     /// the request filter (WebView2Feedback #5293: no WebResourceRequested
     /// for the first document of a handed-over window). NavigationStarting
-    /// re-issues it, when it is not a form submission, so it is filtered,
+    /// cancels it, when it is not a form submission, and it is issued again
+    /// when that navigation finishes (`defer_reissue`), so it is filtered,
     /// carries Sec-GPC and passes the ad and tracker list like any other.
     pub first_hop_unfiltered: bool,
+    /// Windows: a hop of that handed-over navigation, cancelled in
+    /// NavigationStarting and owed again once the engine reports the
+    /// navigation finished (`defer_reissue`): its id, the address to issue
+    /// (tracking parameters stripped) and the hop's standing.
+    pending_reissue: Option<(u64, String, HopStart)>,
     /// "Allow ads and trackers on this tab", while it is on. Memory only and
     /// per tab: it is dropped with this struct, which is dropped with the tab,
     /// and nothing serializes it.
@@ -1802,6 +1808,7 @@ impl TabState {
             scrollbar_registration_pending: false,
             interception_deferred: false,
             first_hop_unfiltered: false,
+            pending_reissue: None,
             ads_allowance: None,
         }
     }
@@ -1988,6 +1995,9 @@ impl TabState {
     /// `expected_navigation`.
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn note_app_navigation(&mut self, url: &str) {
+        // The browser's own address replaces a page's request still owed a
+        // re-issue: the page's request is not sent after it.
+        self.pending_reissue = None;
         self.expect_navigation(
             url,
             HopStart {
@@ -2014,6 +2024,42 @@ impl TabState {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn forget_expected_navigation(&mut self) {
         self.expected_navigation = None;
+    }
+
+    /// A hop of a page's handed-over navigation was cancelled in
+    /// NavigationStarting so the request filter can see it; `url` (tracking
+    /// parameters stripped) is issued again, carrying the hop's standing,
+    /// once the engine reports navigation `navigation_id` finished
+    /// (`take_reissue`).
+    ///
+    /// Not from inside NavigationStarting: a Navigate issued there is queued
+    /// behind the cancel, and on a tab opened by Ctrl+click the engine dropped
+    /// it -- Navigate returned S_OK, nothing started, and the tab was left on
+    /// its empty first document under the page's address (measured on
+    /// WebView2 156, 2026-11-02).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn defer_reissue(&mut self, navigation_id: u64, url: String, start: HopStart) {
+        self.pending_reissue = Some((navigation_id, url, start));
+    }
+
+    /// The re-issue owed when navigation `navigation_id` finishes, if one is.
+    /// Taken once. The completion of any other navigation leaves it: only
+    /// the cancelled navigation's own completion means the engine is done
+    /// with it.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn take_reissue(&mut self, navigation_id: Option<u64>) -> Option<(String, HopStart)> {
+        let navigation_id = navigation_id?;
+        if self.pending_reissue.as_ref().is_some_and(|(owed, _, _)| *owed == navigation_id) {
+            self.pending_reissue.take().map(|(_, url, start)| (url, start))
+        } else {
+            None
+        }
+    }
+
+    /// Whether a re-issue is owed.
+    #[cfg(test)]
+    pub fn reissue_pending(&self) -> bool {
+        self.pending_reissue.is_some()
     }
 
     /// WebView2 `NavigationStarting` for the top frame, first hop or redirect
@@ -2049,6 +2095,15 @@ impl TabState {
     /// R-003). It is still recorded, under `UNREADABLE_NAVIGATION_ID`, so the
     /// correlation can find it.
     pub fn on_top_level_navigation_starting(&mut self, navigation_id: Option<u64>, uri: &str) -> HopStart {
+        // Another navigation started before the cancelled one finished: it
+        // takes the tab, and the page's request is not sent after it.
+        if self
+            .pending_reissue
+            .as_ref()
+            .is_some_and(|(owed, _, _)| Some(*owed) != navigation_id)
+        {
+            self.pending_reissue = None;
+        }
         let Some(navigation_id) = navigation_id else {
             // The hop cannot be tied to its navigation, so a later hop of the
             // same navigation will look like a first hop, and this entry can be
@@ -3429,6 +3484,72 @@ mod handover_tests {
     fn a_hop_without_a_body_is_replayed_through_the_filter() {
         assert_eq!(handover_hop(true, false, "https://www.delta.com/x?utm_source=g"), HandoverHop::Replay);
         assert_eq!(handover_hop(true, false, "http://192.168.1.1/"), HandoverHop::Replay);
+    }
+
+    /// A replayed hop is owed again only when ITS navigation finishes: the
+    /// re-issue from inside NavigationStarting was dropped by the engine on a
+    /// Ctrl+clicked link, leaving a blank tab under the link's address
+    /// (2026-11-02).
+    #[test]
+    fn a_cancelled_hop_is_issued_again_when_its_own_navigation_finishes() {
+        let mut st = TabState::new(&TabPolicy::default());
+        let start = HopStart {
+            app: false,
+            reaches_private: true,
+        };
+        st.defer_reissue(7, "https://usanews.com/a".into(), start);
+        assert!(st.take_reissue(Some(6)).is_none(), "another navigation's completion owes nothing");
+        assert!(st.take_reissue(None).is_none(), "an unreadable id is no one's completion");
+        assert!(st.reissue_pending(), "still owed after those");
+        assert_eq!(st.take_reissue(Some(7)), Some(("https://usanews.com/a".to_string(), start)));
+        assert!(st.take_reissue(Some(7)).is_none(), "issued once");
+        assert!(!st.reissue_pending());
+    }
+
+    /// Whoever takes the tab first wins: the browser's own address, or any
+    /// other navigation that starts before the cancelled one has finished.
+    /// The page's request is not sent after either.
+    #[test]
+    fn a_navigation_that_takes_the_tab_first_retires_the_reissue() {
+        let start = HopStart {
+            app: false,
+            reaches_private: true,
+        };
+        let mut st = TabState::new(&TabPolicy::default());
+        st.defer_reissue(7, "https://usanews.com/a".into(), start);
+        st.note_app_navigation("https://typed.example/");
+        assert!(st.take_reissue(Some(7)).is_none(), "the typed address won");
+
+        let mut st = TabState::new(&TabPolicy::default());
+        st.defer_reissue(7, "https://usanews.com/a".into(), start);
+        st.on_top_level_navigation_starting(Some(9), "https://elsewhere.example/");
+        assert!(st.take_reissue(Some(7)).is_none(), "a newer navigation won");
+
+        let mut st = TabState::new(&TabPolicy::default());
+        st.defer_reissue(7, "https://usanews.com/a".into(), start);
+        st.on_top_level_navigation_starting(None, "https://elsewhere.example/");
+        assert!(st.take_reissue(Some(7)).is_none(), "so did one whose id could not be read");
+
+        // A late hop of the cancelled navigation itself does not retire it.
+        let mut st = TabState::new(&TabPolicy::default());
+        st.defer_reissue(7, "https://usanews.com/a".into(), start);
+        st.on_top_level_navigation_starting(Some(7), "https://usanews.com/a");
+        assert!(st.take_reissue(Some(7)).is_some());
+    }
+
+    /// The re-issue carries the cancelled hop's standing to the navigation
+    /// that replaces it, as the tracking strip does (plan review 2, M-5).
+    #[test]
+    fn the_reissue_carries_the_cancelled_hops_standing() {
+        let mut st = TabState::new(&TabPolicy::default());
+        let start = HopStart {
+            app: true,
+            reaches_private: true,
+        };
+        st.defer_reissue(7, "http://192.168.1.1/".into(), start);
+        let (url, carried) = st.take_reissue(Some(7)).expect("owed");
+        st.expect_navigation(&url, carried);
+        assert_eq!(st.on_top_level_navigation_starting(Some(8), &url), start);
     }
 
     #[test]

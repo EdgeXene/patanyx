@@ -3874,11 +3874,12 @@ fn connect_navigation_events(
                         // both left with no Sec-GPC), so they would skip the
                         // ad and tracker check too. The first hop without a
                         // body -- the request itself, or the GET a form's
-                        // redirect turns into -- is re-issued here like a
-                        // stripped one, same URL, same carried standing, and
-                        // the re-issue is filtered. A form submission cannot be
-                        // re-issued without losing its body, which is why the
-                        // request was handed over at all: it goes as it is.
+                        // redirect turns into -- is cancelled here and issued
+                        // again when this navigation finishes, same URL, same
+                        // carried standing, and the re-issue is filtered. A
+                        // form submission cannot be re-issued without losing
+                        // its body, which is why the request was handed over
+                        // at all: it goes as it is.
                         // Not when the hop is already refused (a blocked or
                         // held host): the refusal stands. The flag ends at the
                         // re-issue or when that first navigation completes.
@@ -3888,8 +3889,9 @@ fn connect_navigation_events(
                         };
                         // Whether this hop is re-issued for the filter (with
                         // or without a tracking parameter stripped on the
-                        // way): a re-issue that fails must then not let the
-                        // unfiltered request go (code review round 3, R-002).
+                        // way): decided before the strip, so a tracked
+                        // address is still the page's unfiltered request
+                        // (code review round 3, R-002).
                         let hop = privacy::handover_hop(unfiltered_first, body_bearing, &uri);
                         let replay = hop == privacy::HandoverHop::Replay;
                         starting_state.borrow_mut().last_top_level_method =
@@ -3935,16 +3937,44 @@ fn connect_navigation_events(
                                 return Ok(());
                             }
                         }
-                        if let Some(clean) =
-                            {
-                                (!body_bearing)
-                                    .then(|| {
-                                        crate::ipc::navigation_strip_target(&uri)
-                                            .or_else(|| replay.then(|| uri.clone()))
-                                    })
-                                    .flatten()
+                        // The page's handed-over hop is cancelled HERE, so
+                        // nothing the filter has not seen is sent, and issued
+                        // again -- tracking parameters stripped, this hop's
+                        // standing carried -- once the engine reports this
+                        // navigation finished (NavigationCompleted below,
+                        // `TabState::defer_reissue`). Issued from inside this
+                        // event it was queued behind the cancel, and on a tab
+                        // opened by Ctrl+click or a middle click the engine
+                        // dropped it: the tab stayed on its empty first
+                        // document under the page's address (measured
+                        // 2026-11-02, WebView2 156). An id that cannot be read
+                        // cannot be matched to its completion: nothing is sent
+                        // (code review round 2, R-001). A cancel the engine
+                        // refuses lets this request go as it is, and it is
+                        // then not issued a second time (fix review, R-001).
+                        if replay {
+                            let clean = crate::ipc::navigation_strip_target(&uri).unwrap_or_else(|| uri.clone());
+                            let owed = {
+                                let mut nav_id: u64 = 0;
+                                args.NavigationId(&mut nav_id).ok().map(|()| nav_id)
+                            };
+                            let cancelled = args.SetCancel(true);
+                            let mut st = starting_state.borrow_mut();
+                            // Re-issued through the filter, the page's first
+                            // navigation needs no more of this.
+                            st.first_hop_unfiltered = false;
+                            match (cancelled, owed) {
+                                (Err(error), _) => diag(&format!(
+                                    "new window: the engine refused the cancel ({error}); the page's request went unfiltered and is not sent again"
+                                )),
+                                (Ok(()), Some(owed)) => st.defer_reissue(owed, clean, start),
+                                (Ok(()), None) => diag(
+                                    "new window: the navigation id could not be read; the page's request was not sent",
+                                ),
                             }
-                        {
+                            return Ok(());
+                        }
+                        if let Some(clean) = (!body_bearing).then(|| crate::ipc::navigation_strip_target(&uri)).flatten() {
                             let mut wide: Vec<u16> =
                                 clean.encode_utf16().chain(std::iter::once(0)).collect();
                             let target = windows::core::PCWSTR(wide.as_mut_ptr());
@@ -3955,9 +3985,6 @@ fn connect_navigation_events(
                             // let a refused redirect through or refuse an
                             // allowed one (plan review 2, M-5).
                             starting_state.borrow_mut().expect_navigation(&clean, start);
-                            // Re-issued through the filter, the page's first
-                            // navigation needs no more of this.
-                            starting_state.borrow_mut().first_hop_unfiltered = false;
                             match navigating.Navigate(target) {
                                 Ok(()) => {
                                     let _ = args.SetCancel(true);
@@ -3968,17 +3995,6 @@ fn connect_navigation_events(
                                 // tracked page beats no page. The carried
                                 // expectation goes with the navigation that
                                 // never started.
-                                Err(error) if replay => {
-                                    // The page's request never passed the
-                                    // filter: it does not go at all (code
-                                    // review round 2, R-001).
-                                    starting_state.borrow_mut().forget_expected_navigation();
-                                    let _ = args.SetCancel(true);
-                                    diag(&format!(
-                                        "new window: re-issue FAILED ({error}); the page's request was not sent"
-                                    ));
-                                    return Ok(());
-                                }
                                 Err(error) => {
                                     starting_state.borrow_mut().forget_expected_navigation();
                                     diag(&format!(
@@ -4219,6 +4235,9 @@ fn connect_navigation_events(
 
         let mut token = Default::default();
         let nav_proxy = proxy.clone();
+        // Handle for the re-issue of a page's cancelled hop; a refcounted
+        // reference to this tab's webview, as `navigating` is.
+        let reissuing = core.clone();
         let completed = core.add_NavigationCompleted(
             &NavigationCompletedEventHandler::create(Box::new(move |_sender, args| {
                 // Success and failure both count as finished: a failed load
@@ -4277,6 +4296,28 @@ fn connect_navigation_events(
                             network_looks_dead(status),
                             &nav_proxy,
                         );
+                    }
+                }
+                // A page's handed-over hop cancelled in NavigationStarting is
+                // issued again now that the engine is done with its
+                // navigation (`TabState::defer_reissue`), through the filter,
+                // carrying the hop's standing. A refused Navigate sends
+                // nothing: the page's request never passed the filter (code
+                // review round 2, R-001). A navigation that SUCCEEDED was not
+                // cancelled -- the engine has ignored a cancel on this event
+                // before (2026-07-29) -- and its page is on screen: it is not
+                // sent a second time (fix review, R-001).
+                let owed = state.borrow_mut().take_reissue(nav_id);
+                if owed.is_some() && success {
+                    diag("new window: the engine did not cancel the page's request; it is not sent again");
+                } else if let Some((url, start)) = owed {
+                    state.borrow_mut().expect_navigation(&url, start);
+                    let wide: Vec<u16> = url.encode_utf16().chain(std::iter::once(0)).collect();
+                    if let Err(error) = reissuing.Navigate(windows::core::PCWSTR(wide.as_ptr())) {
+                        state.borrow_mut().forget_expected_navigation();
+                        diag(&format!(
+                            "new window: re-issue FAILED ({error}); the page's request was not sent"
+                        ));
                     }
                 }
                 Ok(())
@@ -7269,8 +7310,9 @@ pub fn release_adoption(webview: &WebView, view: &TabView, ticket: AdoptionTicke
         return true;
     }
     // The engine shows the handed-over request to no filter; the first
-    // top-level hop is re-issued in NavigationStarting unless it carries a
-    // body (`TabState::first_hop_unfiltered`).
+    // top-level hop is cancelled in NavigationStarting and issued again when
+    // its navigation finishes, unless it carries a body
+    // (`TabState::first_hop_unfiltered`, `TabState::defer_reissue`).
     view.state.borrow_mut().first_hop_unfiltered = true;
     held.complete();
     true
