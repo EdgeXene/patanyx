@@ -45,7 +45,6 @@ NOT RESOLVED LOCALLY
   These declare a licence but no licence file was found in the crate
   source on the machine that generated this. Listed rather than
   omitted, so the gap is visible instead of invisible.
-  - boringtun 0.7.1 (BSD-3-Clause, no licence file in crate)
   - dlopen2 0.8.2 (MIT, no licence file in crate)
   - fluent-langneg 0.13.1 (Apache-2.0 OR MIT, no licence file in crate)
   - intl_pluralrules 7.0.2 (Apache-2.0/MIT, no licence file in crate)
@@ -97,6 +96,7 @@ PACKAGES
   block-buffer 0.12.1 -- MIT OR Apache-2.0
       Copyright (c) 2018-2025 The RustCrypto Project Developers
   boringtun 0.7.1 -- BSD-3-Clause
+      Copyright (c) 2019 Cloudflare, Inc. All rights reserved.
   bsdiff 0.2.1 -- BSD-2-Clause
       Copyright 2003-2005 Colin Percival
       Copyright 2012 Matthew Endsley

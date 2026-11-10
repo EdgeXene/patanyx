@@ -1,0 +1,25 @@
+{
+  "comment": [
+    "Copyright holder lines for crates that ship no licence file in the crate",
+    "source. The generator reports such crates under NOT RESOLVED LOCALLY;",
+    "an entry here gives their holders so the notice travels with the binary",
+    "instead of the gap staying open.",
+    "",
+    "Rules for entries:",
+    "- holders must be verbatim lines from an authoritative source (the crate's",
+    "  own files, or the upstream licence file), never paraphrased or guessed;",
+    "- 'source' says exactly where each line was read from;",
+    "- keyed by crate name; 'version_seen' records the packaged version the",
+    "  lines were read from, so drift is visible to a human reviewer."
+  ],
+  "entries": {
+    "boringtun": {
+      "version_seen": "0.7.1",
+      "licence": "BSD-3-Clause",
+      "holders": [
+        "Copyright (c) 2019 Cloudflare, Inc. All rights reserved."
+      ],
+      "source": "copyright header carried in the crate's own source files (allowed_ips.rs, api.rs, dev_lock.rs, drop_privileges.rs, epoll.rs, errors.rs and the rest), boringtun 0.7.1 as packaged on crates.io"
+    }
+  }
+}
