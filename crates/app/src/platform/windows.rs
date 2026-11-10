@@ -6909,6 +6909,11 @@ pub fn freeze_enforced() -> bool {
     true
 }
 
+/// The macOS smoke gate's lever (its store copies are dropped to prove a
+/// list enforces from memory). WebView2 has no compiled-list store to drop
+/// from: a no-op, never called here.
+pub fn drop_stored_rule_list_copies() {}
+
 /// Manual freeze: immediate request, honest reporting.
 ///
 /// The previous version called `note_enforced()` on the next line, arguing

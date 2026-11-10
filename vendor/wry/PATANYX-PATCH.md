@@ -63,6 +63,36 @@ conditions WebView2 handler attachment but still injects the WebKitGTK
 `window.ipc` bootstrap unconditionally, so no released upgrade fixes both
 backends.
 
+## macOS arm (2026-09-22, added for the darwin backend)
+
+Upstream `wkwebview/mod.rs` injects the same frozen `window.ipc` shim into
+EVERY WKWebView document, unconditionally, while registering the
+`window.webkit.messageHandlers.ipc` receiver only when an `ipc_handler`
+exists. On a macOS build of PATANYX a content page that says `var ipc = …`
+still binds to the shim, and any page that CALLS `window.ipc.postMessage`
+gets a TypeError (the receiver was never registered). Same defect, third
+engine. The receive-side registration stays as-is, for the same reason as
+WebKitGTK: the fingerprint-divergence reporter posts through
+`window.webkit.messageHandlers.ipc`.
+
+```diff
+--- registry/wry-0.55.1/src/wkwebview/mod.rs
++++ vendor/wry/src/wkwebview/mod.rs
+@@
+       // Initialize scripts
+-      w.init(
++      if ipc_handler_delegate.is_some() {
++        w.init(
+ r#"Object.defineProperty(window, 'ipc', {
+   value: Object.freeze({postMessage: function(s) {window.webkit.messageHandlers.ipc.postMessage(s);}})
+ });"#,
+-      true
+-      );
++        true
++        );
++      }
+```
+
 ## Third hunk (1.0.6): enable the WebKitGTK process sandbox
 
 Security audit 2026-10-08, confirmed at runtime: no context ever called

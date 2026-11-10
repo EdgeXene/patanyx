@@ -9405,17 +9405,18 @@ mod tests {
 
     const UNIX: &str = include_str!("platform/unix.rs");
     const WINDOWS: &str = include_str!("platform/windows.rs");
+    const MACOS: &str = include_str!("platform/macos.rs");
     const STATE: &str = include_str!("state.rs");
     const MAIN: &str = include_str!("main.rs");
     const IPC: &str = include_str!("ipc.rs");
 
-    /// Both engines put the allowance over whatever policy they are given.
+    /// Every engine puts the allowance over whatever policy it is given.
     /// A backend that wrote the given policy straight into the tab would let
     /// any browser-wide Privacy switch turn blocking back on in an allowed
     /// tab, which is what `set_privacy` relies on not happening.
     #[test]
     fn every_engine_applies_the_allowance_over_the_policy_it_is_given() {
-        for (name, source) in [("unix", UNIX), ("windows", WINDOWS)] {
+        for (name, source) in [("unix", UNIX), ("windows", WINDOWS), ("macos", MACOS)] {
             let body = body_of(source, "pub fn apply_policy(");
             assert!(
                 body.contains("let effective = st.apply_base_policy(policy);"),

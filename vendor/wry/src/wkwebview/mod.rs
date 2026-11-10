@@ -634,12 +634,16 @@ impl InnerWebView {
       };
 
       // Initialize scripts
-      w.init(
+      // PATANYX patch: the `window.ipc` shim must exist only when an IPC
+      // handler was registered; see PATANYX-PATCH.md in this crate.
+      if w.ipc_handler_delegate.is_some() {
+        w.init(
 r#"Object.defineProperty(window, 'ipc', {
   value: Object.freeze({postMessage: function(s) {window.webkit.messageHandlers.ipc.postMessage(s);}})
 });"#,
-      true
-      );
+        true
+        );
+      }
       for init_script in attributes.initialization_scripts {
         w.init(&init_script.script, init_script.for_main_frame_only);
       }

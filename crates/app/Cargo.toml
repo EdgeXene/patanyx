@@ -65,7 +65,11 @@ updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-
 linux-bridge = []
 
 [dependencies]
-wry = { version = "0.55", features = ["devtools"] }
+# `mac-proxy` is OFF upstream by default; it is the ONLY wry arm that honours
+# `with_proxy_config` on WKWebView (socks5 via Network.framework), and without
+# it the tunnel's fail-closed promise ("Imported mode never sends a request
+# direct") would be silently unenforceable on macOS.
+wry = { version = "0.55", features = ["devtools", "mac-proxy", "transparent"] }
 tao = "0.35"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -197,11 +201,14 @@ windows = { version = "0.61", features = [
   "Win32_System_Registry",
 ] }
 
-# GTK/WebKitGTK exist only on unix; a Windows build must not try to compile
-# them. All uses live in src/platform/unix.rs.
+# libc is needed on every unix, macOS included: kill(2) on the update
+# preflight's process group (updater::installer::preflight).
 [target.'cfg(unix)'.dependencies]
-# kill(2) on the update preflight's process group (updater::installer::preflight).
 libc = "0.2"
+
+# GTK/WebKitGTK exist only on Linux; a macOS or Windows build must not try to
+# compile them. All uses live in src/platform/unix.rs.
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 gtk = "0.18"
 # Same crate+features wry itself uses; needed for the Response policy
 # handler wry does not expose (see fix_downloads in src/platform/unix.rs).
@@ -227,6 +234,84 @@ javascriptcore-rs-sys = "=1.1.1"
 glib-sys = "0.18"
 gobject-sys = "0.18"
 gio-sys = "0.18"
+
+# macOS backend (src/platform/macos.rs): WKWebView through the same objc2
+# crates wry itself uses. Versions PINNED to what the vendored wry 0.55.1
+# resolves (see Cargo.lock) -- two objc2 copies in one binary cannot
+# interoperate, and a mismatched app-kit/web-kit can double-register classes.
+# Feature sets are the union of wry's (always compiled with us) and the
+# extras this backend needs: content rule lists (ad/freeze blocking), user
+# scripts (GPC / divergence / cosmetic), snapshot (capture), and the open /
+# save panels plus appearance and pasteboard (file pickers, theme, clipboard).
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = [
+  "std",
+  "objc2-core-foundation",
+  "NSURLRequest",
+  "NSURL",
+  "NSString",
+  "NSDictionary",
+  "NSObject",
+  "NSData",
+  "NSEnumerator",
+  "NSJSONSerialization",
+  "NSDate",
+  "NSBundle",
+  "NSProcessInfo",
+  "NSValue",
+  "NSRange",
+  "NSError",
+  "NSSet",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["std", "CFCGTypes"] }
+objc2-app-kit = { version = "0.3.2", features = [
+  "std",
+  "objc2-core-foundation",
+  "NSApplication",
+  "NSEvent",
+  "NSWindow",
+  "NSView",
+  "NSPasteboard",
+  "NSResponder",
+  "NSOpenPanel",
+  "NSSavePanel",
+  "NSAppearance",
+  "NSImage",
+  "NSBitmapImageRep",
+  "NSRunningApplication",
+] }
+objc2-web-kit = { version = "0.3.2", features = [
+  "std",
+  "objc2-core-foundation",
+  "objc2-app-kit",
+  "block2",
+  "WKWebView",
+  "WKWebViewConfiguration",
+  "WKWebsiteDataStore",
+  "WKDownload",
+  "WKDownloadDelegate",
+  "WKNavigation",
+  "WKNavigationDelegate",
+  "WKUserContentController",
+  "WKURLSchemeHandler",
+  "WKPreferences",
+  "WKURLSchemeTask",
+  "WKScriptMessageHandler",
+  "WKContentRuleList",
+  "WKContentRuleListStore",
+  "WKUserScript",
+  "WKSnapshotConfiguration",
+  "WKFrameInfo",
+] }
+block2 = "0.6"
+# Named ONLY to reach DispatchQueue::main from the layout code: tao already
+# pulls this exact version (0.3.x) as its own macOS event-loop dependency, so
+# this adds no new code to the build -- it makes an existing one nameable.
+# The view reorder must run OUTSIDE the run-loop observer tao delivers user
+# events from, and the main queue is the standard way out. See reorder_views
+# in src/platform/macos.rs.
+dispatch2 = "0.3"
 
 [dev-dependencies]
 # Test-only: the delta tests GENERATE patches. Shipping code only APPLIES
