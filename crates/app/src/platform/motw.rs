@@ -33,7 +33,9 @@
 //! WHAT IT DOES NOT DO. It does not raise the zone, lower it, or invent one.
 //! It does not touch SmartScreen, which stays off (it reports URL and hash to
 //! Microsoft; see the audit ledger). It is a no-op on Linux, where the
-//! concept does not exist.
+//! concept does not exist. macOS's downloads were checked on hardware
+//! (2026-11-09): WebKit writes `com.apple.quarantine` on WKWebView downloads
+//! itself, so the Gatekeeper half needs no code here.
 //!
 //! WHY THE DECISION IS HERE AND THE I/O IS IN `windows.rs`. `rewrite` is pure:
 //! bytes in, verdict out. `cargo test` proves the property on any host --

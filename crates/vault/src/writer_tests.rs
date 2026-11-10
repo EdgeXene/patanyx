@@ -430,7 +430,10 @@ fn a_long_file_name_still_saves() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-#[cfg(unix)]
+/// Not built on macOS: APFS rejects non-UTF-8 file names outright (errno 92),
+/// so the byte-transparent file-name behaviour this test pins is a property
+/// of Linux file systems, not of the vault writer.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn a_file_name_that_is_not_utf8_still_saves() {
     use std::os::unix::ffi::OsStrExt;

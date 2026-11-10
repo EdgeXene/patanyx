@@ -1696,6 +1696,12 @@ pub fn freeze_enforced() -> bool {
     true
 }
 
+/// The macOS smoke gate's lever (its store copies are dropped to prove a
+/// list enforces from memory). The GTK store is this backend's compile
+/// cache, dropped lists would recompile on every run, and the smoke here has
+/// no call for the lever: a no-op, never called.
+pub fn drop_stored_rule_list_copies() {}
+
 // ---------------------------------------------------------------------------
 // Compiled content filters (raw FFI)
 //

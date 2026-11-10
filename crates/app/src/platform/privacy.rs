@@ -855,6 +855,13 @@ impl FreezeFilterBook {
         self.installed_hosts.clone()
     }
 
+    /// The ids of the freeze filters currently installed in the engine. The
+    /// macOS backend reads this to put the installed list back on a
+    /// controller that lost it (a rebuild), straight from its memory cache.
+    pub fn installed_list_ids(&self) -> Vec<String> {
+        self.installed.clone()
+    }
+
     fn is_current(&self, id: &str, generation: u64) -> bool {
         self.wanted
             .as_ref()
@@ -5847,6 +5854,43 @@ mod tests {
                 "{callback} must end the count on every path"
             );
         }
+    }
+
+    #[test]
+    fn macos_first_page_waits_for_the_ad_and_tracker_filters() {
+        // The macOS backend gates on the same shared counter, pinned against
+        // its source here because macos.rs is cfg-excluded on this Linux test
+        // host. Same shape as the unix pins above.
+        let macos = include_str!("macos.rs");
+        let body = |name: &str| {
+            let at = macos.find(name).unwrap_or_else(|| panic!("macos.rs has {name}"));
+            &macos[at..at + macos[at..].find("\n}\n").expect("end of fn")]
+        };
+        let ready = body("pub fn initial_navigation_ready(");
+        assert!(
+            ready.contains("bundled_filters_loading == 0"),
+            "the first page must wait for the ad and tracker filters"
+        );
+        assert!(
+            ready.contains("session_wipe_finished("),
+            "a tab released by its filters must still wait for the start-up clear"
+        );
+        assert!(
+            body("pub fn build_content(").contains("waiting_for_wipe || !initial_navigation_ready(&view)"),
+            "a new tab must not issue its first page while its filters load"
+        );
+        assert!(
+            body("fn compile_bundled_list(").contains("bundled_filters_loading += 1"),
+            "each filter compile must be counted"
+        );
+        assert!(
+            body("fn compile_bundled_list(").contains("BundledLoadEnds {"),
+            "the count must end when the compile does, however it ends"
+        );
+        assert!(
+            body("impl Drop for BundledLoadEnds {").contains("BundledFiltersSettled"),
+            "the settled event must release the held page at zero"
+        );
     }
 
     #[test]

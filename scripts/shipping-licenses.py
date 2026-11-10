@@ -64,6 +64,13 @@ CONFIGS = [
         ["chat", "relay-client"],
         "PATANYX-Nabu-X for Linux",
     ),
+    ("macos", "aarch64-apple-darwin", [], "PATANYX for macOS"),
+    (
+        "macos-chat",
+        "aarch64-apple-darwin",
+        ["chat", "relay-client"],
+        "PATANYX-Nabu-X for macOS",
+    ),
 ]
 
 # Matched case-INSENSITIVELY against each filename. pathlib.glob is

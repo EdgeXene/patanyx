@@ -332,6 +332,140 @@ mod session_wipe_tests {
             );
         }
     }
+
+    #[test]
+    fn macos_tls_state_never_claims_normal_from_the_scheme() {
+        // Faye's round-three finding: the scheme answering `https` is not a
+        // certificate verdict, and the old code returned `Normal` from it
+        // alone, so the interception warning could never fire even under a
+        // MITM. The pinned shape: `http` answers `NotTls` (no chain exists),
+        // everything else falls through to the error verdict with
+        // `Unreadable` as the default, and `Normal` appears nowhere in the
+        // function.
+        let source = include_str!("macos.rs");
+        let function = between(source, "fn tls_state(", "pub fn tls_issuer");
+        assert!(
+            !function.contains("TlsState::Normal"),
+            "tls_state must not claim Normal: this process never read a chain"
+        );
+        assert!(
+            function.contains("TlsState::Unreadable"),
+            "the secured-scheme default must be Unreadable"
+        );
+        assert!(
+            function.contains("\"http\""),
+            "plaintext stays observable from the scheme"
+        );
+    }
+
+    #[test]
+    fn macos_mask_matches_the_site_data_promise() {
+        // macos.rs is cfg-excluded on this Linux test host, so inspect the
+        // wipe where CI can see it. Same class of compile-time tripwire as
+        // the Windows and unix checks above: it pins the macOS wipe's shape,
+        // and is not a substitute for the smoke gate on real hardware.
+        let source = include_str!("macos.rs");
+        let function = between(source, "fn begin_new_session_wipe(", "// Translate");
+        assert!(function.contains("removeDataOfTypes"));
+        assert!(
+            function.contains("distantPast"),
+            "the wipe must reach back over all history"
+        );
+        // The type set is WebKit's own answer (allWebsiteDataTypes), not a
+        // hand-kept list: a type WebKit adds later is then wiped by default.
+        // HSTS is not one of the public types, so it stays out on its own.
+        assert!(
+            function.contains("allWebsiteDataTypes"),
+            "the macOS wipe must ask the store for every public type"
+        );
+        assert!(
+            !function.contains("WKWebsiteDataType"),
+            "the macOS wipe must not hand-keep its type list"
+        );
+        assert!(
+            !function.contains("HSTS"),
+            "macOS wipe unexpectedly weakens engine protection HSTS"
+        );
+    }
+
+    #[test]
+    fn macos_freeze_filters_stay_out_of_the_persistent_store() {
+        // A freeze filter's rules name every host the user allowed on the
+        // frozen tab. Pinned against the source: it compiles into a per-run
+        // directory, the stored copy leaves the moment the filter is
+        // handled, and a sweep clears what a crash left behind, touching
+        // only stores of runs that have ended.
+        let source = include_str!("macos.rs");
+        let install = between(source, "fn install_freeze_filter(", "/// The freeze compile");
+        assert!(
+            install.contains("request_with_hosts("),
+            "the freeze filter must be asked for through the Book"
+        );
+        assert!(
+            !install.contains("remove_all_filters"),
+            "removing the old freeze filter before the replacement lands leaves a frozen tab with no freeze"
+        );
+        let compile = between(source, "fn compile_freeze_list(", "/// Whether freezing actually blocks");
+        assert!(
+            compile.contains("on_compiled(&id, generation, frozen)"),
+            "a late compile must be judged by its generation"
+        );
+        assert!(
+            compile.contains("remove_stored_rule_list(&store, &id)"),
+            "the stored copy must leave once the filter is handled"
+        );
+        let removal = between(
+            source,
+            "fn remove_stored_rule_list(",
+            "/// Installs the freeze filter",
+        );
+        assert!(
+            removal.contains("removeContentRuleListForIdentifier"),
+            "the stored copy leaves through the store's own removal call"
+        );
+        let store = between(source, "fn freeze_store_dir(", "/// Once per run");
+        assert!(
+            store.contains("0o700"),
+            "the per-run store must not be readable by other users"
+        );
+        let sweep = between(source, "fn remove_stale_freeze_stores(", "/// The per-run store directory name");
+        assert!(
+            sweep.contains("process_is_gone(pid)"),
+            "the sweep must not touch a store whose run may still be alive"
+        );
+        assert!(
+            sweep.contains("symlink_metadata"),
+            "the sweep must check the entry is a real directory"
+        );
+        let gone = between(source, "fn process_is_gone(", "/// Removes every stored list");
+        assert!(
+            gone.contains("libc::kill(pid as libc::pid_t, 0)") && gone.contains("ESRCH"),
+            "gone must be the kernel's answer, not an assumption"
+        );
+    }
+
+    #[test]
+    fn macos_rule_list_rebuilds_are_synchronous() {
+        // Between a removal and an async re-add a tab blocks nothing, and a
+        // reload can outrun its own lists. Pinned against the source: the
+        // rebuild adds every list from the run's memory cache, and no async
+        // store round-trip happens inside it.
+        let source = include_str!("macos.rs");
+        let rebuild = between(source, "fn rebuild_tab_rule_lists(", "/// Adds an ALREADY-COMPILED");
+        assert!(
+            !rebuild.contains("lookUpContentRuleList"),
+            "the rebuild must not wait on a store round-trip"
+        );
+        assert!(
+            rebuild.contains("reinstall_installed_freeze_filter(&cc, view)"),
+            "a frozen tab must not lose its freeze across a rebuild"
+        );
+        let add = between(source, "fn add_rule_list(", "/// The id recorded on this tab's build");
+        assert!(
+            add.contains("cached_rule_list(id)"),
+            "a list the run compiled must go back synchronously"
+        );
+    }
 }
 
 /// How the chrome and the page share the window.
@@ -407,10 +541,17 @@ pub fn presence_throttle_elapsed() -> bool {
     false
 }
 
-#[cfg(unix)]
+// darwin is unix, so "unix" must be spelled "unix minus macos" or a macOS
+// build would compile the GTK backend and fail. macOS gets its own backend.
+#[cfg(all(unix, not(target_os = "macos")))]
 mod unix;
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
 pub use unix::*;
+
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "macos")]
+pub use macos::*;
 
 #[cfg(windows)]
 mod windows;
@@ -1108,7 +1249,9 @@ pub fn save_pdf_supported() -> bool {
 /// rewrites `rbchrome://...` to `http://rbchrome.localhost/...`, so the
 /// boot URL is platform-specific. The page's 'self'-based CSP is
 /// origin-relative and needs no change for either form.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const CHROME_URL: &str = "rbchrome://localhost/index.html";
+#[cfg(target_os = "macos")]
 pub const CHROME_URL: &str = "rbchrome://localhost/index.html";
 /// See the unix arm.
 #[cfg(windows)]
@@ -1130,7 +1273,9 @@ pub const CHROME_URL: &str = "http://rbchrome.localhost/index.html";
 /// Hostile page text goes into this view, so it gets its own origin, its own
 /// data store and its own protocol handler that is never wired to
 /// `serve_chrome`.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const TRANSLATE_URL: &str = "rbtranslate://localhost/translator.html";
+#[cfg(target_os = "macos")]
 pub const TRANSLATE_URL: &str = "rbtranslate://localhost/translator.html";
 /// See the unix arm; wry rewrites custom schemes on WebView2.
 #[cfg(windows)]
@@ -1142,7 +1287,9 @@ pub const TRANSLATE_SCHEME: &str = "rbtranslate";
 /// Navigation allowlist prefix for the translator webview, same discipline as
 /// `CHROME_ORIGIN_PREFIX`: exact, and never loosened to "any http URL" to
 /// accommodate the WebView2 form.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const TRANSLATE_ORIGIN_PREFIX: &str = "rbtranslate://";
+#[cfg(target_os = "macos")]
 pub const TRANSLATE_ORIGIN_PREFIX: &str = "rbtranslate://";
 /// See the unix arm.
 #[cfg(windows)]
@@ -1152,7 +1299,9 @@ pub const TRANSLATE_ORIGIN_PREFIX: &str = "http://rbtranslate.localhost/";
 /// match the platform's origin form precisely — anything looser (e.g. "any
 /// http: URL", to accommodate the WebView2 form) would let the trusted
 /// chrome webview navigate onto the open web.
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "macos")))]
+pub const CHROME_ORIGIN_PREFIX: &str = "rbchrome://";
+#[cfg(target_os = "macos")]
 pub const CHROME_ORIGIN_PREFIX: &str = "rbchrome://";
 /// See the unix arm.
 #[cfg(windows)]
