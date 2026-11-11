@@ -6,7 +6,10 @@
 //! The vault, then the Library's records (bookmarks, bookmark folders, shelved
 //! tab groups and their notes, Deep Recall pages, page snapshots and per-site
 //! exceptions), then each picture as a section of its own, so a backup never
-//! needs every picture in memory at once. Download records never go in: they
+//! needs every picture in memory at once, then each add-on's pages as data
+//! (`<add-on id>/<version>`, then `<add-on id>/index`), never its code. A
+//! Library with no add-on pages writes no add-on section, so its backup stays
+//! one an earlier PATANYX reads. Download records never go in: they
 //! are browsing history, and they stay on the computer that made them
 //! (`patanyx_store::library_backup`). An import keeps this computer's own.
 //!
@@ -26,7 +29,8 @@
 //! 3. The imported vault replaces the old one: the commit point.
 //!    `vault_committed`.
 //! 4. The staged Library moves into place: the live picture folder aside, the
-//!    staged one in, the staged Library file over the live one. `swapped`.
+//!    staged one in, the live add-on folder aside, the staged one in, the
+//!    staged Library file over the live one. `swapped`.
 //! 5. Leftovers are deleted and the journal goes.
 //!
 //! The Library is only ever opened through `AppState::open_store`, which runs
@@ -46,19 +50,19 @@
 //! # Why the journal can only ever name its own folders
 //!
 //! Recovery renames and deletes the folders a journal names, so a journal is
-//! read as untrusted input: a name must be exactly `library-staging-` or
-//! `archive.old-` followed by 16 hex digits, which can only mean a folder
-//! beside the Library file that an import created.
+//! read as untrusted input: a name must be exactly `library-staging-`,
+//! `archive.old-` or `addons.old-` followed by 16 hex digits, which can only
+//! mean a folder beside the Library file that an import created.
 
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use patanyx_store::{
-    validate_backup, BackupError, BackupPictures, KeptDownloads, LibraryBackup, RestoreSummary,
-    Store, StoreError,
-    ARCHIVE_TEXT_MAX_CHARS, LIBRARY_BACKUP_SCHEMA, MAX_ARCHIVE_BYTES, MAX_BACKUP_PICTURE_BYTES,
-    MAX_BOOKMARKS, MAX_SNAPSHOT_PICTURE_BYTES,
+    addon_backup_index, addon_stored_len, validate_backup, AddonNamespace, AddonNamespaceInput, AddonRestore, BackupError,
+    BackupPictures, KeptDownloads, LibraryBackup, PageMeta, RestoreSummary, Store, StoreError,
+    ADDON_BACKUP_INDEX, ADDON_MAX_INDEX_BYTES, ADDON_QUOTA_BYTES, ARCHIVE_TEXT_MAX_CHARS, LIBRARY_BACKUP_SCHEMA,
+    MAX_ARCHIVE_BYTES, MAX_BACKUP_PICTURE_BYTES, MAX_BOOKMARKS, MAX_SNAPSHOT_PICTURE_BYTES,
 };
 use patanyx_vault::{
     BackupReader, BackupSource, BackupWatch, ExportError, PendingImport, RecoveryKey, SectionKind,
@@ -78,13 +82,15 @@ pub const MAX_LIBRARY_SECTION: u64 = 512 * MIB;
 
 /// What each kind of section may weigh, checked before its body is read.
 ///
-/// Add-on sections are not read yet (0): no add-on writes them in this build,
-/// and the reader then answers that a newer PATANYX made the file.
+/// An add-on section is one page (at most 512 KiB) or one add-on's index (at
+/// most 8 MiB); the store checks each against its own limit when it restores
+/// it. A build before this one reads none (0) and answers that a newer
+/// PATANYX made the file.
 pub fn section_limits() -> SectionLimits {
     SectionLimits {
         library: MAX_LIBRARY_SECTION,
         picture: MAX_BACKUP_PICTURE_BYTES,
-        addon: 0,
+        addon: ADDON_MAX_INDEX_BYTES as u64,
     }
 }
 
@@ -154,6 +160,10 @@ struct ExportLibrary {
     backup: LibraryBackup,
     pictures_left_out: usize,
     pictures: BackupPictures,
+    /// Each add-on namespace's id and scoped key, read on the worker. `None`
+    /// when the add-on folder could not be listed: the export then refuses,
+    /// never writes a backup without data it could not see.
+    addons: Option<Vec<(String, AddonNamespaceInput)>>,
 }
 
 impl std::fmt::Debug for ExportInput {
@@ -180,6 +190,7 @@ impl ExportInput {
                     backup,
                     pictures_left_out,
                     pictures,
+                    addons: store.addon_backup_inputs().ok(),
                 })
             }
         };
@@ -199,24 +210,27 @@ impl ExportInput {
         passphrase: &str,
         watch: &BackupWatch,
     ) -> Result<ExportOutcome, ExportError> {
-        self.write_watched(dest, passphrase, watch, &mut |_| {})
+        self.write_watched(dest, passphrase, watch, &mut |_| {}, &mut |_| {})
     }
 
     /// [`ExportInput::write`], calling `before_picture` with each picture's
-    /// index before it is read. Tests use it to stop or change the Library at
-    /// an exact point.
+    /// index before it is read, and `before_addon_page` with each add-on
+    /// page's id before its body is read. Tests use them to stop or change the
+    /// Library at an exact point.
     fn write_watched(
         self,
         dest: &Path,
         passphrase: &str,
         watch: &BackupWatch,
         before_picture: &mut dyn FnMut(usize),
+        before_addon_page: &mut dyn FnMut(&str),
     ) -> Result<ExportOutcome, ExportError> {
         let ExportInput { source, library } = self;
         let Some(ExportLibrary {
             backup,
             pictures_left_out,
             pictures: reader,
+            addons,
         }) = library
         else {
             source.write(dest, passphrase, section_limits(), &mut |_| Ok(()), watch)?;
@@ -237,6 +251,12 @@ impl ExportInput {
         if let Some(refusal) = refusal_for(&backup) {
             return Ok(ExportOutcome::Refused(refusal));
         }
+        let Some(mut addons) = addons else {
+            return Ok(ExportOutcome::Refused(ExportRefusal {
+                code: "export_addon_unreadable",
+                item: None,
+            }));
+        };
         let records = Zeroizing::new(
             serde_json::to_vec(&backup)
                 .map_err(|e| ExportError::BadExport(format!("library encode: {e}")))?,
@@ -296,6 +316,74 @@ impl ExportInput {
                     }
                     sink.section(SectionKind::Picture, id, &picture)?;
                     watch.set_items(done as u64 + 1, pictures.len() as u64);
+                }
+                // Each add-on's pages, then its index naming exactly them. An
+                // add-on with no pages writes nothing, so a Library without
+                // any stays a backup an earlier PATANYX reads.
+                for (id, input) in std::mem::take(&mut addons) {
+                    watch.check()?;
+                    let unreadable = ExportRefusal {
+                        code: "export_addon_unreadable",
+                        item: None,
+                    };
+                    let Ok(namespace) = input.open() else {
+                        refusal = Some(unreadable);
+                        return Err(ExportError::BadExport("refused".into()));
+                    };
+                    let pages = match namespace.backup_pages() {
+                        Ok(Some(pages)) if !pages.is_empty() => pages,
+                        Ok(_) => continue,
+                        Err(_) => {
+                            refusal = Some(unreadable);
+                            return Err(ExportError::BadExport("refused".into()));
+                        }
+                    };
+                    let mut carried = Vec::with_capacity(pages.len());
+                    // What the import will count against the add-on's quota.
+                    // Pages saved while the export runs can add up to more
+                    // than the add-on ever held at once; such a backup is not
+                    // one this build would import, so it is not written.
+                    let mut stored = 0u64;
+                    let over_limit = ExportRefusal {
+                        code: "export_library_over_limit",
+                        item: None,
+                    };
+                    for meta in pages {
+                        before_addon_page(&meta.id);
+                        watch.check()?;
+                        match addon_page(&namespace, meta) {
+                            Ok(Some((meta, body))) => {
+                                stored = stored.saturating_add(addon_stored_len(body.len()));
+                                if stored > addon_quota() {
+                                    refusal = Some(over_limit);
+                                    return Err(ExportError::BadExport("refused".into()));
+                                }
+                                sink.section(SectionKind::Addon, &format!("{id}/{}", meta.version()), &body)?;
+                                carried.push(meta);
+                            }
+                            // Deleted after the export began.
+                            Ok(None) => {}
+                            Err(title) => {
+                                refusal = Some(ExportRefusal {
+                                    code: "export_addon_page_unreadable",
+                                    item: Some(title),
+                                });
+                                return Err(ExportError::BadExport("refused".into()));
+                            }
+                        }
+                    }
+                    if carried.is_empty() {
+                        continue;
+                    }
+                    let index = addon_backup_index(&carried)
+                        .map_err(|e| ExportError::BadExport(format!("add-on index: {e}")))?;
+                    if index.len() > ADDON_MAX_INDEX_BYTES
+                        || stored.saturating_add(addon_stored_len(index.len())) > addon_quota()
+                    {
+                        refusal = Some(over_limit);
+                        return Err(ExportError::BadExport("refused".into()));
+                    }
+                    sink.section(SectionKind::Addon, &format!("{id}/{ADDON_BACKUP_INDEX}"), &index)?;
                 }
                 Ok(())
             },
@@ -365,6 +453,51 @@ fn picture_ids(backup: &LibraryBackup) -> Vec<String> {
         .filter(|s| s.has_picture)
         .map(|s| s.id.clone());
     pages.chain(snapshots).collect()
+}
+
+/// The most an add-on's pages may come to in a backup: the import's quota.
+#[cfg(not(test))]
+fn addon_quota() -> u64 {
+    ADDON_QUOTA_BYTES
+}
+#[cfg(test)]
+thread_local! {
+    /// Tests lower it to reach the export's limit with small pages.
+    pub(crate) static TEST_ADDON_QUOTA: std::cell::Cell<u64> = const { std::cell::Cell::new(ADDON_QUOTA_BYTES) };
+}
+#[cfg(test)]
+fn addon_quota() -> u64 {
+    TEST_ADDON_QUOTA.with(std::cell::Cell::get)
+}
+
+/// One add-on page's body for a backup, by the version the index named when
+/// the export read it. A page saved since is read again by its new version,
+/// and one deleted since is left out (`Ok(None)`): the add-on keeps working
+/// while the backup is written. A version the index still names that is not
+/// there, or does not open, refuses the export (`Err`, with the page's title).
+fn addon_page(
+    namespace: &AddonNamespace,
+    mut meta: PageMeta,
+) -> Result<Option<(PageMeta, Zeroizing<Vec<u8>>)>, String> {
+    // A page saved faster than it can be read four times in a row is not
+    // one a backup can catch; it is refused rather than chased.
+    for _ in 0..4 {
+        match namespace.backup_body(&meta) {
+            Ok(Some(body)) => return Ok(Some((meta, body))),
+            Ok(None) => {}
+            Err(_) => return Err(meta.title),
+        }
+        let now = match namespace.backup_pages() {
+            Ok(pages) => pages.unwrap_or_default().into_iter().find(|p| p.id == meta.id),
+            Err(_) => return Err(meta.title),
+        };
+        match now {
+            None => return Ok(None),
+            Some(now) if now.version() == meta.version() => return Err(meta.title),
+            Some(now) => meta = now,
+        }
+    }
+    Err(meta.title)
 }
 
 /// How the person would recognize the item with `id`: its title, or its
@@ -482,6 +615,8 @@ pub struct Staged {
     /// open): the new Library then starts empty, apart from this computer's
     /// own download records.
     pub library_included: bool,
+    /// Add-on pages restored, across every add-on.
+    pub addon_pages: usize,
 }
 
 impl std::fmt::Debug for Staged {
@@ -489,6 +624,7 @@ impl std::fmt::Debug for Staged {
         f.debug_struct("Staged")
             .field("summary", &self.summary)
             .field("library_included", &self.library_included)
+            .field("addon_pages", &self.addon_pages)
             .finish_non_exhaustive()
     }
 }
@@ -552,6 +688,7 @@ fn stage_inner(
         phase: Phase::Preparing,
         staging: random_name(STAGING_PREFIX),
         old_archive: random_name(OLD_ARCHIVE_PREFIX),
+        old_addons: Some(random_name(OLD_ADDONS_PREFIX)),
         vault_check: None,
         source: src.to_string_lossy().into_owned(),
         superseded,
@@ -568,7 +705,7 @@ fn stage_inner(
         watch,
         after_section,
     );
-    let (pending, summary, library_included, check) = match built {
+    let (pending, summary, library_included, check, addon_pages) = match built {
         Ok(built) => built,
         Err(error) => {
             let cleaned = undo(store_path, &journal);
@@ -587,10 +724,11 @@ fn stage_inner(
         store_path: store_path.to_path_buf(),
         summary,
         library_included,
+        addon_pages,
     })
 }
 
-type Built = (PendingImport, RestoreSummary, bool, String);
+type Built = (PendingImport, RestoreSummary, bool, String, usize);
 
 /// A stop is only reported as clean when everything it built aside is gone;
 /// otherwise the person is told some files remain until the next open. Any
@@ -623,6 +761,10 @@ fn build(
     // Always created, even for a Library with no pictures, so that whether
     // it still exists tells recovery whether it has been moved yet.
     create_private_dir(&staging.join("archive"))?;
+    crash::point("addons-folder-next");
+    // The same for add-on data: an empty folder replaces the live one when
+    // the backup carries none, since the live one is under the old key.
+    create_private_dir(&staging.join("addons"))?;
     crash::point("library-create-next");
 
     let mut reader = BackupReader::open_watched(src, passphrase, section_limits(), watch)?;
@@ -634,6 +776,7 @@ fn build(
     crash::point("library-created");
 
     let mut sections = 0;
+    let mut addon_pages = 0;
     let first = reader.next_section()?;
     after_section(sections);
     let (summary, library_included) = match first {
@@ -649,11 +792,16 @@ fn build(
             drop(section);
             let expected = picture_ids(&backup).len() as u64;
             watch.set_items(0, expected);
+            // Taken before the Library's own restore, which holds it.
+            let addons = library.addon_restorer();
             let mut restore = library.begin_restore(validate_backup(backup)?)?;
+            // The add-on whose pages are being read, and every one finished.
+            let mut addon: Option<(String, AddonRestore)> = None;
+            let mut addons_done = std::collections::BTreeSet::new();
             while let Some(section) = reader.next_section()? {
                 sections += 1;
                 after_section(sections);
-                watch.set_items(sections as u64, expected);
+                watch.set_items((sections as u64).min(expected), expected);
                 watch.check()?;
                 match section.kind {
                     SectionKind::Picture => {
@@ -661,15 +809,39 @@ fn build(
                         crash::point("picture-written");
                     }
                     SectionKind::Library => return Err(bad("the Library appears twice")),
-                    // Unreachable while add-on sections are not read (their
-                    // limit is 0), and refused the same way if they ever are
-                    // before something here can restore them.
+                    // An add-on's pages, then its index. Each add-on comes
+                    // once, whole, and its index ends it.
                     SectionKind::Addon => {
-                        return Err(ImportError::Backup(ExportError::UnreadableVersion(
-                            patanyx_vault::BACKUP_VERSION,
-                        )))
+                        let (id, item) = section
+                            .name
+                            .split_once('/')
+                            .ok_or_else(|| bad("an add-on section with an unusable name"))?;
+                        if addon.as_ref().is_none_or(|(current, _)| current != id) {
+                            if addon.is_some() {
+                                return Err(bad("an add-on's pages end without its index"));
+                            }
+                            if !addons_done.insert(id.to_string()) {
+                                return Err(bad("an add-on appears twice"));
+                            }
+                            addon = Some((id.to_string(), addons.begin(id)?));
+                        }
+                        if item == ADDON_BACKUP_INDEX {
+                            let Some((_, pages)) = addon.take() else {
+                                return Err(bad("an add-on section out of place"));
+                            };
+                            addon_pages += pages.finish(&section.body)?;
+                            crash::point("addon-restored");
+                        } else {
+                            let Some((_, pages)) = addon.as_mut() else {
+                                return Err(bad("an add-on section out of place"));
+                            };
+                            pages.put_version(item, &section.body)?;
+                        }
                     }
                 }
+            }
+            if addon.is_some() {
+                return Err(bad("an add-on's pages end without its index"));
             }
             // Only reached after END was read and matched everything before
             // it: `next_section` returns `None` for nothing else.
@@ -683,8 +855,9 @@ fn build(
     let pending = reader.finish()?;
     drop(library);
     sync_dir(&staging.join("archive"))?;
+    sync_dir(&staging.join("addons"))?;
     sync_dir(&staging)?;
-    Ok((pending, summary, library_included, check_value(&key)))
+    Ok((pending, summary, library_included, check_value(&key), addon_pages))
 }
 
 fn empty_backup() -> LibraryBackup {
@@ -697,6 +870,8 @@ fn empty_backup() -> LibraryBackup {
         archive: Vec::new(),
         page_snapshots: Vec::new(),
         divergence_overrides: Vec::new(),
+        game_hosts: Vec::new(),
+        trackers: Vec::new(),
     }
 }
 
@@ -747,6 +922,8 @@ pub struct Committed {
     pub recovery: RecoveryKey,
     pub summary: RestoreSummary,
     pub library_included: bool,
+    /// Add-on pages the backup restored, across every add-on.
+    pub addon_pages: usize,
     pub library: ImportedLibrary,
 }
 
@@ -802,6 +979,7 @@ pub fn commit(
     let store_path = staged.store_path.clone();
     let summary = staged.summary;
     let library_included = staged.library_included;
+    let addon_pages = staged.addon_pages;
     let (vault, recovery) = staged.install(vault_path, new_passphrase)?;
     let library = match vault.library_key() {
         Err(error) => ImportedLibrary::NotOpened(StoreError::Io(std::io::Error::other(format!(
@@ -826,6 +1004,7 @@ pub fn commit(
         recovery,
         summary,
         library_included,
+        addon_pages,
         library,
     })
 }
@@ -893,7 +1072,7 @@ pub fn recover(store_path: &Path, library_key: &[u8; 32]) -> Result<(), Unfinish
             // marker go: `swapped` is the journal's claim, and a journal is
             // untrusted.
             Phase::Swapped => {
-                if !ours || !library_in_place(store_path, library_key) {
+                if !ours || !library_in_place(store_path, library_key, journal.old_addons.is_some()) {
                     return Err(Unfinished);
                 }
                 // As `finish` treats it: the right Library is in place, so a
@@ -918,7 +1097,7 @@ pub fn recover(store_path: &Path, library_key: &[u8; 32]) -> Result<(), Unfinish
 /// its records name is there, and they open under this Library's key. The
 /// last matters for a backup of this very profile: every id is the same, so
 /// the old pictures would all be "there" by name.
-fn library_in_place(store_path: &Path, library_key: &[u8; 32]) -> bool {
+fn library_in_place(store_path: &Path, library_key: &[u8; 32], addons_moved: bool) -> bool {
     // The Library file itself is a regular file, not a link: a link could
     // point into the staging folder that cleanup is about to delete.
     if !is_regular_file(store_path) {
@@ -928,8 +1107,21 @@ fn library_in_place(store_path: &Path, library_key: &[u8; 32]) -> bool {
     if present(&archive) && !is_real_dir(&archive) {
         return false;
     }
+    // And, when this import moved add-on data, every add-on index beside it
+    // opens under this Library's key: one left under the replaced Library's
+    // key would read as damaged. An import from before add-on data travelled
+    // (a 1.0.7 journal) moved none, so it is not held to that: whatever add-on
+    // data is there was never its to replace.
+    let addons = library_dir(store_path).join("addons");
+    if addons_moved && present(&addons) && !is_real_dir(&addons) {
+        return false;
+    }
     match Store::open(store_path, None, library_key) {
-        Ok(library) => library.pictures_missing() == 0 && library.pictures_open(),
+        Ok(library) => {
+            library.pictures_missing() == 0
+                && library.pictures_open()
+                && (!addons_moved || library.addon_indexes_open())
+        }
         Err(_) => false,
     }
 }
@@ -983,6 +1175,22 @@ pub fn discard(store_path: &Path) -> std::io::Result<()> {
     remove_journal(store_path)
 }
 
+/// After an import of an older backup (versions 1 and 2) has removed the
+/// Library: the add-on data beside it was under that Library's key, which
+/// nothing opens any more, and the add-on would read it as damaged. Moved
+/// aside first, so a folder that cannot be deleted at once is never taken
+/// for the new Library's; [`discard`] sweeps what is left.
+pub fn retire_addons(store_path: &Path) -> std::io::Result<()> {
+    let dir = library_dir(store_path);
+    if !present(&dir.join("addons")) {
+        return Ok(());
+    }
+    let aside = random_name(OLD_ADDONS_PREFIX);
+    fs::rename(dir.join("addons"), dir.join(&aside))?;
+    sync_dir(dir)?;
+    remove_folder(dir, &aside)
+}
+
 /// Moves the staged Library into place, idempotently: every step checks what
 /// is already done, so a crash between any two of them is finished here.
 fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Result<(), Unfinished> {
@@ -993,6 +1201,8 @@ fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Resul
     let staged_library = staging.join(file_name);
     let live_archive = dir.join("archive");
     let old_archive = dir.join(&journal.old_archive);
+    let staged_addons = staging.join("addons");
+    let live_addons = dir.join("addons");
 
     let moved = (|| -> std::io::Result<bool> {
         if !is_real_dir(&staging) {
@@ -1001,8 +1211,19 @@ fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Resul
         // Only a real folder and a regular file are ever moved into place: a
         // link would be followed by the store, outside the profile.
         if (present(&staged_archive) && !is_real_dir(&staged_archive))
+            || (present(&staged_addons) && !is_real_dir(&staged_addons))
             || (present(&staged_library) && !is_regular_file(&staged_library))
         {
+            return Ok(false);
+        }
+        // Staged add-on data with a journal that names no aside folder cannot
+        // have come from one import: never installed, never cleaned away.
+        if journal.old_addons.is_none() && present(&staged_addons) {
+            return Ok(false);
+        }
+        // Each add-on folder inside it, too: a link would survive the move
+        // and point at whatever the clean-up then deletes.
+        if is_real_dir(&staged_addons) && patanyx_store::addon_ids(&staging.join(file_name)).is_err() {
             return Ok(false);
         }
         if present(&staged_archive) {
@@ -1018,6 +1239,21 @@ fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Resul
             crash::point("staged-archive-in-next");
             fs::rename(&staged_archive, &live_archive)?;
         }
+        // The add-on folder, the same way. A journal from before add-on data
+        // travelled names no aside folder, and its import staged none.
+        if let Some(old_addons) = journal.old_addons.as_deref().map(|name| dir.join(name)) {
+            if present(&staged_addons) {
+                if present(&live_addons) {
+                    if present(&old_addons) {
+                        return Ok(false);
+                    }
+                    crash::point("live-addons-aside-next");
+                    fs::rename(&live_addons, &old_addons)?;
+                }
+                crash::point("staged-addons-in-next");
+                fs::rename(&staged_addons, &live_addons)?;
+            }
+        }
         if present(&staged_library) {
             crash::point("staged-library-in-next");
             fs::rename(&staged_library, store_path)?;
@@ -1032,7 +1268,7 @@ fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Resul
     // with this vault and every picture it names is there. Anything else (the
     // old Library because the staged file went missing, or pictures because
     // the staged folder did) is never declared done.
-    if !library_in_place(store_path, library_key) {
+    if !library_in_place(store_path, library_key, journal.old_addons.is_some()) {
         return Err(Unfinished);
     }
     let mut swapped = journal.clone();
@@ -1078,6 +1314,9 @@ fn clean_up(store_path: &Path, journal: &Journal) -> std::io::Result<()> {
     }
     let dir = library_dir(store_path);
     remove_folder(dir, &journal.old_archive)?;
+    if let Some(old_addons) = &journal.old_addons {
+        remove_folder(dir, old_addons)?;
+    }
     remove_folder(dir, &journal.staging)?;
     sweep_import_folders(dir)?;
     remove_journal_temps(store_path)?;
@@ -1091,7 +1330,10 @@ fn sweep_import_folders(dir: &Path) -> std::io::Result<()> {
             for entry in entries.flatten() {
                 let name = entry.file_name();
                 let Some(name) = name.to_str() else { continue };
-                if valid_name(name, STAGING_PREFIX) || valid_name(name, OLD_ARCHIVE_PREFIX) {
+                if valid_name(name, STAGING_PREFIX)
+                    || valid_name(name, OLD_ARCHIVE_PREFIX)
+                    || valid_name(name, OLD_ADDONS_PREFIX)
+                {
                     remove_folder(dir, name)?;
                 }
             }
@@ -1113,6 +1355,7 @@ fn replace_marker(store_path: &Path) -> PathBuf {
 
 const STAGING_PREFIX: &str = "library-staging-";
 const OLD_ARCHIVE_PREFIX: &str = "archive.old-";
+const OLD_ADDONS_PREFIX: &str = "addons.old-";
 const NAME_HEX: usize = 16;
 const MAX_JOURNAL_BYTES: u64 = 64 * 1024;
 
@@ -1133,6 +1376,11 @@ struct Journal {
     staging: String,
     /// The name the live picture folder is moved to during the swap.
     old_archive: String,
+    /// The name the live add-on folder is moved to during the swap. Absent
+    /// from a journal written before add-on data travelled (1.0.7), whose
+    /// import never moves the add-on folder.
+    #[serde(default)]
+    old_addons: Option<String>,
     /// Check value of the imported vault's Library key, from `staged` on.
     vault_check: Option<String>,
     /// The backup file, so an unfinished import can be named.
@@ -1154,6 +1402,7 @@ impl Journal {
         check_ok
             && valid_name(&self.staging, STAGING_PREFIX)
             && valid_name(&self.old_archive, OLD_ARCHIVE_PREFIX)
+            && self.old_addons.as_deref().is_none_or(|name| valid_name(name, OLD_ADDONS_PREFIX))
             && self.superseded.as_deref().is_none_or(|kept| unhex(kept).is_some())
     }
 }

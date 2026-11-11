@@ -54,6 +54,9 @@ const _: () = assert!(patanyx_integrity::MAX_INPUT_BYTES <= u32::MAX as usize);
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snippet {
     /// Plain text, original casing, no markup, no added ellipsis marks.
+    /// Named entities the page tokenizer leaves literal (`&middot;`,
+    /// `&mdash;`, ...) are decoded here, for display only: the search and the
+    /// digest still read the text exactly as the tokenizer produced it.
     pub text: String,
     /// Byte range of the matched query WITHIN `text` (char-boundary safe,
     /// case of the page, not of the query). The UI bolds this range by
@@ -251,6 +254,64 @@ pub fn find_snippets(visible_text: &str, query: &str) -> SnippetSet {
     set
 }
 
+/// Named entities common in page text that the page tokenizer
+/// (patanyx-integrity) leaves literal; it decodes only `&amp;`, `&lt;`,
+/// `&gt;`, `&quot;`, `&apos;`, `&nbsp;` and numeric references, and its
+/// output is digested and compared, so it is not widened. Excerpts showed
+/// `&middot;` as typed (VM pass, 2026-11-10). The semicolon is required, as
+/// in the tokenizer. A page whose text literally reads "&middot;" (written
+/// `&amp;middot;`) shows "·" here: display only, never the search.
+const DISPLAY_ENTITIES: [(&str, &str); 24] = [
+    ("&middot;", "\u{00B7}"),
+    ("&bull;", "\u{2022}"),
+    ("&mdash;", "\u{2014}"),
+    ("&ndash;", "\u{2013}"),
+    ("&hellip;", "\u{2026}"),
+    ("&lsquo;", "\u{2018}"),
+    ("&rsquo;", "\u{2019}"),
+    ("&ldquo;", "\u{201C}"),
+    ("&rdquo;", "\u{201D}"),
+    ("&laquo;", "\u{00AB}"),
+    ("&raquo;", "\u{00BB}"),
+    ("&copy;", "\u{00A9}"),
+    ("&reg;", "\u{00AE}"),
+    ("&trade;", "\u{2122}"),
+    ("&times;", "\u{00D7}"),
+    ("&deg;", "\u{00B0}"),
+    ("&euro;", "\u{20AC}"),
+    ("&pound;", "\u{00A3}"),
+    ("&yen;", "\u{00A5}"),
+    ("&cent;", "\u{00A2}"),
+    ("&sect;", "\u{00A7}"),
+    ("&para;", "\u{00B6}"),
+    ("&rarr;", "\u{2192}"),
+    ("&larr;", "\u{2190}"),
+];
+
+fn decode_display_entities(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp..];
+        match DISPLAY_ENTITIES.iter().find(|(name, _)| rest.starts_with(name)) {
+            Some((name, decoded)) => {
+                out.push_str(decoded);
+                rest = &rest[name.len()..];
+            }
+            None => {
+                out.push('&');
+                rest = &rest[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The window around one match, in the ORIGINAL text. Each edge targets
 /// `SNIPPET_CONTEXT_CHARS` chars of context and then snaps OUTWARD to a
 /// space when one lies within `WORD_SNAP_SLACK_CHARS`: a row that opens or
@@ -300,10 +361,17 @@ fn make_snippet(text: &str, match_start: usize, match_end: usize) -> Snippet {
             break;
         }
     }
+    // Decoded in three parts -- before, the match, after -- so the match
+    // range still names exactly the matched text. An entity cut by a part
+    // edge (a query matching "middot" inside "&middot;") stays literal.
+    let before = decode_display_entities(&text[start..match_start]);
+    let matched = decode_display_entities(&text[match_start..match_end]);
+    let after = decode_display_entities(&text[match_end..end]);
+    let (match_start, match_end) = (before.len(), before.len() + matched.len());
     Snippet {
-        text: text[start..end].to_string(),
-        match_start: match_start - start,
-        match_end: match_end - start,
+        text: before + &matched + &after,
+        match_start,
+        match_end,
         // The cut flags mean exactly "text was dropped on this side".
         cut_start: start > 0,
         cut_end: end < text.len(),
@@ -526,6 +594,32 @@ mod tests {
             .iter()
             .map(|s| &s.text[s.match_start..s.match_end])
             .collect()
+    }
+
+    /// Excerpts showed `&middot;` as typed (VM pass, 2026-11-10). Named
+    /// entities the tokenizer leaves literal are decoded for display, and
+    /// the match range still names exactly the matched text.
+    #[test]
+    fn excerpts_decode_named_entities_and_keep_the_match_range() {
+        let s = only_snippet("Home &middot; Prices &mdash; the needle &copy; 2026", "needle");
+        assert_eq!(s.text, "Home \u{00B7} Prices \u{2014} the needle \u{00A9} 2026");
+        assert_eq!(&s.text[s.match_start..s.match_end], "needle");
+
+        // A match inside the entity's own letters leaves it literal, so the
+        // bold range is still the letters that matched.
+        let s = only_snippet("a &middot; b", "middot");
+        assert_eq!(s.text, "a &middot; b");
+        assert_eq!(&s.text[s.match_start..s.match_end], "middot");
+
+        // An entity that is the match, whole, decodes inside the range.
+        let s = only_snippet("x &middot; y", "&middot;");
+        assert_eq!(s.text, "x \u{00B7} y");
+        assert_eq!(&s.text[s.match_start..s.match_end], "\u{00B7}");
+
+        // Unknown or unterminated entities stay as they are.
+        let s = only_snippet("&foo; and &middot no semicolon needle", "needle");
+        assert_eq!(s.text, "&foo; and &middot no semicolon needle");
+        assert_eq!(&s.text[s.match_start..s.match_end], "needle");
     }
 
     #[test]

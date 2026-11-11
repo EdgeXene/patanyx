@@ -42,6 +42,29 @@
 /// dependency set.
 mod about;
 mod activation;
+/// Fetching a signed add-on from the licence origin.
+mod addon_delivery;
+/// Whether the open add-on may write, against the live date.
+mod addon_entitlement;
+/// Exporting and deleting an add-on's saved pages, installed or not.
+mod addon_data;
+/// Installing, updating and removing an add-on, and opening it.
+mod addon_manager;
+#[cfg(debug_assertions)]
+mod addon_window_timing;
+/// A separately delivered add-on's window and channel.
+mod addon_host;
+/// Installing, opening and removing signed add-on code on disk.
+mod addon_install;
+mod addon_session;
+/// Right-click Send: the selection captured for an add-on.
+mod addon_selection;
+/// The add-on's storage worker.
+mod addon_storage;
+/// The add-on message protocol, host API 1.
+mod addon_protocol;
+#[cfg(test)]
+mod addon_testkit;
 mod adlist_consent;
 mod toplevel_request;
 /// Searching the personal archive: which archived pages answer a query, and
@@ -169,7 +192,22 @@ use state::AppState;
 /// separate thread on Windows: every closure sending these events captures
 /// only `EventLoopProxy` clones (`Send`) plus Copy data — keep it that way.
 enum UserEvent {
+    SendSelection(addon_selection::SelectionSource),
     Ipc(String),
+    /// A frame from the add-on window built at `generation`. Its own event,
+    /// so it can never reach `ipc::dispatch` (`addon_host::handle_ipc`).
+    AddonIpc { generation: u64, raw: String, #[cfg(debug_assertions)] received: std::time::Instant },
+    /// An add-on storage job finished on its worker (`addon_storage`).
+    AddonStorageDone { generation: u64, request_id: u32, outcome: Box<addon_storage::Outcome>, bytes: usize },
+    /// The save window of the add-on session ending at `generation` is over
+    /// (`addon_session`).
+    AddonFlushDeadline { generation: u64, flush_id: String },
+    /// A storage worker whose window had already gone has stopped.
+    AddonWorkerQuiet,
+    AddonManagerDone(Box<addon_manager::Completion>),
+    /// What the add-on panels show, read on a worker at start.
+    AddonViewRead(Box<addon_manager::ViewRead>),
+    AddonLayoutChanged,
     /// An encrypted export or a whole-Library import running on a worker:
     /// its progress is due, or its result is in the mailbox (`backup_job`).
     BackupJob(backup_job::Bell),
@@ -534,6 +572,7 @@ const CHROME_JS: &str = include_str!("chrome/chrome.js");
 /// because unlike chat these exist in every build.
 const INTEGRITY_JS: &str = include_str!("chrome/integrity.js");
 const UPDATE_JS: &str = include_str!("chrome/update.js");
+const ADDONS_JS: &str = include_str!("chrome/addons.js");
 
 /// Whether devtools may be attached to the privileged chrome webview.
 ///
@@ -888,6 +927,7 @@ fn serve_chrome(request: &http::Request<Vec<u8>>) -> http::Response<Cow<'static,
         "/chrome.css" => ("text/css; charset=utf-8", CHROME_CSS.as_bytes()),
         "/chrome.js" => ("text/javascript; charset=utf-8", CHROME_JS.as_bytes()),
         "/integrity.js" => ("text/javascript; charset=utf-8", INTEGRITY_JS.as_bytes()),
+        "/addons.js" => ("text/javascript; charset=utf-8", ADDONS_JS.as_bytes()),
         "/update.js" => ("text/javascript; charset=utf-8", UPDATE_JS.as_bytes()),
         _ => {
             return http::Response::builder()
@@ -1692,6 +1732,8 @@ fn main() {
     // measured from startup, not from the first event to arrive.
     let mut schedule = schedule::Schedule::new(std::time::Instant::now());
     let mut app = AppState::new(chrome, hosts, proxy.clone(), smoke_mode);
+    // The add-on panels' names, versions and hidden buttons, read off the loop.
+    addon_manager::load_view(&mut app);
     // The hosts an allowed tab must still refuse on WebKitGTK, worked out from
     // the list in force before anyone can tick the switch. Until it arrives
     // the switch says it is not ready rather than allowing without them.
@@ -1762,6 +1804,11 @@ fn main() {
     }
 
     platform::show_all(&app.hosts);
+    // No add-on window exists yet: earlier sessions' engine folders go.
+    addon_host::sweep_all_engine_dirs();
+    // Debug builds only: a test add-on for the real-engine isolation runs.
+    #[cfg(debug_assertions)]
+    addon_host::dev_open_from_env(&mut app);
 
     if smoke_mode {
         // chrome.js sends an IPC {cmd:"ping"} on load; if it has not arrived
@@ -1804,6 +1851,11 @@ fn main() {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         };
+        // An open add-on: the next UTC midnight, when a licence can end.
+        let scheduled = match (scheduled, addon_entitlement::deadline(&app)) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         // The vault deadline is now the WARNING first and the lock second, and
         // it is `None` when there is nothing pending -- no vault open, or the
         // user chose never. Asking the state for it keeps the timeout, the
@@ -1840,31 +1892,38 @@ fn main() {
             }
             Event::UserEvent(UserEvent::QuitForUpdate) => {
                 // The replacement is already running. Leaving this one open is
-                // what produced two browsers per click.
-                *control_flow = ControlFlow::Exit;
+                // what produced two browsers per click. An open add-on gets
+                // its 300 ms to save first; this event comes back after.
+                if addon_session::hold_quit(&mut app, true) {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             Event::UserEvent(UserEvent::QuitForRelaunch) => {
                 // Same reason, and the same exit: Exit unwinds the event loop,
                 // which drops AppState and with it the vault, so the key
                 // material is zeroized and the vault's file lock is released
                 // for the process already waiting at its unlock screen.
-                *control_flow = ControlFlow::Exit;
+                if addon_session::hold_quit(&mut app, false) {
+                    *control_flow = ControlFlow::Exit;
+                }
             }
             // A running backup is asked first: an export or an uncommitted
             // import is stopped and the window closes when it has (or after a
             // grace period); during an import's commit the close is held,
             // because closing then loses the one-time recovery key. A second
             // close always closes (`backup_job::hold_close`).
+            // Then an open add-on is given its 300 ms to save; the close
+            // comes back as `CloseWindow` when it has ended.
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                if backup_job::hold_close(&mut app) {
+                if backup_job::hold_close(&mut app) && addon_session::hold_close(&mut app) {
                     *control_flow = ControlFlow::Exit;
                 }
             }
             Event::UserEvent(UserEvent::CloseWindow) => {
-                if backup_job::hold_close(&mut app) {
+                if backup_job::hold_close(&mut app) && addon_session::hold_close(&mut app) {
                     *control_flow = ControlFlow::Exit;
                 }
             }
@@ -1901,6 +1960,30 @@ fn main() {
             // A key was pressed inside a page. The ONLY effect is to say a
             // human is here; see UserEvent::UserPresence.
             Event::UserEvent(UserEvent::UserPresence) => app.touch(),
+            Event::UserEvent(UserEvent::AddonIpc { generation, raw, #[cfg(debug_assertions)] received }) => {
+                #[cfg(debug_assertions)]
+                addon_window_timing::received(received);
+                addon_host::handle_ipc(&mut app, generation, &raw);
+                addon_manager::resume(&mut app);
+            }
+            Event::UserEvent(UserEvent::AddonStorageDone { generation, request_id, outcome, bytes }) => {
+                addon_host::storage_done(&mut app, generation, request_id, *outcome, bytes);
+                addon_manager::resume(&mut app);
+            }
+            Event::UserEvent(UserEvent::AddonFlushDeadline { generation, flush_id }) => {
+                addon_session::deadline(&mut app, generation, &flush_id);
+                addon_manager::resume(&mut app);
+            }
+            Event::UserEvent(UserEvent::AddonWorkerQuiet) => {
+                addon_session::worker_quiet(&mut app);
+                addon_manager::resume(&mut app);
+            }
+            Event::UserEvent(UserEvent::AddonManagerDone(done)) => addon_manager::complete(&mut app, *done),
+            Event::UserEvent(UserEvent::AddonViewRead(done)) => addon_manager::view_read(&mut app, *done),
+            Event::UserEvent(UserEvent::AddonLayoutChanged) => {
+                addon_host::apply(&app);
+                addon_host::notify_geometry(&app);
+            }
             Event::UserEvent(UserEvent::Ipc(body)) => {
                 // NOT touched here any more. Every frame used to count as
                 // presence, including the ones nobody sent: the Tab Activity
@@ -2241,6 +2324,7 @@ fn main() {
                     app.exit_page_fullscreen();
                 }
                 match action {
+                    Shortcut::ToggleAddon => addon_host::shortcut(&mut app),
                     shortcuts::Shortcut::ZoomIn => app.zoom_active(1),
                     shortcuts::Shortcut::ZoomOut => app.zoom_active(-1),
                     shortcuts::Shortcut::ZoomReset => app.zoom_active(0),
@@ -2323,6 +2407,9 @@ fn main() {
             // that already shows "locked" nothing it did not know.
             Event::UserEvent(UserEvent::ContextMenuAction { action, target }) => {
                 app.on_context_menu_action(action, target.as_deref());
+            }
+            Event::UserEvent(UserEvent::SendSelection(source)) => {
+                addon_selection::activate(&mut app, source);
             }
             Event::UserEvent(UserEvent::PdfSaved { path, success }) => {
                 app.on_pdf_saved(&path, success);
@@ -2451,6 +2538,9 @@ fn main() {
             Event::LoopDestroyed => {
                 // A stopped export gets a moment to remove its temporary file.
                 backup_job::on_exit(&mut app);
+                // Every exit asked the add-on first; this catches any that
+                // did not, without waiting.
+                addon_session::end_now(&mut app);
                 platform::clear_persisted_permissions(app.chrome());
                 // The kept profile is a second profile with its own stored
                 // decisions (kept_profile.rs): a kept tab reaches it.
@@ -2471,6 +2561,15 @@ fn main() {
             }
             _ => {}
         }
+        // The active tab's site, when it changed (navigation, switch, close),
+        // and the browser's theme once a window is ready.
+        addon_host::site_check(&app);
+        addon_host::theme_check(&app);
+        // Live Premium for an open add-on window, after every event: a
+        // licence can end, an activation answer can land, the machine can
+        // wake from sleep.
+        addon_entitlement::recheck(&mut app);
+        addon_selection::sync_menu(&app);
     });
 }
 

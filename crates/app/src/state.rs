@@ -140,6 +140,53 @@ pub fn is_allowed_content_url(url: &str) -> bool {
 /// Both of those are false-ALLOW directions, which is why they are handled
 /// here rather than left to fail closed.
 pub(crate) fn host_of(url: &str) -> Option<String> {
+    page_host(url).map(|(_, host, _)| host)
+}
+
+/// `host_of`, for an https page only. Saved passwords are filled on nothing
+/// else: a credential is stored as a bare host, and one saved over https must
+/// never reach the plain-http page of the same name, whose content anyone on
+/// the network can write (finding S-0a47ea9404bd). Same normalisation as
+/// `host_of`, because it is the same parse.
+pub(crate) fn secure_host_of(url: &str) -> Option<String> {
+    secure_page_of(url).map(|page| page.host)
+}
+
+/// An https page's host, and its port when that is not 443.
+pub(crate) struct SecurePage {
+    pub(crate) host: String,
+    /// `None` on the default port (none written, an empty one, or 443).
+    /// Anything else, including a port that does not parse, is `Some`: a
+    /// port this side cannot read must never count as the default one.
+    pub(crate) other_port: Option<String>,
+}
+
+impl SecurePage {
+    /// The page as the user should see it named: the host, plus the port when
+    /// it is not the default one (lowercased, like the host; tab URLs come from
+    /// the engine, whose ports are always numbers).
+    pub(crate) fn label(&self) -> String {
+        match &self.other_port {
+            Some(port) => format!("{}:{}", self.host, port),
+            None => self.host.clone(),
+        }
+    }
+}
+
+/// `secure_host_of`, keeping the port. Saved credentials are stored as a bare
+/// host, so a password saved for `login.example.com` must not count as saved
+/// for `login.example.com:8443`, which can be a different service on the
+/// same name (secscan recheck of S-0a47ea9404bd, 2026-11-10).
+pub(crate) fn secure_page_of(url: &str) -> Option<SecurePage> {
+    match page_host(url) {
+        Some((true, host, other_port)) => Some(SecurePage { host, other_port }),
+        _ => None,
+    }
+}
+
+/// The body of `host_of`, also saying whether the page is https and, when
+/// the port is not the scheme's default, what it is.
+fn page_host(url: &str) -> Option<(bool, String, Option<String>)> {
     // Tab, LF and CR are stripped because the engines strip them. The REST of the
     // C0 range and DEL are stripped for a different reason: they are not legal in a
     // host at all, so an engine either rejects the URL or drops them, and either way
@@ -148,9 +195,10 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
     // direction -- it can only cause a DENY.
     let cleaned: String = url.chars().filter(|c| !c.is_ascii_control()).collect();
     let lower = cleaned.to_ascii_lowercase();
-    let rest = lower
-        .strip_prefix("http://")
-        .or_else(|| lower.strip_prefix("https://"))?;
+    let (secure, rest) = match lower.strip_prefix("https://") {
+        Some(rest) => (true, rest),
+        None => (false, lower.strip_prefix("http://")?),
+    };
     let authority = rest.split(['/', '?', '#', '\\']).next().unwrap_or("");
     // The LAST '@' separates userinfo from host: userinfo may itself contain
     // an encoded '@', and taking the first one would read the attacker's half.
@@ -160,9 +208,38 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
     };
     // An IPv6 literal keeps its brackets and its colons; the port, if any,
     // follows the closing bracket.
-    let host = match host_port.find(']') {
-        Some(end) => &host_port[..=end],
-        None => host_port.split(':').next().unwrap_or(""),
+    let (host, port) = match host_port.find(']') {
+        Some(end) => {
+            let after = &host_port[end + 1..];
+            // Anything after the bracket that is not ":port" is kept as the
+            // "port", so it reads as non-default rather than as no port.
+            let port = match after.strip_prefix(':') {
+                Some(port) => Some(port),
+                None if after.is_empty() => None,
+                None => Some(after),
+            };
+            (&host_port[..=end], port)
+        }
+        None => match host_port.split_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (host_port, None),
+        },
+    };
+    // The default port is the one the scheme implies: none, an empty one, or
+    // the number itself. Anything else -- another number, or text that does
+    // not parse -- is reported, so a caller that cares treats it as another
+    // service on the same name.
+    let default_port: u16 = if secure { 443 } else { 80 };
+    let other_port = match port {
+        None | Some("") => None,
+        // Leading zeros are the same number (`:000443` is 443).
+        Some(port)
+            if port.bytes().all(|b| b.is_ascii_digit())
+                && port.trim_start_matches('0').parse::<u16>().ok() == Some(default_port) =>
+        {
+            None
+        }
+        Some(port) => Some(port.to_string()),
     };
     // A TRAILING DOT NAMES THE SAME HOST. `rbchrome.localhost.` is the
     // root-anchored spelling of `rbchrome.localhost` and the engines resolve it to
@@ -181,7 +258,7 @@ pub(crate) fn host_of(url: &str) -> Option<String> {
     if host.is_empty() {
         None
     } else {
-        Some(host.to_string())
+        Some((secure, host.to_string(), other_port))
     }
 }
 
@@ -1189,6 +1266,9 @@ pub struct Tab {
 }
 
 impl Tab {
+    pub(crate) fn selection_capture(&self) -> crate::addon_selection::SharedCapture {
+        self.view.selection.clone()
+    }
     /// Release a first navigation held behind the startup profile wipe.
     ///
     /// The URL is read at release time. If the publisher typed a different
@@ -2189,6 +2269,8 @@ fn build_tab_as(
             adopt.is_some(),
         )?;
     *new_tab_gate.borrow_mut() = Some(platform::new_tab_gate(&view));
+    // A new tab's webview is created on top; lift the add-on back above it.
+    platform::raise_addon(hosts);
     // The engine zooms on keys this process never sees; this is how the
     // indicator learns about it.
     platform::connect_zoom_changed(&webview, proxy, id);
@@ -2459,16 +2541,25 @@ fn check_download_file_in(dir: &Path, filename: &str, sha256: &[u8; 32]) -> File
     }
 }
 
-/// The two places keyboard focus can usefully be. The chrome is ONE webview
+/// The surfaces where keyboard focus can be. The chrome is one webview
 /// holding the address bar, the find bar and every panel field; the page is
 /// whichever content webview belongs to the active tab.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FocusSurface {
     Chrome,
     Content,
+    Addon,
+}
+
+/// The native surfaces that may keep the next keystroke during a tab change.
+pub(crate) fn tab_focus(current: FocusSurface, before: FocusSurface, modal: bool, addon: bool) -> FocusSurface {
+    if modal { FocusSurface::Chrome }
+    else if addon && (current == FocusSurface::Addon || (current == FocusSurface::Chrome && before == FocusSurface::Addon)) { FocusSurface::Addon }
+    else { FocusSurface::Content }
 }
 
 pub struct AppState {
+    pub(crate) addon_selection: crate::addon_selection::SelectionState,
     /// The string catalog. English-only until the locale setting exists;
     /// lives here because resolution is per-call on the UI thread and a
     /// locale change must repaint everything (see i18n.rs on why there is
@@ -2487,6 +2578,25 @@ pub struct AppState {
     /// The hidden translator webview, built on first use and kept afterwards.
     /// `None` until somebody translates something; see `translator()`.
     translator: Option<WebView>,
+    /// The open add-on window, if any (`addon_host`).
+    pub addon: Option<crate::addon_host::AddonSession>,
+    pub(crate) addon_manager: crate::addon_manager::Manager,
+    addon_focus_after_modal: std::cell::Cell<bool>,
+    /// The page had the keyboard when a modal covered the window: it gets it
+    /// back when the window is a strip again.
+    content_focus_after_modal: std::cell::Cell<bool>,
+    pub addon_geometry: std::cell::RefCell<std::collections::BTreeMap<String, crate::addon_host::WindowMemory>>,
+    /// The last add-on window generation handed out; every window gets a
+    /// new one, and frames from older windows are ignored.
+    addon_generation: u64,
+    /// Storage workers of add-on windows already gone, until each stops
+    /// (`addon_session::quiescent`).
+    pub addon_draining: Vec<std::sync::Arc<()>>,
+    /// Whether this process has already tried to renew the Library's data
+    /// key at an unlock (`renew_library_key`): one try per run, so a disk that
+    /// is full does not cost a re-key at every unlock. A passphrase change
+    /// tries regardless.
+    pub library_rekey_tried: bool,
     /// Live while a translation is in flight. Dropping it stops the poll
     /// thread, which is what keeps an idle browser from ticking.
     translate_polling: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
@@ -3064,8 +3174,17 @@ impl AppState {
                 }
             },
             locale_generation: 1,
+            addon_selection: crate::addon_selection::SelectionState::default(),
             translation_seq: 0,
             translator: None,
+            addon: None,
+            addon_manager: crate::addon_manager::Manager::default(),
+            addon_focus_after_modal: std::cell::Cell::new(false),
+            content_focus_after_modal: std::cell::Cell::new(false),
+            addon_geometry: std::cell::RefCell::new(crate::prefs::load().addon_windows),
+            addon_generation: 0,
+            addon_draining: Vec::new(),
+            library_rekey_tried: false,
             translate_polling: None,
             #[cfg(debug_assertions)]
             last_extracted: Vec::new(),
@@ -3273,9 +3392,17 @@ impl AppState {
         // that restores the window (restore_focus).
         let page_had_it = match self.focus_intent.get() {
             FocusSurface::Content => true,
+            FocusSurface::Addon => false,
             FocusSurface::Chrome => self.focus_before.get() == FocusSurface::Content,
         };
+        let addon_had_it = self.focus_intent.get() == FocusSurface::Addon
+            || (self.focus_intent.get() == FocusSurface::Chrome && self.focus_before.get() == FocusSurface::Addon);
         platform::window_control(&self.hosts, action)?;
+        if addon_had_it && !self.modal_covers_window() {
+            if action == crate::window_frame::WindowAction::Minimize {
+                self.focus_intent.set(FocusSurface::Addon);
+            } else { crate::addon_host::focus(self); }
+        }
         if page_had_it && !self.modal_covers_window() {
             if action == crate::window_frame::WindowAction::Minimize {
                 self.focus_intent.set(FocusSurface::Content);
@@ -3351,6 +3478,10 @@ impl AppState {
         // spin the event loop. The commit is bounded; the idle lock comes
         // back with the imported vault's session.
         if crate::backup_job::committing(self) {
+            return None;
+        }
+        // Likewise while a lock waits up to 300 ms for an add-on's last save.
+        if crate::addon_session::lock_pending(self) {
             return None;
         }
         let after = self.autolock_after()?;
@@ -3607,6 +3738,8 @@ impl AppState {
             if idle < after {
                 let seconds = (after - idle).as_secs().max(1);
                 self.emit("vault_lock_warning", json!({ "seconds": seconds }));
+                // An open add-on saves early on the same warning.
+                crate::addon_host::emit(self, "vault_lock_warning", json!({ "seconds": seconds }));
             }
         }
 
@@ -3651,6 +3784,8 @@ impl AppState {
         if let Some(id) = self.page_fullscreen {
             if let Some(tab) = self.tabs.iter().find(|t| t.id == id) {
                 platform::layout_fullscreen(&self.hosts, &self.chrome, &tab.webview);
+                crate::addon_host::apply(self);
+                crate::addon_host::notify_geometry(self);
                 return;
             }
         }
@@ -3708,6 +3843,8 @@ impl AppState {
             self.chrome_right,
             self.chrome_arrangement,
         );
+        crate::addon_host::apply(self);
+        crate::addon_host::notify_geometry(self);
     }
 
     /// Cover the window with the chrome, or give it back to the page.
@@ -3725,6 +3862,19 @@ impl AppState {
         }
         // A modal must never open behind a fullscreen page.
         if matches!(next, platform::ChromeLayout::Overlay) {
+            self.addon_focus_after_modal.set(self.focus_intent.get() == FocusSurface::Addon
+                || self.focus_before.get() == FocusSurface::Addon);
+            // A page under a modal gets a zero rect and loses the keyboard; the
+            // add-on window is only hidden, and would keep it. The modal takes
+            // it here from either; going back to the strip gives it back
+            // (below). Taking it only from the add-on left a panel opened by a
+            // shortcut from the page (F9 for Reader View) with the keyboard
+            // nowhere: F9 again and Escape did nothing until a click (Windows
+            // VM, 2026-10-22).
+            self.content_focus_after_modal.set(self.focus_intent.get() == FocusSurface::Content);
+            if self.focus_intent.get() != FocusSurface::Chrome {
+                self.focus_chrome();
+            }
             self.exit_page_fullscreen();
         }
         // The docked chat pane and Side by Side do not share the window:
@@ -3765,6 +3915,14 @@ impl AppState {
             platform::set_chrome_height(&self.hosts, self.chrome_height);
         }
         self.relayout();
+        if matches!(next, platform::ChromeLayout::Strip) {
+            let page = self.content_focus_after_modal.replace(false);
+            if self.addon_focus_after_modal.replace(false) {
+                crate::addon_host::focus(self);
+            } else if page {
+                self.focus_active_content();
+            }
+        }
     }
 
     /// Whether a docked pane is currently laid out.
@@ -3870,6 +4028,11 @@ impl AppState {
             platform::set_page_scrollbar(&tab.webview, &tab.view, palette.scrollbar);
         }
         caption_tinted
+    }
+
+    /// The colours the chrome last reported (or prefs held at launch).
+    pub(crate) fn chrome_palette(&self) -> platform::ChromePalette {
+        self.chrome_palette
     }
 
     /// The deferred half of the maximize/restore re-apply (see `relayout`):
@@ -4485,7 +4648,7 @@ impl AppState {
     /// from a page (see `focus_url_bar`), so any path that wants a chrome field
     /// to receive typing after a page had it goes through here first.
     pub fn focus_chrome(&self) {
-        self.focus_intent.set(FocusSurface::Chrome);
+        self.note_focus(FocusSurface::Chrome);
         let _ = self.chrome.focus();
     }
 
@@ -4501,10 +4664,14 @@ impl AppState {
         platform::show_tab(&tab.view, &tab.webview);
         if self.modal_covers_window() {
             self.focus_chrome();
+        } else if tab_focus(self.focus_intent.get(), self.focus_before.get(), false, self.addon.is_some()) == FocusSurface::Addon && crate::addon_host::focus(self) {
+            // A tab change leaves the editor's caret where the person put it.
         } else {
             self.focus_intent.set(FocusSurface::Content);
             platform::focus_content(&tab.webview);
         }
+        // A shown tab must not bury the add-on window.
+        platform::raise_addon(&self.hosts);
     }
 
     /// A modal panel (the vault, the library, ...) covers the window.
@@ -4515,10 +4682,29 @@ impl AppState {
         )
     }
 
+    /// An explicit manager Open dismisses the Vault and focuses the new view
+    /// after the chrome has actually removed its modal arrangement.
+    pub fn reveal_addon(&self) {
+        self.addon_focus_after_modal.set(true);
+        self.emit("addon_manager_opened", json!({}));
+    }
+
+    /// The add-on hides while a modal covers the window.
+    pub fn addon_hidden_by_modal(&self) -> bool {
+        self.modal_covers_window()
+    }
+
+    /// A new add-on window generation.
+    pub fn next_addon_generation(&mut self) -> u64 {
+        self.addon_generation += 1;
+        self.addon_generation
+    }
+
     /// Record where the user put the keyboard, as reported by the platform
     /// (a click into the page or into the chrome). Our own focus calls set the
     /// intent directly; this is how a CLICK is heard.
     pub fn note_focus(&self, surface: FocusSurface) {
+        if surface == self.focus_intent.get() || (surface == FocusSurface::Addon && self.addon.is_none()) { return; }
         self.focus_before.set(self.focus_intent.get());
         self.focus_intent.set(surface);
     }
@@ -4539,6 +4725,8 @@ impl AppState {
     #[cfg_attr(not(windows), allow(dead_code))]
     pub fn restore_focus(&self) {
         match self.focus_intent.get() {
+            FocusSurface::Addon if !self.modal_covers_window() && crate::addon_host::focus(self) => {}
+            FocusSurface::Addon => self.focus_chrome(),
             FocusSurface::Chrome => {
                 let _ = self.chrome.focus();
                 self.emit("focus_restore", json!({}));
@@ -4583,8 +4771,14 @@ impl AppState {
     /// Ctrl+T path never focused it at all. A tab opened on a real URL keeps
     /// focus on the page, as every browser does; a background tab changes
     /// nothing.
+    ///
+    /// EVEN WHEN THE ADD-ON HAD THE KEYBOARD. It used to keep it here, so the
+    /// address someone typed for the new tab went into their add-on page and
+    /// was saved there (add-on hand test 2026-10-21, H-09). A switch to a tab
+    /// that shows a page still leaves the add-on its keyboard
+    /// (`show_and_focus_tab`); a blank tab has only the bar to type into.
     fn focus_url_bar_for_blank_tab(&self, switch: bool, url: &str) {
-        if switch && url == "about:blank" {
+        if switch && url == "about:blank" && !self.modal_covers_window() {
             self.focus_url_bar();
         }
     }
@@ -7400,11 +7594,18 @@ impl AppState {
     /// second copy is what let the auto-lock and the explicit lock drift
     /// apart once already.
     pub fn lock_vault(&mut self) {
+        crate::addon_manager::cancel(self);
+        crate::addon_manager::resume(self);
         // A running backup is asked first: an export, or an import that has
         // not committed, is stopped and the lock goes ahead now. An import's
         // commit cannot be stopped; the lock then waits for its result
         // (`backup_job::on_lock`).
         if !crate::backup_job::on_lock(self) {
+            return;
+        }
+        // Then an open add-on is given its 300 ms to save; the lock comes
+        // back here when it has ended (`addon_session`).
+        if !crate::addon_session::on_lock(self) {
             return;
         }
         self.vault = None; // dropping Vault zeroizes key material
@@ -7420,6 +7621,7 @@ impl AppState {
     /// not emit `vault_locked`, because the chrome is showing the new recovery
     /// key at that moment.
     pub fn end_vault_session(&mut self) {
+        crate::addon_manager::cancel(self);
         // FIRST: pending comparisons and snapshot drafts carry text read out
         // of the ending vault's Library, and a late answer must not land in a
         // different profile. (Reads no vault state, so it is safe after the
@@ -7492,6 +7694,17 @@ impl AppState {
     /// reads, decrypts or checks the Library itself.
     pub fn attach_imported_library(&mut self, library: crate::vault_backup::ImportedLibrary) {
         use crate::vault_backup::ImportedLibrary;
+        // A key renewal that never finished on the Library this import
+        // replaced left a journal: resolved here, against the imported
+        // Library (which it does not match, so only the renewal's own folders
+        // go), so it cannot later be taken for one on the new Library.
+        if patanyx_store::rekey_journal_exists(&self.store_path) {
+            if let Some(Ok(library_key)) = self.vault.as_ref().map(Vault::library_key) {
+                if let Err(error) = patanyx_store::recover_rekey(&self.store_path, &library_key) {
+                    eprintln!("patanyx library: a stale key renewal could not be cleared: {error}");
+                }
+            }
+        }
         match library {
             ImportedLibrary::Unfinished => {
                 self.store = None;
@@ -7583,6 +7796,31 @@ impl AppState {
             }
             let _ = std::fs::remove_file(&marker);
         }
+        // A re-key of the Library that did not finish comes next: AFTER the
+        // import's recovery and its replace marker (an import can replace the
+        // Library while a re-key journal is present, and a marker keeps a
+        // previous profile's Library detached, journal or not), and before
+        // any Library is opened. Its own table decides finish, undo or
+        // discard (`recover_rekey`).
+        if patanyx_store::rekey_journal_exists(&self.store_path) {
+            let Some(Ok(library_key)) = self.vault.as_ref().map(Vault::library_key) else {
+                return;
+            };
+            if let Err(code) = self.hold_library_lock("library_in_use") {
+                self.store = None;
+                self.store_error = Some(code);
+                return;
+            }
+            if let Err(error) = patanyx_store::recover_rekey(&self.store_path, &library_key) {
+                eprintln!("patanyx library: an unfinished key renewal could not be resolved: {error}");
+                // The Library's own error, not "lock and unlock again": the
+                // next unlock would meet the same journal or the same file,
+                // so nothing here promises a fix it cannot make.
+                self.store = None;
+                self.store_error = Some(crate::ipc::store_code(error));
+                return;
+            }
+        }
         let library_key = match self.vault.as_ref().map(Vault::library_key) {
             Some(Ok(key)) => key,
             Some(Err(_)) => {
@@ -7627,6 +7865,60 @@ impl AppState {
         self.after_store_opened();
     }
 
+    /// Closes the Library and records why it stays shut.
+    pub(crate) fn keep_library_shut(&mut self, code: &'static str) {
+        self.store = None;
+        self.store_error = Some(code);
+    }
+
+    /// Renews the Library's data key if it is still the one its version 1
+    /// file derived from a passphrase (secscan S-1a563619ce84,
+    /// `Store::rekey`), once per run and only while no add-on window or
+    /// worker holds a key derived from it; and retries the retirement of
+    /// leftovers made under a key already retired. A re-key that does not
+    /// finish cleanly leaves the Library as it was and is tried again at a
+    /// later unlock; one that leaves it neither finished nor undone keeps it
+    /// shut until the next unlock resolves it.
+    fn renew_library_key(&mut self) {
+        let Some(Ok(library_key)) = self.vault.as_ref().map(Vault::library_key) else {
+            return;
+        };
+        // Through the write accessor, so nothing here runs under an import.
+        let needs = match self.store_for_write() {
+            Ok(store) => {
+                if store.retire_old_key_leftovers(&library_key).is_err() {
+                    eprintln!("patanyx library: leftovers under a retired key remain; retried next unlock");
+                }
+                store.needs_rekey()
+            }
+            Err(_) => false,
+        };
+        if !needs || self.library_rekey_tried || !crate::addon_session::quiescent(self) {
+            return;
+        }
+        self.library_rekey_tried = true;
+        let Ok(store) = self.store_for_write() else {
+            return;
+        };
+        match store.rekey(&library_key, env!("CARGO_PKG_VERSION")) {
+            Ok(report) => eprintln!(
+                "patanyx library: data key renewed ({} pictures, {} add-on files; left out as damaged: {} and {})",
+                report.pictures, report.addon_files, report.pictures_left_out, report.addon_files_left_out
+            ),
+            Err(patanyx_store::RekeyError::Undone(error)) => {
+                eprintln!("patanyx library: key renewal undone, tried again at the next run's unlock: {error}")
+            }
+            Err(patanyx_store::RekeyError::Paused) => {
+                eprintln!("patanyx library: key renewal paused for this build after unfinished attempts")
+            }
+            Err(patanyx_store::RekeyError::Unfinished(error)) => {
+                eprintln!("patanyx library: key renewal unfinished, Library kept shut: {error}");
+                self.store = None;
+                self.store_error = Some("library_rekey_unfinished");
+            }
+        }
+    }
+
     /// Takes the Library lock for this process unless it already holds it
     /// (`take_library_lock`); `busy` is the refusal when another PATANYX
     /// process holds it. True when this call is what took it.
@@ -7650,6 +7942,7 @@ impl AppState {
     }
 
     fn after_store_opened(&mut self) {
+        self.renew_library_key();
         // Per-site divergence choices live in the store, and the script that
         // needs them is built by platform code with no AppState in reach, so
         // the table is snapshotted into a process-level cache here.
@@ -7896,6 +8189,9 @@ impl AppState {
     fn set_active_inner(&mut self, index: usize, focus: bool) {
         if index >= self.tabs.len() || index == self.active {
             return;
+        }
+        for tab in &self.tabs {
+            tab.selection_capture().borrow_mut().invalidate();
         }
         // Showing another page ends fullscreen first: the window must not
         // stay fullscreen around a page that never asked for it. Switching TO
@@ -9307,6 +9603,26 @@ mod tests {
     };
     use std::path::{Path, PathBuf};
 
+    /// An import's recovery and its replace marker come before a re-key's
+    /// recovery (an import can replace the Library while a re-key journal is
+    /// present), and all of them before the Library is opened (plan review,
+    /// finding 3; Part 2 review, R-005). Checked in the source because an
+    /// AppState cannot be built in a unit test.
+    #[test]
+    fn open_store_resolves_an_import_then_a_rekey_then_opens() {
+        let source = include_str!("state.rs");
+        let start = source
+            .find("pub fn open_store(&mut self, passphrase: Option<&str>) {")
+            .expect("open_store moved");
+        let end = start + source[start..].find("\n    }\n").expect("open_store has no end");
+        let body = &source[start..end];
+        let import = body.find("crate::vault_backup::recover(").expect("the import recovery moved");
+        let marker = body.find("self.detach_store_unreplaced();").expect("the replace marker moved");
+        let rekey = body.find("patanyx_store::recover_rekey(").expect("the re-key recovery moved");
+        let open = body.find("Store::open(").expect("the open moved");
+        assert!(import < marker && marker < rekey && rekey < open, "open_store's order changed");
+    }
+
     /// `lock_vault` is still the one place the vault locks, and everything it
     /// ends now lives in `end_vault_session`, which an import over a live vault
     /// reuses without announcing a lock. Checked in the source because an
@@ -9372,6 +9688,22 @@ mod tests {
         );
     }
 
+    /// A modal takes the keyboard from the page as well as from the add-on,
+    /// and gives the page its keyboard back when it closes (Reader View by
+    /// F9: F9 again and Escape did nothing, 2026-10-22).
+    #[test]
+    fn a_modal_takes_the_keyboard_from_the_page_and_gives_it_back() {
+        let body = body_of(include_str!("state.rs"), "pub fn set_chrome_arrangement(");
+        let take = body
+            .find("if self.focus_intent.get() != FocusSurface::Chrome {\n                self.focus_chrome();")
+            .expect("a modal no longer takes the keyboard from the page");
+        let noted = body
+            .find("self.content_focus_after_modal.set(self.focus_intent.get() == FocusSurface::Content);")
+            .expect("the page's keyboard is no longer remembered");
+        assert!(noted < take, "the page must be remembered before the chrome takes the keyboard");
+        assert!(body.contains("} else if page {\n                self.focus_active_content();"));
+    }
+
     // ---- "Allow ads and trackers on this tab", pinned in the source ------
     //
     // AppState and the engine handlers cannot be built in a unit test, so the
@@ -9408,6 +9740,21 @@ mod tests {
     const STATE: &str = include_str!("state.rs");
     const MAIN: &str = include_str!("main.rs");
     const IPC: &str = include_str!("ipc.rs");
+
+    /// The right-click menu converts through the window the controller's
+    /// bounds are relative to. A child webview sits in its own container below
+    /// the toolbar; the main window put every menu one toolbar-height too high
+    /// (add-on hand test 2026-10-21, H-03).
+    #[test]
+    fn windows_menu_point_converts_through_the_controllers_own_parent() {
+        let body = body_of(WINDOWS, "fn menu_screen_point(");
+        assert!(body.contains("controller.ParentWindow(&mut host)"), "menu point no longer asks the controller for its parent");
+        assert!(body.contains("ClientToScreen(host, &mut origin)"), "menu point converts through some other window");
+        assert!(!body.contains("ClientToScreen(parent,"), "menu point converts through the main window again");
+        for term in ["x: origin.x + bounds.left + (f64::from(css.x) * scale) as i32", "y: origin.y + bounds.top + (f64::from(css.y) * scale) as i32"] {
+            assert!(body.contains(term), "menu point no longer adds the click to the converted origin: {term}");
+        }
+    }
 
     /// Both engines put the allowance over whatever policy they are given.
     /// A backend that wrote the given policy straight into the tab would let

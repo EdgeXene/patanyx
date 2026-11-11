@@ -545,6 +545,8 @@ pub mod menu_compose {
     /// One row of the menu before a platform gives it a widget or a Win32 id.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Entry {
+        /// Label and receiver come from addon_selection's runtime seam.
+        SendSelection,
         /// A `menu_ids` value; a chosen one goes to state.rs, the single
         /// interpreter of menu ids.
         Action(u32),
@@ -648,6 +650,14 @@ pub mod menu_compose {
                 entries.push(Entry::Separator);
             }
             entries.extend(section);
+        }
+        entries
+    }
+
+    pub fn with_selection(mut entries: Vec<Entry>, ready: bool) -> Vec<Entry> {
+        if ready {
+            entries.push(Entry::Separator);
+            entries.push(Entry::SendSelection);
         }
         entries
     }
@@ -1147,6 +1157,43 @@ pub const TRANSLATE_ORIGIN_PREFIX: &str = "rbtranslate://";
 /// See the unix arm.
 #[cfg(windows)]
 pub const TRANSLATE_ORIGIN_PREFIX: &str = "http://rbtranslate.localhost/";
+
+/// An add-on's own scheme, origin and document, per add-on id: its own
+/// origin, like the translator's, never the chrome's. The id is validated
+/// (lowercase letters, digits and single hyphens) before it reaches here.
+pub fn addon_scheme(id: &str) -> String {
+    format!("rbaddon-{id}")
+}
+#[cfg(unix)]
+pub fn addon_origin_prefix(id: &str) -> String {
+    // The host too: the scheme alone would let the add-on navigate to any
+    // other authority under it.
+    format!("rbaddon-{id}://localhost/")
+}
+/// See the unix arm; wry rewrites custom schemes on WebView2.
+#[cfg(windows)]
+pub fn addon_origin_prefix(id: &str) -> String {
+    format!("http://rbaddon-{id}.localhost/")
+}
+#[cfg(unix)]
+pub fn addon_url(id: &str) -> String {
+    format!("rbaddon-{id}://localhost/index.html")
+}
+#[cfg(windows)]
+pub fn addon_url(id: &str) -> String {
+    format!("http://rbaddon-{id}.localhost/index.html")
+}
+
+/// Where an add-on's engine data lives: beside the translator's, one folder
+/// per add-on, with one subfolder per session that the host removes when the
+/// session ends.
+pub fn addon_profile_dir_for(vault_path: &Path, id: &str) -> PathBuf {
+    vault_path
+        .parent()
+        .map_or_else(|| PathBuf::from("."), Path::to_path_buf)
+        .join("addon-data")
+        .join(id)
+}
 
 /// Exact navigation allowlist prefix for the chrome webview. This must
 /// match the platform's origin form precisely — anything looser (e.g. "any
@@ -3099,4 +3146,9 @@ mod profile_path_tests {
     fn a_path_with_no_file_name_yields_nothing_to_report() {
         assert!(stray_profile_dir(Path::new("..")).is_none());
     }
+}
+
+/// Page-relative logical geometry, shared with the native placement test.
+pub fn addon_window_rect(area: (f64, f64), rect: (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    (area.0 + rect.0, area.1 + rect.1, rect.2, rect.3)
 }

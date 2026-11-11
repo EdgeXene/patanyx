@@ -194,6 +194,14 @@ const REASON_CASES = [
     mustNot: /unlock the vault/i,
     why: "the only reason that may assert a search happened and found nothing",
   },
+  {
+    // Saved passwords fill on https pages only (finding S-0a47ea9404bd).
+    reason: "not-secure",
+    must: /secure \(https\) pages/i,
+    mustNot: /unlock the vault|no saved password for this site/i,
+    why: "on a plain-http page nothing is filled, so the user is told why " +
+      "instead of being sent to unlock a vault that would not help",
+  },
 ];
 
 for (const c of REASON_CASES) {
@@ -1147,6 +1155,271 @@ check(
       "the fetched status carried a pending_save; the banner must be showing",
     );
     delete global.rbResolve["tab_status"];
+  },
+);
+
+// Finding S-0a47ea9404bd, the subdomain half. A password saved on another
+// host of this site is offered, but the offer names that host and the fill
+// waits for the user to confirm it; the host refuses a sibling fill that does
+// not carry the confirmed host (ipc.rs `fill_allowed`).
+check(
+  "a sibling offer names the saved host and fills only after confirmation",
+  async () => {
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    const offer = {
+      id: "cred-sib",
+      username: "alice",
+      origin: "login.example.com",
+      sibling: true,
+    };
+    global.rbResolve["cred_autofill_offer_get"] = { items: [offer], reason: "match" };
+    global.rbResolve["cred_autofill_fill"] = {};
+    statusEvent("usercontent.example.com", { content_script_registered: "applied" });
+    await flush();
+    const desc = global.$("tab-autofill-desc");
+    const btn = global.$("btn-autofill-fill");
+    assert(
+      /login\.example\.com/.test(desc.textContent) &&
+        /login\.example\.com/.test(btn.textContent) &&
+        /login\.example\.com/.test(global.$("btn-fill").title),
+      "a sibling offer must name the host the password was saved on, on the " +
+        "panel and the toolbar; shown " +
+        JSON.stringify([desc.textContent, btn.textContent, global.$("btn-fill").title]),
+    );
+    const fills = () => global.rbCalls.filter((c) => c.cmd === "cred_autofill_fill");
+    const before = fills().length;
+
+    btn._fire("click");
+    await flush();
+    assert(global.$("confirm-overlay").hidden === false, "no confirmation was asked");
+    assert(
+      /login\.example\.com/.test(global.$("confirm-text").textContent),
+      "the confirmation must name the saved host",
+    );
+    assert(fills().length === before, "the fill was sent before the user answered");
+    global.$("confirm-cancel")._fire("click");
+    await flush();
+    assert(fills().length === before, "a declined confirmation still sent the fill");
+
+    btn._fire("click");
+    await flush();
+    global.$("confirm-yes")._fire("click");
+    await flush();
+    const sent = fills().slice(before);
+    assert(sent.length === 1, "a confirmed sibling fill must be sent once; got " + sent.length);
+    assert(
+      sent[0].args && sent[0].args.confirmed_origin === "login.example.com",
+      "the fill must carry the confirmed host; got " + JSON.stringify(sent[0].args),
+    );
+    delete global.rbResolve["cred_autofill_fill"];
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+  },
+);
+
+// The port half (secscan recheck, 2026-11-10). The same host on another port
+// is offered as a sibling, and the host sends `page` with the port, because
+// the tab status names the host alone: without it the question would read
+// "saved on login.example.com, not login.example.com". It is also marked
+// `same_host`, and asked with its own sentence: passwords are stored without
+// a port, so "saved on X, not X:8443" would be untrue for one saved there.
+check("a port page's confirmation names the page with its port", async () => {
+  global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+  global.$("btn-vault")._fire("click");
+  await flush();
+  await openTabPanel();
+  global.rbResolve["cred_autofill_offer_get"] = {
+    items: [
+      {
+        id: "cred-port",
+        username: "alice",
+        origin: "login.example.com",
+        sibling: true,
+        same_host: true,
+        page: "login.example.com:8443",
+      },
+    ],
+    reason: "match",
+  };
+  global.rbResolve["cred_autofill_fill"] = {};
+  statusEvent("login.example.com", { content_script_registered: "applied" });
+  await flush();
+  const fills = () =>
+    global.rbCalls.filter((c) => c.cmd === "cred_autofill_fill");
+  const before = fills().length;
+  global.$("btn-autofill-fill")._fire("click");
+  await flush();
+  assert(
+    global.$("confirm-overlay").hidden === false,
+    "no confirmation was asked on a port page",
+  );
+  const asked = global.$("confirm-text").textContent;
+  assert(
+    /login\.example\.com:8443/.test(asked) && /different service/.test(asked),
+    "the confirmation must name the page with its port, in the same-host " +
+      "sentence; shown " + JSON.stringify(asked),
+  );
+  assert(
+    !/not login\.example\.com/.test(asked),
+    "a same-host port page must not be told the password was saved elsewhere; shown " +
+      JSON.stringify(asked),
+  );
+  assert(
+    fills().length === before,
+    "the fill was sent before the user answered",
+  );
+  global.$("confirm-cancel")._fire("click");
+  await flush();
+  assert(
+    fills().length === before,
+    "a declined confirmation still sent the fill",
+  );
+  delete global.rbResolve["cred_autofill_fill"];
+  global.rbResolve["cred_autofill_offer_get"] = {
+    items: [],
+    reason: "no-match",
+  };
+});
+
+// The question is drawn by the chrome, which with no panel open is only the
+// toolbar strip. Asked from the toolbar's Fill password, it was drawn clipped
+// to nothing and only the toolbar dimmed (Windows VM, 2026-11-10): the page
+// must be covered while it is up, and uncovered once it is answered.
+check("a question asked from the toolbar with no panel open covers the page", async () => {
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    await flush();
+  };
+  global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+  if (!global.$("tab-panel").hidden) {
+    global.$("btn-tab")._fire("click");
+    await flush();
+  }
+  await settle();
+  assert(global.$("tab-panel").hidden, "setup: the Tab Activity panel is still open");
+  global.rbResolve["cred_autofill_offer_get"] = {
+    items: [{ id: "cred-tb", username: "alice", origin: "login.example.com", sibling: true }],
+    reason: "match",
+  };
+  global.rbResolve["cred_autofill_fill"] = {};
+  statusEvent("usercontent.example.com", { content_script_registered: "applied" });
+  await flush();
+  const mark = global.rbCalls.length;
+  const covers = () =>
+    global.rbCalls.slice(mark).filter((c) => c.cmd === "chrome_overlay").map((c) => c.args.cover);
+  global.$("btn-fill")._fire("click");
+  await flush();
+  assert(global.$("confirm-overlay").hidden === false, "no question was asked");
+  assert(
+    covers()[covers().length - 1] === true,
+    "the question was asked with the page uncovered, so it is drawn clipped; sent " +
+      JSON.stringify(covers()),
+  );
+  global.$("confirm-cancel")._fire("click");
+  await settle();
+  assert(
+    covers()[covers().length - 1] === false,
+    "the page stayed covered after the question was answered; sent " + JSON.stringify(covers()),
+  );
+  delete global.rbResolve["cred_autofill_fill"];
+  global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+});
+
+check(
+  "a confirmation answered after the page changed sends no fill",
+  async () => {
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-nav", username: "alice", origin: "login.example.com", sibling: true }],
+      reason: "match",
+    };
+    global.rbResolve["cred_autofill_fill"] = {};
+    statusEvent("usercontent.example.com", { content_script_registered: "applied" });
+    await flush();
+    const fills = () => global.rbCalls.filter((c) => c.cmd === "cred_autofill_fill");
+    const before = fills().length;
+    global.$("btn-autofill-fill")._fire("click");
+    await flush();
+    assert(global.$("confirm-overlay").hidden === false, "setup: no confirmation was asked");
+    // The tab moves on while the question is open; the old offer is gone.
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+    statusEvent("other.example.org", { content_script_registered: "applied" });
+    await flush();
+    global.$("confirm-yes")._fire("click");
+    await flush();
+    assert(
+      fills().length === before,
+      "a yes given to a question about the previous page sent a fill",
+    );
+    delete global.rbResolve["cred_autofill_fill"];
+  },
+);
+
+check(
+  "an https lookup still in flight when the page turns http does not restore its offer",
+  async () => {
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    let release;
+    global.rbResolve["cred_autofill_offer_get"] = new Promise((r) => {
+      release = r;
+    });
+    statusEvent("example.com", { content_script_registered: "applied", page_insecure: false });
+    await flush();
+    // Same host, now over plain http: the host answers not-secure at once.
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "not-secure" };
+    statusEvent("example.com", { content_script_registered: "applied", page_insecure: true });
+    await flush();
+    // The https lookup's match lands last.
+    release({
+      items: [{ id: "cred-https", username: "alice", origin: "example.com", sibling: false }],
+      reason: "match",
+    });
+    await flush();
+    const desc = global.$("tab-autofill-desc");
+    assert(
+      desc.dataset.state === "not-secure" && global.$("btn-autofill-fill").disabled === true,
+      "a late https reply restored an offer on the http page; state " +
+        JSON.stringify(desc.dataset.state),
+    );
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
+  },
+);
+
+check(
+  "an exact-host offer fills with no confirmation and no confirmed host",
+  async () => {
+    global.rbResolve["vault_status"] = { exists: true, unlocked: true };
+    global.$("btn-vault")._fire("click");
+    await flush();
+    await openTabPanel();
+    global.rbResolve["cred_autofill_offer_get"] = {
+      items: [{ id: "cred-exact", username: "bob", origin: "example.org", sibling: false }],
+      reason: "match",
+    };
+    global.rbResolve["cred_autofill_fill"] = {};
+    statusEvent("example.org", { content_script_registered: "applied" });
+    await flush();
+    const fills = () => global.rbCalls.filter((c) => c.cmd === "cred_autofill_fill");
+    const before = fills().length;
+    global.$("btn-autofill-fill")._fire("click");
+    await flush();
+    assert(global.$("confirm-overlay").hidden !== false, "an exact match asked for confirmation");
+    const sent = fills().slice(before);
+    assert(sent.length === 1, "an exact fill must be sent once; got " + sent.length);
+    assert(
+      !("confirmed_origin" in (sent[0].args || {})),
+      "an exact fill must not carry a confirmed host",
+    );
+    delete global.rbResolve["cred_autofill_fill"];
+    global.rbResolve["cred_autofill_offer_get"] = { items: [], reason: "no-match" };
   },
 );
 

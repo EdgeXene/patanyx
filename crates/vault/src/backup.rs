@@ -689,6 +689,16 @@ struct ExportPayload {
     extra: Option<Vec<u8>>,
 }
 
+/// `ExportPayload` as written, borrowing instead of owning, so an export makes
+/// no copy of the decrypted data. Same field names, order and skip rule;
+/// serde_json writes a `&[u8]` exactly as it writes a `Vec<u8>`.
+#[derive(serde::Serialize)]
+struct ExportPayloadRef<'a> {
+    vault: &'a VaultData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra: Option<&'a [u8]>,
+}
+
 /// A version 2 export payload, held to the rule a vault file is held to
 /// (`Vault::parse_payload`): the vault's declared schema is read and decided on
 /// BEFORE the full structure is built, a newer schema is refused as newer (not
@@ -1051,9 +1061,12 @@ impl Vault {
         let header = encode_export_header(&params, &salt, &nonce);
         // Built fully in memory and written once; no intermediate file ever
         // holds the serialized contents.
-        let payload = ExportPayload {
-            vault: self.data_ref().clone(),
-            extra: extra.map(<[u8]>::to_vec),
+        // BORROWED, not cloned: the clone this used to make was a whole second
+        // copy of every password, dropped unwiped (secscan S-308138676a3f).
+        // Serializes to the same bytes as `ExportPayload` (pinned by a test).
+        let payload = ExportPayloadRef {
+            vault: self.data_ref(),
+            extra,
         };
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&payload)
@@ -3374,5 +3387,34 @@ mod import_discards_the_replaced_vault {
         assert!(!siblings(&dir).iter().any(|n| n.contains(".bak-")));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&src_dir);
+    }
+}
+
+#[cfg(test)]
+mod borrowed_export_payload {
+    use super::*;
+
+    /// Secscan S-308138676a3f: the export no longer clones the decrypted
+    /// data, and the file it writes is byte for byte what the owning
+    /// `ExportPayload` wrote, with and without `extra`.
+    #[test]
+    fn the_borrowed_payload_serializes_exactly_like_the_owned_one() {
+        let mut data = VaultData::default();
+        data.notes.push(crate::model::SecretNote {
+            id: "n1".to_string(),
+            title: "t".to_string(),
+            body: "body".to_string(),
+            created_at: 1,
+            updated_at: 2,
+        });
+        for extra in [None, Some(vec![0u8, 1, 2, 255])] {
+            let owned = ExportPayload { vault: data.clone(), extra: extra.clone() };
+            let borrowed = ExportPayloadRef { vault: &data, extra: extra.as_deref() };
+            assert_eq!(
+                serde_json::to_vec(&borrowed).unwrap(),
+                serde_json::to_vec(&owned).unwrap(),
+                "extra = {extra:?}"
+            );
+        }
     }
 }

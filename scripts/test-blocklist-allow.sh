@@ -61,7 +61,18 @@ N=$(parse "$ALLOW" | wc -l)
 # held publishing for a day until it was ruled ALLOW.
 # 78 as of 2026-09-16: dribbble.com, PhishDestroy's report of the Dribbble
 # apex, which held three hourly builds until it was ruled ALLOW.
-check "shipped allowlist parses to 78 hosts" "78" "$N"
+# 81 as of 2026-10-11: myshn.eu (Skyhigh Security) and two Clickadu ad-network
+# hosts (goldfishouncereburial.com, attacheatableoverlabor.com), all three
+# carried only by ShadowWhisperer.Malware. They held publishing from
+# 2026-10-10 19:00Z until they were ruled ALLOW.
+# 82 as of 2026-10-14: google.com.py, Google Search for Paraguay, carried only
+# by phishunt.io (a Google share link that redirected elsewhere). It held
+# publishing from 2026-10-14 22:02Z until it was ruled ALLOW.
+# 84 as of 2026-11-06: optimumdesk.com and totalav.com, two software vendors
+# the 1.1.0 snapshot armed, carried only by ShadowWhisperer.Malware.
+# 85 the same day: sendspace.com, the file-sharing service, from the 1.1.0
+# warn-band review (PhishDestroy alone).
+check "shipped allowlist parses to 85 hosts" "85" "$N"
 # googll.store was allowlisted for one draft on the strength of its Tranco rank
 # and then removed; see the note in the allowlist. Asserted explicitly because
 # the mistake is an easy one to make twice.
@@ -82,6 +93,15 @@ check "  pypi.org is allowlisted" "yes" \
 # confirm-file by-name pin in test-popularity-tripwire.sh.
 check "  dribbble.com is allowlisted" "yes" \
   "$(parse "$ALLOW" | grep -qx 'dribbble.com' && echo yes || echo no)"
+for h in myshn.eu goldfishouncereburial.com attacheatableoverlabor.com google.com.py; do
+  check "  $h is allowlisted" "yes" \
+    "$(parse "$ALLOW" | grep -qx "$h" && echo yes || echo no)"
+done
+# Phishing.Database lists this subdomain of the allowlisted myshn.eu apex. The
+# apex entry is exact-match, so the subdomain must never be an allowlist entry
+# itself, or the sign-in lookalike would stop being blocked.
+check "  login.live.com.office.rp.skydemo.myshn.eu is NOT allowlisted" "no" \
+  "$(parse "$ALLOW" | grep -qx 'login.live.com.office.rp.skydemo.myshn.eu' && echo yes || echo no)"
 
 # The parse in this test must be the one the script actually runs.
 check "test parse matches the shipped script" "yes" \

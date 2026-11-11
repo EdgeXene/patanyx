@@ -212,11 +212,19 @@ PYEOF
     echo "  bundle check silently stops covering premium-unlocked builds." >&2
     exit 1
   fi
-  markers="$(grep -acE "PATANYX-Nabu-X for |$unlocked_marker" "$binary" || true)"
+  # A qualification build (`addon-launch`) shows the add-on manager early;
+  # its marker is addon_manager.rs::LAUNCH_TEST_MARKER, asserted the same way.
+  launch_marker="ADD-ON LAUNCH TEST BUILD: the add-on manager is shown before its release"
+  if ! grep -qF "$launch_marker" /src/crates/app/src/addon_manager.rs; then
+    echo "GATE FAIL: LAUNCH_TEST_MARKER in addon_manager.rs no longer matches the" >&2
+    echo "  string this gate greps for. Update both together." >&2
+    exit 1
+  fi
+  markers="$(grep -acE "PATANYX-Nabu-X for |$unlocked_marker|$launch_marker" "$binary" || true)"
   if [ -z "${FEATURES:-}" ]; then
     if [ "${markers:-0}" -gt 0 ]; then
       echo "GATE FAIL: the PUBLIC bundle carries a non-public Nabu-X title marker;" >&2
-      echo "  it was built with chat or premium-unlocked compiled in." >&2
+      echo "  it was built with chat, premium-unlocked or addon-launch compiled in." >&2
       exit 1
     fi
     echo "  public build: no chat marker present"

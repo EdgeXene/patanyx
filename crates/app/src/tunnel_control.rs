@@ -343,16 +343,19 @@ pub fn on_vault_unlocked(state: &AppState) {
 /// crate). `enabled` is consumed by the caller's filter -- it is a vault
 /// decision, not tunnel configuration. The secret Strings MOVE into the
 /// config; neither type gets a Debug or Display that could print them.
-fn into_tunnel_config(settings: TunnelSettings) -> TunnelConfig {
+/// Taken rather than moved: `TunnelSettings` wipes its keys when it drops, so
+/// its fields are moved out with `mem::take`, leaving it empty to drop.
+fn into_tunnel_config(mut settings: TunnelSettings) -> TunnelConfig {
+    use std::mem::take;
     TunnelConfig {
-        private_key_b64: settings.private_key_b64,
-        peer_public_key_b64: settings.peer_public_key_b64,
-        endpoint: settings.endpoint,
-        preshared_key_b64: settings.preshared_key_b64,
+        private_key_b64: take(&mut settings.private_key_b64),
+        peer_public_key_b64: take(&mut settings.peer_public_key_b64),
+        endpoint: take(&mut settings.endpoint),
+        preshared_key_b64: take(&mut settings.preshared_key_b64),
         keepalive_secs: settings.keepalive_secs,
-        allowed_ips: settings.allowed_ips,
-        dns: settings.dns,
-        address: settings.address,
+        allowed_ips: take(&mut settings.allowed_ips),
+        dns: take(&mut settings.dns),
+        address: take(&mut settings.address),
     }
 }
 

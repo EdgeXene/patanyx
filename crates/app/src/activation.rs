@@ -150,7 +150,7 @@ pub fn decode_hex_16(hex: &str) -> Option<[u8; 16]> {
 /// query. `PATANYX_LICENCE_ORIGIN` overrides it for the end-to-end gate,
 /// exactly like `PATANYX_UPDATE_MANIFEST_URL` does for the updater; a
 /// shipped build never sets it.
-fn licence_origin() -> String {
+pub(crate) fn licence_origin() -> String {
     // DEBUG BUILDS ONLY. The loopback filter was the only guard in a shipped
     // binary, and a local process that controls the launch environment and a
     // loopback port would receive the full bearer token on the next unlock
@@ -181,7 +181,7 @@ fn licence_origin() -> String {
 /// agree about where a host ends and there is one place to correct if a
 /// browser ever normalizes differently. A port is required, as before: the
 /// override exists for the end-to-end gate, which always names one.
-fn is_loopback_origin(value: &str) -> bool {
+pub(crate) fn is_loopback_origin(value: &str) -> bool {
     let Some(host) = crate::state::host_of(value) else {
         return false;
     };

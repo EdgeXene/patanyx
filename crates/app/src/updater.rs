@@ -239,6 +239,24 @@ pub(crate) fn base_url() -> &'static str {
     UPDATE_BASE_URL
 }
 
+// Keys that may sign an add-on bundle's index. A class of its own, disjoint
+// from every other list (`addon_key_tests`). Tests inject their key
+// explicitly; no build, including a debug build, falls back to it.
+//
+// PROVISIONED 2026-10-17 on the publishing server with
+// `patanyx-sign keygen /root/.patanyx-keys/addon.key addon` (0600, beside
+// blocklist.key: an add-on update is signed there, like a blocklist). Only the
+// verifying half is here; the signing half has never left that file.
+pub(crate) const ADDON_KEYS: &[&str] =
+    &["818af0391a88387b9349cfff11f5ad546c89f9fac7c85ed6fc33accfabfdba0f"];
+
+pub(crate) fn addon_trusted_keys() -> Result<TrustedKeys, patanyx_update::UpdateError> {
+    TrustedKeys::from_hex(ADDON_KEYS)
+}
+
+#[cfg(test)]
+pub(crate) const ADDON_TEST_SEED: [u8; 32] = [0x73; 32];
+
 /// The floor: versions below this are refused even when validly signed. This
 /// is how a known-bad release is retired permanently. Bump deliberately, in
 /// a commit of its own, naming the incident it answers.
@@ -5395,13 +5413,14 @@ mod advisory_key_tests {
     //! The advisory key list, pinned in BOTH directions: disjoint from every
     //! other class, and EMPTY until the lander provisions it -- so nothing in
     //! this tree can be read as an active advisory channel.
-    use super::{ADVISORY_KEYS, BLOCKLIST_KEYS, MODEL_KEYS, PUBLISHER_KEYS};
+    use super::{ADDON_KEYS, ADVISORY_KEYS, BLOCKLIST_KEYS, MODEL_KEYS, PUBLISHER_KEYS};
 
     /// A stolen advisory key must not be a key any other verifier trusts.
     /// Domain separation stops replay; only disjoint key SETS stop forgery.
     #[test]
     fn the_advisory_key_set_is_disjoint_from_every_other_class() {
         for key in ADVISORY_KEYS {
+            assert!(!ADDON_KEYS.contains(key));
             assert!(!PUBLISHER_KEYS.contains(key), "advisory key is a release key: {key}");
             assert!(!BLOCKLIST_KEYS.contains(key), "advisory key is a blocklist key: {key}");
             assert!(!MODEL_KEYS.contains(key), "advisory key is a model key: {key}");
@@ -5442,5 +5461,26 @@ mod advisory_key_tests {
         }
         // And the placeholder shape is refused if someone pastes it.
         assert!(patanyx_update::TrustedKeys::from_hex(&[&"0".repeat(64)]).is_err());
+    }
+}
+
+#[cfg(test)]
+mod addon_key_tests {
+    use super::*;
+    #[test]
+    fn addon_keys_are_provisioned_once_and_disjoint() {
+        assert_eq!(ADDON_KEYS.len(), 1, "exactly one add-on signing key");
+        assert!(addon_trusted_keys().is_ok());
+        let test = patanyx_update::hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&ADDON_TEST_SEED)
+                .verifying_key().as_bytes(),
+        );
+        for ring in [PUBLISHER_KEYS, BLOCKLIST_KEYS, MODEL_KEYS, ADVISORY_KEYS] {
+            assert!(!ring.contains(&test.as_str()));
+            for key in ADDON_KEYS {
+                assert!(!ring.contains(key));
+            }
+        }
+        assert!(!ADDON_KEYS.contains(&test.as_str()));
     }
 }

@@ -541,6 +541,40 @@ def shipped_version(repo: pathlib.Path) -> str | None:
     return match.group(1) if match else None
 
 
+# THE WINDOWS FRONT DOOR may be an older release than the one shipping, on
+# purpose. A maintenance release skips Authenticode signing (2026-10-28, 1.0.8),
+# so the download page keeps serving the last Authenticode-signed exe at
+# /dl/PATANYX.exe and says so ("for the Windows download on v1.0.7"); installed
+# copies update past it on their own. A feature release moves the front door.
+# Judging that sentence against Cargo.toml failed a page that was telling the
+# truth (1.0.10, 2026-11-03). The authority for it is the file itself: the
+# FileVersion in the served exe's version resource. Only the download page may
+# name that version, and only while it is older than the one shipping; any
+# other stale number there or anywhere else still fails.
+FRONT_DOOR = "dl/PATANYX.exe"
+_FILE_VERSION = "FileVersion".encode("utf-16-le")
+
+
+def front_door_version(site: pathlib.Path) -> str | None:
+    """The FileVersion of the Windows exe the site serves, or None."""
+    exe = site / FRONT_DOOR
+    if not exe.is_file() or exe.is_symlink():
+        return None
+    data = exe.read_bytes()
+    at = data.find(_FILE_VERSION)
+    while at >= 0:
+        value = data[at + len(_FILE_VERSION) : at + len(_FILE_VERSION) + 64].decode("utf-16-le", "ignore")
+        match = re.match(r"\x00*(\d+\.\d+\.\d+)\x00", value)
+        if match:
+            return match.group(1)
+        at = data.find(_FILE_VERSION, at + 1)
+    return None
+
+
+def _older(a: str, b: str) -> bool:
+    return tuple(int(x) for x in a.split(".")) < tuple(int(x) for x in b.split("."))
+
+
 def published_entries(site: pathlib.Path) -> int | None:
     """The entry count from the signed manifest -- the only authority for it.
 
@@ -602,8 +636,17 @@ def main() -> int:
         # What counts as a version claim, and the engine versions it sets
         # aside: VERSION_CLAIM and version_claims above.
         failures.extend(version_self_test())
+        front_door = front_door_version(site)
+        if front_door is not None and _older(front_door, version):
+            warnings.append(
+                f"download: the Windows download ({FRONT_DOOR}) is {front_door} "
+                f"while {version} ships; the download page may name it"
+            )
         for page in pages:
             for found in sorted(version_claims(visible_text(raw[page]), version)):
+                if (found == front_door and name(page) == "download"
+                        and _older(front_door, version)):
+                    continue
                 if found != version:
                     failures.append(
                         f"{name(page)}: shows version {found} in visible text, "

@@ -23,6 +23,9 @@ use serde_json::Value;
 pub enum SitePage {
     Guide,
     PremiumGuide,
+    /// The Premium page's add-on walkthrough, opened from the one-time add-on
+    /// banner (1.1.0). The anchor is a plain "tour": no add-on is named here.
+    PremiumTour,
     /// TEST ONLY: proves that resolving a name cannot bypass URL gates.
     #[cfg(test)]
     RefusedFixture,
@@ -34,6 +37,7 @@ impl SitePage {
         match self {
             Self::Guide => "guide",
             Self::PremiumGuide => "premium_guide",
+            Self::PremiumTour => "premium_tour",
             #[cfg(test)]
             Self::RefusedFixture => "__refused_fixture",
         }
@@ -41,7 +45,7 @@ impl SitePage {
 
     /// Unknown identifiers fail closed; there is no default page.
     pub fn from_id(id: &str) -> Option<Self> {
-        if let Some(page) = [Self::Guide, Self::PremiumGuide]
+        if let Some(page) = [Self::Guide, Self::PremiumGuide, Self::PremiumTour]
             .into_iter()
             .find(|page| page.id() == id)
         {
@@ -58,7 +62,7 @@ impl SitePage {
     pub fn available(self) -> bool {
         match self {
             Self::Guide => true,
-            Self::PremiumGuide => crate::licence_control::PREMIUM_ON_SALE,
+            Self::PremiumGuide | Self::PremiumTour => crate::licence_control::PREMIUM_ON_SALE,
             #[cfg(test)]
             Self::RefusedFixture => true,
         }
@@ -69,6 +73,7 @@ impl SitePage {
         match self {
             Self::Guide => "https://patanyx.net/guide/",
             Self::PremiumGuide => "https://patanyx.net/premium-guide/",
+            Self::PremiumTour => "https://patanyx.net/premium/#tour",
             #[cfg(test)]
             Self::RefusedFixture => "file:///site-page-fixture-must-be-refused",
         }
@@ -114,6 +119,18 @@ mod tests {
         } else {
             assert_eq!(premium, Err("bad_args"));
         }
+    }
+
+    #[test]
+    fn the_tour_opens_the_premium_page_at_its_tour_and_follows_the_sale_flag() {
+        let tour = destination_for(&json!({ "page": "premium_tour" }));
+        if crate::licence_control::PREMIUM_ON_SALE {
+            assert_eq!(tour.as_deref(), Ok("https://patanyx.net/premium/#tour"));
+        } else {
+            assert_eq!(tour, Err("bad_args"));
+        }
+        assert_eq!(SitePage::PremiumTour.available(), crate::licence_control::PREMIUM_ON_SALE);
+        assert_eq!(SitePage::from_id("premium_tour"), Some(SitePage::PremiumTour));
     }
 
     #[test]

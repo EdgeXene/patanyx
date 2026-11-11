@@ -173,7 +173,15 @@ parse_confirm() {
 # same reason as #18 -- shared nameservers, address pool and default redirect
 # are ONE provider signal, not several, so common purpose is not established and
 # no vendor has classified either domain.
+# The three 1.0.6 KEEP BLOCKED rulings of 2026-10-10 were replaced by ALLOW on
+# 2026-10-11 (blocklist-allow.txt), so they left this file, back to 20.
+# 23 as of 2026-11-06: juneworewyjyna.com, fozekikikiminu.com and
+# free-dating4you.com, armed by the 1.1.0 snapshot, kept blocked as
+# precautionary (decoy pages; a 403 to this server).
 check "confirm file parses to 23 hosts" "23" "$(parse_confirm | wc -l)"
+check "  the 1.1.0 trio is among them" "yes" \
+  "$(parse_confirm | grep -qx 'juneworewyjyna.com' && parse_confirm | grep -qx 'fozekikikiminu.com' \
+     && parse_confirm | grep -qx 'free-dating4you.com' && echo yes || echo no)"
 check "  the 2026-09-21 pair is among them" "yes" \
   "$(parse_confirm | grep -qx 'realizationnewestfangs.com' \
      && parse_confirm | grep -qx 'zoologyfibre.com' && echo yes || echo no)"

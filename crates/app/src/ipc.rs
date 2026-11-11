@@ -97,11 +97,12 @@ pub(crate) const AUTOFILL_REASON_FIELD: &str = "reason";
 fn autofill_offer_payload(
     items: Value,
     has_origin: bool,
+    secure: bool,
     vault_file_exists: bool,
     unlocked: bool,
 ) -> Value {
     let matched = items.as_array().is_some_and(|a| !a.is_empty());
-    let reason = autofill_offer_reason(has_origin, vault_file_exists, unlocked, matched);
+    let reason = autofill_offer_reason(has_origin, secure, vault_file_exists, unlocked, matched);
     let mut reply = serde_json::Map::new();
     reply.insert("items".to_string(), items);
     reply.insert(AUTOFILL_REASON_FIELD.to_string(), json!(reason));
@@ -110,6 +111,7 @@ fn autofill_offer_payload(
 
 fn autofill_offer_reason(
     has_origin: bool,
+    secure: bool,
     vault_file_exists: bool,
     unlocked: bool,
     matched: bool,
@@ -123,10 +125,104 @@ fn autofill_offer_reason(
     if !vault_file_exists {
         return "no-vault";
     }
+    // Before `locked`: on a plain-http page nothing would be filled even with
+    // the vault open, so asking the user to unlock it would be a false lead.
+    if !secure {
+        return "not-secure";
+    }
     if !unlocked {
         return "locked";
     }
     "no-match"
+}
+
+/// How a saved credential relates to the page it would be filled into.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FillMatch {
+    /// Saved on this very host.
+    Exact,
+    /// Saved on another host of the same registrable domain.
+    Sibling,
+}
+
+/// THE autofill decision, for the offer and the fill alike (finding
+/// S-0a47ea9404bd). Only an https page qualifies (`secure_host_of`). The
+/// exact host fills as before. Another host of the same registrable domain is
+/// still offered -- a password saved on `accounts.google.com` is wanted on
+/// `mail.google.com` -- but as a `Sibling`, which `fill_allowed` releases only
+/// after the user has seen and confirmed the host it was saved on, because
+/// that other host may serve someone else's content.
+///
+/// The same host on a port other than 443 is a `Sibling` too: credentials are
+/// stored as a bare host, so `login.example.com:8443` -- which can be another
+/// service on the same name -- must ask first rather than count as the place
+/// the password was saved (secscan recheck, 2026-11-10). Known limit of a
+/// portless store: a password saved on `host:8443` reads as saved on `host`,
+/// so it still fills on port 443 without asking.
+pub(crate) fn autofill_match(stored: &str, page_url: &str) -> Option<FillMatch> {
+    let page = crate::state::secure_page_of(page_url)?;
+    if stored == page.host && page.other_port.is_none() {
+        Some(FillMatch::Exact)
+    } else if stored == page.host || crate::psl::same_site(stored, &page.host) {
+        Some(FillMatch::Sibling)
+    } else {
+        None
+    }
+}
+
+/// Sort key for the offer, lowest first: the exact match (same host, default
+/// port); then the same host on another port, which is still the most
+/// specific credential there even though it asks first; then the rest.
+fn offer_rank(stored: Option<&str>, page_url: &str) -> u8 {
+    match (stored, crate::state::secure_page_of(page_url)) {
+        (Some(stored), Some(page)) if stored == page.host => {
+            if page.other_port.is_none() {
+                0
+            } else {
+                1
+            }
+        }
+        _ => 2,
+    }
+}
+
+/// Marks each offered credential for the chrome. `sibling` is anything but an
+/// exact match, decided by `autofill_match` itself so the offer and the fill
+/// cannot disagree (the fill re-checks with the same function and refuses a
+/// sibling the user did not confirm). `page` names the page with its port, so
+/// the question the chrome asks says where the password would go, and
+/// `same_host` marks the same host on another port.
+fn mark_offer_items(items: &mut Value, page_url: &str) {
+    let page = crate::state::secure_page_of(page_url);
+    if let Some(list) = items.as_array_mut() {
+        for item in list {
+            let stored = item.get("origin").and_then(Value::as_str).map(str::to_owned);
+            let stored = stored.as_deref();
+            let matched = stored.and_then(|stored| autofill_match(stored, page_url));
+            item["sibling"] = json!(matched != Some(FillMatch::Exact));
+            item["page"] = json!(page.as_ref().map(|page| page.label()));
+            // Same host, another port: the chrome asks with its own sentence,
+            // because a portless store cannot say the password was saved
+            // anywhere but here.
+            item["same_host"] = json!(matched == Some(FillMatch::Sibling)
+                && page.as_ref().is_some_and(|page| stored == Some(page.host.as_str())));
+        }
+    }
+}
+
+/// Whether a fill may go ahead. A sibling match needs `confirmed_origin`, the
+/// saved host the chrome showed the user and they confirmed, to be exactly the
+/// credential's own host; nothing else releases it.
+pub(crate) fn fill_allowed(
+    matched: Option<FillMatch>,
+    confirmed_origin: Option<&str>,
+    stored: &str,
+) -> bool {
+    match matched {
+        Some(FillMatch::Exact) => true,
+        Some(FillMatch::Sibling) => confirmed_origin == Some(stored),
+        None => false,
+    }
 }
 
 fn counts_as_presence(cmd: &str) -> bool {
@@ -748,8 +844,34 @@ fn chat_gate() -> Result<(), &'static str> {
     crate::tab_search::cross_tab_gate(crate::licence_control::premium_active())
 }
 
+/// DEBUG BUILDS ONLY: a command answered as the chrome's would be, for the
+/// development add-on loader (`addon_host::dev_open_from_env`).
+#[cfg(debug_assertions)]
+pub(crate) fn dev_command(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'static str> {
+    handle(state, cmd, args)
+}
+
 fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'static str> {
+    crate::addon_manager::before_command(state, cmd);
     match cmd {
+        "addon_manager_status" => Ok(crate::addon_manager::status(state)),
+        "addon_manager_action" => {
+            let action = serde_json::from_value(args.get("action").cloned().ok_or("bad_args")?).map_err(|_| "bad_args")?;
+            let id = args.get("id").and_then(Value::as_str).unwrap_or("");
+            crate::addon_manager::start(state, action, id, args.get("confirmed").and_then(Value::as_bool) == Some(true))
+        }
+        // Customize: one add-on's toolbar button shown or hidden. Its Tools
+        // menu entry stays either way.
+        // The one-time add-on banner was answered: never announce that id again.
+        "addon_announced_set" => {
+            let id = args.get("id").and_then(Value::as_str).ok_or("bad_args")?;
+            crate::addon_manager::set_announced(state, id)
+        }
+        "toolbar_addon_shown_set" => {
+            let id = args.get("id").and_then(Value::as_str).ok_or("bad_args")?;
+            let shown = args.get("shown").and_then(Value::as_bool).ok_or("bad_args")?;
+            crate::addon_manager::set_shown(state, id, shown)
+        }
         // The reply carries the active tab's URL so a chrome UI that finished
         // loading after the first navigation can still populate its URL bar.
         "ping" => Ok(json!({ "url": state.active_url() })),
@@ -1659,28 +1781,31 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // of those happened, so the chrome never has to guess (and never has
         // to guess wrong, which is what it did before).
         "cred_autofill_offer_get" => {
-            let origin = state
-                .tabs
-                .get(state.active)
-                .and_then(|t| crate::state::host_of(&t.url));
-            // Registrable-domain match, not exact host: a password is saved on
-            // the one subdomain that carries the login form
-            // (`accounts.google.com`) and then wanted on the others
-            // (`mail.google.com`). `same_site` is what keeps that from also
-            // meaning `mybank.co.uk` and `evil.co.uk` -- see app::psl.
-            let items = match (&origin, state.vault.as_ref()) {
-                (Some(origin), Some(vault)) => {
-                    let mut items =
-                        vault.credentials_matching(|stored| crate::psl::same_site(stored, origin));
-                    // Exact-host credentials first, so the single offer the
-                    // chrome takes (`items[0]`) is the most specific one. A
-                    // vault holding both `accounts.google.com` and a bare
+            let page_url = state.tabs.get(state.active).map(|t| t.url.clone());
+            let origin = page_url.as_deref().and_then(crate::state::host_of);
+            let secure = page_url
+                .as_deref()
+                .and_then(crate::state::secure_host_of)
+                .is_some();
+            // `autofill_match` decides: https pages only; the exact host, or
+            // another host of the same registrable domain as a sibling the
+            // user must confirm (see its doc). `same_site` underneath is what
+            // keeps that from also meaning `mybank.co.uk` and `evil.co.uk`.
+            let items = match (&page_url, &origin, state.vault.as_ref()) {
+                (Some(url), Some(_), Some(vault)) if secure => {
+                    let mut items = vault
+                        .credentials_matching(|stored| autofill_match(stored, url).is_some());
+                    // Exact matches first, so the single offer the chrome
+                    // takes (`items[0]`) is the most specific one. A vault
+                    // holding both `accounts.google.com` and a bare
                     // `google.com` entry must offer the one that names this
                     // page, not whichever happened to be saved first.
-                    items.sort_by_key(|c| c.origin.as_deref() != Some(origin.as_str()));
+                    items.sort_by_key(|c| offer_rank(c.origin.as_deref(), url));
+                    let mut items = json!(items);
+                    mark_offer_items(&mut items, url);
                     items
                 }
-                _ => Vec::new(),
+                _ => json!([]),
             };
             // The reason rides the SAME reply as the items, deliberately. A
             // second round trip for "and why" could answer about a different
@@ -1688,35 +1813,35 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // lock between two IPC calls -- and the surface would then be
             // explaining a lookup that never happened.
             Ok(autofill_offer_payload(
-                json!(items),
+                items,
                 origin.is_some(),
+                secure,
                 Vault::exists(&state.vault_path),
                 state.vault.is_some(),
             ))
         }
         "cred_autofill_fill" => {
             let id = arg_str(args, "id")?;
-            // Re-derived fresh, not reused from whatever origin the offer
-            // list was built against: the tab may have navigated in the
-            // time between rendering the offer and this click.
-            let current_origin = state
+            // The saved host the user confirmed, for a sibling fill only.
+            let confirmed_origin = args.get("confirmed_origin").and_then(Value::as_str);
+            // Re-derived fresh, not reused from whatever page the offer list
+            // was built against: the tab may have navigated in the time
+            // between rendering the offer and this click.
+            let page_url = state
                 .tabs
                 .get(state.active)
-                .and_then(|t| crate::state::host_of(&t.url))
+                .map(|t| t.url.clone())
                 .ok_or("no_site")?;
             let (username, password) = {
                 let vault = unlocked(state)?;
                 let entry = vault.get_credential(id).ok_or("not_found")?;
-                // Same rule the OFFER used, and it has to be: an exact-host
-                // check here would show a fill button on `mail.google.com` for
-                // a credential saved on `accounts.google.com` and then refuse
-                // the click. This is still an independent re-check rather than
-                // trust in the offer -- the id arrives from the chrome, and the
-                // tab may have navigated since the offer was rendered.
-                let allowed = entry
-                    .origin
-                    .as_deref()
-                    .is_some_and(|stored| crate::psl::same_site(stored, &current_origin));
+                // Same rule the OFFER used (`autofill_match`), re-checked here
+                // rather than trusted: the id arrives from the chrome, and the
+                // tab may have navigated since the offer was rendered. A
+                // sibling also needs the user's confirmation of the saved host.
+                let allowed = entry.origin.as_deref().is_some_and(|stored| {
+                    fill_allowed(autofill_match(stored, &page_url), confirmed_origin, stored)
+                });
                 if !allowed {
                     return Err("origin_mismatch");
                 }
@@ -1745,6 +1870,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let body = arg_str(args, "body")?;
             let vault = unlocked(state)?;
             let id = vault.add_note(title, body).map_err(vault_code)?;
+            crate::addon_host::notes_changed(state);
             Ok(json!({ "id": id }))
         }
         "note_update" => {
@@ -1754,11 +1880,13 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             unlocked(state)?
                 .update_note(id, title, body)
                 .map_err(vault_code)?;
+            crate::addon_host::notes_changed(state);
             Ok(json!({}))
         }
         "note_delete" => {
             let id = arg_str(args, "id")?;
             unlocked(state)?.delete_note(id).map_err(vault_code)?;
+            crate::addon_host::notes_changed(state);
             Ok(json!({}))
         }
 
@@ -2260,10 +2388,19 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 return Err("bad_args");
             }
             let version = patanyx_vault::backup_file_version(Path::new(src)).map_err(export_code)?;
+            // Add-on pages any import replaces (M12), counted in the Library
+            // open now: the form says so before the person confirms. Nothing
+            // is inferred from the file, whose add-on sections are read only
+            // once its passphrase is known.
+            let window_open = !crate::addon_session::quiescent(state);
+            let library = state.vault.as_ref().and(state.store.as_ref());
+            let (addon_pages, addon_ids) = crate::addon_data::import_exposure(library, &state.store_path, window_open);
             Ok(json!({
                 "version": version,
                 "whole_library": version == patanyx_vault::BACKUP_VERSION,
                 "older": matches!(version, 0x01 | 0x02),
+                "addon_pages": addon_pages,
+                "addon_ids": addon_ids,
             }))
         }
         "vault_import" => {
@@ -2291,6 +2428,19 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                     zeroize::Zeroizing::new(passphrase.to_string()),
                     zeroize::Zeroizing::new(new_passphrase.to_string()),
                 );
+            }
+            // This import retires the add-on folder with the Library it
+            // replaces, and runs on the event loop, which cannot wait for an
+            // add-on's last save. So an open add-on window is ended with its
+            // save, and the import is refused until its storage worker is
+            // done; asked again a moment later, it goes ahead (M11, R-006).
+            if !crate::addon_session::quiescent(state) {
+                crate::addon_session::end(
+                    state,
+                    crate::addon_session::Reason::VaultImport,
+                    crate::addon_session::Then::NOTHING,
+                );
+                return Err("addon_busy");
             }
             // AN IMPORT REPLACES THE LIBRARY, so it takes the Library lock
             // before anything is touched (final review, R-001): another
@@ -2399,13 +2549,17 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
         // from its key. The Library now opens with a key the vault derives
         // from its master (Store format version 3), which a passphrase change
         // does not touch; a Library from before that moves into the vault
-        // here, at its owner's first change, keeping its key. The order and
-        // the crash reasoning live in `change_vault_and_library_passphrase`.
+        // here, at its owner's first change, and is then re-keyed in the
+        // same change (every picture, add-on file and record re-encrypted
+        // under a fresh key, `Store::rekey`), so the passphrase being retired
+        // no longer derives its key. The order and the crash reasoning live
+        // in `change_vault_and_library_passphrase` and `rekey.rs`.
         //
-        // A committed change answers Ok with `warnings`: cleanup still owed
+        // A committed change answers Ok with `warnings`: what is still owed
         // AFTER the new passphrase took effect (an old-passphrase vault
         // backup that could not be removed; a leftover copy of the Library's
-        // version 1 file that could not be confirmed gone). Only a change
+        // version 1 file that could not be confirmed gone; a Library key
+        // that could not be renewed). Only a change
         // that did NOT happen is an error, so the form can say which
         // passphrase works now.
         "vault_change_passphrase" => {
@@ -2414,15 +2568,43 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             crate::backup_job::refuse_if_running(state)?;
             let current = arg_str(args, "current")?;
             let new = arg_str(args, "new")?;
+            // A Library that moves from version 1 here, or still uses the key
+            // its version 1 file derived, is re-keyed by this change, which
+            // re-encrypts the add-on files too: no add-on may be writing. As
+            // an import does, an open add-on window is ended with its save
+            // and the change is refused until its worker is done; asked again
+            // a moment later, it goes ahead.
+            let rekeys = state.store.as_ref().is_some_and(|s| s.format_version() == 1 || s.needs_rekey());
+            if rekeys && !crate::addon_session::quiescent(state) {
+                crate::addon_session::end(
+                    state,
+                    crate::addon_session::Reason::VaultImport,
+                    crate::addon_session::Then::NOTHING,
+                );
+                return Err("addon_busy");
+            }
             let library_file_exists = Store::exists(&state.store_path);
             let vault = state.vault.as_mut().ok_or("not_unlocked")?;
-            let warnings = change_vault_and_library_passphrase(
+            let changed = change_vault_and_library_passphrase(
                 vault,
                 state.store.as_mut(),
                 library_file_exists,
                 current,
                 new,
-            )?;
+            );
+            let warnings = match changed {
+                Ok(warnings) => warnings,
+                // The key renewal was left neither finished nor undone: the
+                // passphrase did not change, and the Library stays shut until
+                // the next unlock resolves it (`recover_rekey`). The reply
+                // says both, and that locking and unlocking is the way on
+                // (review R-004): "try again" would only find it shut.
+                Err("library_rekey_unfinished") => {
+                    state.keep_library_shut("library_rekey_unfinished");
+                    return Err("passphrase_change_library_rekey_unfinished");
+                }
+                Err(code) => return Err(code),
+            };
             Ok(json!({ "warnings": warnings }))
         }
 
@@ -2449,7 +2631,20 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             }
             let vault = state.vault.as_ref().ok_or("not_unlocked")?;
             let store =
-                repair_library_passphrase(vault, &state.store_path, library_passphrase, current)?;
+                match repair_library_passphrase(vault, &state.store_path, library_passphrase, current) {
+                    Ok(store) => store,
+                    // Moved but its re-key left neither finished nor undone:
+                    // the repair no longer applies (the file is version 3), so
+                    // the Library says why it is shut instead of offering it.
+                    Err("library_rekey_unfinished") => {
+                        state.keep_library_shut("library_rekey_unfinished");
+                        return Err("library_rekey_unfinished");
+                    }
+                    Err(code) => return Err(code),
+                };
+            // The repair already tried the key renewal; attaching must not
+            // try it again in the same request (the next unlock does).
+            state.library_rekey_tried = true;
             state.attach_store(store);
             Ok(json!({}))
         }
@@ -2682,6 +2877,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mut p = crate::prefs::load();
             p.chrome_theme = theme;
             crate::prefs::save(&p).map_err(|_| "io")?;
+            crate::addon_host::theme_changed(state, p.chrome_scheme, theme);
             Ok(json!({ "theme": theme.as_str() }))
         }
         "chrome_theme_get" => Ok(json!({
@@ -2736,6 +2932,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             let mut p = crate::prefs::load();
             p.chrome_scheme = scheme;
             crate::prefs::save(&p).map_err(|_| "io")?;
+            crate::addon_host::theme_changed(state, scheme, p.chrome_theme);
             // The native hover readout paints with these colours too, and
             // cannot read CSS variables; this is the one runtime point where
             // the scheme changes, so it is the one place that re-colours it.
@@ -4923,8 +5120,9 @@ pub fn smoke_vault_sequence(state: &mut AppState) -> Result<(), String> {
     smoke_library_intact(state, &download_id, &picture_id)?;
 
     // A LIBRARY FROM BEFORE VERSION 3 moves into the vault at its owner's
-    // first change, keeping its key, and the leftover copies its writer left
-    // stop opening with the old passphrase because they are gone. Stands in
+    // first change and is re-keyed in the same change (`Store::rekey`), and
+    // the leftover copies its writer left stop opening with the old
+    // passphrase because they are gone. Stands in
     // for an existing profile: a version 1 Library under the current
     // passphrase, with a copy at each of the writer's leftover names.
     smoke_step(state, "vault_lock", json!({}))?;
@@ -7275,6 +7473,13 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
             return "not_replaced";
         }
     }
+    // Add-on data beside the removed Library was under its key: it goes with
+    // it, rather than greet the add-on as damage under the new one, and
+    // before the marker clears, while this replacement is still the one in
+    // progress. Nothing writes it: the import waited for the add-on's storage
+    // worker. Best effort: data left behind reads as damaged, and the add-on
+    // data controls delete it.
+    let _ = crate::vault_backup::retire_addons(&state.store_path);
     if state.store_path.exists() || clear_library_replace_marker(&marker).is_err() {
         state.detach_store_unreplaced();
         return "not_replaced";
@@ -7309,11 +7514,15 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
 ///      power cut cannot bring the version 1 file back once the vault has
 ///      moved (plan gate, R-612), where the platform can flush a directory at
 ///      all (Windows cannot; see `sync_parent` in the store).
-///   4. The vault rotates, rollback-safe.
+///   4. A Library still on the data key the version 1 file derived is
+///      re-keyed (secscan S-1a563619ce84). A renewal that did not happen is
+///      reported, not a reason to stop; one left half done stops the change.
+///   5. The vault rotates, rollback-safe.
 ///
-/// A failure before step 4 leaves both files opening with the current
-/// passphrase, whatever the Library's version by then (a version 3 Library
-/// opens through the vault's unchanged master), so nothing needs undoing.
+/// A failure before step 5 leaves both files opening with the current
+/// passphrase, whatever the Library's version or key by then (a version 3
+/// Library opens through the vault's unchanged master), so nothing needs
+/// undoing.
 ///
 /// A Library file that exists but is not open (left under another
 /// passphrase, being replaced by an import, open in another PATANYX window,
@@ -7323,12 +7532,12 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
 /// stranded Libraries in 0.9.x (pentest F-001). No Library file at all is
 /// fine; the next unlock creates one inside the vault.
 ///
-/// Ok carries the cleanup still owed AFTER the change took effect, in the
-/// order it applies; both can occur together and neither may hide the other
+/// Ok carries what is still owed AFTER the change took effect, in the order
+/// it applies; any of them can occur together and none may hide another
 /// (plan review, 2026-09-26).
 fn change_vault_and_library_passphrase(
     vault: &mut Vault,
-    store: Option<&mut Store>,
+    mut store: Option<&mut Store>,
     library_file_exists: bool,
     current: &str,
     new: &str,
@@ -7347,12 +7556,46 @@ fn change_vault_and_library_passphrase(
         return Err("auth_failed");
     }
     let mut leftovers_retained = false;
-    if let Some(store) = store {
+    let mut key_not_renewed = false;
+    if let Some(store) = store.as_deref_mut() {
         let library_key = vault.library_key().map_err(vault_code)?;
         store.move_into_vault(&library_key).map_err(store_code)?;
         leftovers_retained = store.retire_v1_leftovers().is_err();
         if store.confirm_durable().is_err() {
             return Err("passphrase_change_not_confirmed");
+        }
+        // THE KEY IS RENEWED BEFORE THE PASSPHRASE CHANGES (secscan
+        // S-1a563619ce84): the move keeps the data key the version 1 file
+        // derived from the CURRENT passphrase, harmless while it stays
+        // current, so it is renewed first. A renewal that did not happen
+        // (undone with the Library as it was, or paused for this build after
+        // crashed attempts) does NOT stop the change: refusing would keep the
+        // vault itself under a passphrase its owner wants retired, and a
+        // cause that repeats (too little free disk space for the second copy
+        // the renewal builds) would refuse every change for good (reviews
+        // R-002, F-001). The change goes ahead and its reply says the key
+        // was not renewed, so nothing claims the old passphrase opens
+        // nothing. An undone renewal is tried again at every passphrase
+        // change and at the first unlock of each run (`renew_library_key`:
+        // once per run, so a full disk does not cost a re-key at every
+        // unlock). Only a renewal left neither finished nor undone stops the
+        // change, with the Library shut until the next unlock resolves it.
+        if store.needs_rekey() {
+            match store.rekey(&library_key, env!("CARGO_PKG_VERSION")) {
+                Ok(report) => leftovers_retained |= report.leftovers_retained,
+                Err(patanyx_store::RekeyError::Paused) => {
+                    eprintln!("patanyx library: key renewal paused for this build; the change goes ahead");
+                    key_not_renewed = true;
+                }
+                Err(patanyx_store::RekeyError::Undone(error)) => {
+                    eprintln!("patanyx library: key renewal undone; the change goes ahead: {error}");
+                    key_not_renewed = true;
+                }
+                Err(patanyx_store::RekeyError::Unfinished(error)) => {
+                    eprintln!("patanyx library: key renewal unfinished, passphrase not changed: {error}");
+                    return Err("library_rekey_unfinished");
+                }
+            }
         }
     }
     let mut warnings = Vec::new();
@@ -7366,6 +7609,9 @@ fn change_vault_and_library_passphrase(
     }
     if leftovers_retained {
         warnings.push("passphrase_changed_library_leftover_retained");
+    }
+    if key_not_renewed {
+        warnings.push("passphrase_changed_library_key_not_renewed");
     }
     Ok(warnings)
 }
@@ -7394,6 +7640,19 @@ fn repair_library_passphrase(
     };
     let library_key = vault.library_key().map_err(vault_code)?;
     store.move_into_vault(&library_key).map_err(store_code)?;
+    // The moved Library still has the key the passphrase it was left under
+    // derived: re-keyed here, before it is attached, while nothing else can
+    // hold a key derived from it (it was shut). A re-key that does not
+    // finish cleanly is tried again at the next run's unlock, or at a
+    // passphrase change.
+    match store.rekey(&library_key, env!("CARGO_PKG_VERSION")) {
+        Ok(_) => {}
+        Err(patanyx_store::RekeyError::Unfinished(error)) => {
+            eprintln!("patanyx library: key renewal unfinished after the repair: {error}");
+            return Err("library_rekey_unfinished");
+        }
+        Err(other) => eprintln!("patanyx library: key renewal not done now, tried at next unlock: {other:?}"),
+    }
     Ok(store)
 }
 
@@ -7506,22 +7765,24 @@ fn store_tunnel_config(state: &mut AppState, text: &mut String) -> Result<Value,
     // buffer surviving un-wiped). The parsed copies below move into the
     // vault, whose own drop wipes them.
     text.zeroize();
-    let config = match parsed {
+    let mut config = match parsed {
         Ok(config) => config,
         Err(refusal) => return Ok(json!({ "imported": false, "error": refusal.to_string() })),
     };
+    // MOVE the secrets out of the parsed config rather than cloning: one
+    // fewer copy of key material. Taken (`mem::take`) because the config
+    // wipes its keys when it drops, which forbids a plain field move.
+    use std::mem::take;
     let mut settings = patanyx_vault::TunnelSettings {
         enabled: true,
-        // MOVE the secrets out of the parsed config rather than
-        // cloning: one fewer copy of key material to zeroize.
-        private_key_b64: config.private_key_b64,
-        peer_public_key_b64: config.peer_public_key_b64,
-        endpoint: config.endpoint,
-        preshared_key_b64: config.preshared_key_b64,
+        private_key_b64: take(&mut config.private_key_b64),
+        peer_public_key_b64: take(&mut config.peer_public_key_b64),
+        endpoint: take(&mut config.endpoint),
+        preshared_key_b64: take(&mut config.preshared_key_b64),
         keepalive_secs: config.keepalive_secs,
-        allowed_ips: config.allowed_ips,
-        dns: config.dns,
-        address: config.address,
+        allowed_ips: take(&mut config.allowed_ips),
+        dns: take(&mut config.dns),
+        address: take(&mut config.address),
     };
     // The vault can auto-lock while the file dialog is open. On that
     // path `settings` would drop as a plain struct -- no vault around
@@ -8213,8 +8474,9 @@ mod tests {
     /// rule to the wrong call site is a defect no psl test can see.
     #[test]
     fn the_offer_matches_by_site_and_prefers_the_exact_host() {
-        // A tiny stand-in for the vault's stored origins, filtered by exactly
-        // the closure the handler passes to `credentials_matching`.
+        // A tiny stand-in for the vault's stored origins, filtered by the
+        // decision the handler passes to `credentials_matching`
+        // (`autofill_match`), on the https page of each host.
         let stored = [
             "accounts.google.com",
             "google.com",
@@ -8223,10 +8485,11 @@ mod tests {
             "notgoogle.com",
         ];
         let offer = |page: &str| -> Vec<&str> {
+            let url = format!("https://{page}/");
             let mut hit: Vec<&str> = stored
                 .iter()
                 .copied()
-                .filter(|s| super::super::psl::same_site(s, page))
+                .filter(|s| super::autofill_match(s, &url).is_some())
                 .collect();
             hit.sort_by_key(|s| *s != page);
             hit
@@ -8255,6 +8518,155 @@ mod tests {
             !offer("google.com").contains(&"notgoogle.com"),
             "a shared suffix string is not a shared site"
         );
+    }
+
+    /// Finding S-0a47ea9404bd, the scheme half: a credential is stored as a
+    /// bare host, so without this a password saved over https was offered and
+    /// filled on the plain-http page of the same name, which anyone on the
+    /// network can write.
+    #[test]
+    fn an_https_saved_password_is_not_matched_on_plain_http() {
+        use super::{autofill_match, FillMatch};
+        let stored = "login.example.com";
+        assert_eq!(autofill_match(stored, "https://login.example.com/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match(stored, "http://login.example.com/"), None);
+        assert_eq!(autofill_match(stored, "http://www.example.com/"), None);
+        assert_eq!(autofill_match(stored, "HTTP://LOGIN.EXAMPLE.COM/"), None);
+        assert_eq!(autofill_match(stored, "file:///login.example.com"), None);
+    }
+
+    /// The subdomain half: another host of the same registrable domain is a
+    /// Sibling, never an Exact match, and the Public Suffix List still keeps
+    /// unrelated sites under a shared suffix apart.
+    #[test]
+    fn a_sibling_host_is_a_sibling_match_never_an_exact_one() {
+        use super::{autofill_match, FillMatch};
+        assert_eq!(
+            autofill_match("login.example.com", "https://usercontent.example.com/"),
+            Some(FillMatch::Sibling)
+        );
+        assert_eq!(
+            autofill_match("accounts.google.com", "https://mail.google.com/"),
+            Some(FillMatch::Sibling)
+        );
+        assert_eq!(autofill_match("alice.github.io", "https://bob.github.io/"), None);
+        assert_eq!(autofill_match("mybank.co.uk", "https://evil.co.uk/"), None);
+    }
+
+    /// A sibling is released only with the user's confirmation of the exact
+    /// saved host; an exact match needs none; no match is never released.
+    #[test]
+    fn a_sibling_fill_is_refused_without_the_confirmed_origin() {
+        use super::{fill_allowed, FillMatch};
+        let stored = "login.example.com";
+        assert!(!fill_allowed(Some(FillMatch::Sibling), None, stored));
+        assert!(!fill_allowed(Some(FillMatch::Sibling), Some("usercontent.example.com"), stored));
+        assert!(!fill_allowed(Some(FillMatch::Sibling), Some("example.com"), stored));
+        assert!(fill_allowed(Some(FillMatch::Sibling), Some(stored), stored));
+        assert!(fill_allowed(Some(FillMatch::Exact), None, stored));
+        assert!(!fill_allowed(None, Some(stored), stored));
+    }
+
+    /// `secure_host_of` is `host_of`'s parse, for https only.
+    #[test]
+    fn secure_host_of_answers_for_https_pages_only() {
+        use super::super::state::secure_host_of;
+        assert_eq!(secure_host_of("http://example.com/"), None);
+        assert_eq!(secure_host_of("ftp://example.com/"), None);
+        assert_eq!(secure_host_of("HTTPS://Example.com./a").as_deref(), Some("example.com"));
+        assert_eq!(secure_host_of("ht\ttps://example.com/").as_deref(), Some("example.com"));
+        assert_eq!(secure_host_of("https://user@example.com:8443/").as_deref(), Some("example.com"));
+    }
+
+    /// The port half (secscan recheck of S-0a47ea9404bd): the same host on a
+    /// port other than 443 is a Sibling, so it asks first; the default port,
+    /// written or not, is still Exact.
+    #[test]
+    fn the_same_host_on_another_port_is_a_sibling_never_an_exact_match() {
+        use super::{autofill_match, fill_allowed, FillMatch};
+        let stored = "login.example.com";
+        assert_eq!(autofill_match(stored, "https://login.example.com:8443/"), Some(FillMatch::Sibling));
+        assert_eq!(autofill_match(stored, "https://login.example.com:1/"), Some(FillMatch::Sibling));
+        assert_eq!(autofill_match(stored, "https://login.example.com:443/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match(stored, "https://login.example.com:0443/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match(stored, "https://login.example.com:000443/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match(stored, "https://login.example.com:/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match(stored, "https://login.example.com/"), Some(FillMatch::Exact));
+        // Port 80 is http's default, not https's.
+        assert_eq!(autofill_match(stored, "https://login.example.com:80/"), Some(FillMatch::Sibling));
+        // A port this side cannot read never counts as the default one.
+        assert_eq!(autofill_match(stored, "https://login.example.com:44x/"), Some(FillMatch::Sibling));
+        assert_eq!(autofill_match(stored, "https://login.example.com:99999/"), Some(FillMatch::Sibling));
+        // Userinfo with a colon is not a port.
+        assert_eq!(autofill_match(stored, "https://a:b@login.example.com/"), Some(FillMatch::Exact));
+        assert_eq!(
+            autofill_match(stored, "https://a:b@login.example.com:8443/"),
+            Some(FillMatch::Sibling)
+        );
+        // IPv6 literals: the port follows the bracket.
+        assert_eq!(autofill_match("[::1]", "https://[::1]/"), Some(FillMatch::Exact));
+        assert_eq!(autofill_match("[::1]", "https://[::1]:8443/"), Some(FillMatch::Sibling));
+        assert_eq!(autofill_match("[::1]", "https://[::1]x/"), Some(FillMatch::Sibling));
+        // Plain http on any port is still never matched.
+        assert_eq!(autofill_match(stored, "http://login.example.com:8443/"), None);
+        // And the fill: a port page needs the confirmed saved host.
+        let on_port = autofill_match(stored, "https://login.example.com:8443/");
+        assert!(!fill_allowed(on_port, None, stored));
+        assert!(fill_allowed(on_port, Some(stored), stored));
+    }
+
+    /// The offer marks a port page's credential as a sibling and names the
+    /// page with its port, so the chrome asks "saved on X, not X:8443"
+    /// instead of filling, or naming the same host twice.
+    #[test]
+    fn the_offer_marks_a_port_page_as_a_sibling_and_names_the_port() {
+        let mut items = json!([{ "id": "c1", "origin": "login.example.com" }]);
+        super::mark_offer_items(&mut items, "https://login.example.com:8443/a");
+        assert_eq!(items[0]["sibling"], json!(true));
+        assert_eq!(items[0]["same_host"], json!(true));
+        assert_eq!(items[0]["page"], json!("login.example.com:8443"));
+
+        let mut items = json!([
+            { "id": "c1", "origin": "login.example.com" },
+            { "id": "c2", "origin": "example.com" }
+        ]);
+        super::mark_offer_items(&mut items, "https://login.example.com/");
+        assert_eq!(items[0]["sibling"], json!(false));
+        assert_eq!(items[1]["sibling"], json!(true));
+        assert_eq!(items[0]["same_host"], json!(false));
+        assert_eq!(items[1]["same_host"], json!(false), "another host is a plain sibling");
+        assert_eq!(items[0]["page"], json!("login.example.com"));
+    }
+
+    /// The offer's order: the credential naming this host comes first, on
+    /// the default port and on another one alike (there it is still the most
+    /// specific, though it asks first); the chrome offers only items[0].
+    #[test]
+    fn the_offer_puts_the_credential_naming_this_host_first() {
+        for page in ["https://login.example.com/", "https://login.example.com:8443/"] {
+            let mut stored = vec!["example.com", "login.example.com", "www.example.com"];
+            stored.sort_by_key(|s| super::offer_rank(Some(s), page));
+            assert_eq!(stored, vec!["login.example.com", "example.com", "www.example.com"], "{page}");
+        }
+        assert!(
+            super::offer_rank(Some("login.example.com"), "https://login.example.com/")
+                < super::offer_rank(Some("login.example.com"), "https://login.example.com:8443/")
+        );
+        assert_eq!(super::offer_rank(None, "https://login.example.com/"), 2);
+    }
+
+    /// The page label shows any port other than the default, so
+    /// the question never hides the one thing that tells the pages apart
+    /// (review R-001).
+    #[test]
+    fn a_secure_page_label_names_only_a_numeric_non_default_port() {
+        use super::super::state::secure_page_of;
+        let label = |url: &str| secure_page_of(url).map(|page| page.label());
+        assert_eq!(label("https://example.com:8443/").as_deref(), Some("example.com:8443"));
+        assert_eq!(label("https://example.com:443/").as_deref(), Some("example.com"));
+        assert_eq!(label("https://example.com:44x/").as_deref(), Some("example.com:44x"));
+        assert_eq!(label("https://[::1]:8443/").as_deref(), Some("[::1]:8443"));
+        assert_eq!(label("http://example.com:8443/"), None);
     }
 
     #[test]
@@ -8850,28 +9262,33 @@ mod tests {
     #[test]
     fn an_empty_offer_list_says_why_it_is_empty() {
         use super::autofill_offer_reason;
-        // (origin, vault file exists, unlocked, matched) -> reason
+        // (origin, secure, vault file exists, unlocked, matched) -> reason
         let cases = [
             // The defect. A vault exists and is shut: NOTHING was searched.
-            ((true, true, false, false), "locked"),
+            ((true, true, true, false, false), "locked"),
             // Nothing was ever saved anywhere, so there is no vault to unlock.
-            ((true, false, false, false), "no-vault"),
+            ((true, true, false, false, false), "no-vault"),
+            ((true, false, false, false, false), "no-vault"),
             // The HOST had no origin for the active tab, so no lookup ran.
-            ((false, true, true, false), "no-site"),
+            ((false, false, true, true, false), "no-site"),
             // A no-origin page cannot become "locked" or "no-vault": the
             // lookup was not attempted for a reason that precedes the vault.
-            ((false, true, false, false), "no-site"),
-            ((false, false, false, false), "no-site"),
+            ((false, false, true, false, false), "no-site"),
+            ((false, false, false, false, false), "no-site"),
+            // A plain-http page is never filled, so it says so, and a locked
+            // vault on one is not told to unlock for nothing.
+            ((true, false, true, true, false), "not-secure"),
+            ((true, false, true, false, false), "not-secure"),
             // The ONLY row that asserts a search happened and found nothing.
-            ((true, true, true, false), "no-match"),
+            ((true, true, true, true, false), "no-match"),
             // A match outranks everything; the chrome renders the offer.
-            ((true, true, true, true), "match"),
+            ((true, true, true, true, true), "match"),
         ];
-        for ((origin, exists, unlocked, matched), want) in cases {
-            let got = autofill_offer_reason(origin, exists, unlocked, matched);
+        for ((origin, secure, exists, unlocked, matched), want) in cases {
+            let got = autofill_offer_reason(origin, secure, exists, unlocked, matched);
             assert_eq!(
                 got, want,
-                "origin={origin} exists={exists} unlocked={unlocked} matched={matched}"
+                "origin={origin} secure={secure} exists={exists} unlocked={unlocked} matched={matched}"
             );
         }
     }
@@ -8885,17 +9302,18 @@ mod tests {
         use super::{autofill_offer_payload, AUTOFILL_REASON_FIELD};
         let none = json!([]);
         let one = json!([{ "id": "c1", "username": "alice" }]);
-        // (items, has_origin, vault file exists, unlocked) -> reason
+        // (items, has_origin, secure, vault file exists, unlocked) -> reason
         let cases = [
-            (none.clone(), true, true, false, "locked"),
-            (none.clone(), true, false, false, "no-vault"),
-            (none.clone(), false, true, true, "no-site"),
-            (none.clone(), true, true, true, "no-match"),
-            (one.clone(), true, true, true, "match"),
+            (none.clone(), true, true, true, false, "locked"),
+            (none.clone(), true, true, false, false, "no-vault"),
+            (none.clone(), false, false, true, true, "no-site"),
+            (none.clone(), true, false, true, true, "not-secure"),
+            (none.clone(), true, true, true, true, "no-match"),
+            (one.clone(), true, true, true, true, "match"),
         ];
-        for (items, origin, exists, unlocked, want) in cases {
+        for (items, origin, secure, exists, unlocked, want) in cases {
             let sent = items.clone();
-            let reply = autofill_offer_payload(items, origin, exists, unlocked);
+            let reply = autofill_offer_payload(items, origin, secure, exists, unlocked);
             let obj = reply.as_object().expect("the reply must be an object");
             assert!(
                 obj.contains_key(AUTOFILL_REASON_FIELD),
@@ -8906,7 +9324,7 @@ mod tests {
             assert_eq!(
                 obj.get(AUTOFILL_REASON_FIELD).and_then(|v| v.as_str()),
                 Some(want),
-                "origin={origin} exists={exists} unlocked={unlocked}"
+                "origin={origin} secure={secure} exists={exists} unlocked={unlocked}"
             );
             // The items still have to arrive, under their own name.
             assert_eq!(obj.get("items"), Some(&sent), "the reply lost its items");
@@ -8919,11 +9337,14 @@ mod tests {
         use super::autofill_offer_reason;
         for exists in [true, false] {
             for origin in [true, false] {
-                let got = autofill_offer_reason(origin, exists, false, false);
-                assert_ne!(
-                    got, "no-match",
-                    "a locked vault claimed a search happened (origin={origin} exists={exists})"
-                );
+                for secure in [true, false] {
+                    let got = autofill_offer_reason(origin, secure, exists, false, false);
+                    assert_ne!(
+                        got, "no-match",
+                        "a locked vault claimed a search happened \
+                         (origin={origin} secure={secure} exists={exists})"
+                    );
+                }
             }
         }
     }
@@ -8961,17 +9382,19 @@ mod tests {
         // reason cannot be added in Rust without this noticing.
         let mut reachable = Vec::new();
         for origin in [true, false] {
-            for exists in [true, false] {
-                for unlocked in [true, false] {
-                    let r = autofill_offer_reason(origin, exists, unlocked, false);
-                    if !reachable.contains(&r) {
-                        reachable.push(r);
+            for secure in [true, false] {
+                for exists in [true, false] {
+                    for unlocked in [true, false] {
+                        let r = autofill_offer_reason(origin, secure, exists, unlocked, false);
+                        if !reachable.contains(&r) {
+                            reachable.push(r);
+                        }
                     }
                 }
             }
         }
         assert!(
-            reachable.len() >= 4,
+            reachable.len() >= 5,
             "expected every empty-list reason to be reachable, got {reachable:?}"
         );
         for reason in reachable {
@@ -9667,6 +10090,8 @@ mod passphrase_change_tests {
         let download = store
             .record_download("https://dl.example/f", "f", 1, [1u8; 32])
             .unwrap();
+        let picture_file = p.library.parent().unwrap().join("archive").join(&picture);
+        let picture_before = std::fs::read(&picture_file).unwrap();
         let warnings = change_vault_and_library_passphrase(
             &mut vault,
             Some(&mut store),
@@ -9677,6 +10102,12 @@ mod passphrase_change_tests {
         .expect("the change");
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(store.format_version(), 3);
+        // Secscan S-1a563619ce84: the same change renews the data key, so the
+        // passphrase it retires no longer derives it, and the pictures were
+        // re-encrypted under the new one.
+        assert!(!store.needs_rekey(), "the change left the Library on its version 1 key");
+        assert_ne!(std::fs::read(&picture_file).unwrap(), picture_before, "the picture was not re-encrypted");
+        assert!(!patanyx_store::rekey_journal_exists(&p.library));
         drop(vault);
         drop(store);
         assert!(vault_opens(&p.vault, "new pass"));
@@ -9692,6 +10123,56 @@ mod passphrase_change_tests {
             Store::unlock(&p.library, "old pass").is_err(),
             "the Library file still opens with the old passphrase"
         );
+    }
+
+    /// Secscan S-1a563619ce84, reviews R-002 and F-001: a renewal that does
+    /// not happen (here a linked `archive`, which it refuses; in life, too
+    /// little free disk space) does not stop the change, which would keep
+    /// the vault under a passphrase its owner wants retired, and the reply
+    /// says the key was not renewed. The Library stays usable and asks for
+    /// renewal again.
+    #[cfg(unix)]
+    #[test]
+    fn a_change_whose_key_renewal_does_not_happen_goes_ahead_and_says_so() {
+        let (p, mut vault, mut store) = profile("old pass");
+        let bookmark = store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        let dir = p.library.parent().unwrap().to_path_buf();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.join("archive")).unwrap();
+        std::fs::rename(dir.join("archive"), elsewhere.path().join("archive")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("archive"), dir.join("archive")).unwrap();
+        let warnings =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old pass", "new pass")
+                .expect("the change goes ahead");
+        assert_eq!(warnings, vec!["passphrase_changed_library_key_not_renewed"]);
+        assert!(store.needs_rekey(), "it is asked for again at the next unlock");
+        drop(vault);
+        drop(store);
+        assert!(vault_opens(&p.vault, "new pass"));
+        assert!(!vault_opens(&p.vault, "old pass"));
+        let reopened = library_through_vault(&p, "new pass").expect("the Library follows");
+        assert!(reopened.get_bookmark(&bookmark).is_some());
+    }
+
+    /// A renewal left neither finished nor undone (here: a journal already
+    /// there) stops the change; the current passphrase still opens both.
+    #[test]
+    fn a_change_whose_key_renewal_is_left_half_done_is_refused() {
+        let (p, mut vault, mut store) = profile("old pass");
+        let bookmark = store.add_bookmark("https://kept.example/", "Kept").unwrap();
+        let mut journal = p.library.clone().into_os_string();
+        journal.push(".rekey-journal");
+        std::fs::write(&journal, b"{}").unwrap();
+        let outcome =
+            change_vault_and_library_passphrase(&mut vault, Some(&mut store), true, "old pass", "new pass");
+        assert_eq!(outcome, Err("library_rekey_unfinished"));
+        drop(vault);
+        drop(store);
+        assert!(vault_opens(&p.vault, "old pass"), "the passphrase changed although the renewal was half done");
+        assert!(!vault_opens(&p.vault, "new pass"));
+        std::fs::remove_file(&journal).unwrap();
+        let reopened = library_through_vault(&p, "old pass").expect("the Library still opens");
+        assert!(reopened.get_bookmark(&bookmark).is_some());
     }
 
     #[test]
@@ -9930,6 +10411,10 @@ mod passphrase_change_tests {
         let repaired = repair_library_passphrase(&vault, &p.library, "previous", "current")
             .expect("the repair");
         assert_eq!(repaired.format_version(), 3);
+        assert!(
+            !repaired.needs_rekey(),
+            "the repaired Library kept the key the passphrase it was left under derived"
+        );
         assert!(repaired.get_bookmark(&bookmark).is_some());
         drop(repaired);
         drop(vault);

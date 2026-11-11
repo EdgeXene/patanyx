@@ -518,6 +518,107 @@ check("the older-backup warning sits inside the form, before its button", () => 
   assert(note !== -1 && note < button, "the warning is not in the form above the button");
 });
 
+// ---- M12: add-on pages an import replaces ----------------------------------------
+// The count comes from this Library (vault_import_inspect.addon_pages), never
+// from the file: null is add-on data that could not be counted.
+
+check("the Backup pane warns before an import replaces add-on pages", async () => {
+  const note = global.$("bk-import-addons");
+  assert(note, "bk-import-addons is not in index.html");
+  await pick("bk-import-", { version: 4, whole_library: true, older: false, addon_pages: 3, addon_ids: ["text-pages"] });
+  assert(note.hidden === false, "a Library with add-on pages was about to be replaced and no warning appeared");
+  assert(global.$("bk-import-addons-known").hidden === false && global.$("bk-import-addons-export").hidden === false,
+    "counted pages are not named, or their export is not offered");
+  const markup = html.slice(html.indexOf('id="bk-import-addons"'));
+  const body = markup.slice(0, markup.indexOf("</div>"));
+  assert(/replaces/.test(body) && /removes them/.test(body), "the add-on warning does not say the pages are replaced or removed");
+  assert(/export/i.test(body), "the add-on warning offers no export");
+  await pick("bk-import-", { version: 4, whole_library: true, older: false, addon_pages: 0, addon_ids: [] });
+  assert(note.hidden === true, "the add-on warning stayed up for a Library with no add-on pages");
+  await pick("bk-import-", { version: 2, whole_library: false, older: true, addon_pages: null, addon_ids: ["text-pages"] });
+  assert(note.hidden === false, "add-on data that could not be counted was not warned about");
+  assert(global.$("bk-import-addons-known").hidden === true && global.$("bk-import-addons-unknown").hidden === false,
+    "data that could not be counted was stated as pages that are there");
+  assert(global.$("bk-import-addons-export").hidden === true, "an export that cannot succeed was offered for uncounted data");
+  // A file-header answer without the field is not taken as proof of anything.
+  await pick("bk-import-", { version: 4, whole_library: true, older: false });
+  assert(note.hidden === true, "the add-on warning appeared with no count from this Library");
+});
+
+check("add-on pages at stake hold a typed submit for a second one", async () => {
+  const note = global.$("bk-import-addons");
+  note.hidden = true;
+  global.rbCalls.length = 0;
+  global.rbReject = null;
+  global.rbResolve = {
+    vault_import_inspect: { version: 4, whole_library: true, older: false, addon_pages: 2, addon_ids: ["text-pages"] },
+    vault_import: { recovery_key: "AAAA-BBBB", bookmarks: 0, library: "replaced" },
+  };
+  fill("bk-import-", { src: "/tmp/typed-addons.rbx" });
+  global.$("bk-import-form")._fire("submit");
+  await flush();
+  assert(!global.rbCalls.some((c) => c.cmd === "vault_import"), "add-on pages were replaced before their warning was on screen");
+  assert(note.hidden === false, "the add-on warning was not shown on submit");
+  fill("bk-import-", { src: "/tmp/typed-addons.rbx" });
+  global.$("bk-import-form")._fire("submit");
+  await flush();
+  assert(
+    global.rbCalls.filter((c) => c.cmd === "vault_import").length === 1,
+    "the second submit, with the add-on warning read, did not import",
+  );
+});
+
+check("a second press before the add-on warning appears is not a confirmation", async () => {
+  const note = global.$("bk-import-addons");
+  note.hidden = true;
+  global.rbCalls.length = 0;
+  global.rbReject = null;
+  global.rbResolve = {
+    vault_import_inspect: { version: 4, whole_library: true, older: false, addon_pages: 2, addon_ids: ["text-pages"] },
+    vault_import: { recovery_key: "AAAA-BBBB", bookmarks: 0, library: "replaced" },
+  };
+  fill("bk-import-", { src: "/tmp/double-press.rbx" });
+  // Two presses while the first check is still out.
+  global.$("bk-import-form")._fire("submit");
+  global.$("bk-import-form")._fire("submit");
+  await flush();
+  assert(!global.rbCalls.some((c) => c.cmd === "vault_import"), "a press made before the warning was on screen confirmed it");
+  assert(note.hidden === false, "the add-on warning was not shown");
+  fill("bk-import-", { src: "/tmp/double-press.rbx" });
+  global.$("bk-import-form")._fire("submit");
+  await flush();
+  assert(global.rbCalls.filter((c) => c.cmd === "vault_import").length === 1, "the press after the warning did not import");
+});
+
+check("the add-on warning's export runs the add-on's own export, and never the import", async () => {
+  const exported = [];
+  global.window.__addons = { refresh: async () => {}, exportPages: async (id) => { exported.push(id); } };
+  global.rbCalls.length = 0;
+  await pick("bk-import-", { version: 4, whole_library: true, older: false, addon_pages: 1, addon_ids: ["text-pages"] });
+  global.rbCalls.length = 0;
+  global.$("bk-import-addons-export")._fire("click");
+  await flush();
+  assert(global.window.__rb.isPanelOpen("addons") && global.$("addons-panel").hidden === false, "export opens Add-ons to show its result");
+  assert(exported.length === 1 && exported[0] === "text-pages", "the export was not asked of the add-on: " + JSON.stringify(exported));
+  assert(!global.rbCalls.some((c) => c.cmd === "vault_import"), "the export offer started the import");
+  delete global.window.__addons;
+});
+
+check("the add-on warning sits inside the form, before its button, and not on the no-vault screen", () => {
+  const form = html.slice(html.indexOf('id="bk-import-form"'));
+  const note = form.indexOf('id="bk-import-addons"');
+  const button = form.indexOf('type="submit"');
+  assert(note !== -1 && note < button, "the add-on warning is not in the form above the button");
+  assert(!global.$("import-addons"), "the no-vault screen grew an add-on note");
+});
+
+check("restored add-on pages are counted with the rest of the import", async () => {
+  const reply = JSON.parse(JSON.stringify(WHOLE_REPLY));
+  reply.restored.addon_pages = 4;
+  const result = await importWith("bk-import-", reply);
+  assert(/Add-on pages restored from the backup: 4/.test(result.textContent), "restored add-on pages went uncounted: " + result.textContent);
+});
+
 check("the no-vault screen has nothing to lose and inspects nothing", async () => {
   assert(!global.$("import-older"), "the no-vault screen grew an older-backup note");
   await pick("import-", { version: 2, older: true });
@@ -566,7 +667,7 @@ check("an export made with no Library open says it holds the vault only", async 
   assert(ok.textContent.length > 0 && !/\d/.test(ok.textContent), "vault-only export not stated: " + ok.textContent);
 });
 
-for (const code of ["export_item_too_large", "export_picture_unreadable"]) {
+for (const code of ["export_item_too_large", "export_picture_unreadable", "export_addon_page_unreadable"]) {
   check(`an export refused with ${code} wrote nothing and names the item`, async () => {
     const { ok, err } = await exportWith({ refused: code, item: "My saved page", bookmark_limit: 100000 });
     assert(ok.textContent === "", "a refused export claimed it was written");
@@ -574,6 +675,18 @@ for (const code of ["export_item_too_large", "export_picture_unreadable"]) {
     assert(global.$("bk-exp-pass1").value === "export-pass", "the passphrases were cleared for a retry");
   });
 }
+
+check("an untitled add-on page that cannot be read gets its own message, not the Library's", async () => {
+  const { err } = await exportWith({ refused: "export_addon_page_unreadable", item: "", bookmark_limit: 100000 });
+  assert(/Could not read an add-on page/.test(err.textContent), "an untitled page fell to the generic message: " + err.textContent);
+});
+
+check("an export refused for unreadable add-on data says so, not that the Library failed", async () => {
+  const { ok, err } = await exportWith({ refused: "export_addon_unreadable", item: null, bookmark_limit: 100000 });
+  assert(ok.textContent === "", "a refused export claimed it was written");
+  assert(/add-on pages/i.test(err.textContent) && /in Add-ons/.test(err.textContent), "the add-on refusal fell to the generic message: " + err.textContent);
+});
+
 
 for (const code of [
   "export_too_many_bookmarks",
@@ -1276,6 +1389,33 @@ check("a lock while a saved export's counts are worded still says it was saved",
     assert(/already complete/.test(last.title || ""), "the late stop went unmentioned");
     assert(last.dataset && last.dataset.sticky === "1", "the notice does not stay");
   });
+});
+
+// Every command that opens a file chooser answers only once the user has
+// picked, so it must wait for that answer. The 30 s deadline used to throw
+// the choice away for anyone slower than that (VM pass, 2026-11-10), and the
+// host then went ahead anyway behind an error the user had already been shown.
+check("every command that opens a file chooser waits for the answer", () => {
+  const chromeSrc = fs.readFileSync(path.join(chromeDir, "chrome.js"), "utf8");
+  for (const cmd of ["file_pick_open", "file_pick_save", "tunnel_import", "bookmarks_import"]) {
+    const re = new RegExp('rb\\(\\s*"' + cmd + '"', "g");
+    let found = 0;
+    let m;
+    while ((m = re.exec(chromeSrc))) {
+      found++;
+      const call = chromeSrc.slice(m.index, chromeSrc.indexOf(");", m.index));
+      assert(
+        call.includes("RB_UNTIL_ANSWERED"),
+        cmd + " is sent with the usual deadline: " + JSON.stringify(call.slice(0, 120)),
+      );
+    }
+    assert(found > 0, "no " + cmd + " call found; the check needs updating");
+  }
+  const addonsSrc = fs.readFileSync(path.join(chromeDir, "addons.js"), "utf8");
+  assert(
+    /action === "export" \? untilAnswered/.test(addonsSrc),
+    "an add-on export (which asks for a folder) is sent with the usual deadline",
+  );
 });
 
 (async () => {

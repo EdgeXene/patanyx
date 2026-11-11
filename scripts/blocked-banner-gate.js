@@ -189,6 +189,8 @@ check("a notice replaced between press and click spends nothing (review round 2,
 });
 
 check("navigating the blocked tab elsewhere takes the notice down (pentest F-006 review)", () => {
+  // Tab 1 is the active tab: a notice shows only over its own tab.
+  global.window.__rb_event({ event: "tab_status", data: { id: 1, origin: "news.example", blocked_pending: null, tls: "normal", profile: "persistent", page_insecure: false, freeze_phase: "loaded", freeze_enforcement: "inactive", pending_save: null } });
   global.window.__rb_event({ event: "navigation_blocked", data: { tab_id: 1, pending_id: 9, host: "evil.example", rule: "evil.example", body: "x" } });
   assert(global.$("blocked-warning").hidden === false, "precondition: notice shown");
   // The attempting page's own status, notice still pending: stays up.
@@ -367,6 +369,28 @@ check(
     global.$("blocked-dismiss")._fire("click");
   },
 );
+
+check("the notice shows only over its own tab, and again on return to it", () => {
+  const status = (id, pending) => global.window.__rb_event({ event: "tab_status", data: { id, origin: "page.example", blocked_pending: pending, tls: "normal", profile: "persistent", page_insecure: false, freeze_phase: "loaded", freeze_enforcement: "inactive", pending_save: null } });
+  status(8, null);
+  global.window.__rb_event({ event: "navigation_blocked", data: { tab_id: 8, pending_id: 51, host: "switch.example", rule: "switch.example", body: "x" } });
+  assert(global.$("blocked-warning").hidden === false, "precondition: notice shown on its tab");
+  status(9, null);
+  assert(global.$("blocked-warning").hidden === true, "the notice stayed over another tab after a switch");
+  status(8, 51);
+  assert(global.$("blocked-warning").hidden === false, "the notice did not come back on its own tab");
+  const before = global.rbCalls.filter((c) => c.cmd === "blocklist_allow").length;
+  global.$("blocked-allow")._fire("pointerdown"); global.$("blocked-allow")._fire("click");
+  const calls = global.rbCalls.filter((c) => c.cmd === "blocklist_allow");
+  assert(calls.length === before + 1 && calls[calls.length - 1].args.tab_id === 8 && calls[calls.length - 1].args.pending_id === 51, "the returned notice did not send its own tab's consent");
+  // A block in a background tab waits for that tab.
+  status(9, null);
+  global.window.__rb_event({ event: "navigation_blocked", data: { tab_id: 10, pending_id: 52, host: "bg2.example", rule: "bg2.example", body: "y" } });
+  assert(global.$("blocked-warning").hidden === true, "a background tab's notice covered the active tab");
+  status(10, 52);
+  assert(global.$("blocked-warning").hidden === false, "the background tab's notice did not show on that tab");
+  global.window.__rb_event({ event: "navigation_blocked_retired", data: { tab_id: 10 } });
+});
 
 check("a malformed event changes nothing", () => {
   global.$("blocked-warning").hidden = true;

@@ -442,3 +442,118 @@ dribbble.com         # 1214  Dribbble, the design portfolio site. RDAP records
                      #       the service, and an apex block takes every
                      #       designer's portfolio with it. Exact-match: a
                      #       listed subdomain stays blocked.
+
+# --- Ruling 2026-10-11 ----------------------------------------------------
+# ShadowWhisperer's Malware list carried three hosts that moved into the Tranco
+# top 10,000, and the tripwire refused every hourly build from 2026-10-10
+# 19:00Z until this ruling, ALLOW for all three, on 2026-10-11. It replaces the
+# 1.0.6 KEEP BLOCKED ruling of 2026-10-10. ShadowWhisperer.Malware is the ONLY
+# feed here that carries any of them.
+
+myshn.eu             # 6094  Skyhigh Security. www.myshn.eu presents a
+                     #       GlobalSign OV certificate whose subject names
+                     #       "Skyhigh Security" (Plano, Texas), and that host
+                     #       is a CNAME into shn.io. The apex itself returned
+                     #       no A record; its MX is Microsoft 365 mail
+                     #       protection. Phishing.Database separately lists
+                     #       three subdomains that imitate Microsoft sign-in
+                     #       pages (account.live.com.office.harting.myshn.eu,
+                     #       login.live.com.office.harting.myshn.eu,
+                     #       login.live.com.office.rp.skydemo.myshn.eu). Those
+                     #       STAY BLOCKED: this entry is exact-match and
+                     #       shelters no subdomain. What decides it is scope
+                     #       plus identity: a vendor's customer-tenant domain,
+                     #       where the abuse is a claim about a tenant name
+                     #       and is already listed by name.
+
+# The next two are recorded together because every lookup returned the same
+# shape for both. From this server on 2026-10-11: both names resolve to the one
+# address 94.242.247.34, each on its own four Route 53 nameservers; RDAP
+# (Verisign) records both registered on 2025-03-12, four seconds apart
+# (15:49:09Z and 15:49:13Z), through Amazon Registrar; both present a DV
+# wildcard certificate from Google Trust Services, issued 2026-08-19, that
+# names NO organisation; and both answer HTTP 200 with the same 19,812-byte
+# page (identical etag) titled "Operated by Clickadu Advertisement Network",
+# with a clickadu.com favicon. That is a page describing itself, which is
+# weaker identity evidence than clickadu.net above, whose OV certificate names
+# "Clickadu S.R.O.". Registration seconds apart is also how the
+# publicdnsservice names in blocklist-confirm.txt were linked; these two are on
+# different nameservers and addresses, and this review consulted no vendor
+# classification for either. Scope decides it: this list blocks PHISHING (see
+# the telegram.im block above), and an ad network's delivery domains are
+# adware-adjacent, the same call as clickadu.net. The adlist files under
+# crates/app/src do not carry either host, so after this nothing in the
+# browser blocks them. REVISIT if a second feed or a vendor classification ever
+# reports either host as phishing.
+goldfishouncereburial.com   # 8824  Clickadu ad-network page, by its own title.
+attacheatableoverlabor.com  # 8922  Same page, same address; see the note above.
+
+# --- Ruling 2026-10-14 ----------------------------------------------------
+# phishunt.io reported one URL on Google's Paraguay search domain, first seen
+# by this pipeline at 2026-10-14T22:02Z, and the tripwire refused every hourly
+# build from 22:02Z (Tranco #5164 in the 2026-10-12 snapshot, refuse band).
+# Ruled ALLOW on 2026-10-14.
+# phishunt.io is the ONLY feed here that carries it; the other five do not.
+
+google.com.py        # 5164  Google Search, Paraguay. The one reported URL was
+                     #       https://google.com.py/share.google?q=<id>, a
+                     #       Google share link: fetched from this server on
+                     #       2026-10-14 without following, it answered 301 to
+                     #       the same path on www.google.com.py, and that
+                     #       answered 301 to an address-shaped cPanel host
+                     #       (138-124-182-120.cprapid.com). The abuse is a
+                     #       claim about that destination, not about Google.
+                     #       Lookups the same day: nameservers ns1-4.google.com;
+                     #       the apex resolves to 64.233.162.94, inside the
+                     #       ARIN block NET-64-233-160-0-1 whose RDAP names
+                     #       Google LLC; server header gws; certificate
+                     #       *.google.com.py plus the apex, issued by Google
+                     #       Trust Services (WE2), DV, so it names no
+                     #       organisation. .py has no RDAP service in the IANA
+                     #       bootstrap, so no registry record was read.
+                     #       Exact-match: a listed subdomain stays blocked.
+
+# --- 1.1.0 tripwire rulings, 2026-11-06 ------------------------------------
+# The 2026-11-07 snapshot armed five hosts that ShadowWhisperer.Malware alone
+# carries; the other five feeds carry none of them. These two are long-standing
+# software vendors; the other three stay blocked (blocklist-confirm.txt).
+# Lookups from this server on 2026-11-06, pages fetched without following
+# redirects. Scope decides both: this list blocks PHISHING, and a vendor whose
+# product is abused, or sold hard, is not a phishing site.
+
+optimumdesk.com      # 6574  OptimumDesk, an IT service-management platform
+                     #       (help desk and remote support). RDAP (Verisign):
+                     #       registered 2011-03-25 through GoDaddy; its own
+                     #       nameservers; Let's Encrypt DV certificate, so it
+                     #       names no organisation; the page answers 200,
+                     #       titled "OptimumDesk - IT Full-Service Management
+                     #       Platform". Remote-support tools are abused by
+                     #       tech-support scams, which is a claim about how a
+                     #       product is used, and an apex block takes the
+                     #       vendor's own customers with it. Exact-match: a
+                     #       listed subdomain stays blocked.
+totalav.com          # 8720  TotalAV, a consumer antivirus vendor. RDAP
+                     #       (Verisign): registered 1999-11-29 through eNom;
+                     #       Route 53 nameservers; Sectigo DV wildcard
+                     #       certificate (names no organisation); the apex
+                     #       answers 302 to https://www.totalav.com/. Sold
+                     #       through aggressive advertising, which is
+                     #       adware-adjacent at most, the same call as
+                     #       clickadu.net. Exact-match: a listed subdomain
+                     #       stays blocked.
+
+# --- Warn-band review at the 1.1.0 release, 2026-11-06 ---------------------
+# review-blocklist-fps.py, top 25 of the 10k-100k band, all reported by
+# PhishDestroy alone. One is ruled here; the rest stay blocked (crypto and
+# casino lookalikes, modded-app sites, and services whose pages answered this
+# server only with a Cloudflare challenge, so nothing was learned about them).
+
+sendspace.com        # 15074 Sendspace, the file-sharing service. RDAP: about
+                     #       21 years registered; Sectigo DV wildcard
+                     #       certificate (names no organisation); the apex
+                     #       answers 301 to https://www.sendspace.com/. A
+                     #       phishing file shared there is a claim about that
+                     #       file, not the service, and an apex block takes
+                     #       every user's files with it: the dribbble.com
+                     #       call. Exact-match: a listed subdomain stays
+                     #       blocked.

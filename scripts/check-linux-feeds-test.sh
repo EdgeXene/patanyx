@@ -124,6 +124,7 @@ expect ok     "a later release (1.0.7) with /v1 frozen passes" \
 markers="$here/forbidden-build-markers.py"
 chat_marker="PATANYX-Nabu-X for "
 unlocked_marker="UNLOCKED TEST BUILD: Premium forced on; no license checked"
+launch_marker="ADD-ON LAUNCH TEST BUILD: the add-on manager is shown before its release"
 
 # plant <from> <name> <line>: a copy of a stand-in with one more line.
 plant() {
@@ -155,6 +156,8 @@ planted_v2 strict-chat "${chat_marker}Linux -- third-party software"
 expect_named "a chat build on /v2 is refused" "chat build marker" "${P2[@]}"
 planted_v2 strict-unlocked "PATANYX Browser -- $unlocked_marker"
 expect_named "a premium-unlocked build on /v2 is refused" "premium-unlocked build marker" "${P2[@]}"
+planted_v2 strict-launch "PATANYX Browser -- $launch_marker"
+expect_named "an addon-launch build on /v2 is refused" "addon-launch build marker" "${P2[@]}"
 planted_v2 strict-cargo "/root/.cargo/registry/src/index.crates.io-0000/gtk-0.18.2/src/lib.rs"
 expect_named "a binary with a /.cargo/ build path is refused" "containing /.cargo/" "${P2[@]}"
 planted_v2 strict-rustup "/root/.rustup/toolchains/1.98.1-x86_64-unknown-linux-gnu/lib/rustlib/src"
@@ -179,6 +182,7 @@ scan() {  # scan <want-exit> <label> <args...>
 scan 0 "a clean stand-in passes" "$strict"
 scan 1 "a chat marker is found" "$work/strict-chat"
 scan 1 "the unlocked marker is found" "$work/strict-unlocked"
+scan 1 "the add-on launch marker is found" "$work/strict-launch"
 scan 1 "a /.cargo/ path is found" "$work/strict-cargo"
 scan 1 "a /.rustup/ path is found" "$work/strict-rustup"
 scan 0 "remapped paths and cargo-like domains are not findings" "$work/strict-clean"
@@ -199,6 +203,9 @@ listed() { python3 -I "$markers" --list | grep -qxF -- "$1$2$3"; }
 tab=$'\t'
 pin "the list carries the chat marker" listed chat "$tab" "$chat_marker"
 pin "the list carries the unlocked marker" listed premium-unlocked "$tab" "$unlocked_marker"
+pin "the list carries the add-on launch marker" listed addon-launch "$tab" "$launch_marker"
+pin "the launch marker is addon_manager.rs LAUNCH_TEST_MARKER" \
+  grep -qF "\"$launch_marker\";" "$src/crates/app/src/addon_manager.rs"
 pin "the list carries /.cargo/" listed path "$tab" /.cargo/
 pin "the list carries /.rustup/" listed path "$tab" /.rustup/
 pin "the unlocked marker is about.rs UNLOCKED_BUILD_MARKER" \

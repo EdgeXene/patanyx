@@ -1,6 +1,6 @@
 [package]
 name = "patanyx"
-version = "1.0.10"
+version = "1.1.0"
 license = "Apache-2.0"
 edition = "2021"
 
@@ -33,6 +33,13 @@ chat = ["dep:patanyx-chat"]
 # a public binary must contain NO discoverable runtime licence bypass. It must
 # NEVER enter `default`, a public package, or any release build offered to users.
 premium-unlocked = []
+# QUALIFICATION TEST ARTIFACT: shows the add-on manager before its release
+# switch, so the signed add-on can be installed from the delivery endpoint on a
+# test machine with a real Premium licence. Compile-time for the same reason as
+# `premium-unlocked`, and it compiles in a marker that build-windows.sh and
+# build-flatpak.sh refuse in a public build. It must NEVER enter `default`, a
+# public package, or any release build offered to users.
+addon-launch = []
 # Reachable-beyond-the-LAN chat. Implies `chat` (a relay without the chat
 # stack is dead weight) and forwards to the flag crates/chat declares —
 # chat_panel.rs gates on THIS name via cfg!(feature = "relay-client").

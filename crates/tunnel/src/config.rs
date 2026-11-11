@@ -101,6 +101,19 @@ pub struct TunnelConfig {
     pub address: Vec<String>,
 }
 
+/// The keys wipe themselves when the config drops, on every path: a start
+/// that fails part way returns before `start_on` wipes them, and a config that
+/// never reaches the tunnel (a failed thread spawn) is dropped where it is.
+impl Drop for TunnelConfig {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.private_key_b64.zeroize();
+        if let Some(preshared) = &mut self.preshared_key_b64 {
+            preshared.zeroize();
+        }
+    }
+}
+
 impl fmt::Debug for TunnelConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TunnelConfig")

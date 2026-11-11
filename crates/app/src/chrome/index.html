@@ -743,6 +743,11 @@
         <span id="chat-dot" class="dot" hidden></span>
       </button>
 
+      <!-- Add-ons: hidden by in-menu. -->
+      <button id="btn-addons" class="feature-btn in-menu" type="button" aria-pressed="false" title="Add-ons" data-msg-title="chrome.addons.heading">
+        <span class="feature-label" data-msg="chrome.addons.heading">Add-ons</span>
+      </button>
+
       <!-- The tools modal's one door (was Deep Recall's own button; the
            the three content tools were collapsed into one modal and one
            toolbar slot, 2026-08-19). In MARKUP now rather than built by
@@ -813,6 +818,9 @@
     <div id="group-menu" class="menu-layer" role="menu" hidden></div>
 
     <div id="main-menu" class="menu-layer" role="menu" aria-labelledby="btn-main-menu" hidden>
+      <button id="menu-addons" type="button" class="menu-entry" role="menuitem" data-proxy-for="btn-addons">
+        <span class="menu-entry-label" data-msg="chrome.addons.heading">Add-ons</span>
+      </button>
       <button
         id="menu-reader"
         type="button"
@@ -983,6 +991,23 @@
       <div class="banner-actions">
         <button id="tutorial-banner-watch" type="button" class="small" data-msg="chrome.tutorial.banner.watch.button">Watch</button>
         <button id="tutorial-banner-later" type="button" class="small" data-msg="chrome.tutorial.banner.later.button">Not now</button>
+      </div>
+    </div>
+
+    <!-- One-time announcement of a Premium add-on (1.1.0). Its name and summary
+         come from the signed catalog (addons.js); this markup names no add-on. -->
+    <div id="addon-banner" role="status" hidden>
+      <svg class="ico" viewBox="0 0 16 16" aria-hidden="true">
+        <path d="M8 1.8 L9.6 6.2 L14.2 6.4 L10.6 9.2 L11.9 13.6 L8 11 L4.1 13.6 L5.4 9.2 L1.8 6.4 L6.4 6.2 Z" />
+      </svg>
+      <div class="banner-text">
+        <span class="banner-title"><span data-msg="addon.banner.title">New for Premium:</span> <span id="addon-banner-name"></span></span>
+        <span id="addon-banner-summary"></span>
+      </div>
+      <div class="banner-actions">
+        <button id="addon-banner-try" type="button" class="small"><span data-msg="addon.banner.try">Try</span> <span id="addon-banner-try-name"></span></button>
+        <button id="addon-banner-tour" type="button" class="small" data-msg="addon.banner.tour">Watch the tour</button>
+        <button id="addon-banner-later" type="button" class="small" data-msg="addon.banner.later">Not now</button>
       </div>
     </div>
 
@@ -1657,13 +1682,7 @@
         </button>
       </div>
 
-      <span class="section-label" data-msg="chrome.tab.translate.manage.label">Languages you can install</span>
-      <p class="panel-note" data-msg="chrome.tab.translate.manage.note">
-        Install a language to translate pages in it. Packs are a few tens of
-        megabytes and download once, then work offline. Language names are shown
-        in English for now.
-      </p>
-      <ul id="translate-langs" class="items"></ul>
+      <button id="translate-manage" type="button" class="small" data-msg="chrome.addons.manage.languages">Manage languages</button>
       </div>
     </section>
     <!-- BOOKMARKS MANAGER. Carries `panel-modal` like every other panel (the
@@ -2344,6 +2363,13 @@
             <input id="fold-tools" type="checkbox" />
             <span data-msg="chrome.fold.tools.span">Tools</span>
           </label>
+        </div>
+        <!-- Add-on buttons (addons.js fills one checkbox per add-on, labelled
+             with its signed name; stored as prefs toolbar_hidden_addons). They
+             are Tools members: on the row only while Tools is not folded, and
+             only if checked here. Every one keeps its entry in the Tools menu. -->
+        <div id="addon-toolbar-choices" role="group" aria-labelledby="addon-toolbar-head" hidden>
+          <span class="fold-head" id="addon-toolbar-head" data-msg="chrome.addon.toolbar.head">With Tools open, show:</span>
         </div>
       </section>
 
@@ -3651,7 +3677,7 @@
 
           <h2 data-msg="chrome.pane.backup.h2.n2">Encrypted export</h2>
           <p class="panel-intro" data-msg="chrome.pane.backup.p.n2">
-            Back up or move your vault and your Library in one encrypted file, protected by a passphrase of its own. It includes everything in your vault, such as your passwords, notes, Private Tunnel configuration and Premium token. While your Library is open, it also includes your bookmarks, Tab Shelf, Deep Recall pages and page snapshots with their pictures, and your Divergence Exceptions. Download records stay on this computer. Earlier versions of PATANYX cannot open the file. There is no recovery key for the file, so without its passphrase it cannot be opened. If you forget your vault passphrase, use your recovery key.
+            Back up or move your vault and your Library in one encrypted file, protected by a passphrase of its own. It includes everything in your vault, such as your passwords, notes, Private Tunnel configuration and Premium token. While your Library is open, it also includes your bookmarks, Tab Shelf, Deep Recall pages and page snapshots with their pictures, your Divergence Exceptions, and pages saved by Premium add-ons. Download records stay on this computer. Earlier versions of PATANYX cannot open the file. There is no recovery key for the file, so without its passphrase it cannot be opened. If you forget your vault passphrase, use your recovery key.
           </p>
           <form id="bk-export-form" class="entry-form">
             <div class="form-buttons">
@@ -3721,6 +3747,15 @@
                  vault and bookmarks only). The import still replaces the
                  whole Library, so what it cannot bring back is said here,
                  before the person confirms. -->
+            <!-- Any import replaces the add-on
+                 pages beside the Library with the backup's, or with none, so
+                 the person is told, and offered the add-on's own text export,
+                 before confirming (M12). -->
+            <div class="destructive-warning" id="bk-import-addons" role="note" hidden>
+              <p id="bk-import-addons-known" data-msg="chrome.bk.import.addons.p">Importing replaces your add-on pages, or removes them if the backup has none. Export them first to keep a copy.</p>
+              <p id="bk-import-addons-unknown" hidden data-msg="chrome.bk.import.addons.unknown.p">You may have add-on pages here. Importing replaces them, or removes them if the backup has none.</p>
+              <button type="button" id="bk-import-addons-export" data-msg="chrome.bk.import.addons.export">Export pages</button>
+            </div>
             <p class="destructive-warning" id="bk-import-older" role="note" hidden data-msg="chrome.bk.import.older.p">
               This backup was made by an earlier version of PATANYX and holds only your vault and, at most, your bookmarks. Importing it still replaces your whole Library, so your Tab Shelf, Deep Recall pages, page snapshots, empty bookmark folders, Divergence Exceptions and download records on this computer will be gone.
             </p>
@@ -3769,8 +3804,8 @@
                hid this form: rotating the vault alone stranded the Library,
                pentest F-001). The Library opens with the vault, so a change
                moves only the vault; a Library from before that moves into the
-               vault at its owner's first change, keeping its key, so nothing
-               inside either file is re-encrypted. See
+               vault at its owner's first change, keeping its key, which that
+               change then renews (secscan S-1a563619ce84). See
                change_vault_and_library_passphrase in ipc.rs. The intro is a
                pinned claim (claims.list): it must stay true for every outcome
                the form can report. -->
@@ -3805,7 +3840,7 @@
 
           <h2 data-msg="chrome.pane.backup.h2.n5">Plaintext export: the way out</h2>
           <p class="error" data-msg="chrome.pane.backup.p.n5">
-            This writes every password and note into an unencrypted file. Backups, search tools, or the disk may keep readable copies after you delete it.
+            This writes every password and note into an unencrypted file. Backups, search tools, or the disk may keep readable copies after you delete it. Pages saved by a Premium add-on have their own export in Add-ons.
           </p>
           <p class="panel-intro" data-msg="chrome.pane.backup.p.n6">
             Use this to leave PATANYX. Delete the file when finished.
@@ -3850,6 +3885,116 @@
           <!-- Populated only when partner_list says this placement applies. -->
           <div id="partner-vault"></div>
         </div>
+      </div>
+    </section>
+
+    <!-- The disclosures sit beside the controls they describe. -->
+    <section id="addons-panel" hidden>
+      <h2 data-msg="chrome.addons.heading">Add-ons</h2>
+      <div id="addon-controls" class="addon-controls" hidden>
+        <h3 data-msg="chrome.addons.premium.heading">Premium add-ons</h3>
+        <!-- One card per add-on the signed catalog or an installed manifest
+             names (addons.js); each opens that add-on's own panel. Nothing
+             here names an add-on: every name and summary is signed data. -->
+        <div id="addon-manager" hidden>
+          <p id="addon-catalog-line" role="status" aria-live="polite"></p>
+          <div id="addon-known-list"></div>
+          <!-- What's sent: the network disclosure, tucked (addons.js). -->
+          <div id="addon-whats-sent-host"></div>
+        </div>
+        <!-- Saved pages of an add-on that has no panel any more: not
+             installed and not in the catalog (plan P-2). Hidden when none. -->
+        <div id="addon-orphans" hidden>
+          <h4 data-msg="addon.data.heading">Pages from removed add-ons</h4>
+          <label for="addon-data-id" data-msg="addon.data.id">Add-on</label>
+          <select id="addon-data-id"></select>
+          <div class="form-buttons">
+            <button type="button" data-addon-action="export" data-msg="addon.export">Export pages</button>
+            <button type="button" data-addon-action="delete" data-msg="addon.delete">Delete pages</button>
+          </div>
+        </div>
+        <div id="addon-messages" hidden>
+          <span data-msg="addon.premium.tag">Premium</span>
+          <span data-msg="addon.open">Open</span>
+          <span data-msg="addon.install">Install</span>
+          <span data-msg="addon.installed">Installed</span>
+          <span data-msg="addon.update.available">Update available</span>
+          <span data-msg="addon.update.to">Update to</span>
+          <span data-msg="addon.unlock">Unlock Vault</span>
+          <span data-msg="addon.state.locked">Unlock your Vault to use this add-on.</span>
+          <span data-msg="addon.version.word">Version</span>
+          <span data-msg="addon.size">Download size</span>
+          <span data-msg="addon.unit.kb">KB</span>
+          <span data-msg="addon.unit.mb">MB</span>
+          <span data-msg="addon.pages.one">1 page saved</span>
+          <span data-msg="addon.pages.many">pages saved</span>
+          <span data-msg="addon.more">More</span>
+          <span data-msg="addon.export.short">Export pages</span>
+          <span data-msg="addon.delete.short">Delete pages</span>
+          <span data-msg="addon.rollback.to">Use version</span>
+          <span data-msg="addon.remove">Remove</span>
+          <span data-msg="addon.whats.sent">What's sent</span>
+          <span data-msg="addon.network.note">To show, install and update your add-ons, PATANYX sends EdgeXene your Premium token and device ID. Downloads come through Cloudflare, which gets neither. Both see your IP address. What you write never leaves your device.</span>
+          <span data-msg="addon.catalog.checking">Checking your add-ons…</span>
+          <span data-msg="addon.catalog.network">Could not check your add-ons.</span>
+          <span data-msg="addon.catalog.previous">Showing your last add-on list.</span>
+          <span data-msg="addon.catalog.locked">Unlock your Vault to see your add-ons.</span>
+          <span data-msg="addon.catalog.rate">Too many requests. Try again later.</span>
+          <span data-msg="addon.catalog.license">Your Premium token was not accepted.</span>
+          <span data-msg="addon.catalog.expired">Your Premium has ended.</span>
+          <span data-msg="addon.catalog.inactive">Premium is not active on this device.</span>
+          <span data-msg="addon.catalog.none">No add-ons are available right now.</span>
+          <span data-msg="addon.catalog.invalid">Could not verify the add-on list.</span>
+          <span data-msg="addon.status.waiting">Waiting for your pages to save.</span>
+          <span data-msg="addon.status.working">Working…</span>
+          <span data-msg="addon.status.success">Done.</span>
+          <span data-msg="addon.working.install">Installing…</span>
+          <span data-msg="addon.working.update">Updating…</span>
+          <span data-msg="addon.working.rollback">Changing version…</span>
+          <span data-msg="addon.working.remove">Removing…</span>
+          <span data-msg="addon.working.export">Exporting…</span>
+          <span data-msg="addon.working.delete">Deleting pages…</span>
+          <span data-msg="addon.working.check">Checking for updates…</span>
+          <span data-msg="addon.working.open">Opening…</span>
+          <span data-msg="addon.done.install">Installed.</span>
+          <span data-msg="addon.done.update">Updated.</span>
+          <span data-msg="addon.done.rollback">Version changed.</span>
+          <span data-msg="addon.done.remove">Removed.</span>
+          <span data-msg="addon.done.delete">Pages deleted.</span>
+          <span data-msg="addon.done.export">Exported.</span>
+          <span data-msg="addon.done.check">Checked for updates.</span>
+          <span data-msg="addon.status.failed">Something went wrong. Try again.</span>
+          <span data-msg="addon.status.busy">Busy right now. Try again in a moment.</span>
+          <span data-msg="addon.status.locked">Unlock your Vault to continue.</span>
+          <span data-msg="addon.status.premium">Activate Premium on this device to continue.</span>
+          <span data-msg="addon.status.unconfigured">Add-ons are not available in this build.</span>
+          <span data-msg="addon.status.cancelled">Canceled.</span>
+          <span data-msg="addon.status.export.stopped">Export stopped. Files already saved are not encrypted.</span>
+          <span data-msg="addon.status.partial">Some pages could not be exported. See below.</span>
+          <span data-msg="addon.page.exists">That file already exists. It was not overwritten.</span>
+          <span data-msg="addon.page.unreadable">This page could not be read.</span>
+          <span data-msg="addon.status.export.unreadable">Pages could not be read. Nothing was exported.</span>
+          <span data-msg="addon.export.confirm">Export your pages? The files will not be encrypted.</span>
+          <span data-msg="addon.delete.confirm">Delete all saved pages? This cannot be undone.</span>
+          <span data-msg="addon.remove.confirm">Remove this add-on? Your pages will stay.</span>
+          <span data-msg="addon.export.folder">Choose a folder for unencrypted pages</span>
+          <span data-msg="addon.choose">Choose folder</span>
+          <span data-msg="addon.cancel">Cancel</span>
+        </div>
+        <p id="addon-operation-status" role="status" aria-live="polite"></p>
+        <p id="addon-export-result" hidden><span data-msg="addon.export.count">Pages exported:</span> <span id="addon-export-count"></span></p>
+        <ul id="addon-page-failures"></ul>
+      </div>
+      <div id="addons-translate" class="addons-section">
+        <h3 data-msg="chrome.addons.languages.heading">Translator languages</h3>
+        <span class="section-label" data-msg="chrome.tab.translate.manage.label">Languages you can install</span>
+        <p class="panel-note" data-msg="chrome.tab.translate.manage.note">
+          Install a language to translate pages in it. Packs are a few tens of
+          megabytes and download once, then work offline. Language names are shown
+          in English for now.
+        </p>
+        <p class="panel-note" data-msg="chrome.tab.translate.disclosure">The first time you choose a language, the browser downloads that language pack from us. That request tells our server which language pair you selected, and nothing about the page you were reading. After the pack is stored, translating contacts nobody.</p>
+        <ul id="translate-langs" class="items"></ul>
       </div>
     </section>
 
@@ -4216,5 +4361,6 @@
     <script src="chrome.js"></script>
     <script src="integrity.js" defer></script>
     <script src="update.js" defer></script>
+    <script src="addons.js" defer></script>
   </body>
 </html>

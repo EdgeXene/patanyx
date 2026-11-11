@@ -100,6 +100,10 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = match refs.as_slice() {
+        ["keygen", out, "addon"] => keygen(Path::new(out), KeyPurpose::Addon),
+        ["sign-addon", key, payload] => sign_addon(Path::new(key), Path::new(payload), false),
+        ["sign-addon-index", key, payload] => sign_addon(Path::new(key), Path::new(payload), true),
+        ["sign-addon-catalog", key, payload] => sign_addon_catalog(Path::new(key), Path::new(payload)),
         ["keygen", out, "release"] => keygen(Path::new(out), KeyPurpose::Release),
         ["keygen", out, "blocklist"] => keygen(Path::new(out), KeyPurpose::Blocklist),
         ["keygen", out, "licence"] => keygen(Path::new(out), KeyPurpose::Licence),
@@ -138,6 +142,11 @@ fn main() -> ExitCode {
 
 const USAGE: &str = "\
 patanyx-sign -- publisher tooling for the signed update channel
+
+  keygen <out-key-file> addon      generate an ADD-ON signing keypair
+  sign-addon <key-file> <payload.json>        sign an add-on manifest
+  sign-addon-index <key-file> <payload.json>  sign an add-on index
+  sign-addon-catalog <key-file> <payload.json>  sign the add-on catalog (display data)
 
   keygen <out-key-file> release    generate a RELEASE signing keypair
   keygen <out-key-file> blocklist  generate a BLOCKLIST signing keypair
@@ -279,6 +288,9 @@ fn keygen(out: &Path, purpose: KeyPurpose) -> Result<(), String> {
     let seed = os_random_seed()?;
     let signing = SigningKey::from_bytes(&seed);
     let verifying = signing.verifying_key();
+    if matches!(purpose, KeyPurpose::Addon) {
+        addon_key_self_check(&signing)?;
+    }
 
     // Hex, one line, no surrounding JSON: this file is read back by this tool
     // and by nothing else, and a format with no parser has no parser bugs.
@@ -288,6 +300,11 @@ fn keygen(out: &Path, purpose: KeyPurpose) -> Result<(), String> {
     println!("Signing key written to {}", out.display());
     println!();
     match purpose {
+        KeyPurpose::Addon => {
+            println!("Paste this into ADDON_KEYS in crates/app/src/updater.rs:");
+            println!("    pub(crate) const ADDON_KEYS: &[&str] = &[\"{}\"];", hex::encode(verifying.as_bytes()));
+            println!("Keep this private signing key offline and separate from all other signing keys.");
+        }
         KeyPurpose::Release => {
             println!("Paste this into PUBLISHER_KEYS in crates/app/src/updater.rs:");
             println!();
@@ -365,6 +382,7 @@ fn keygen(out: &Path, purpose: KeyPurpose) -> Result<(), String> {
 /// once is not.
 #[derive(Clone, Copy)]
 enum KeyPurpose {
+    Addon,
     Licence,
     Release,
     Blocklist,
@@ -955,4 +973,92 @@ fn verify_for(envelope_path: &Path, key_hex: &str, feed: ReleaseFeed) -> Result<
         manifest.published_at()
     );
     Ok(())
+}
+
+// Both formats self-check using the exact verifier used by the client.
+fn signed_addon(signing: &SigningKey, payload: &str, index: bool) -> Result<Vec<u8>, String> {
+    use patanyx_update::{verify_addon_index, verify_addon_manifest,
+        SIGNING_DOMAIN_ADDON_INDEX, SIGNING_DOMAIN_ADDON_MANIFEST};
+    let domain = if index { SIGNING_DOMAIN_ADDON_INDEX } else { SIGNING_DOMAIN_ADDON_MANIFEST };
+    let message = [domain, payload.as_bytes()].concat();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "v": 1, "payload": payload, "sig": hex::encode(&signing.sign(&message).to_bytes())
+    })).map_err(|e| e.to_string())?;
+    let keys = TrustedKeys::new(vec![signing.verifying_key()]).map_err(|e| e.to_string())?;
+    let checked = if index { verify_addon_index(&bytes, &keys).map(|_| ()) }
+        else { verify_addon_manifest(&bytes, &keys).map(|_| ()) };
+    checked.map_err(|e| format!("REFUSING TO EMIT: {e}"))?;
+    Ok(bytes)
+}
+
+fn sign_addon(key_path: &Path, payload_path: &Path, index: bool) -> Result<(), String> {
+    let signing = read_signing_key(key_path)?;
+    let payload = fs::read_to_string(payload_path).map_err(|e| e.to_string())?;
+    let bytes = signed_addon(&signing, &payload, index)?;
+    println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+// The catalog: display data only, its own domain, the same self-check.
+fn signed_addon_catalog(signing: &SigningKey, payload: &str) -> Result<Vec<u8>, String> {
+    use patanyx_update::{verify_addon_catalog, SIGNING_DOMAIN_ADDON_CATALOG};
+    let message = [SIGNING_DOMAIN_ADDON_CATALOG, payload.as_bytes()].concat();
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "v": 1, "payload": payload, "sig": hex::encode(&signing.sign(&message).to_bytes())
+    })).map_err(|e| e.to_string())?;
+    let keys = TrustedKeys::new(vec![signing.verifying_key()]).map_err(|e| e.to_string())?;
+    verify_addon_catalog(&bytes, &keys).map_err(|e| format!("REFUSING TO EMIT: {e}"))?;
+    Ok(bytes)
+}
+
+fn sign_addon_catalog(key_path: &Path, payload_path: &Path) -> Result<(), String> {
+    let signing = read_signing_key(key_path)?;
+    let payload = fs::read_to_string(payload_path).map_err(|e| e.to_string())?;
+    let bytes = signed_addon_catalog(&signing, &payload)?;
+    println!("{}", String::from_utf8(bytes).map_err(|e| e.to_string())?);
+    Ok(())
+}
+
+// Exercise both verifier domains before keygen writes or prints anything.
+fn addon_key_self_check(signing: &SigningKey) -> Result<(), String> {
+    use sha2::{Digest, Sha256};
+    let payload = serde_json::json!({
+        "id": "text-pages", "name": "Key check", "version": "0.0.0",
+        "host_api": 1, "data_format": "text-pages-v1", "premium": true,
+        "capabilities": ["text_pages"], "mark": patanyx_update::addon::addon_mark(),
+        "files": [{"path": "index.html", "size": 0, "sha256": hex::encode(&Sha256::digest(b""))}]
+    });
+    let manifest = signed_addon(signing, &payload.to_string(), false)?;
+    let index = serde_json::json!({
+        "schema": 1, "id": "text-pages", "sequence": 0, "issued_at": 1, "expires_at": 2,
+        "current": {"version": "0.0.0", "host_api": 1, "data_format": "text-pages-v1",
+            "manifest_size": manifest.len(), "manifest_sha256": hex::encode(&Sha256::digest(&manifest))},
+        "rollback": null
+    });
+    signed_addon(signing, &index.to_string(), true)?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod addon_signer_tests {
+    use super::*;
+    #[test]
+    fn addon_signer_self_checks_both_formats_and_refuses_bad_payloads() {
+        let signing = SigningKey::from_bytes(&[0x73; 32]);
+        addon_key_self_check(&signing).unwrap();
+        assert!(signed_addon(&signing, "{}", false).is_err());
+        assert!(signed_addon(&signing, "{}", true).is_err());
+    }
+    #[test]
+    fn catalog_signer_self_checks_and_refuses_bad_payloads() {
+        let signing = SigningKey::from_bytes(&[0x73; 32]);
+        let good = serde_json::json!({"schema": 1, "sequence": 1, "issued_at": 1, "expires_at": 2,
+            "addons": [{"id": "text-pages", "name": "Key check", "summary": "A check.", "version": "0.0.0", "size": 1}]});
+        let bytes = signed_addon_catalog(&signing, &good.to_string()).unwrap();
+        let keys = TrustedKeys::new(vec![signing.verifying_key()]).unwrap();
+        assert!(patanyx_update::verify_addon_catalog(&bytes, &keys).is_ok());
+        assert!(patanyx_update::verify_addon_index(&bytes, &keys).is_err());
+        assert!(signed_addon_catalog(&signing, "{}").is_err());
+        assert!(signed_addon(&signing, &good.to_string(), true).is_err());
+    }
 }

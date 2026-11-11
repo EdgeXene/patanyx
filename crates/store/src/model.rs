@@ -70,6 +70,53 @@ pub struct StoreData {
     /// ADDITIVE ONLY, same rule as the fields above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) v1_salt: Option<V1Salt>,
+    /// Set once a Library that moved from version 1 has had its data key
+    /// renewed (`rekey.rs`): the key the old passphrase and the version 1 salt
+    /// derive then opens nothing that is current. A Library created in the
+    /// vault, or imported, never had that key and never needs this.
+    ///
+    /// ADDITIVE ONLY, same rule as the fields above; an older build keeps it
+    /// in `other` and writes it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) rekeyed: bool,
+    /// A re-key this build started and never finished: counted so one that
+    /// crashes the browser cannot do it at every unlock (see `rekey.rs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rekey_try: Option<RekeyTry>,
+    /// The check value of a retired data key while copies of the Library
+    /// written under it may remain (the writer's crash leftovers): retirement
+    /// is retried at every unlock until it succeeds. Never a key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) k1_leftovers: Option<String>,
+    /// Every key this build does not know, kept exactly as it was read and
+    /// written back on every save.
+    ///
+    /// WHY. Every build of this browser shares one Library file, and the
+    /// fields above are typed: before this map, a build that did not know a
+    /// field read past it ("additive only") and then DROPPED it on its next
+    /// save. A PATANYX Nabu-X build keeps data the public build has no use
+    /// for (Game mode sites, trackers), so running the public build on the
+    /// same computer silently erased it (plan review 2026-10-19, R-013).
+    /// Builds with this map leave such data alone; older builds still drop
+    /// it, which is why the field exists at all and not a promise elsewhere.
+    #[serde(flatten)]
+    pub(crate) other: std::collections::BTreeMap<String, Preserved>,
+}
+
+/// A value under a key this build does not know (`StoreData::other`): held
+/// as JSON and written back unchanged. Its own type so `Debug` prints only
+/// that something is there, never what (it can hold addresses).
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Preserved(pub(crate) serde_json::Value);
+
+// JSON has no NaN, so equality on a parsed value is total.
+impl Eq for Preserved {}
+
+impl std::fmt::Debug for Preserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Preserved(<kept unchanged>)")
+    }
 }
 
 /// The recorded version 1 salt (`StoreData::v1_salt`), serialized as exactly
@@ -98,8 +145,20 @@ impl Default for StoreData {
             page_snapshots: Vec::new(),
             divergence_overrides: Vec::new(),
             v1_salt: None,
+            rekeyed: false,
+            rekey_try: None,
+            k1_leftovers: None,
+            other: std::collections::BTreeMap::new(),
         }
     }
+}
+
+/// A started re-key, by build: `started` attempts of `build` that never
+/// finished. A different build starts again from nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RekeyTry {
+    pub(crate) build: String,
+    pub(crate) started: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

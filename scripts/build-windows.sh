@@ -143,6 +143,7 @@ target_dir="${CARGO_TARGET_DIR:-target}"
 exe="$target_dir/x86_64-pc-windows-msvc/release/patanyx.exe"
 case "$FEATURES" in
   *premium-unlocked*) want="UNLOCKED TEST BUILD: Premium forced on; no license checked" ;;
+  *addon-launch*)     want="ADD-ON LAUNCH TEST BUILD: the add-on manager is shown before its release" ;;
   *chat*)             want="PATANYX-Nabu-X for " ;;
   *)                  want="" ;;
 esac
@@ -174,10 +175,10 @@ if [ -z "$want" ]; then
   #
   # The window title is still asserted, by main.rs::build_variant_tests,
   # which compares Rust strings and is unaffected by how they are stored.
-  leaked="$(strings -a "$exe" | grep -cE "PATANYX-Nabu-X for |UNLOCKED TEST BUILD: Premium forced on; no license checked" || true)"
+  leaked="$(strings -a "$exe" | grep -cE "PATANYX-Nabu-X for |UNLOCKED TEST BUILD: Premium forced on; no license checked|ADD-ON LAUNCH TEST BUILD: the add-on manager is shown before its release" || true)"
   if [ "${leaked:-0}" -gt 0 ]; then
     echo "BUILD FAIL: the PUBLIC binary carries a non-public Nabu-X title marker" >&2
-    echo "  It was built with chat or premium-unlocked compiled in; refusing to stage it as public." >&2
+    echo "  It was built with chat, premium-unlocked or addon-launch compiled in; refusing to stage it as public." >&2
     exit 1
   fi
   echo "attribution says: PATANYX (public; no Nabu-X build marker present)"

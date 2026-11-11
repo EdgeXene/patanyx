@@ -96,6 +96,16 @@ pub struct LibraryBackup {
     pub archive: Vec<ArchiveRecord>,
     pub page_snapshots: Vec<PageSnapshot>,
     pub divergence_overrides: Vec<DivergenceOverride>,
+    /// Sites a PATANYX Nabu-X build kept in Game mode. This build has no Game
+    /// mode: the field is read only so that such a backup imports, its sites
+    /// are not kept, and it is never written.
+    #[serde(default, skip_serializing)]
+    pub game_hosts: Vec<String>,
+    /// Trackers a PATANYX Nabu-X build keeps (its Assistant). This build has
+    /// no trackers: the field is read only so that such a backup imports,
+    /// they are not kept, and it is never written.
+    #[serde(default, skip_serializing)]
+    pub trackers: Vec<crate::model::Preserved>,
 }
 
 /// Hand-written: a derived Debug would print addresses, titles and the text
@@ -376,6 +386,8 @@ impl Store {
             archive: self.data.archive.clone(),
             page_snapshots: self.data.page_snapshots.clone(),
             divergence_overrides: self.data.divergence_overrides.clone(),
+            game_hosts: Vec::new(),
+            trackers: Vec::new(),
         }
     }
 
@@ -716,6 +728,13 @@ impl RestoreInProgress<'_> {
             page_snapshots: backup.page_snapshots,
             divergence_overrides: backup.divergence_overrides,
             v1_salt: None,
+            // A restored Library is under a fresh random key already.
+            rekeyed: false,
+            rekey_try: None,
+            k1_leftovers: None,
+            // A restore replaces the Library with the backup, so nothing
+            // this build did not know survives from the Library it replaces.
+            other: std::collections::BTreeMap::new(),
         };
         if let Err(error) = store.save() {
             store.data = StoreData::default();

@@ -282,7 +282,7 @@ check("native focus into a page happens only where a modal is checked first", ()
   const guarded = [
     [
       "fn show_and_focus_tab(",
-      /if self\.modal_covers_window\(\) \{\s*self\.focus_chrome\(\);\s*\} else \{[^}]*platform::focus_content\(/,
+      /if self\.modal_covers_window\(\) \{\s*self\.focus_chrome\(\);\s*\} else if tab_focus\([^\n]+FocusSurface::Addon && crate::addon_host::focus\(self\) \{[^}]*\} else \{[^}]*platform::focus_content\(/,
     ],
     [
       "pub fn focus_active_content(",

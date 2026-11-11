@@ -359,6 +359,7 @@ chrome-fold-saved-span = Saved
 chrome-fold-saved-title = Show as one button that opens its tools
 chrome-fold-tools-span = Tools
 chrome-fold-tools-title = Show as one button that opens its tools
+chrome-addon-toolbar-head = With Tools open, show:
 chrome-placement-left-button = Left
 chrome-labels-show-button = Icons and names
 chrome-labels-hide-button = Icons only
@@ -519,7 +520,7 @@ chrome-recovery-create-form-button = Create a recovery key
 chrome-pane-backup-h2 = Lock when idle
 chrome-pane-backup-p = Typing anywhere keeps the vault unlocked. You get a one-minute warning before it locks. Locking clears your keys from memory and signs you out of Private Chat.
 chrome-pane-backup-h2-n2 = Encrypted export
-chrome-pane-backup-p-n2 = Back up or move your vault and your Library in one encrypted file, protected by a passphrase of its own. It includes everything in your vault, such as your passwords, notes, Private Tunnel configuration and Premium token. While your Library is open, it also includes your bookmarks, Tab Shelf, Deep Recall pages and page snapshots with their pictures, and your Divergence Exceptions. Download records stay on this computer. Earlier versions of PATANYX cannot open the file. There is no recovery key for the file, so without its passphrase it cannot be opened. If you forget your vault passphrase, use your recovery key.
+chrome-pane-backup-p-n2 = Back up or move your vault and your Library in one encrypted file, protected by a passphrase of its own. It includes everything in your vault, such as your passwords, notes, Private Tunnel configuration and Premium token. While your Library is open, it also includes your bookmarks, Tab Shelf, Deep Recall pages and page snapshots with their pictures, your Divergence Exceptions, and pages saved by Premium add-ons. Download records stay on this computer. Earlier versions of PATANYX cannot open the file. There is no recovery key for the file, so without its passphrase it cannot be opened. If you forget your vault passphrase, use your recovery key.
 chrome-bk-exp-pick-button = Choose location
 chrome-bk-exp-dest-placeholder = Destination file path
 chrome-bk-exp-pass1-placeholder = Export passphrase
@@ -543,7 +544,7 @@ chrome-library-repair-old-placeholder = Passphrase your Library still uses
 chrome-library-repair-current-placeholder = Your current passphrase
 chrome-library-repair-button = Open Library
 chrome-pane-backup-h2-n5 = Plaintext export: the way out
-chrome-pane-backup-p-n5 = This writes every password and note into an unencrypted file. Backups, search tools, or the disk may keep readable copies after you delete it.
+chrome-pane-backup-p-n5 = This writes every password and note into an unencrypted file. Backups, search tools, or the disk may keep readable copies after you delete it. Pages saved by a Premium add-on have their own export in Add-ons.
 chrome-pane-backup-p-n6 = Use this to leave PATANYX. Delete the file when finished.
 chrome-bk-plain-pick-button = Choose location
 chrome-bk-plain-dest-placeholder = Destination file path
@@ -620,6 +621,8 @@ chrome-js-autofill-reason-locked = Unlock the vault to check for a saved passwor
 chrome-js-autofill-reason-no-match = No saved password for this site.
 chrome-js-autofill-reason-no-site = No site to check for a saved password.
 chrome-js-autofill-reason-no-vault = No vault yet. Create one to save passwords.
+chrome-js-autofill-reason-not-secure = Saved passwords fill only on secure (https) pages.
+chrome-js-autofill-sibling-confirm-yes = Fill
 chrome-js-autofill-reason-unavailable = Autofill is not available in this tab.
 chrome-js-autolock-fifteen = 15 minutes
 chrome-js-autolock-five = 5 minutes
@@ -655,6 +658,11 @@ chrome-js-backup-job-stopping = Stopping.
 chrome-js-backup-job-pictures = Pictures:
 chrome-js-backup-close-held-committing = The import is finishing. Closing PATANYX now loses the new recovery key, which is shown only once. Close again to close anyway.
 chrome-js-backup-close-held-working = Stopping the export or import. PATANYX closes when it has stopped, or after 10 seconds.
+# An add-on page or add-on folder an export could not read.
+chrome-js-backup-exp-addon-page-unreadable = Nothing was written. Could not read "{ $item }". Try again. If it still fails, export the pages from Add-ons, delete them, then back up again.
+# An untitled add-on page an export could not read.
+chrome-js-backup-exp-addon-page-unreadable-unnamed = Nothing was written. Could not read an add-on page. Try again. If it still fails, export the pages from Add-ons, delete them, then back up again.
+chrome-js-backup-exp-addon-unreadable = Nothing was written. Could not read the add-on pages. Try again. If it still fails, delete them in Add-ons, then back up again.
 chrome-js-backup-exp-picture-unreadable = Nothing was written. The picture saved with "{ $item }" could not be read. Try again. If it still cannot be read, delete it from your Library, then export again.
 chrome-js-backup-exp-library-too-large = Nothing was written. Without pictures, your Library comes to more than 512 MB, the most a backup can carry. Delete some Deep Recall pages, then try again.
 chrome-js-backup-exp-library-over-limit = Nothing was written. Your Library holds more than a backup can carry.
@@ -762,8 +770,10 @@ chrome-js-error-adlist-not-listed = That site is no longer on the list, so nothi
 chrome-js-error-adlist-no-exception = Opening anyway is not available on this platform
 chrome-js-error-blocked-stale = That notice is out of date. Try the page again
 chrome-js-error-passphrase-changed-backups-retained = Passphrase changed, but PATANYX could not confirm that every older backup or temporary copy of your vault is gone. They are in the same folder as your vault file, and some may be hidden files whose names start with .tmp-. Any that remain may still open with an earlier passphrase and may also open your Library. Delete them by hand.
+chrome-js-error-passphrase-changed-library-key-not-renewed = Passphrase changed, but PATANYX could not renew your Library's encryption key. Until it does, anyone with an older copy of your Library file and an earlier passphrase it opened with may be able to read your Library. Renewing needs free disk space about the size of your Library.
 chrome-js-error-passphrase-changed-library-leftover-retained = Passphrase changed, but PATANYX could not confirm that every leftover copy of your Library is gone. They are in the folder where PATANYX keeps your Library. Anyone with one of them and the earlier passphrase it opens with may be able to read your Library. Delete them by hand.
 chrome-js-error-passphrase-change-library-unavailable = Passphrase not changed, because your Library is not open here. Open the Library panel to see why.
+chrome-js-error-passphrase-change-library-rekey-unfinished = Passphrase not changed. Your Library is closed because renewing its encryption key did not finish. Your current passphrase still works. Lock the Vault and unlock it again to complete or undo the renewal.
 chrome-js-error-passphrase-change-not-confirmed = Passphrase not changed. PATANYX could not confirm that your Library is saved to disk, so it canceled the change. Your current passphrase still works. Try again.
 chrome-js-error-cookie-delete-all-failed = Could not clear cookies. The engine refused the request; nothing was changed.
 chrome-js-error-cookie-delete-failed = Could not clear cookies for this site. The engine refused the request; nothing was changed.
@@ -783,8 +793,10 @@ chrome-js-error-io = Could not read or write to this computer's storage
 chrome-js-error-library-not-replaced = The previous profile's Library could not be replaced, so bookmarks, Tab Shelf, and download records are unavailable. The imported vault and its passwords are still available.
 chrome-js-error-library-import-unfinished = Your Library is closed because an import did not finish. To finish it, import { $path } again.
 chrome-js-error-library-import-unfinished-nopath = Your Library is closed because an import did not finish. To finish it, import the same backup file again.
+chrome-js-error-library-rekey-unfinished = Your Library is closed because renewing its encryption key did not finish. Lock the Vault and unlock it again to complete or undo the renewal.
 chrome-js-error-library-replace-refused = The Library could not be prepared for safe replacement, so the vault was not imported.
 chrome-js-error-backup-in-progress = An encrypted export or import is running. Try again when it has finished.
+chrome-js-error-addon-busy = An add-on is busy. Try again in a moment.
 chrome-js-error-backup-past-commit = The import can no longer be stopped. Keep PATANYX open until it finishes.
 chrome-js-error-backup-not-running = That export or import has already ended.
 chrome-js-error-backup-cancelled = Stopped. Nothing was saved or replaced.
@@ -929,6 +941,8 @@ chrome-js-import-path-placeholder = Backup file path
 chrome-js-import-restored = Restored from the backup. Bookmarks: { $bookmarks }, shelved windows: { $groups }, Deep Recall pages: { $pages }, pictures: { $pictures }, Divergence Exceptions: { $exceptions }.
 chrome-js-import-downloads-kept = Download records kept from this computer: { $count }.
 chrome-js-import-downloads-dropped = Download records not kept because they failed their check: { $count }.
+# Add-on pages an import restored (M12).
+chrome-js-import-addon-pages = Add-on pages restored: { $count }.
 chrome-js-import-downloads-not-kept = Download records on this computer were not kept, because your Library was closed.
 chrome-js-import-no-library = This backup held only a vault, so your Library now has no bookmarks, shelved windows or Deep Recall pages.
 chrome-js-import-pick-title = Choose a PATANYX backup file
@@ -1285,6 +1299,11 @@ chrome-js-batch-partial-failure = { $failed } of { $total } could not be changed
 chrome-js-autofill-offer-desc = A saved password for { $username } is available.
 chrome-js-autofill-offer-button = Fill password for { $username }
 chrome-js-autofill-offer-title = Fill the saved password for { $username }
+chrome-js-autofill-offer-desc-sibling = A password for { $username } saved on { $site } is available.
+chrome-js-autofill-offer-button-sibling = Fill password for { $username } from { $site }
+chrome-js-autofill-offer-title-sibling = Fill the password for { $username } saved on { $site }
+chrome-js-autofill-sibling-confirm = This password was saved on { $site }, not { $page }. Fill it here?
+chrome-js-autofill-port-confirm = This password is saved for { $site }. This page is { $page }, which may be a different service. Fill it here?
 chrome-js-shield-refused = REFUSED by the engine: { $labels }
 chrome-js-shield-aria = Privacy protections: { $sentence }
 
@@ -1560,7 +1579,8 @@ chrome-translate-status-failed-script = This page is not written in the language
 chrome-translate-status-failed-source-unknown = Could not tell what language this page is in. Choose the source language and try again. (Languages that share an alphabet, like English and French, cannot be told apart automatically.)
 chrome-translate-status-failed-unavailable = There is no language pack for that translation direction yet. The page is unchanged.
 chrome-translate-status-failed-busy = Another translation is already running. Let it finish, then try this page.
-chrome-translate-no-target = No language installed for this. Install one below.
+# Languages are installed in the Add-ons panel now.
+chrome-translate-no-target = Install a language in Add-ons.
 chrome-translate-lang-downloading-pct = Downloading…{" "}
 chrome-translate-lang-downloading = Downloading…
 chrome-translate-lang-installed = Installed
@@ -1569,7 +1589,8 @@ chrome-translate-lang-remove = Remove
 chrome-translate-lang-install = Install
 chrome-translate-lang-partial = One direction only
 chrome-translate-lang-complete = Get the other direction
-chrome-translate-no-target-partial = You have the other direction only. Get this one below.
+# Languages are installed in the Add-ons panel now.
+chrome-translate-no-target-partial = Get this direction in Add-ons.
 chrome-translate-lang-failed-unreachable = Download failed: could not reach the language pack server.
 chrome-translate-lang-failed-not-offered = This language pack is not available yet.
 chrome-translate-lang-failed-untrusted = Download failed: the pack did not verify, so nothing was kept.
@@ -1695,6 +1716,14 @@ chrome-premium-activation-lead = On a network that blocks EdgeXene, activate wit
 chrome-premium-activation-rest = and enter this device's ID together with your Premium token. Paste the code it gives you below. The code only works on this computer, so it is safe to carry across on a phone screen.
 chrome-bk-import-warning-lead = Importing
 chrome-bk-import-warning-rest = . Your vault and Library here are replaced by the backup's, including every password, note, bookmark, shelved window and Deep Recall page, your Private Tunnel configuration and your Premium token. There is no undo. If you may want any of it back, make an encrypted export first.
+# Add-on pages an import replaces (M12).
+chrome-bk-import-addons-p = Importing replaces your add-on pages, or removes them if the backup has none. Export them first to keep a copy.
+# Add-on data that cannot be counted: the Library is not open, an
+# add-on window is still saving, the add-on folder cannot be listed, or an
+# index cannot be read. No remedy is named, since none fits every case, and
+# no export is offered.
+chrome-bk-import-addons-unknown-p = You may have add-on pages here. Importing replaces them, or removes them if the backup has none.
+chrome-bk-import-addons-export = Export pages
 chrome-bk-import-older-p = This backup was made by an earlier version of PATANYX and holds only your vault and, at most, your bookmarks. Importing it still replaces your whole Library, so your Tab Shelf, Deep Recall pages, page snapshots, empty bookmark folders, Divergence Exceptions and download records on this computer will be gone.
 
 chrome-tutorial-banner-title-span = New in 1.0.5: Reader View, Tab Groups and Side by Side
@@ -1728,3 +1757,147 @@ chrome-js-tutorial-groups-step-3 = Shelve this group closes its tabs and keeps t
 chrome-js-tutorial-side-step-1 = Click Side by Side in the toolbar (under Tabs, if that group is folded), or press Ctrl+Shift+S, to show this tab beside the one next to it.
 chrome-js-tutorial-side-step-2 = To choose the pair yourself, right-click the other tab and click Show beside the tab on screen.
 chrome-js-tutorial-side-step-3 = Click into either half to work in it. Click Side by Side again to go back to one page.
+addon-selection-send = Send to { $name }
+
+# Add-on window, manager, plaintext export, deletion and retention.
+addon-data-heading = Pages from removed add-ons
+
+addon-data-id = Add-on
+
+addon-export = Export pages
+
+addon-delete = Delete pages
+
+addon-network-note = To show, install and update your add-ons, PATANYX sends EdgeXene your Premium token and device ID. Downloads come through Cloudflare, which gets neither. Both see your IP address. What you write never leaves your device.
+
+addon-open = Open
+
+addon-install = Install
+
+addon-remove = Remove
+
+addon-status-waiting = Waiting for your pages to save.
+
+addon-status-working = Working…
+
+addon-status-success = Done.
+
+# What the status line says while an add-on action runs and when it has
+# finished, per action (hand test H-15: "Working..." and "Operation
+# completed." said nothing about what happened). The two lines above stay as
+# the fallback for an action not listed here.
+addon-working-install = Installing…
+addon-working-open = Opening…
+addon-working-update = Updating…
+addon-working-rollback = Changing version…
+addon-working-remove = Removing…
+addon-working-export = Exporting…
+addon-working-delete = Deleting pages…
+addon-working-check = Checking for updates…
+addon-done-install = Installed.
+addon-done-update = Updated.
+addon-done-rollback = Version changed.
+addon-done-remove = Removed.
+addon-done-delete = Pages deleted.
+addon-done-export = Exported.
+addon-done-check = Checked for updates.
+
+addon-status-failed = Something went wrong. Try again.
+
+addon-status-busy = Busy right now. Try again in a moment.
+
+addon-status-locked = Unlock your Vault to continue.
+
+addon-status-premium = Activate Premium on this device to continue.
+
+addon-status-unconfigured = Add-ons are not available in this build.
+
+addon-status-cancelled = Canceled.
+addon-status-export-stopped = Export stopped. Files already saved are not encrypted.
+
+addon-status-partial = Some pages could not be exported. See below.
+
+addon-page-exists = That file already exists. It was not overwritten.
+
+addon-page-unreadable = This page could not be read.
+addon-status-export-unreadable = Pages could not be read. Nothing was exported.
+
+addon-installed = Installed
+
+addon-export-confirm = Export your pages? The files will not be encrypted.
+
+addon-delete-confirm = Delete all saved pages? This cannot be undone.
+
+addon-remove-confirm = Remove this add-on? Your pages will stay.
+
+addon-export-folder = Choose a folder for unencrypted pages
+
+addon-choose = Choose folder
+
+addon-cancel = Cancel
+
+addon-export-count = Pages exported:
+
+addon-premium-tag = Premium
+
+addon-version-word = Version
+
+addon-pages-one = 1 page saved
+
+addon-pages-many = pages saved
+
+addon-export-short = Export pages
+
+addon-delete-short = Delete pages
+
+addon-whats-sent = What's sent
+
+addon-size = Download size
+
+addon-unit-kb = KB
+
+addon-unit-mb = MB
+
+addon-update-available = Update available
+
+addon-update-to = Update to
+
+addon-rollback-to = Use version
+
+addon-more = More
+
+addon-unlock = Unlock Vault
+
+addon-state-locked = Unlock your Vault to use this add-on.
+
+addon-catalog-checking = Checking your add-ons…
+
+addon-catalog-network = Could not check your add-ons.
+
+addon-catalog-previous = Showing your last add-on list.
+
+addon-catalog-locked = Unlock your Vault to see your add-ons.
+
+addon-catalog-rate = Too many requests. Try again later.
+
+addon-catalog-license = Your Premium token was not accepted.
+
+addon-catalog-expired = Your Premium has ended.
+
+addon-catalog-inactive = Premium is not active on this device.
+
+addon-catalog-none = No add-ons are available right now.
+
+addon-catalog-invalid = Could not verify the add-on list.
+
+# The one-time Premium add-on banner (1.1.0). The add-on's name follows the
+# title and the Try label, and its summary is the body: both come from the
+# signed catalog, never from this file.
+addon-banner-title = New for Premium:
+addon-banner-try = Try
+addon-banner-tour = Watch the tour
+addon-banner-later = Not now
+chrome-addons-heading = Add-ons
+chrome-addons-premium-heading = Premium add-ons
+chrome-addons-languages-heading = Translator languages
+chrome-addons-manage-languages = Manage languages

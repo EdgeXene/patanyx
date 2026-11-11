@@ -50,11 +50,12 @@ TARGETS = ("x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc")
 # Every feature set this line builds an artifact with, not a subset: a
 # TLS-relevant feature can hide in any of them. The published binaries are
 # the default set (scripts/build-windows.sh with FEATURES empty, and
-# scripts/repro-build.sh with no --features); the other two are test builds.
+# scripts/repro-build.sh with no --features); the other three are test builds.
 PROFILES = (
     ("public", ()),
     ("chat and relay", ("--features", "chat,relay-client")),
     ("Premium test build", ("--features", "premium-unlocked")),
+    ("add-on test build", ("--features", "addon-launch")),
 )
 
 

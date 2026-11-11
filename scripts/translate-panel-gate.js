@@ -162,6 +162,28 @@ check("a half-installed language can be removed", () => {
   );
 });
 
+check("Add-ons installs a language with Assistant and Tab Activity closed", async () => {
+  const flush = async () => { for (let i = 0; i < 12; i++) await new Promise(resolve => setImmediate(resolve)); };
+  const missing = {languages: [{code: "el", name: "Greek", installed: false}], premium_active: true};
+  global.rbResolve = {packs_status: missing, pack_install: PACKS};
+  global.rbCalls.length = 0;
+  global.$("translate-manage")._fire("click");
+  await flush();
+  assert(global.window.__rb.isPanelOpen("addons"), "Manage languages opens Add-ons");
+  assert(!global.window.__rb.isPanelOpen("assistant") && !global.window.__rb.isPanelOpen("tab"), "other panels closed");
+  assert(global.rbCalls.some(c => c.cmd === "packs_status"), "opening Add-ons refreshes packs");
+  const install = global.$("translate-langs").children[0].children.find(el => el.textContent === "Install");
+  assert(install, "missing language offers Install");
+  install._fire("click");
+  await flush();
+  const calls = global.rbCalls.filter(c => c.cmd === "pack_install");
+  assert(calls.length === 1 && calls[0].args.code === "el", "one install for Greek");
+  assert(global.$("translate-langs").children[0].children.some(el => el.textContent === "Remove"), "installed row updates in Add-ons");
+  const html = fs.readFileSync(process.env.HTML_PATH, "utf8");
+  const addons = html.match(/<section id="addons-panel"[^>]*>([\s\S]*?)<\/section>/)[1];
+  assert(addons.includes('id="translate-langs"') && html.split('id="translate-langs"').length === 2, "language list moved once");
+});
+
 check("a missing pack list cannot throw", () => {
   // `fillSourceOptions` guards `!translatePacks` but not
   // `translatePacks.languages`. A truthy-but-shapeless reply -- which the IPC

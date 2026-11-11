@@ -163,6 +163,9 @@ pub struct BackupJob {
     exit_when_done: bool,
     import: Option<ImportHold>,
     parked_downloads: Vec<ParkedDownload>,
+    /// Phase A's result, held until nothing writes to an add-on's files
+    /// (`staged_ready`).
+    parked: Option<Staged>,
 }
 
 impl std::fmt::Debug for BackupJob {
@@ -229,6 +232,9 @@ pub(crate) fn close_decision(phase: Option<JobPhase>, requests_before: u8) -> Cl
 pub fn refuse_if_running(state: &AppState) -> Result<(), &'static str> {
     if state.backup_job.is_some() {
         Err("backup_in_progress")
+    } else if crate::addon_manager::busy(state) {
+        // Its own words: the backup message would name the wrong job.
+        Err("addon_busy")
     } else {
         Ok(())
     }
@@ -274,6 +280,7 @@ pub fn on_lock(state: &mut AppState) -> bool {
 
 /// Asked by the close arms. True: close now.
 pub fn hold_close(state: &mut AppState) -> bool {
+    crate::addon_manager::cancel(state);
     let phase = state.backup_job.as_ref().map(|job| job.phase);
     let before = state.backup_job.as_ref().map_or(0, |job| job.close_requests);
     let decision = close_decision(phase, before);
@@ -398,6 +405,9 @@ pub fn start_import(
     let kept = state.store.as_ref().map(Store::kept_downloads);
     let library_was_closed = state.store.is_none() && Store::exists(&state.store_path);
     let store_path = state.store_path.clone();
+    // An open add-on window ends now, with its 300 ms to save, while the
+    // backup is read; the commit waits for it (`staged_ready`).
+    crate::addon_session::end(state, crate::addon_session::Reason::VaultImport, crate::addon_session::Then::NOTHING);
     let mut job = new_job(state, JobKind::Import);
     job.import = Some(ImportHold {
         newly_locked,
@@ -431,6 +441,7 @@ fn new_job(state: &mut AppState, kind: JobKind) -> BackupJob {
         exit_when_done: false,
         import: None,
         parked_downloads: Vec::new(),
+        parked: None,
     }
 }
 
@@ -584,6 +595,17 @@ fn handle(state: &mut AppState, outcome: Outcome) -> Option<Value> {
     }
 }
 
+/// An import's phase A result held for an add-on (`staged_ready`) goes on
+/// once nothing writes to the add-on's files.
+pub fn resume_parked(state: &mut AppState) {
+    if !crate::addon_session::quiescent(state) {
+        return;
+    }
+    if let Some(staged) = state.backup_job.as_mut().and_then(|job| job.parked.take()) {
+        staged_ready(state, staged);
+    }
+}
+
 /// Phase A finished. Unless a stop arrived meanwhile, the live vault and
 /// Library are closed and phase B starts.
 fn staged_ready(state: &mut AppState, staged: Staged) {
@@ -595,6 +617,15 @@ fn staged_ready(state: &mut AppState, staged: Staged) {
         // since removing what it built can take a while.
         if let Some(job) = state.backup_job.as_mut() {
             job.worker = Some(spawn_outcome(proxy, job, move || Outcome::Abandoned(staged.abandon())));
+        }
+        return;
+    }
+    // Nothing may write to an add-on's files while they are replaced: the
+    // ending add-on's last save, or a write its worker had already begun,
+    // finishes first. The result waits; `resume_parked` brings it back.
+    if !crate::addon_session::quiescent(state) {
+        if let Some(job) = state.backup_job.as_mut() {
+            job.parked = Some(staged);
         }
         return;
     }
@@ -637,6 +668,7 @@ fn committed_ready(state: &mut AppState, committed: Committed) -> Option<Value> 
         recovery,
         summary,
         library_included,
+        addon_pages,
         library,
     } = committed;
     let library_was_closed = state
@@ -674,6 +706,9 @@ fn committed_ready(state: &mut AppState, committed: Committed) -> Option<Value> 
         library_included,
         library_was_closed,
     );
+    // Add-on pages are replaced with the rest of the Library, so how many came
+    // back is said with the rest of the counts (M12).
+    payload["restored"]["addon_pages"] = json!(addon_pages);
     // The countdown started with this result: the chrome then refreshes
     // nothing that would count as presence until the person acts, or the
     // countdown would quietly restart (code review round 4, R-001).

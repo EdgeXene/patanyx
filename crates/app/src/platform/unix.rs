@@ -20,6 +20,7 @@
 //! in the page, never from a re-fetch. See the dedicated section below.
 
 use std::cell::{Cell, RefCell};
+use std::path::Path;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -107,11 +108,22 @@ pub struct Hosts {
     /// write and hide below checks it, so a background tab's load or the
     /// pointer leaving the page cannot take the notice down early.
     notice_active: Rc<Cell<bool>>,
+    /// The add-on window's rectangle inside the page
+    /// (x, y, w, h), read by the content overlay's position handler.
+    addon_rect: Rc<Cell<(i32, i32, i32, i32)>>,
+    /// The add-on's container, while one is open.
+    addon_box: RefCell<Option<gtk::Box>>,
+    addon_layout_connected: Cell<bool>,
 }
+
+/// The add-on container's widget name, which the content overlay's
+/// position handler keys on.
+const ADDON_WIDGET_NAME: &str = "patanyx-addon";
 
 /// One per tab: the container packed into the content box. Tab visibility
 /// is controlled by showing/hiding this container.
 pub struct TabView {
+    pub(crate) selection: crate::addon_selection::SharedCapture,
     container: gtk::Box,
     /// Shared with the engine callbacks below; GTK is single-threaded (the
     /// main loop), so Rc/RefCell is sufficient and correct.
@@ -167,6 +179,29 @@ pub fn create_hosts(window: Window) -> Hosts {
     let content_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let overlay = gtk::Overlay::new();
     overlay.add(&content_box);
+    // The add-on window is an overlay child of the page's
+    // overlay, placed from `addon_rect`. Every other child (the hover readout)
+    // gets `None`, which leaves it to the default halign/valign placement.
+    let addon_rect = Rc::new(Cell::new((0, 0, 0, 0)));
+    {
+        let addon_rect = Rc::clone(&addon_rect);
+        overlay.connect_get_child_position(move |_overlay, child| {
+            if child.widget_name() == ADDON_WIDGET_NAME {
+                // Kept inside the overlay's CURRENT allocation as well: the
+                // page area can shrink before AppState re-clamps.
+                let a = _overlay.allocation();
+                let (x, y, w, h) = addon_rect.get();
+                let w = w.min(a.width()).max(1);
+                let h = h.min(a.height()).max(1);
+                let x = x.clamp(0, (a.width() - w).max(0));
+                let y = y.clamp(0, (a.height() - h).max(0));
+                #[cfg(debug_assertions)]
+                crate::addon_window_timing::applied();
+                return Some(gtk::Rectangle::new(x, y, w, h));
+            }
+            None
+        });
+    }
 
     let insets = Rc::new(Cell::new((CHROME_HEIGHT_PX, 0, 0)));
     // The closed strip's height, remembered apart from `insets.0`.
@@ -292,8 +327,108 @@ pub fn create_hosts(window: Window) -> Hosts {
         fullscreen,
         fullscreen_eligible: Rc::new(RefCell::new(Vec::new())),
         notice_active: Rc::new(Cell::new(false)),
+        addon_rect,
+        addon_box: RefCell::new(None),
+        addon_layout_connected: Cell::new(false),
     }
 }
+
+/// The add-on webview's builder: its own engine folder `dir` (one per add-on
+/// session, chosen by the host), and therefore its own website-data store, as
+/// the translator's. Never the default context the tabs share.
+pub fn new_addon_webview_builder(dir: &Path) -> Result<WebViewBuilder<'static>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("add-on engine folder: {e}"))?;
+    Ok(WebViewBuilder::new_with_web_context(Box::leak(Box::new(wry::WebContext::new(Some(
+        dir.to_path_buf(),
+    ))))))
+}
+
+/// Builds the add-on webview in its own box over the page, then loads `url`.
+/// WebKitGTK decides a navigation before it sends it, so no request wall is
+/// needed here (N0: 0 requests reached a logging endpoint); the navigation
+/// lock, the CSP and the new-window and download refusals are the fence.
+/// A key pressed in the add-on's window is someone here, as in a tab: the
+/// engine's native key event, which nothing the add-on's script does can
+/// produce. Throttled, and carrying nothing about which key.
+pub fn connect_addon_layout(hosts: &Hosts, proxy: &EventLoopProxy<UserEvent>) {
+    if hosts.addon_layout_connected.replace(true) { return; }
+    let proxy = proxy.clone();
+    let previous = Cell::new((0, 0));
+    hosts.content_overlay.connect_size_allocate(move |_, area| {
+        let size = (area.width(), area.height());
+        if previous.replace(size) != size { let _ = proxy.send_event(UserEvent::AddonLayoutChanged); }
+    });
+}
+
+/// Escape is the add-on's: see the Windows twin. Ctrl+Shift+J stays native.
+pub fn connect_addon_presence(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+    connect_shortcuts(webview, proxy);
+    connect_focus_tracking(webview, proxy, crate::state::FocusSurface::Addon);
+}
+
+pub fn build_addon(hosts: &Hosts, builder: WebViewBuilder<'_>, url: &str, _origin_prefix: &str) -> Result<WebView, String> {
+    let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    container.set_widget_name(ADDON_WIDGET_NAME);
+    // Out of `show_all`'s reach: visibility belongs to `place_addon_in`.
+    container.set_no_show_all(true);
+    hosts.content_overlay.add_overlay(&container);
+    hosts.content_overlay.set_overlay_pass_through(&container, false);
+    let webview = match builder.build_gtk(&container) {
+        Ok(webview) => webview,
+        Err(e) => {
+            hosts.content_overlay.remove(&container);
+            return Err(e.to_string());
+        }
+    };
+    for child in container.children() {
+        child.show();
+    }
+    *hosts.addon_box.borrow_mut() = Some(container);
+    webview.load_url(url).map_err(|e| e.to_string())?;
+    Ok(webview)
+}
+
+/// Removes the add-on's container from the page overlay. The webview itself
+/// is dropped by the caller.
+pub fn destroy_addon(hosts: &Hosts) {
+    if let Some(container) = hosts.addon_box.borrow_mut().take() {
+        hosts.content_overlay.remove(&container);
+    }
+}
+
+/// The area the add-on may occupy, as (x, y, w, h) in the add-on's own
+/// coordinates. On this backend the add-on lives inside the page's overlay,
+/// so the area starts at (0, 0) and is the page's allocation.
+pub fn addon_area(hosts: &Hosts, _active: Option<&WebView>) -> (f64, f64, f64, f64) {
+    let a = hosts.content_overlay.allocation();
+    (0.0, 0.0, f64::from(a.width()), f64::from(a.height()))
+}
+
+/// Places (and shows or hides) the add-on. `rect` is relative to the area
+/// `addon_area` returned. Applied on the next GTK allocation.
+pub fn place_addon_in(
+    hosts: &Hosts,
+    _webview: &WebView,
+    _area: (f64, f64),
+    rect: (f64, f64, f64, f64),
+    visible: bool,
+) {
+    #[allow(clippy::cast_possible_truncation)]
+    hosts
+        .addon_rect
+        .set((rect.0 as i32, rect.1 as i32, rect.2 as i32, rect.3 as i32));
+    if let Some(container) = hosts.addon_box.borrow().as_ref() {
+        if visible {
+            container.show();
+        } else {
+            container.hide();
+        }
+        container.queue_resize();
+    }
+}
+
+/// Nothing to re-raise here; overlay children keep their order.
+pub fn raise_addon(_hosts: &Hosts) {}
 
 /// Attaches the readout's style provider and loads the colours for `scheme`.
 ///
@@ -428,6 +563,8 @@ pub fn report_stray_profile() {}
 /// both platforms rather than exposing whichever engine happens to be
 /// underneath.
 use super::{menu_compose, menu_ids};
+#[path = "selection_unix.rs"]
+mod selection_channel;
 
 /// Builds PATANYX's own right-click menu and keeps WebKitGTK's suppressed.
 ///
@@ -445,7 +582,11 @@ use super::{menu_compose, menu_ids};
 /// in the system clipboard itself, so no menu id round trip through state.rs
 /// and no script in the content webview. Everything else becomes a
 /// `UserEvent::ContextMenuAction` for state.rs, the one interpreter.
-fn connect_context_menu(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+fn connect_context_menu(
+    webview: &WebView,
+    proxy: &EventLoopProxy<UserEvent>,
+    selection: Option<selection_channel::Shared>,
+) {
     use gtk::prelude::*;
     use webkit2gtk::{HitTestResultContext, HitTestResultExt, WebViewExt};
     use wry::WebViewExtUnix;
@@ -467,8 +608,14 @@ fn connect_context_menu(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
         };
 
         let menu = gtk::Menu::new();
+        if let Some(channel) = selection.as_ref() {
+            selection_channel::begin(channel, &menu, target.selection || target.editable);
+        }
         for entry in menu_compose::compose(target) {
             match entry {
+                // Added asynchronously only after this native request has a
+                // nonempty, bounded response from its originating document.
+                menu_compose::Entry::SendSelection => {}
                 menu_compose::Entry::Separator => {
                     menu.append(&gtk::SeparatorMenuItem::new());
                 }
@@ -509,6 +656,9 @@ fn connect_context_menu(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
                     menu.append(&item);
                 }
             }
+        }
+        if let Some(channel) = selection.as_ref() {
+            selection_channel::add_send_item(channel, &menu);
         }
         menu.show_all();
         // The only strong reference to the menu is this stack frame, which is
@@ -649,6 +799,7 @@ fn connect_shortcuts(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
 fn gdk_key(value: gtk::gdk::keys::Key) -> Option<Key> {
     use gtk::gdk::keys::constants as k;
     let key = match value {
+        k::j | k::J => Key::J,
         k::t | k::T => Key::T,
         k::w | k::W => Key::W,
         k::l | k::L => Key::L,
@@ -738,8 +889,9 @@ pub fn build_chrome(
             CHROME_TRANSPARENT.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
-    connect_context_menu(&webview, proxy);
+    connect_context_menu(&webview, proxy, None);
     connect_shortcuts(&webview, proxy);
+    connect_focus_tracking(&webview, proxy, crate::state::FocusSurface::Chrome);
     // No privacy policy on the chrome webview on purpose: it is our own UI
     // (needs JavaScript, talks IPC), not web content.
     Ok(webview)
@@ -909,7 +1061,9 @@ pub fn build_content(
     let translate_channel = translate_script.borrow().is_some()
         && connect_translate_channel(&webview, id, proxy, translate_outbox.clone());
     ITP_CONFIRMED.with(|c| c.set(enable_itp(&webview)));
-    connect_context_menu(&webview, proxy);
+    let selection = crate::addon_selection::Capture::new(id);
+    let selection_channel = selection_channel::connect(&webview, selection.clone(), proxy);
+    connect_context_menu(&webview, proxy, selection_channel);
     connect_hover_readout(&webview, hosts);
     connect_shortcuts(&webview, proxy);
     connect_pane_focus(&webview, proxy, id);
@@ -944,6 +1098,7 @@ pub fn build_content(
     connect_tls_errors(&webview, state.clone());
 
     let view = TabView {
+        selection,
         container,
         state,
         ads,
@@ -4703,6 +4858,11 @@ pub fn file_choice_supported() -> bool {
     true
 }
 
+pub fn pick_addon_export_folder(_hosts: &Hosts, title: &str, choose: &str, cancel: &str) -> Option<std::path::PathBuf> {
+    run_chooser(gtk::FileChooserNative::new(Some(title), gtk::Window::NONE,
+        gtk::FileChooserAction::SelectFolder, Some(choose), Some(cancel)))
+}
+
 /// Asks the user for one existing file.
 ///
 /// Runs a nested main loop, which is correct in this position: IPC is
@@ -5321,7 +5481,17 @@ fn connect_pane_focus(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, id: 
     use wry::WebViewExtUnix;
     let proxy = proxy.clone();
     webview.webview().connect_focus_in_event(move |_widget, _event| {
+        let _ = proxy.send_event(UserEvent::SurfaceFocused(crate::state::FocusSurface::Content));
         let _ = proxy.send_event(UserEvent::PaneFocused(id));
+        gtk::glib::Propagation::Proceed
+    });
+}
+
+fn connect_focus_tracking(webview: &WebView, proxy: &EventLoopProxy<UserEvent>, surface: crate::state::FocusSurface) {
+    use wry::WebViewExtUnix;
+    let proxy = proxy.clone();
+    webview.webview().connect_focus_in_event(move |_, _| {
+        let _ = proxy.send_event(UserEvent::SurfaceFocused(surface));
         gtk::glib::Propagation::Proceed
     });
 }

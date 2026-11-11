@@ -72,8 +72,8 @@ const PLANTS = {
   // The window is uncovered while the card is still fading.
   "js-uncover-mid-fade": [
     "js",
-    "    const want = !!openPanelName || !!closingPanel || menuOpen || menuClosing;\n",
-    "    const want = !!openPanelName || menuOpen || menuClosing;\n",
+    "    const want = !!openPanelName || !!closingPanel || menuOpen || menuClosing || confirmShown;\n",
+    "    const want = !!openPanelName || menuOpen || menuClosing || confirmShown;\n",
   ],
   // The strip height is sent while the card is still fading.
   "js-stale-height-mid-fade": [

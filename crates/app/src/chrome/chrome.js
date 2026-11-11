@@ -201,7 +201,15 @@
   // whole Library with its pictures and can outlast any deadline, and an
   // import's reply holds the one-time recovery key: dropped, the vault was
   // replaced and its key never shown. So these four wait for their answer,
-  // however long, with the button held down meanwhile. The one other way a
+  // however long, with the button held down meanwhile. So do the two unlocks:
+  // an unlock can renew the Library's key once (a Library that moved from
+  // version 1, secscan S-1a563619ce84), which takes as long as the Library
+  // is large, and an unlock's reply can carry a recovery key minted by a
+  // vault migration, shown nowhere else (review R-003). So does every command
+  // that opens a file chooser (file_pick_open, file_pick_save, tunnel_import,
+  // bookmarks_import, an add-on export): the host answers only once the user
+  // has picked, and a deadline used to throw away the choice of anyone who
+  // took longer than 30 s to find the file. The one other way a
   // reply never comes is a frame the Rust side drops for size, so that is
   // refused below, before anything is posted.
   // (No `Infinity` deadline: setTimeout clamps an oversized delay and would
@@ -491,6 +499,16 @@
   window.__rb_event = (msg) => {
     if (!msg || typeof msg.event !== "string") return;
     switch (msg.event) {
+      case "addon_open_vault_premium":
+        if (openPanelName !== "vault") togglePanelNamed("vault");
+        refreshVault();
+        break;
+      case "addon_manager_opened":
+        closeOpenPanel();
+        break;
+      case "addon_manager":
+        if (window.__addons) window.__addons.render(msg.data);
+        break;
       // A running export or import (backup_job.rs): progress while it runs,
       // its result exactly once, and a close held for it.
       case "backup_progress":
@@ -498,10 +516,20 @@
         break;
       case "backup_finished":
         backupJobEvent("finished", msg.data);
+        // An import held the add-on slot, and a completed one opens a new
+        // vault session: the check owed at unlock may now run (addons.js
+        // backupFinished, reviews R-042 and R-043).
+        if (window.__addons) window.__addons.backupFinished(msg.data);
         break;
       case "backup_close_held":
         backupCloseHeld(msg.data || {});
         break;
+      // An add-on's "Edit in Vault": the host checked the note exists.
+      case "addon_vault_note_edit": {
+        const id = msg.data && typeof msg.data.id === "string" ? msg.data.id : "";
+        if (id) openNoteInVaultEditor(id);
+        break;
+      }
       case "url_changed": {
         const data = msg.data || {};
         const url = data.url || "";
@@ -691,6 +719,7 @@
         );
         break;
       case "vault_locked":
+        if (window.__addons) window.__addons.refresh();
         // Hide the warning too: the thing it warned about has happened, and a
         // banner counting down to a lock that already occurred is worse than
         // no banner. (A second `case "vault_locked"` further down would have
@@ -979,6 +1008,7 @@
       // An encrypted export or import runs on its own, and nothing that
       // rewrites or replaces the vault or the Library may run under it.
       backup_in_progress: i18nText("chrome-js-error-backup-in-progress", "An encrypted export or import is running. Try again when it has finished."),
+      addon_busy: i18nText("chrome-js-error-addon-busy", "An add-on is busy. Try again in a moment."),
       backup_past_commit: i18nText("chrome-js-error-backup-past-commit", "The import can no longer be stopped. Keep PATANYX open until it finishes."),
       backup_not_running: i18nText("chrome-js-error-backup-not-running", "That export or import has already ended."),
       backup_cancelled: i18nText("chrome-js-error-backup-cancelled", "Stopped. Nothing was saved or replaced."),
@@ -1035,8 +1065,10 @@
       adlist_no_exception: i18nText("chrome-js-error-adlist-no-exception", "Opening anyway is not available on this platform"),
       blocked_stale: i18nText("chrome-js-error-blocked-stale", "That notice is out of date. Try the page again"),
       passphrase_changed_backups_retained: i18nText("chrome-js-error-passphrase-changed-backups-retained", "Passphrase changed, but PATANYX could not confirm that every older backup or temporary copy of your vault is gone. They are in the same folder as your vault file, and some may be hidden files whose names start with .tmp-. Any that remain may still open with an earlier passphrase and may also open your Library. Delete them by hand."),
+      passphrase_changed_library_key_not_renewed: i18nText("chrome-js-error-passphrase-changed-library-key-not-renewed", "Passphrase changed, but PATANYX could not renew your Library's encryption key. Until it does, anyone with an older copy of your Library file and an earlier passphrase it opened with may be able to read your Library. Renewing needs free disk space about the size of your Library."),
       passphrase_changed_library_leftover_retained: i18nText("chrome-js-error-passphrase-changed-library-leftover-retained", "Passphrase changed, but PATANYX could not confirm that every leftover copy of your Library is gone. They are in the folder where PATANYX keeps your Library. Anyone with one of them and the earlier passphrase it opens with may be able to read your Library. Delete them by hand."),
       passphrase_change_library_unavailable: i18nText("chrome-js-error-passphrase-change-library-unavailable", "Passphrase not changed, because your Library is not open here. Open the Library panel to see why."),
+      passphrase_change_library_rekey_unfinished: i18nText("chrome-js-error-passphrase-change-library-rekey-unfinished", "Passphrase not changed. Your Library is closed because renewing its encryption key did not finish. Your current passphrase still works. Lock the Vault and unlock it again to complete or undo the renewal."),
       passphrase_change_not_confirmed: i18nText("chrome-js-error-passphrase-change-not-confirmed", "Passphrase not changed. PATANYX could not confirm that your Library is saved to disk, so it canceled the change. Your current passphrase still works. Try again."),
       duplicate_contact: i18nText("chrome-js-error-duplicate-contact", "You already have a contact with that number"),
       // Its own code rather than bad_args: the requirement is not guessable
@@ -1085,6 +1117,7 @@
       import_earlier_unfinished: i18nText("chrome-js-error-import-earlier-unfinished", "Nothing was imported. Earlier imports on this computer did not finish. Unlock your vault once so PATANYX can finish or undo them, then import again."),
       disk_full: i18nText("chrome-js-error-disk-full", "There is not enough free disk space to finish. Free some space, then try again."),
       library_import_unfinished: i18nText("chrome-js-error-library-import-unfinished-nopath", "Your Library is closed because an import did not finish. To finish it, import the same backup file again."),
+      library_rekey_unfinished: i18nText("chrome-js-error-library-rekey-unfinished", "Your Library is closed because renewing its encryption key did not finish. Lock the Vault and unlock it again to complete or undo the renewal."),
       export_not_confirmed: i18nText("chrome-js-error-export-not-confirmed", "Type the confirmation sentence exactly to continue."),
       target_is_vault:
         i18nText("chrome-js-error-target-is-vault", "That path is your live vault. Choose a different destination."),
@@ -1232,8 +1265,20 @@
 
   window.__rb = {
     request: rb,
+    // For a request that opens a file chooser (see RB_UNTIL_ANSWERED).
+    untilAnswered: RB_UNTIL_ANSWERED,
     friendly,
     registerPanel: (name, spec) => registerPanel(name, spec),
+    isPanelOpen: (name) => openPanelName === name,
+    openAddons: () => openAddons(),
+    // For addons.js: an add-on's own button joins the Tools group, and its
+    // panel's "Unlock Vault" opens the Vault the way an add-on asking for it
+    // does.
+    addGroupMember: (g, id) => addGroupMember(g, id),
+    openVault: () => {
+      if (openPanelName !== "vault") togglePanelNamed("vault");
+      refreshVault();
+    },
     // Shared for the same reason `request` and `friendly` are: chat.js is a
     // separate script and must ask its destructive question with the same
     // dialog, not fall back to the engine's window.confirm and reintroduce
@@ -2305,6 +2350,12 @@
   // Focus is returned to whatever raised the dialog, so a keyboard user is
   // put back where they were rather than at the top of the panel.
   let confirmResolve = null;
+  // Whether the dialog is up (or still fading out). It counts as covering
+  // the page (sendChromeCoverage): the dialog is drawn by the chrome, which
+  // with no panel or menu open is only the strip, so a question asked from
+  // the toolbar -- Fill password for another subdomain -- was drawn clipped
+  // to nothing and only the toolbar dimmed (Windows VM, 2026-11-10).
+  let confirmShown = false;
   function askConfirm(message, confirmLabel) {
     const overlay = $("confirm-overlay");
     const yes = $("confirm-yes");
@@ -2329,6 +2380,8 @@
     }
     overlay.classList.remove("closing");
     overlay.hidden = false;
+    confirmShown = true;
+    syncChromeCoverage();
     $("confirm-cancel").focus();
     return new Promise((resolve) => {
       confirmResolve = (answer) => {
@@ -2349,6 +2402,8 @@
       confirmHideTimer = 0;
       overlay.hidden = true;
       overlay.classList.remove("closing");
+      confirmShown = false;
+      syncChromeCoverage();
     };
     if (prefersReducedMotion()) hide();
     else confirmHideTimer = setTimeout(hide, PANEL_CLOSE_MS);
@@ -2744,13 +2799,17 @@
       err.textContent = i18nText("chrome-js-recovery-empty-prompt", "Enter the recovery key you were given.");
       return;
     }
+    const button = $("recovery-form").querySelector('button[type="submit"]');
+    if (button) button.disabled = true;
     try {
-      await rb("vault_unlock_recovery", { recovery_key: key });
+      await rb("vault_unlock_recovery", { recovery_key: key }, RB_UNTIL_ANSWERED);
       // Clear it from the DOM as well as the screen: it is a master credential.
       $("recovery-input").value = "";
       await refreshVault();
     } catch (e) {
       err.textContent = friendly(e);
+    } finally {
+      if (button) button.disabled = false;
     }
   });
 
@@ -2883,8 +2942,9 @@
   }
   function sendChromeCoverage() {
     // A card still fading out keeps the window covered (beginPanelClose),
-    // and so does the main menu, which draws below the strip like a card.
-    const want = !!openPanelName || !!closingPanel || menuOpen || menuClosing;
+    // and so does the main menu, which draws below the strip like a card, and
+    // so does the confirm dialog (askConfirm), wherever it was asked from.
+    const want = !!openPanelName || !!closingPanel || menuOpen || menuClosing || confirmShown;
     if (want === chromeCovered) return;
     chromeCovered = want;
     rb("chrome_overlay", { cover: want }).catch(() => {});
@@ -3127,7 +3187,7 @@
   // The pills that left the rows for the main menu. They wear in-menu
   // (hidden) from here as well as from the markup, because two of them are
   // appended at runtime.
-  const IN_MENU_PILLS = new Set(["btn-reader", "btn-about", "btn-integrity", "btn-update"]);
+  const IN_MENU_PILLS = new Set(["btn-addons", "btn-reader", "btn-about", "btn-integrity", "btn-update"]);
   // TOOLBAR GROUPS: id -> the buttons it folds, in row order. The markup
   // carries the same membership as data-group on each button, with a pill
   // per group (id group-<id>); toolbar-groups-gate.js holds the two
@@ -3140,6 +3200,21 @@
     ["tools", ["btn-theme", "btn-ocr-region", "btn-chat"]],
   ];
   const TOOLBAR_GROUP_IDS = TOOLBAR_GROUPS.map(([g]) => g);
+  // Add-on buttons, created at runtime by addons.js from signed data, join
+  // the Tools group here and nowhere else: one list, read by every place that
+  // asks what a group holds (its menu, which group a button is in, the
+  // pill's state), so a runtime member behaves like a static one (plan
+  // P-7). Only add-on ids, only Tools.
+  const RUNTIME_GROUP_MEMBERS = new Map([["tools", []]]);
+  const RUNTIME_MEMBER_ID = /^btn-addon-[a-z][a-z0-9-]{0,31}$/;
+  function addGroupMember(g, id) {
+    const list = RUNTIME_GROUP_MEMBERS.get(g);
+    if (!list || typeof id !== "string" || !RUNTIME_MEMBER_ID.test(id)) return false;
+    if (!list.includes(id)) list.push(id);
+    return true;
+  }
+  const membersOf = (g) =>
+    ((TOOLBAR_GROUPS.find(([id]) => id === g) || [g, []])[1]).concat(RUNTIME_GROUP_MEMBERS.get(g) || []);
   // When the row runs out of room it folds from its right end.
   const AUTO_FOLD_ORDER = ["tools", "saved", "tabs", "network"];
   // What the user chose (the pref, as Rust last answered it), and what the
@@ -3162,7 +3237,7 @@
   const autoFolded = new Set();
   const isFolded = (g) => userFolded.has(g) || autoFolded.has(g);
   function groupOf(id) {
-    for (const [g, members] of TOOLBAR_GROUPS) if (members.includes(id)) return g;
+    for (const g of TOOLBAR_GROUP_IDS) if (membersOf(g).includes(id)) return g;
     return null;
   }
   // Where the keyboard goes when a panel closes: its own button, unless that
@@ -3173,6 +3248,11 @@
     if (IN_MENU_PILLS.has(spec.button.id)) return $("btn-main-menu");
     const g = groupOf(spec.button.id);
     if (g && isFolded(g)) return $("group-" + g);
+    // An add-on button the user took off the toolbar, with Tools unfolded:
+    // nothing on screen opened it but the menu (Add-ons).
+    if (spec.button.hasAttribute("data-addon-button") && !spec.button.hasAttribute("data-shown")) {
+      return $("btn-main-menu");
+    }
     return spec.button;
   }
   // Entry -> the real button it clicks (null: an action of its own). A table
@@ -3181,6 +3261,7 @@
   // The markup carries the same pairing as data-proxy-for; toolbar-gate.js
   // holds the two together.
   const MENU_ENTRIES = [
+    ["menu-addons", "btn-addons"],
     ["menu-reader", "btn-reader"],
     ["menu-print", null],
     ["menu-save-pdf", "btn-save-pdf"],
@@ -3320,7 +3401,7 @@
   let groupMenuItems = [];
   // The real button behind each entry, in the same order.
   let groupMenuReals = [];
-  const groupMembers = (g) => (TOOLBAR_GROUPS.find(([id]) => id === g) || [g, []])[1];
+  const groupMembers = (g) => membersOf(g);
   const shownMembers = (g) =>
     groupMembers(g)
       .map((id) => document.getElementById(id))
@@ -3628,7 +3709,8 @@
   // elements and a write of the same value is still a mutation (round 3,
   // R-001).
   function syncGroupPills() {
-    for (const [g, members] of TOOLBAR_GROUPS) {
+    for (const g of TOOLBAR_GROUP_IDS) {
+      const members = membersOf(g);
       const pill = $("group-" + g);
       if (!pill) continue;
       let warning = false;
@@ -3985,8 +4067,10 @@
 
     // A locked vault ended the scan server-side along with it. Every
     // control state here is assigned from the snapshot on every render, so
-    // a later unlocked snapshot re-enables the box and button on its own --
-    // there is no separate "unlock" path to keep in step.
+    // a later unlocked snapshot re-enables the box and button on its own.
+    // The host sends that snapshot when the vault opens
+    // (`licence_control::on_vault_unlocked`); until it did, the field stayed
+    // disabled after Lock then Unlock until a restart.
     findtabsLocked.hidden = !locked;
     findtabsQuery.disabled = locked;
     findtabsRun.disabled = locked;
@@ -4804,10 +4888,10 @@
       o.textContent =
         row && row.partial
           ? i18nText("chrome-translate-no-target-partial",
-              "You have the other direction only. Get this one below.",
+              "Get this direction in Add-ons.",
             )
           : i18nText("chrome-translate-no-target",
-              "No language installed for this. Install one below.",
+              "Install a language in Add-ons.",
             );
       tgtSel.appendChild(o);
     }
@@ -4981,6 +5065,21 @@
       /* leave the last known state; the panel simply does not update */
     }
   }
+
+  function openAddons() {
+    if (openPanelName !== "addons") togglePanelNamed("addons");
+  }
+  registerPanel("addons", {
+    el: $("addons-panel"),
+    button: $("btn-addons"),
+    heightPx: 800,
+    onOpen: () => {
+      refreshTranslatePacks();
+      if (window.__addons) window.__addons.opened();
+      if (window.__rb_assistant) window.__rb_assistant.refreshModels();
+    },
+  });
+  $("translate-manage").addEventListener("click", openAddons);
 
   // Why a pack download stopped, for the packs list. Deliberately NOT
   // translateFailureText: that copy ends "the page is unchanged and still
@@ -5348,13 +5447,23 @@
       i18nText("chrome-js-autofill-reason-no-site", "No site to check for a saved password."),
     "no-match": () =>
       i18nText("chrome-js-autofill-reason-no-match", "No saved password for this site."),
+    // Saved passwords are filled on https pages only (finding S-0a47ea9404bd).
+    "not-secure": () =>
+      i18nText("chrome-js-autofill-reason-not-secure", "Saved passwords fill only on secure (https) pages."),
   };
 
   function autofillKey(st) {
     if (!st) return "none";
-    return [st.origin || "", vaultUnlocked, st.content_script_registered].join(
-      "|",
-    );
+    // `origin` is a bare host, so https and http on one host share it; the
+    // page's own insecure flag is in the key so a lookup made on the https
+    // page cannot land after a move to the http page and restore its offer
+    // (passwords fill on https pages only).
+    return [
+      st.origin || "",
+      st.page_insecure === true,
+      vaultUnlocked,
+      st.content_script_registered,
+    ].join("|");
   }
 
   // Paints both surfaces from state already in hand. Split out from the lookup
@@ -5366,6 +5475,43 @@
     const toolbarBtn = $("btn-fill");
     const offer = lastAutofillOffer;
 
+    if (offer && offer.sibling === true) {
+      // SAVED ON ANOTHER HOST of this site. Named on every surface, because
+      // the host releases it only after the user confirms that host
+      // (fillOffer), and a confirmation is only consent if they saw it first.
+      const site = offer.origin || "";
+      i18nSet(
+        desc,
+        "chrome-js-autofill-offer-desc-sibling",
+        { username: offer.username, site },
+        "A password for " + offer.username + " saved on " + site + " is available.",
+      );
+      desc.dataset.state = "offer";
+      panelBtn.disabled = false;
+      i18nSet(
+        panelBtn,
+        "chrome-js-autofill-offer-button-sibling",
+        { username: offer.username, site },
+        "Fill password for " + offer.username + " from " + site,
+      );
+      if (toolbarBtn) {
+        toolbarBtn.hidden = false;
+        toolbarBtn.classList.add("is-active");
+        toolbarBtn.title = "Fill the password for " + offer.username + " saved on " + site;
+        if (currentUiLocale !== "en") {
+          const mine = i18nHold(toolbarBtn);
+          i18nResolve(
+            "chrome-js-autofill-offer-title-sibling",
+            { username: offer.username, site },
+            "Fill the password for " + offer.username + " saved on " + site,
+          ).then((t) => {
+            if (toolbarBtn.__i18nToken !== mine) return;
+            toolbarBtn.title = t;
+          });
+        }
+      }
+      return;
+    }
     if (offer) {
       i18nSet(
         desc,
@@ -5519,11 +5665,49 @@
       });
   }
 
+  // A sibling offer (saved on another host of this site) is filled only after
+  // the user has seen the host it was saved on and said yes; the host refuses
+  // a sibling fill that does not name that confirmed host. Returns quietly if
+  // the user declines or the offer changed while the question was open.
+  async function fillOffer(offer) {
+    const args = { id: offer.id };
+    if (offer.sibling === true) {
+      const site = offer.origin || "";
+      // The host names the page with its port (`page`), so a password saved
+      // on login.example.com is asked about as "not login.example.com:8443"
+      // rather than naming the same host twice.
+      const page = offer.page || (lastTabStatus && lastTabStatus.origin) || "";
+      // Same host, another port. Passwords are stored without a port, so the
+      // vault cannot say it was saved somewhere else -- it may have been saved
+      // on this very port. The question says only what is known.
+      const question =
+        offer.same_host === true
+          ? await i18nResolve(
+              "chrome-js-autofill-port-confirm",
+              { site, page },
+              "This password is saved for " + site + ". This page is " + page +
+                ", which may be a different service. Fill it here?",
+            )
+          : await i18nResolve(
+              "chrome-js-autofill-sibling-confirm",
+              { site, page },
+              "This password was saved on " + site + ", not " + page + ". Fill it here?",
+            );
+      const ok = await askConfirm(
+        question,
+        i18nText("chrome-js-autofill-sibling-confirm-yes", "Fill"),
+      );
+      if (!ok || lastAutofillOffer !== offer) return;
+      args.confirmed_origin = site;
+    }
+    await rb("cred_autofill_fill", args);
+  }
+
   $("btn-fill").addEventListener("click", async () => {
     const offer = lastAutofillOffer;
     if (!offer) return;
     try {
-      await rb("cred_autofill_fill", { id: offer.id });
+      await fillOffer(offer);
     } catch (e) {
       toast(friendly(e), true);
     }
@@ -5535,7 +5719,7 @@
     const btn = $("btn-autofill-fill");
     btn.disabled = true;
     try {
-      await rb("cred_autofill_fill", { id: offer.id });
+      await fillOffer(offer);
     } catch (e) {
       toast(friendly(e), true);
     } finally {
@@ -5754,7 +5938,8 @@
   // that is answered, it is the 1.0.5 banner as before. One element, so
   // its styling, the side toolbar's offsets and BANNERS cover both (plan
   // review 2026-10-13). The 1.0.7 text is set here, after any locale
-  // fill, which rewrites the markup's own 1.0.5 text first.
+  // fill, which rewrites the markup's own 1.0.5 text first. (Retired in
+  // 1.1.0, see maybeShowTutorialBanner: this stays, unused, for now.)
   let tutorialBannerTopic = "reader-view";
   let keepVideo = false;
   function applyTutorialBannerText() {
@@ -5781,25 +5966,18 @@
     else renderTutorial();
   });
   $("tutorial-banner-later").addEventListener("click", answerTutorialBanner);
-  // Asked after the first-run tour, never over it: called from the boot
-  // check when the tour is already resolved, and from the tour's close.
+  // RETIRED IN 1.1.0 (deferred from 1.0.9 and 1.0.10): the 1.0.5 and
+  // 1.0.7 banners no longer show, on any platform, whatever seen and
+  // keep_seen say. The videos stay in About (Watch the feature videos),
+  // and this still tells About whether the Kept Sites video is here.
+  // Called from the boot check when the tour is already resolved, and
+  // from the tour's close.
   function maybeShowTutorialBanner() {
     rb("tutorial_seen_get")
       .then((data) => {
         if (!data) return;
         keepVideo = data.keep_video === true;
         $("tutorial-topic-keep").hidden = !keepVideo;
-        let topic = null;
-        if (keepVideo && data.keep_seen === false) topic = "keep-sites";
-        else if (data.seen === false) topic = "reader-view";
-        if (topic === null) return;
-        tutorialBannerTopic = topic;
-        applyTutorialBannerText();
-        const banner = $("tutorial-banner");
-        if (banner.hidden) {
-          banner.hidden = false;
-          syncChromeInsets();
-        }
       })
       .catch(() => {});
   }
@@ -6634,7 +6812,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const err = $("tunnelp-error");
     err.hidden = true;
     try {
-      const r = await rb("tunnel_import");
+      const r = await rb("tunnel_import", {}, RB_UNTIL_ANSWERED);
       if (r && r.imported) {
         // DECIDED: importing does NOT switch the tunnel on -- the static
         // note in the panel says so, and the refresh reflects the stored
@@ -7833,6 +8011,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   }
 
   function showState(name) {
+    if (window.__addons) window.__addons.refresh();
     for (const key of Object.keys(statePanes)) {
       statePanes[key].hidden = key !== name;
     }
@@ -7908,6 +8087,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   }
 
   async function refreshVault() {
+    if (window.__addons) window.__addons.refresh();
     try {
       const st = await rb("vault_status");
       if (!st.exists) {
@@ -8456,10 +8636,14 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
   function wireSavePicker(buttonId, fieldId, title, name) {
     $(buttonId).addEventListener("click", async () => {
       try {
-        const r = await rb("file_pick_save", {
-          title,
-          suggested_name: name,
-        });
+        const r = await rb(
+          "file_pick_save",
+          {
+            title,
+            suggested_name: name,
+          },
+          RB_UNTIL_ANSWERED,
+        );
         if (!r || !r.path) return;
         $(fieldId).value = r.path;
       } catch (e) {
@@ -8914,6 +9098,17 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
           return;
         }
         break;
+      case "export_addon_page_unreadable":
+        if (item) {
+          i18nSet(err, "chrome-js-backup-exp-addon-page-unreadable", { item },
+            "Nothing was written. The add-on page \"" + item + "\" could not be read. Try again. If it still cannot be read, export the add-on's pages as text from Add-on data, delete the add-on data, then back up again.");
+          return;
+        }
+        err.textContent = i18nText("chrome-js-backup-exp-addon-page-unreadable-unnamed", "Nothing was written. Could not read an add-on page. Try again. If it still fails, export the pages from Add-ons, delete them, then back up again.");
+        return;
+      case "export_addon_unreadable":
+        err.textContent = i18nText("chrome-js-backup-exp-addon-unreadable", "Nothing was written. Could not read the add-on pages. Try again. If it still fails, delete them in Add-ons, then back up again.");
+        return;
       case "export_library_changed":
         if (item) {
           i18nSet(err, "chrome-js-backup-exp-library-changed", { item },
@@ -9023,9 +9218,13 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       const err = $(id("error"));
       err.textContent = "";
       try {
-        const r = await rb("file_pick_open", {
-          title: i18nText("chrome-js-import-pick-title", "Choose a PATANYX backup file"),
-        });
+        const r = await rb(
+          "file_pick_open",
+          {
+            title: i18nText("chrome-js-import-pick-title", "Choose a PATANYX backup file"),
+          },
+          RB_UNTIL_ANSWERED,
+        );
         // Cancel is an answer, not a failure: leave everything as it was.
         if (!r || !r.path) return;
         $(id("src")).value = r.path;
@@ -9050,6 +9249,48 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // The file the older-backup note has been shown for, so a submit can tell
     // whether the person has seen it.
     let warnedOlderFor = null;
+    // ADD-ON PAGES ARE REPLACED TOO (M12). Any import replaces the pages an
+    // add-on saved beside this Library, with the backup's or with none. The
+    // count comes from this Library, never from the file; null means there is
+    // add-on data that could not be counted, which is warned about the same.
+    let warnedAddonsFor = null;
+    let addonIdsAtRisk = [];
+    // A check is under way for a submit: another press meanwhile is not a
+    // confirmation of a warning nobody has seen yet.
+    let inspecting = false;
+    const addonPagesAtRisk = (kind) =>
+      !!kind && (kind.addon_pages === null || Number(kind.addon_pages) > 0);
+    function showAddonsNote(kind, src) {
+      const note = $(id("addons"));
+      if (!note) return false;
+      const atRisk = addonPagesAtRisk(kind);
+      note.hidden = !atRisk;
+      addonIdsAtRisk = atRisk && Array.isArray(kind.addon_ids) ? kind.addon_ids.slice() : [];
+      warnedAddonsFor = atRisk ? src : null;
+      // Counted pages are named as there and can be exported now. Data that
+      // could not be counted (the Library not open, an add-on window still
+      // saving, a folder or index that cannot be read) is only said to be
+      // possible, and no export is offered: none fits every one of those.
+      const counted = atRisk && kind.addon_pages !== null;
+      const known = $(id("addons-known"));
+      const unknown = $(id("addons-unknown"));
+      const exportButton = $(id("addons-export"));
+      if (known) known.hidden = !counted;
+      if (unknown) unknown.hidden = counted;
+      if (exportButton) exportButton.hidden = !counted || addonIdsAtRisk.length === 0;
+      return atRisk;
+    }
+    const addonsExport = $(id("addons-export"));
+    if (addonsExport) {
+      // The add-on's own export: its confirmation, its folder, its result in
+      // Add-ons. Never part of the import, and never automatic.
+      addonsExport.addEventListener("click", async () => {
+        const addons = window.__addons;
+        if (!addons || typeof addons.exportPages !== "function") return;
+        for (const addonId of addonIdsAtRisk) await addons.exportPages(addonId);
+        openAddons();
+      });
+    }
     async function inspectChosen() {
       const note = $(id("older"));
       if (!note) return;
@@ -9062,6 +9303,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         if (mine !== inspectToken) return;
         note.hidden = !(kind && kind.older);
         if (!note.hidden) warnedOlderFor = src;
+        showAddonsNote(kind, src);
       } catch (e) {
         // The import itself reports an unreadable file; this note only adds
         // to a file it can read.
@@ -9109,19 +9351,31 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       // submitted with Enter can arrive before the check that shows the note,
       // so the check runs here too: if the note has not been on screen for
       // this file, it is shown and nothing is imported until the next submit.
-      if ($(id("older")) && warnedOlderFor !== src) {
+      if ($(id("older")) && (warnedOlderFor !== src || ($(id("addons")) && warnedAddonsFor !== src))) {
+        if (inspecting) return;
+        inspecting = true;
         let kind = null;
         try {
           kind = await rb("vault_import_inspect", { src });
         } catch (e) {
           // The import itself reports a file it cannot read.
+        } finally {
+          inspecting = false;
         }
         if (generation !== vaultGeneration) return;
-        if (kind && kind.older) {
+        let hold = false;
+        if (kind && kind.older && warnedOlderFor !== src) {
           warnedOlderFor = src;
           $(id("older")).hidden = false;
-          return;
+          hold = true;
         }
+        // The same rule for add-on pages: named on screen before an import
+        // replaces them, and the next submit goes ahead.
+        if (warnedAddonsFor !== src && addonPagesAtRisk(kind)) {
+          showAddonsNote(kind, src);
+          hold = true;
+        }
+        if (hold) return;
       }
       // Held down until the answer, however long a whole Library takes, so a
       // second press cannot start a second import underneath the first.
@@ -9147,6 +9401,9 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         $(id("chosen")).textContent = "";
         if ($(id("older"))) $(id("older")).hidden = true;
         warnedOlderFor = null;
+        if ($(id("addons"))) $(id("addons")).hidden = true;
+        warnedAddonsFor = null;
+        addonIdsAtRisk = [];
         // The replaced vault's session ends on screen too, as a lock ends it:
         // a password still revealed, or an edit form still open, belongs to
         // the vault that is gone. Left up, the next render showed the old
@@ -9270,6 +9527,13 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
         "Download records not kept because they failed their check: " + c(n("downloads_dropped")) + ".",
       ));
     }
+    if (n("addon_pages") > 0) {
+      parts.push(await i18nResolve(
+        "chrome-js-import-addon-pages",
+        { count: n("addon_pages") },
+        "Add-on pages restored from the backup: " + c(n("addon_pages")) + ".",
+      ));
+    }
     if (r.downloads_not_kept_library_closed === true) {
       parts.push(i18nText("chrome-js-import-downloads-not-kept", "Download records on this computer were not kept, because your Library was closed."));
     }
@@ -9316,8 +9580,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const err = $("unlock-error");
     err.textContent = "";
     const pass = $("unlock-pass").value;
+    const button = $("unlock-form").querySelector('button[type="submit"]');
+    if (button) button.disabled = true;
     try {
-      const opened = await rb("vault_unlock", { passphrase: pass });
+      const opened = await rb("vault_unlock", { passphrase: pass }, RB_UNTIL_ANSWERED);
       $("unlock-pass").value = "";
       // Unlocking an older vault migrates it and mints a recovery key the user
       // has never seen. Showing it here is the only chance they get.
@@ -9330,6 +9596,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       await reloadLists();
     } catch (e) {
       err.textContent = friendly(e);
+    } finally {
+      if (button) button.disabled = false;
     }
   });
 
@@ -9537,6 +9805,36 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
   }
 
+  // Loads one Vault note into the Vault panel's own editor. Shared by the
+  // list's Edit button and an add-on's "Edit in Vault" request, which only
+  // names the note: the editing, and its explicit Save, stay the Vault's.
+  async function editNoteById(id) {
+    try {
+      const note = await rb("note_get", { id });
+      editingNote = id;
+      $("note-title").value = note.title || "";
+      $("note-body").value = note.body || "";
+      $("note-submit").textContent = i18nText("chrome-js-creds-save-changes", "Save changes");
+      $("note-cancel").hidden = false;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // An add-on asked to edit a Vault note: open the Vault panel (if it is not
+  // open already) and load that note into its editor.
+  async function openNoteInVaultEditor(id) {
+    if (openPanelName !== "vault") togglePanelNamed("vault");
+    if (await editNoteById(id)) {
+      // On the Notes tab: the editor was loaded behind whichever tab was
+      // last shown, usually Credentials (add-on hand test 2026-10-21, H-12).
+      selectTab("notes");
+      const form = $("note-form");
+      if (form) form.scrollIntoView({ block: "nearest" });
+    }
+  }
+
   function renderNotes() {
     noteListEl.textContent = "";
     for (const item of noteItems) {
@@ -9548,18 +9846,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       const row = el("div", "item-row");
       const editBtn = el("button", "small", i18nText("chrome-js-creds-edit", "Edit"));
       editBtn.type = "button";
-      editBtn.addEventListener("click", async () => {
-        try {
-          const note = await rb("note_get", { id: item.id });
-          editingNote = item.id;
-          $("note-title").value = note.title || "";
-          $("note-body").value = note.body || "";
-          $("note-submit").textContent = i18nText("chrome-js-creds-save-changes", "Save changes");
-          $("note-cancel").hidden = false;
-        } catch (e) {
-          /* ignore */
-        }
-      });
+      editBtn.addEventListener("click", () => editNoteById(item.id));
       row.appendChild(editBtn);
 
       const delBtn = el("button", "small danger", i18nText("chrome-js-confirm-default-label", "Delete"));
@@ -9829,6 +10116,8 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     "engine-floor-warning",
     // The feature-videos banner (1.0.5): same band, same rule.
     "tutorial-banner",
+    // The one-time Premium add-on announcement (1.1.0): same band, same rule.
+    "addon-banner",
     // The find bar. NOT a banner by role (role="search"), which is exactly how
     // it escaped the toolbar gate's role=alert|status sweep and this list.
     // With the toolbar across the top the closed strip is measured against a
@@ -9950,6 +10239,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // second pass).
     const switchedTab = typeof st.id === "number" && st.id !== activeTabId;
     if (typeof st.id === "number") activeTabId = st.id;
+    showBlockedForActiveTab();
     // The hosts the freeze really lets through, from Rust. An exception that
     // failed to install is rolled back there, and the ledger must not keep
     // showing it as Allowed (final review, R-003).
@@ -11009,7 +11299,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     summary.hidden = true;
     btn.disabled = true;
     try {
-      const r = await rb("bookmarks_import");
+      const r = await rb("bookmarks_import", {}, RB_UNTIL_ANSWERED);
       if (r) {
         // Both skip categories always shown, zeros included: "skipped 0"
         // is confirmation the category was considered, not noise.
@@ -11894,10 +12184,17 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     slot(data);
   };
 
-  async function startScan(kind, onDone, onError) {
+  // `onPicked` runs once the user has chosen a file, before the scan: a
+  // caller's "Reading the image..." goes there, because a cancelled picker
+  // never reaches the scan and would otherwise leave that line up for good.
+  async function startScan(kind, onDone, onError, onPicked) {
     let picked;
     try {
-      picked = await rb("file_pick_open", { title: i18nText("chrome-js-ocr-pick-title", "Choose an image") });
+      picked = await rb(
+        "file_pick_open",
+        { title: i18nText("chrome-js-ocr-pick-title", "Choose an image") },
+        RB_UNTIL_ANSWERED,
+      );
     } catch (e) {
       // A refusal that arrives AFTER the UI precheck (the licence changed in
       // between) must explain itself as a Premium refusal, not as the tab
@@ -11907,6 +12204,7 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     }
     // Cancel is an answer, not a failure: leave everything exactly as it was.
     if (!picked || !picked.path) return;
+    if (onPicked) onPicked();
     try {
       // The TOKEN, not the path. Rust mints it when the user confirms the
       // dialog and consumes it here, so the file being read is the file that
@@ -11934,8 +12232,6 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const err = $("recovery-error");
     const note = $("recovery-scan-note");
     err.textContent = "";
-    note.hidden = false;
-    note.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
     startScan(
       "recovery",
       (data) => {
@@ -11951,6 +12247,10 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       (msg) => {
         note.hidden = true;
         err.textContent = msg;
+      },
+      () => {
+        note.hidden = false;
+        note.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
       },
     );
   });
@@ -11982,9 +12282,6 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     const status = $("leakcheck-status");
     const list = $("leakcheck-list");
     err.textContent = "";
-    list.replaceChildren();
-    leakTextReset();
-    status.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
     startScan(
       "leaks",
       (data) => {
@@ -12020,6 +12317,12 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
       (msg) => {
         status.textContent = "";
         err.textContent = msg;
+      },
+      () => {
+        // The previous result stays until a new image is actually chosen.
+        list.replaceChildren();
+        leakTextReset();
+        status.textContent = i18nText("chrome-js-ocr-recovery-reading", "Reading the image...");
       },
     );
   });
@@ -14013,14 +14316,28 @@ i18nText("chrome-tunnel-warn-down-body", "Private Tunnel is down, so pages will 
     // through this file. The comment above about "reported for", not
     // "known to", now guards chrome-blocked-body in en.ftl.
     $("blocked-body").textContent = data.body || "";
+    blockedNotice = true;
+    showBlockedForActiveTab();
+  }
+
+  // The notice describes one tab's navigation, so it shows only while that
+  // tab is the active one, and comes back when the user returns to it. It
+  // used to stay up over every other tab after a switch (VM, 2026-10-22).
+  // Before the first tab status names the active tab, and for a notice with
+  // no tab id, it shows as it always did.
+  let blockedNotice = false;
+  function showBlockedForActiveTab() {
+    const show =
+      blockedNotice && (blockedTabId === null || activeTabId === null || activeTabId === blockedTabId);
     const banner = $("blocked-warning");
-    if (banner.hidden) {
-      banner.hidden = false;
+    if (banner.hidden === show) {
+      banner.hidden = !show;
       syncChromeInsets();
     }
   }
 
   function hideBlocked() {
+    blockedNotice = false;
     blockedTabId = null;
     blockedPendingId = null;
     const banner = $("blocked-warning");

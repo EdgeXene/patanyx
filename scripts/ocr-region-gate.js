@@ -473,6 +473,43 @@ check("a leak-check refusal AFTER the precheck is explained as Premium", async (
   delete global.rbResolve.premium_status;
 });
 
+check("a cancelled image picker leaves no 'Reading the image...' behind", async () => {
+  // Both callers used to set that line BEFORE the picker opened, and a
+  // cancel returns without scanning, so the line stayed up for good.
+  global.rbReject = null;
+  global.rbResolve.premium_status = { state: "active", premium: true, on_sale: true };
+  global.rbResolve.file_pick_open = {};
+  const status = $("leakcheck-status");
+  status.textContent = "No listed clues found in 3 line(s).";
+  $("leakcheck-pick").click();
+  await flush();
+  assert(
+    status.textContent === "No listed clues found in 3 line(s).",
+    "a cancelled image check must leave the previous result: " + JSON.stringify(status.textContent),
+  );
+  const note = $("recovery-scan-note");
+  note.hidden = true;
+  note.textContent = "";
+  $("recovery-scan").click();
+  await flush();
+  assert(
+    note.hidden === true && !/Reading the image/.test(note.textContent || ""),
+    "a cancelled recovery scan must not show a reading note: " + JSON.stringify(note.textContent),
+  );
+  // And a picked file still says it is reading, before the scan answers.
+  global.rbResolve.file_pick_open = { path: "/tmp/x.png", token: 7 };
+  global.rbResolve.ocr_scan = { token: 41 };
+  $("leakcheck-pick").click();
+  await flush();
+  assert(
+    /Reading the image/.test(status.textContent),
+    "a picked image must show the reading line: " + JSON.stringify(status.textContent),
+  );
+  delete global.rbResolve.ocr_scan;
+  delete global.rbResolve.file_pick_open;
+  delete global.rbResolve.premium_status;
+});
+
 (async () => {
   for (const [name, fn] of checks) {
     try {

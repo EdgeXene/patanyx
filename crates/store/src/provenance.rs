@@ -3,8 +3,9 @@
 //! Scope of the guarantee, stated once and precisely: a valid HMAC proves
 //! the record has not been altered **since it was recorded, to the owner**
 //! — and it proves nothing to anyone else. The MAC key is derived from the
-//! store key, which is derived from the owner's passphrase; anyone with the
-//! passphrase can forge records, and no one can verify a record without
+//! store key, which the vault unlocks (or, for a Library still in format
+//! version 1, the owner's passphrase derives); anyone who can open the
+//! Library can forge records, and no one can verify a record without
 //! it. This is intentionally NOT a signature: the browser's identity key is
 //! X25519 (Diffie-Hellman), which cannot sign, and third-party-verifiable
 //! provenance would require a separate Ed25519 identity decision.

@@ -98,6 +98,7 @@ const ISOLATE_PLACEABLES: bool = true;
 /// Hand-written while the catalog is five messages; generation out of
 /// `build.rs` earns its keep when the bulk extraction lands.
 pub mod keys {
+    pub const ADDON_SELECTION_SEND: &str = "addon-selection-send";
     pub const PREFS_DNS_SYSTEM_DESCRIPTION: &str = "prefs-dns-system-description";
     pub const PREFS_DNS_QUAD9_DESCRIPTION: &str = "prefs-dns-quad9-description";
     pub const PREFS_TUNNEL_OFF_DESCRIPTION: &str = "prefs-tunnel-off-description";
@@ -136,6 +137,7 @@ pub mod keys {
     /// forgotten here fails `every_key_resolves` the moment nothing else
     /// exercises it.
     pub const ALL: &[&str] = &[
+        ADDON_SELECTION_SEND,
         PREFS_DNS_SYSTEM_DESCRIPTION,
         PREFS_DNS_QUAD9_DESCRIPTION,
         PREFS_TUNNEL_OFF_DESCRIPTION,

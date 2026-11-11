@@ -123,8 +123,9 @@ pub fn version_of(bytes: &[u8]) -> Result<u8, StoreError> {
 // ONE PASSPHRASE: THE VAULT'S. The Vault and the Library share one
 // passphrase, and a change made in the vault carries over to the Library with
 // no second file to keep in step. So a version 3 Library has no passphrase
-// material at all. Its data key (the same key a version 1 file derives from the
-// passphrase, so no picture and no download record is ever rewritten) is stored
+// material at all. Its data key (at first the same key a version 1 file derived
+// from the passphrase, so the move rewrites no picture and no record; then
+// renewed once by `rekey.rs`, which does rewrite them) is stored
 // wrapped under a key the vault derives from its own master
 // (`Vault::library_key`). That master is random and never changes when the
 // passphrase does, so a passphrase change touches only the vault, and the

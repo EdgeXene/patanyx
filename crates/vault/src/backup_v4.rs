@@ -1060,6 +1060,17 @@ impl BackupReader {
                 continue;
             }
             let take = (n - out.len()).min(self.plain.len() - self.position);
+            // GROWN BY HAND, never by `extend_from_slice` reallocating: an
+            // outgrown buffer would be freed with decrypted text still in it,
+            // and `Zeroizing` only wipes the buffer it holds at the end
+            // (Mythos 5.2 red-team, Part 1). Never sized to `n` up front:
+            // `n` comes from the file, up to 256 MiB.
+            if out.len() + take > out.capacity() {
+                let want = (out.len() + take).max(out.capacity().saturating_mul(2)).min(n);
+                let mut bigger = Zeroizing::new(Vec::with_capacity(want));
+                bigger.extend_from_slice(&out);
+                out = bigger;
+            }
             out.extend_from_slice(&self.plain[self.position..self.position + take]);
             self.position += take;
         }

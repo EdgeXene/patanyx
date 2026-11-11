@@ -41,6 +41,8 @@ chrome-onboarding-panel-p-n4
 chrome-pane-backup-p
 chrome-pane-backup-p-n2
 chrome-bk-import-older-p
+chrome-bk-import-addons-p
+chrome-bk-import-addons-unknown-p
 chrome-bk-import-warning-rest
 chrome-js-manager-delete-all-confirm
 chrome-pane-backup-p-n4

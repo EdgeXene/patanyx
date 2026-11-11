@@ -813,10 +813,19 @@ impl Vault {
             .iter_mut()
             .find(|e| e.id == id)
             .ok_or_else(|| VaultError::NotFound(id.to_string()))?;
+        // The old values are wiped before they are replaced: an assignment
+        // drops the old String without wiping it.
+        entry.site.zeroize();
         entry.site = site.to_string();
+        if let Some(old) = &mut entry.origin {
+            old.zeroize();
+        }
         entry.origin = origin.map(str::to_string);
+        entry.username.zeroize();
         entry.username = username.to_string();
+        entry.password.zeroize();
         entry.password = password.to_string();
+        entry.note.zeroize();
         entry.note = note.to_string();
         entry.updated_at = now_unix();
         self.save()
@@ -946,7 +955,10 @@ impl Vault {
             .iter_mut()
             .find(|n| n.id == id)
             .ok_or_else(|| VaultError::NotFound(id.to_string()))?;
+        // Wiped before replaced, as in `update_credential`.
+        note.title.zeroize();
         note.title = title.to_string();
+        note.body.zeroize();
         note.body = body.to_string();
         note.updated_at = now_unix();
         self.save()
@@ -1066,10 +1078,9 @@ impl Vault {
     /// The imported WireGuard tunnel configuration, cloned; `None` until the
     /// caller imports one.
     ///
-    /// The clone carries the private key on the heap and `TunnelSettings`
-    /// has no `Drop`, so the CALLER owns wiping it. Today's only caller
-    /// hands the Strings straight into `patanyx_tunnel::TunnelConfig`,
-    /// which wipes them once boringtun holds the decoded copies. Anyone who
+    /// The clone carries the private key on the heap; `TunnelSettings` wipes
+    /// its keys when it drops, and today's only caller moves the Strings
+    /// into `patanyx_tunnel::TunnelConfig`, which wipes them too. Anyone who
     /// only wants to know WHETHER a tunnel is stored must call
     /// `has_tunnel_settings` instead -- cloning a key to ask a yes/no
     /// question is how an unwiped copy ends up on the heap for the life of
@@ -1106,10 +1117,9 @@ impl Vault {
     /// The stored Premium licence record, cloned; `None` until the caller
     /// pastes a token.
     ///
-    /// The clone carries the bearer token on the heap and `LicenceRecord`
-    /// has no `Drop`, so the CALLER owns wiping it. Today's only caller
-    /// (`licence_control`) zeroizes the text the moment evaluation is done
-    /// with it. Anyone who only wants to know WHETHER a token is stored
+    /// The clone carries the bearer token on the heap; `LicenceRecord` wipes
+    /// it when it drops, and today's only caller (`licence_control`) also
+    /// zeroizes the text the moment evaluation is done with it. Anyone who only wants to know WHETHER a token is stored
     /// must call `has_licence_record` instead -- cloning a credential to
     /// ask a yes/no question is how an unwiped copy ends up on the heap for
     /// the life of the process (the rule `tunnel_settings` documents,
@@ -1299,35 +1309,10 @@ impl Vault {
 
 impl Drop for Vault {
     fn drop(&mut self) {
-        // `master` wipes itself via Zeroizing; scrub per-entry secrets as well.
-        for entry in &mut self.data.credentials {
-            entry.password.zeroize();
-        }
-        for note in &mut self.data.notes {
-            note.body.zeroize();
-        }
-        // Contacts wipe their own secrets when the book drops (`Contact`
-        // implements Drop); the identity secret is a plain array with no such
-        // guard, so it is wiped here like passwords and note bodies.
-        if let Some(identity) = &mut self.data.chat_identity {
-            identity.zeroize();
-        }
-        // The tunnel's secret strings have no self-wiping guard either, so
-        // they are wiped here exactly like passwords and note bodies.
-        if let Some(tunnel) = &mut self.data.tunnel {
-            tunnel.private_key_b64.zeroize();
-            if let Some(preshared) = &mut tunnel.preshared_key_b64 {
-                preshared.zeroize();
-            }
-        }
-        // The licence token is a bearer credential with no self-wiping
-        // guard: same treatment.
-        if let Some(licence) = &mut self.data.licence {
-            licence.token_text.zeroize();
-        }
-        for record in &mut self.data.activation {
-            record.receipt_text.zeroize();
-        }
+        // `master` wipes itself via Zeroizing, and the decrypted data wipes
+        // itself when it drops (`VaultData`'s Drop, which used to live here
+        // and so covered only the copy a `Vault` held). Kept as a Drop impl
+        // so a `Vault` still cannot be taken apart field by field.
     }
 }
 
@@ -1691,7 +1676,7 @@ mod tests {
         vault.release_device(&dev_a).unwrap();
         drop(vault);
         let mut reopened = Vault::unlock(&path, "test passphrase").unwrap();
-        let ids: Vec<String> = reopened.activation_records().into_iter().map(|r| r.device_id_hex).collect();
+        let ids: Vec<String> = reopened.activation_records().into_iter().map(|mut r| std::mem::take(&mut r.device_id_hex)).collect();
         assert_eq!(ids, vec![dev_b.clone()], "only device A's receipt is gone");
         assert!(reopened.is_released(&dev_a));
         reopened.clear_released_device_if(&dev_b).unwrap();

@@ -435,6 +435,26 @@ pub fn normalize_toolbar_groups<'a>(ids: impl IntoIterator<Item = &'a str>) -> V
         .collect()
 }
 
+/// Add-on ids as stored: valid ids only, each once, in the order given, at
+/// most 32 (the catalog's own limit).
+pub fn normalize_addon_ids<'a>(ids: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for id in ids {
+        if patanyx_update::addon::valid_addon_id(id) && !out.iter().any(|o| o == id) && out.len() < 32 {
+            out.push(id.to_owned());
+        }
+    }
+    out
+}
+
+fn lenient_addon_ids<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    let v = serde_json::Value::deserialize(d)?;
+    let Some(items) = v.as_array() else {
+        return Ok(Vec::new());
+    };
+    Ok(normalize_addon_ids(items.iter().filter_map(|item| item.as_str())))
+}
+
 /// A hand-edited or older file cannot fold a group that does not exist: a
 /// value that is not a list reads as nothing folded, and unknown ids drop.
 fn lenient_toolbar_groups<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
@@ -870,9 +890,21 @@ pub fn wipe_exempts(exempt: &[String], host: &str) -> bool {
     })
 }
 
+fn lenient_addon_windows<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<std::collections::BTreeMap<String, crate::addon_host::WindowMemory>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(value.as_object().into_iter().flat_map(|items| items.iter()).filter_map(|(id, value)| {
+        if !crate::addon_host::id_ok(id) { return None; }
+        serde_json::from_value::<crate::addon_host::WindowMemory>(value.clone()).ok()
+            .map(|memory| (id.clone(), memory.checked()))
+    }).collect())
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Prefs {
+    /// Per add-on window position, size and collapse state; no page content.
+    #[serde(default, deserialize_with = "lenient_addon_windows")]
+    pub addon_windows: std::collections::BTreeMap<String, crate::addon_host::WindowMemory>,
     /// Who resolves the sites the user visits, from the NEXT start: the
     /// engine takes this only at environment creation. The resolver the
     /// engine is running right now is [`applied_dns`], and the two differ
@@ -1033,6 +1065,14 @@ pub struct Prefs {
     /// empty: nothing folded, the toolbar every earlier build drew.
     #[serde(default, deserialize_with = "lenient_toolbar_groups")]
     pub toolbar_folded: Vec<String>,
+    /// Add-ons whose toolbar button the user hid in Customize; their Tools
+    /// menu entry stays. Absent reads empty: every add-on's button shows while Tools is not folded.
+    #[serde(default, deserialize_with = "lenient_addon_ids")]
+    pub toolbar_hidden_addons: Vec<String>,
+    /// Premium add-ons the one-time banner has already announced (1.1.0):
+    /// an id listed here is never announced again. Absent reads empty.
+    #[serde(default, deserialize_with = "lenient_addon_ids")]
+    pub announced_addons: Vec<String>,
     /// Download a verified update in the background the moment a check
     /// offers one, so the consent click is an instant restart instead of a
     /// wait. INSTALLING still requires that click -- this flag never
@@ -1128,6 +1168,7 @@ pub struct Prefs {
 impl Default for Prefs {
     fn default() -> Self {
         Self {
+            addon_windows: std::collections::BTreeMap::new(),
             dns: DnsMode::default(),
             resolver_chosen: false,
             ui_locale: ui_locale_default(),
@@ -1145,6 +1186,8 @@ impl Default for Prefs {
             chrome_scheme: ChromeScheme::default(),
             chrome_texture: ChromeTexture::default(),
             toolbar_folded: Vec::new(),
+            toolbar_hidden_addons: Vec::new(),
+            announced_addons: Vec::new(),
             update_background_download: true,
             update_auto_apply: false,
             vault_lock_on_session_lock: lock_on_session_lock_default(),
@@ -1477,29 +1520,131 @@ pub fn save(prefs: &Prefs) -> Result<(), &'static str> {
         std::fs::create_dir_all(dir).map_err(|_| "io")?;
     }
     let body = stored_body(prefs).map_err(|_| "io")?;
-    // WRITE-THEN-RENAME. This used to be a plain write, argued as "a torn
-    // write loses a resolver preference and `load` falls back to the default"
-    // -- which was accurate about the mechanism and wrong about the cost.
-    // The default is `System`: no encrypted DNS and no fail-closed behaviour.
-    // So a torn write did not lose a preference, it silently turned off the
-    // protection the user had switched on, and nothing said so.
-    //
-    // A rename over the same directory is atomic on both platforms, and the
-    // temp file is a sibling so it never crosses a filesystem boundary. This
-    // is not cargo-culted from the vault: it is the cheapest way to make the
-    // failure mode "the old choice survives" instead of "the choice is gone".
-    let tmp = path.with_extension("json.new");
-    std::fs::write(&tmp, body).map_err(|_| "io")?;
-    std::fs::rename(&tmp, &path).map_err(|_| {
-        // Leave nothing behind on failure; a stray .new is confusing and, if
-        // it were ever read, would be a half-written preference file.
+    replace_file(&path, body.as_bytes()).map_err(|_| "io")
+}
+
+/// The write behind `save`. WRITE-THEN-RENAME. This used to be a plain write,
+/// argued as "a torn write loses a resolver preference and `load` falls back
+/// to the default" -- which was accurate about the mechanism and wrong about
+/// the cost. The default is `System`: no encrypted DNS and no fail-closed
+/// behaviour. So a torn write did not lose a preference, it silently turned
+/// off the protection the user had switched on, and nothing said so.
+///
+/// A rename over the same directory is atomic on both platforms, and the
+/// temp file is a sibling so it never crosses a filesystem boundary. This is
+/// not cargo-culted from the vault: it is the cheapest way to make the failure
+/// mode "the old choice survives" instead of "the choice is gone".
+///
+/// The temp file has a fresh random name and is created only if nothing is
+/// there (`create_new`, which refuses an existing name, a planted link
+/// included). It used to be the fixed `prefs.json.new`, written through
+/// whatever was at that name: a link planted there was followed and its
+/// target overwritten, and on Linux the rename then moved the link itself
+/// onto prefs.json, so every later load read the planted file (secscan
+/// S-5a168218d895). Owner-only on unix, synced, and the directory synced
+/// after the rename so the new name survives a crash; the temp is removed on
+/// any failure.
+fn replace_file(path: &std::path::Path, body: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut nonce = [0u8; 8];
+    getrandom::getrandom(&mut nonce).map_err(|_| std::io::Error::other("no randomness"))?;
+    let tmp = dir.join(format!(
+        ".prefs-{}.tmp",
+        patanyx_update::hex::encode(&nonce)
+    ));
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp)?;
+        file.write_all(body)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-        "io"
-    })
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
+
+    /// Secscan S-5a168218d895: the temp file used to be the fixed
+    /// `prefs.json.new`, written through whatever was there. A link planted
+    /// at that name must never be followed now, and the file it points at
+    /// must be left alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_the_old_temp_name_is_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.path().join("prefs.json.new")).unwrap();
+        let path = dir.path().join("prefs.json");
+        super::replace_file(&path, br#"{"dns":"system"}"#).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file(), "prefs.json must be a plain file");
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"dns":"system"}"#);
+    }
+
+    /// A link planted AT prefs.json is replaced, not written through.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_planted_at_the_prefs_file_is_replaced_not_written_through() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"keep").unwrap();
+        let path = dir.path().join("prefs.json");
+        std::os::unix::fs::symlink(&victim, &path).unwrap();
+        super::replace_file(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep");
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.file_type().is_file());
+        assert_eq!(meta.permissions().mode() & 0o077, 0, "prefs.json must be owner-only");
+    }
+
+    /// Success leaves only prefs.json; a failed rename leaves the old file
+    /// and no temp behind.
+    #[test]
+    fn the_write_leaves_no_temp_file_behind_whether_it_succeeds_or_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("prefs.json");
+        super::replace_file(&path, b"{}").unwrap();
+        super::replace_file(&path, br#"{"dns":"system"}"#).unwrap();
+        let names: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["prefs.json".to_string()]);
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"dns":"system"}"#);
+
+        // A rename onto a non-empty directory fails on both platforms.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        std::fs::write(blocked.join("inside"), b"x").unwrap();
+        assert!(super::replace_file(&blocked, b"{}").is_err());
+        let leftovers: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "a failed write left {leftovers:?}");
+        assert_eq!(std::fs::read(&path).unwrap(), br#"{"dns":"system"}"#);
+    }
 
     #[test]
     fn translate_target_round_trips_and_defaults_empty() {
@@ -1729,6 +1874,35 @@ mod tests {
             assert_eq!(ChromeScheme::parse(scheme.as_str()), Some(scheme));
         }
         assert_eq!(ChromeScheme::parse("sepia"), None);
+    }
+
+    #[test]
+    fn announced_addons_keeps_valid_ids_once() {
+        let p: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(p.announced_addons.is_empty());
+        let p: Prefs = serde_json::from_str(r#"{"announced_addons":["text-pages","../x","Bad","text-pages",7]}"#).unwrap();
+        assert_eq!(p.announced_addons, vec!["text-pages".to_string()]);
+        let p: Prefs = serde_json::from_str(r#"{"announced_addons":"text-pages"}"#).unwrap();
+        assert!(p.announced_addons.is_empty());
+        let round: Prefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(round.announced_addons.is_empty());
+    }
+
+    #[test]
+    fn toolbar_hidden_addons_keeps_valid_ids_once() {
+        let p: Prefs = serde_json::from_str("{}").unwrap();
+        assert!(p.toolbar_hidden_addons.is_empty());
+        let p: Prefs = serde_json::from_str(
+            r#"{"toolbar_hidden_addons":["text-pages","../x","Bad","text-pages","other-tool",7]}"#,
+        )
+        .unwrap();
+        assert_eq!(p.toolbar_hidden_addons, vec!["text-pages".to_string(), "other-tool".to_string()]);
+        let p: Prefs = serde_json::from_str(r#"{"toolbar_hidden_addons":"text-pages"}"#).unwrap();
+        assert!(p.toolbar_hidden_addons.is_empty());
+        let many: Vec<String> = (0..40).map(|i| format!("a{i}")).collect();
+        assert_eq!(normalize_addon_ids(many.iter().map(String::as_str)).len(), 32);
+        let back: Prefs = serde_json::from_str(&serde_json::to_string(&p).unwrap()).unwrap();
+        assert!(back.toolbar_hidden_addons.is_empty());
     }
 
     #[test]

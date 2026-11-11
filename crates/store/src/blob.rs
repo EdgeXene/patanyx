@@ -108,6 +108,16 @@ fn validate_id(id: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// Whether a blob file starts as this module's blobs do but carries a format
+/// version this build does not read: written by a newer build. Such a file is
+/// not damage, and nothing that rewrites blobs may treat it as damage.
+pub(crate) fn is_other_version(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read as _;
+    let mut head = Vec::with_capacity(MAGIC.len() + 1);
+    fs::File::open(path)?.take((MAGIC.len() + 1) as u64).read_to_end(&mut head)?;
+    Ok(head.len() == MAGIC.len() + 1 && &head[..MAGIC.len()] == MAGIC && head[MAGIC.len()] != BLOB_VERSION)
+}
+
 /// The same check as `validate_id`, as a yes or no, for code that must refuse
 /// an id BEFORE it gets anywhere near a write: a backup is validated whole
 /// before anything is restored, and it must judge ids exactly as this module

@@ -29,9 +29,11 @@
 //!
 //! Anything else shaped like a Library (a version 1 file not proven ours, a
 //! version this build does not know) is kept, and the change reports it. A
-//! version 3 file is never a candidate: it holds nothing a passphrase opens,
-//! and the Library itself is version 3 whenever this runs, so it can never be
-//! the file removed. A file that is not this store's, or that stops before
+//! version 3 file is never a candidate HERE: the Library itself is version 3
+//! whenever this runs, so it can never be the file removed. (A version 3 copy
+//! made under a data key that `rekey.rs` has since retired does still read
+//! with the old passphrase; `retire_v3_leftovers` removes those, proven by the
+//! retired key's check value.) A file that is not this store's, or that stops before
 //! its salt, is kept silently.
 //!
 //! No other process of this build or later writes this Library meanwhile: the
@@ -195,6 +197,59 @@ fn is_temp_name(name: &str) -> bool {
             && hex
                 .bytes()
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// Removes the writer's crash leftovers that are VERSION 3 copies of this
+/// Library made under a data key a re-key has since retired (`rekey.rs`):
+/// the wrapped key in such a copy, unwrapped with the vault's Library key, is
+/// the retired key, so it still reads with the old passphrase and the
+/// version 1 salt. Proven by `old_check`, the retired key's check value;
+/// every other entry is kept. Same names, same safe open, same reporting as
+/// `retire_leftovers`.
+pub(crate) fn retire_v3_leftovers(
+    library: &Path,
+    library_key: &[u8; crate::crypto::KEY_LEN],
+    old_check: &str,
+    flush: impl FnOnce() -> io::Result<()>,
+) -> Result<(), StoreError> {
+    let entries = match fs::read_dir(library_dir(library)) {
+        Ok(entries) => entries.map(|entry| entry.map(|entry| (entry.file_name(), entry.path()))),
+        Err(error) => return Err(retained(Some(error), 0)),
+    };
+    retire_entries(library, entries, |path| classify_v3(library_key, old_check, path), flush)
+}
+
+/// A version 3 copy whose key is the retired one is ours; anything else,
+/// including a version 1 file (that is `retire_leftovers`' job), is kept.
+fn classify_v3(
+    library_key: &[u8; crate::crypto::KEY_LEN],
+    old_check: &str,
+    path: &Path,
+) -> io::Result<Leftover> {
+    let Some(file) = open_leftover(path)? else {
+        return Ok(Leftover::Foreign);
+    };
+    let mut head = Vec::with_capacity(format::HEADER_LEN_V3);
+    file.take(format::HEADER_LEN_V3 as u64).read_to_end(&mut head)?;
+    let Ok(header) = format::decode_header_v3(&head) else {
+        return Ok(Leftover::Foreign);
+    };
+    let unwrapped = crate::crypto::decrypt(
+        library_key,
+        &header.wrap_nonce,
+        &head[..format::WRAP_AAD_LEN],
+        &header.wrapped,
+    );
+    Ok(match unwrapped {
+        Ok(key) if key.len() == crate::crypto::KEY_LEN => {
+            let mut held = [0u8; crate::crypto::KEY_LEN];
+            held.copy_from_slice(&key);
+            let ours = crate::rekey::check_value(&held) == old_check;
+            zeroize::Zeroize::zeroize(&mut held);
+            if ours { Leftover::Ours } else { Leftover::Foreign }
+        }
+        _ => Leftover::Foreign,
     })
 }
 

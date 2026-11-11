@@ -94,6 +94,12 @@ pub struct SessionLicence {
 /// every reader treats `None` as FREE.
 static SESSION: Mutex<Option<SessionLicence>> = Mutex::new(None);
 
+/// The verified token's absolute expiry day, for the session `SESSION`
+/// holds: what lets a reader decide Premium against TODAY's date rather
+/// than the unlock's (an add-on window can stay open across the end of a
+/// licence). `None` with no token, an unverified one, or a perpetual one.
+static EXPIRES_DAY: Mutex<Option<u32>> = Mutex::new(None);
+
 /// One activation (or release) worker at a time.
 static ACTIVATION_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 /// The reason the LAST attempt ended unactivated, shown until the next
@@ -261,10 +267,11 @@ pub fn on_vault_unlocked(state: &AppState) {
         .as_ref()
         .and_then(|vault| vault.licence_record());
     let keys = patanyx_licence::licence_keys();
+    let today = today_utc_day_number();
     let mut session = evaluate_stored(
         record.as_ref().map(|record| record.token_text.as_str()),
         keys.as_ref().map_err(|error| error.to_string()),
-        today_utc_day_number(),
+        today,
     );
     // Phase 4: is THIS device activated? Receipts come from the vault, the
     // device id from beside it (read only, never minted here: an unlock
@@ -277,7 +284,8 @@ pub fn on_vault_unlocked(state: &AppState) {
                 vault
                     .activation_records()
                     .into_iter()
-                    .map(|r| r.receipt_text)
+                    // Taken, not moved: the record wipes itself on drop.
+                    .map(|mut r| std::mem::take(&mut r.receipt_text))
                     .collect()
             })
             .unwrap_or_default();
@@ -353,6 +361,7 @@ pub fn on_vault_unlocked(state: &AppState) {
             Some("device_id_unreadable" | "device_id_io" | "released")
         );
     let license_id_hex = session.license_id_hex.clone();
+    *lock(&EXPIRES_DAY) = expires_day_of(session.state, today);
     *lock(&SESSION) = Some(session);
     // ONE silent retry per unlock while unactivated: the first unlock after
     // a paste is what activates a device in the normal case, and a lost
@@ -377,6 +386,11 @@ pub fn on_vault_unlocked(state: &AppState) {
             }
         }
     }
+    // Find across tabs is disabled while the vault is locked, and the lock
+    // tells it so (`end_vault_session`). Nothing told it the vault had opened
+    // again, so the field stayed disabled until a restart. Every unlock path
+    // (create, unlock, recovery unlock, both imports) comes through here.
+    state.emit_tab_scan_state();
 }
 
 /// Phase 4 bookkeeping for the activation worker (`activation.rs`).
@@ -562,8 +576,25 @@ pub fn activation_copy(reason: &str) -> &'static str {
 /// may survive the lock in memory.
 pub fn on_vault_locked() {
     *lock(&SESSION) = None;
+    *lock(&EXPIRES_DAY) = None;
     *lock(&LAST_ACTIVATION_RESULT) = None;
     *lock(&RETRIED_FOR) = None;
+}
+
+/// The absolute expiry day of a state evaluated on `today`: `days_left`
+/// counts the expiry day itself, so it is `today + days_left - 1`.
+pub(crate) fn expires_day_of(state: LicenceState, today: u32) -> Option<u32> {
+    match state {
+        LicenceState::Active { days_left } => Some(today.saturating_add(days_left.saturating_sub(1))),
+        LicenceState::Lapsed { expires_day } => Some(expires_day),
+        LicenceState::Free | LicenceState::Perpetual => None,
+    }
+}
+
+/// The session's licence, its absolute expiry day and today's UTC day, read
+/// together, for a decision against the live date (`addon_entitlement`).
+pub(crate) fn live_view() -> (Option<SessionLicence>, Option<u32>, u32) {
+    (current(), *lock(&EXPIRES_DAY), today_utc_day_number())
 }
 
 /// The current session state, if the vault is unlocked and has been
@@ -769,6 +800,44 @@ fn month_name(month: u32) -> &'static str {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// Find across tabs stayed disabled after Lock then Unlock until a
+    /// restart: the lock tells it (`end_vault_session`), and nothing told it
+    /// about the unlock. The emit lives in `on_vault_unlocked`; this pins it
+    /// there, and that every unlock path still runs `on_vault_unlocked`.
+    #[test]
+    fn every_unlock_tells_find_across_tabs_the_vault_opened() {
+        let body_of = |source: &'static str, anchor: &str, terminator: &str| {
+            let start = source.find(anchor).unwrap_or_else(|| panic!("{anchor} moved"));
+            let end = start
+                + source[start..]
+                    .find(terminator)
+                    .unwrap_or_else(|| panic!("{anchor} has no terminator"));
+            &source[start..end]
+        };
+        let hook = body_of(
+            include_str!("licence_control.rs"),
+            "pub fn on_vault_unlocked(state: &AppState) {",
+            "\n}\n",
+        );
+        assert!(
+            hook.contains("state.emit_tab_scan_state();"),
+            "on_vault_unlocked no longer tells Find across tabs the vault opened"
+        );
+        let ipc = include_str!("ipc.rs");
+        for (anchor, terminator) in [
+            ("\"vault_create\" => {", "\n        }\n"),
+            ("\"vault_unlock\" => {", "\n        }\n"),
+            ("\"vault_unlock_recovery\" => {", "\n        }\n"),
+            ("pub(crate) fn start_imported_vault_session(state: &mut AppState) {", "\n}\n"),
+        ] {
+            assert!(
+                body_of(ipc, anchor, terminator)
+                    .contains("crate::licence_control::on_vault_unlocked(state);"),
+                "{anchor} no longer runs on_vault_unlocked"
+            );
+        }
+    }
 
     /// Fixed seeds, never an RNG — the workspace rule, and it keeps the
     /// tests deterministic (mirrors the licence crate's own tests).

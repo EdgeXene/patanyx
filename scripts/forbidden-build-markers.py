@@ -24,6 +24,9 @@ What is searched for, as raw bytes anywhere in the file (the same thing
                         contiguous bytes (build-windows.sh has the measurement).
       premium-unlocked  about.rs UNLOCKED_BUILD_MARKER, compiled only under
                         cfg(feature = "premium-unlocked").
+      addon-launch      addon_manager.rs LAUNCH_TEST_MARKER, compiled only under
+                        cfg(feature = "addon-launch") (a qualification build
+                        that shows the add-on manager before its release).
   * BUILD PATHS: /.cargo/ and /.rustup/ as directory names inside a path,
     which is what an unremapped registry or toolchain path looks like
     (/root/.cargo/registry/..., /root/.rustup/toolchains/...). The remapped
@@ -52,6 +55,7 @@ import sys
 FEATURE_MARKERS = (
     ("chat", "PATANYX-Nabu-X for "),
     ("premium-unlocked", "UNLOCKED TEST BUILD: Premium forced on; no license checked"),
+    ("addon-launch", "ADD-ON LAUNCH TEST BUILD: the add-on manager is shown before its release"),
 )
 
 # A dotted cargo or rustup directory inside a path: an unremapped build path.

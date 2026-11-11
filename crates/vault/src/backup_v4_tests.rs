@@ -690,3 +690,59 @@ fn a_backup_source_never_prints_the_vault() {
     assert!(!printed.contains("kept with the vault"), "{printed}");
     assert!(printed.contains("bytes"));
 }
+
+/// Secscan S-fbff300de5e6 / S-308138676a3f: decrypted vault data held by an
+/// export's read-back, by an import read but never installed, and by a reader
+/// stopped part way, is wiped when it drops -- not only when a `Vault` does.
+#[test]
+fn decrypted_vault_data_is_wiped_wherever_it_is_dropped() {
+    use crate::model::drop_tests::wiped;
+    let dir = TestDir::new("wiped-on-drop");
+    let vault = vault_in(&dir);
+    let dest = dir.path().join("backup.rbvx");
+
+    // The export reads its own file back to check it, and that read builds a
+    // whole decrypted import it then throws away.
+    let before = wiped();
+    export(&vault, &dest, &sample_sections()).unwrap();
+    assert!(wiped() > before, "the export's read-back dropped decrypted data unwiped");
+
+    // An import read in full and dropped without being installed.
+    let before = wiped();
+    let (pending, _) = read_all(&dest, PASS).unwrap();
+    drop(pending);
+    assert!(wiped() > before, "an import that was not installed was dropped unwiped");
+
+    // A reader stopped after the vault section, before the end.
+    let watch = BackupWatch::new();
+    watch.stop_at(BackupStage::Reading, 2 * SEGMENT_CIPHER as u64);
+    let before = wiped();
+    {
+        let mut reader = BackupReader::open_watched(&dest, PASS, limits(), &watch).unwrap();
+        let outcome = loop {
+            match reader.next_section() {
+                Ok(Some(_)) => continue,
+                other => break other.map(|_| ()),
+            }
+        };
+        assert!(matches!(outcome, Err(ExportError::Cancelled)), "the reader was not stopped: {outcome:?}");
+    }
+    assert!(wiped() > before, "a stopped reader dropped decrypted data unwiped");
+}
+
+/// A vault section over one segment (1 MiB) is read by growing the buffer by
+/// hand (so every outgrown copy is wiped); it must still read back whole.
+#[test]
+fn a_vault_larger_than_a_segment_reads_back_whole() {
+    let dir = TestDir::new("big-vault");
+    let mut vault = vault_in(&dir);
+    let body: String = (0..3 * 1024 * 1024).map(|i| char::from(b'a' + (i % 26) as u8)).collect();
+    vault.add_note("a big note", &body).unwrap();
+    let dest = dir.path().join("backup.rbvx");
+    export(&vault, &dest, &sample_sections()).unwrap();
+    let (pending, _) = read_all(&dest, PASS).unwrap();
+    assert_eq!(
+        serde_json::to_value(&pending.data).unwrap(),
+        serde_json::to_value(vault.data_ref()).unwrap()
+    );
+}

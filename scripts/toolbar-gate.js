@@ -157,12 +157,13 @@ const MUST_BE_VISIBLE = [
   ["btn-chat", "chat, in the builds that have it"],
   ["btn-bookmark", "bookmarking the current page"],
   ["btn-library", "bookmarks and downloads"],
-  ["btn-main-menu", "the menu holding Reader View, print, integrity, updates and about"],
+  ["btn-main-menu", "the menu holding Add-ons, Reader View, print, integrity, updates and about"],
 ];
 // Controls that live in the main menu since 1.0.7: the real button stays in
 // the toolbar under `in-menu` and the named proxy clicks it. Reachability,
 // not visibility, is what this gate holds for these: see the menu checks.
 const IN_MENU = [
+  ["btn-addons", "menu-addons", "Add-ons"],
   ["btn-reader", "menu-reader", "Reader View"],
   ["btn-about", "menu-about", "version, licence and third-party notices"],
   ["btn-integrity", "menu-integrity", "page integrity"],
@@ -916,6 +917,24 @@ check("nothing can hide a control behind a disclosure", () => {
     !/class="[^"]*\bmenu-item\b/.test(html),
     "menu-item markup is back; the pills are toolbar buttons now",
   );
+});
+
+check("Menu opens Add-ons and closing it returns focus to Menu", async () => {
+  global.$("btn-main-menu")._fire("click");
+  await flush();
+  global.$("menu-addons")._fire("click");
+  await flush();
+  assert(global.window.__rb.isPanelOpen("addons"), "Add-ons proxy must open its panel");
+  assert(global.$("addons-panel").hidden === false, "panel is visible");
+  assert(global.$("btn-addons").classList.contains("in-menu"), "opener stays hidden in Menu");
+  let focused = false;
+  const menuButton = global.$("btn-main-menu");
+  const focus = menuButton.focus;
+  menuButton.focus = () => { focused = true; };
+  global.fireDocument("keydown", {key: "Escape"});
+  await flush();
+  assert(focused, "focus returns to the visible Menu button");
+  menuButton.focus = focus;
 });
 
 check("every control in the menu is reachable through it", async () => {

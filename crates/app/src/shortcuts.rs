@@ -28,6 +28,7 @@ impl Mods {
 /// `resolve`, so the backends can map a small fixed set of native codes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Key {
+    J,
     T,
     W,
     L,
@@ -66,6 +67,7 @@ pub enum Key {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Shortcut {
+    ToggleAddon,
     NewTab,
     CloseTab,
     NextTab,
@@ -183,6 +185,7 @@ pub fn vk_key(virtual_key: u32) -> Option<Key> {
     const VK_SUBTRACT: u32 = 0x6D;
     const VK_NUMPAD0: u32 = 0x60;
     let key = match virtual_key {
+        0x4A => Key::J,
         0x54 => Key::T,
         0x57 => Key::W,
         0x4C => Key::L,
@@ -224,6 +227,7 @@ pub fn vk_key(virtual_key: u32) -> Option<Key> {
 /// through untouched.
 pub fn resolve(mods: Mods, key: Key) -> Option<Shortcut> {
     match key {
+        Key::J if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::ToggleAddon),
         // Ctrl+Shift+L locks the vault; Ctrl+L focuses the URL bar. Checked
         // shift-first so the more specific binding wins.
         Key::L if mods.ctrl && mods.shift && !mods.alt => Some(Shortcut::LockVault),
@@ -651,5 +655,21 @@ mod tests {
         );
         // Ctrl+F3 is nobody's binding; it falls through to the page.
         assert_eq!(resolve(CTRL, Key::F3), None);
+    }
+}
+
+#[cfg(test)]
+mod addon_shortcut_tests {
+    use super::*;
+    #[test]
+    fn addon_toggle_is_exact_and_does_not_shadow_existing_bindings() {
+        for ctrl in [false, true] { for shift in [false, true] { for alt in [false, true] {
+            assert_eq!(resolve(Mods::new(ctrl, shift, alt), Key::J),
+                if ctrl && shift && !alt { Some(Shortcut::ToggleAddon) } else { None });
+        }}}
+        assert_eq!(vk_key(0x4A), Some(Key::J));
+        assert_eq!(resolve(Mods::new(true, true, false), Key::L), Some(Shortcut::LockVault));
+        assert_eq!(resolve(Mods::new(true, true, false), Key::S), Some(Shortcut::ToggleSideBySide));
+        assert_eq!(resolve(Mods::new(true, true, false), Key::F), Some(Shortcut::OpenFindAcrossTabs));
     }
 }

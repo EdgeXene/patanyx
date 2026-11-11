@@ -55,7 +55,7 @@ fi
 
 # A string a future feature writes straight into a sink must fail here,
 # not ship English-only forever.
-for f in chrome.js integrity.js update.js chat.js; do
+for f in chrome.js integrity.js update.js chat.js addons.js; do
   if ! python3 scripts/i18n-bare-literal-check.py "crates/app/src/chrome/$f" \
       > "$TMP/bare.out" 2>&1; then
     cat "$TMP/bare.out" >&2
@@ -65,7 +65,7 @@ done
 
 # chrome.js and the catalog must carry the same English too: every
 # i18nText("id", "English") literal is the golden copy for its message.
-for f in chrome.js integrity.js update.js chat.js; do
+for f in chrome.js integrity.js update.js chat.js addons.js; do
   if ! python3 scripts/i18n-js-check.py "crates/app/src/chrome/$f" "$FTL" \
       > "$TMP/js-check.out" 2>&1; then
     cat "$TMP/js-check.out" >&2
@@ -132,7 +132,7 @@ for key in re.findall(r'data-msg(?:-[a-z-]+)?="([a-z0-9.]+)"', html_src):
 # ...and i18nText call sites reference messages the same way (their
 # text-agreement is i18n-js-check.py's job, mirroring the html check).
 js_src = ""
-for name in ("chrome.js", "integrity.js", "update.js", "chat.js"):
+for name in ("chrome.js", "integrity.js", "update.js", "chat.js", "addons.js"):
     js_src += open("crates/app/src/chrome/" + name, encoding="utf-8").read()
 for key in re.findall(r'i18n(?:Text|Resolve)\(\s*"([a-z0-9-]+)"', js_src):
     referenced.add(key)
@@ -144,6 +144,14 @@ for key in re.findall(r'i18nSet\([^,]+,\s*"([a-z0-9-]+)"', js_src):
 # names a message.
 for key in re.findall(r'id:\s*"(chrome-js-[a-z0-9-]+)"', js_src):
     referenced.add(key)
+# These moved surfaces must retain their catalog markers, including the
+# route from the old Translator panel. (This line has no Assistant, so no
+# models section and no route to it.)
+for key in ("chrome-addons-heading", "chrome-addons-premium-heading",
+            "chrome-addons-languages-heading", "chrome-addons-manage-languages"):
+    if f'data-msg="{key.replace("-", ".")}"' not in html_src:
+        print(f"GATE FAIL: Add-ons markup no longer references {key}.")
+        sys.exit(1)
 missing = sorted(referenced - set(messages))
 unreferenced = sorted(set(messages) - referenced)
 status = 0

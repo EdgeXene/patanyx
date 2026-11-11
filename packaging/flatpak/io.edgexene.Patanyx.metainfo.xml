@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.1.0" date="2026-11-06">
+      <description>
+        <p>Translator languages now live in the new Add-ons panel, in the Menu. Reader View no longer opens on a site's list of languages, and a blocked-site notice stays on its own tab. Premium add-ons are Windows only in this release.</p>
+      </description>
+    </release>
     <release version="1.0.10" date="2026-11-02">
       <description>
         <p>This version fixes a security problem: in versions 0.9.60 through 1.0.8, a web page could make PATANYX close if you right-clicked a specially made link on it and chose "Copy link without known redirects or tracking parameters". Now the command copies the link and PATANYX stays open. The same command now also unwraps Bing search result links, and says tracking parameters were removed only when they were. On Windows, a link opened in a new tab with Ctrl+click or the middle mouse button could leave that tab blank while its address bar showed the link's address; the page now opens. Update as soon as you can.</p>

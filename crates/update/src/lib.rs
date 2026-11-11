@@ -118,6 +118,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addon;
 mod advisory;
 mod delta;
 mod error;
@@ -133,6 +134,11 @@ mod version;
 /// and hashes.
 pub mod hex;
 
+pub use addon::{
+    verify_addon_catalog, verify_addon_index, verify_addon_manifest, AddonCatalog, AddonFile,
+    AddonIndex, AddonManifest, AddonRelease, CatalogEntry, SIGNING_DOMAIN_ADDON_CATALOG,
+    SIGNING_DOMAIN_ADDON_INDEX, SIGNING_DOMAIN_ADDON_MANIFEST,
+};
 pub use advisory::{
     verify_advisory_manifest, AdvisoryManifest, MAX_FUTURE_SECONDS as ADVISORY_MAX_FUTURE_SECONDS,
     MAX_MAJOR_AHEAD as ADVISORY_MAX_MAJOR_AHEAD, SIGNING_DOMAIN_ADVISORY,

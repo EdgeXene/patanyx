@@ -99,6 +99,20 @@ apt-cache policy libwebkit2gtk-4.1-0 2>/dev/null | sed -n '1,5p' || true
 if [ "$PHASE" != runtime ]; then
 
 echo
+echo "=== cargo audit ==="
+# RustSec advisories against the locked dependency set. Cheap, and the only
+# thing that notices a dependency going bad between releases. It runs FIRST,
+# before anything below compiles that set, so a bad dependency is seen before
+# its build scripts run. The image carries cargo-audit (packaging/Dockerfile.ci);
+# a missing one is a gate failure, not a skip. It printed "SKIPPED
+# (cargo-audit not installed)" on every run until 2026-11-03.
+if ! command -v cargo-audit >/dev/null 2>&1; then
+  echo "GATE FAIL: cargo-audit is not installed in this image; rebuild it from packaging/Dockerfile.ci" >&2
+  exit 1
+fi
+cargo audit
+
+echo
 echo "=== tests ==="
 cargo test --workspace --locked
 cargo test -p patanyx --features chat --locked
@@ -136,13 +150,6 @@ echo "=== lints ==="
 # defect it spots is seen. Tighten to -D warnings once the backlog is cleared,
 # and make that a deliberate commit rather than a side effect of this one.
 cargo clippy --workspace --all-targets --locked
-# RustSec advisories against the locked dependency set. Cheap, and the only
-# thing that notices a dependency going bad between releases.
-if command -v cargo-audit >/dev/null 2>&1; then
-  cargo audit
-else
-  echo "cargo audit: SKIPPED (cargo-audit not installed)"
-fi
 
 ./scripts/toolchain-pin-gate.sh
 ./scripts/chrome-js-gate.sh
@@ -192,7 +199,7 @@ python3 ./scripts/check-cargo-sources.py
 # The literal is deliberate and moves by hand with every Cargo bump (release
 # procedure step 1). Deriving it from Cargo.toml would reduce the release-identity check
 # to comparing Cargo.toml with itself; 1.0.1 shipped with this still at 1.0.0.
-EXPECTED_VERSION=1.0.10 ./scripts/check-version.sh
+EXPECTED_VERSION=1.1.0 ./scripts/check-version.sh
 # The About panel names every third-party package compiled into the binary, and
 # that list is a checked-in file. Add a dependency without regenerating it and
 # the browser confidently attributes a set of software it is no longer built

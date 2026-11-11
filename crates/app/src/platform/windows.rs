@@ -347,6 +347,7 @@ pub struct Hosts {
 /// registered at build time; WebView2 raises its events on the UI thread,
 /// so Rc/RefCell is correct.
 pub struct TabView {
+    pub(crate) selection: crate::addon_selection::SharedCapture,
     state: Rc<RefCell<TabState>>,
     /// For engine answers that arrive after the call that asked, so the
     /// toolbar and panels hear them (review 2026-10-12, R-002).
@@ -2034,6 +2035,228 @@ pub fn build_translator(hosts: &Hosts, builder: WebViewBuilder<'_>) -> Result<We
     Ok(webview)
 }
 
+/// The add-on window's own child HWND, captured at build time as the one
+/// direct child that was not there before. Zero while no add-on is open.
+static ADDON_CHILD: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+
+/// The direct children of the main window, as raw handles.
+fn direct_children(hosts: &Hosts) -> Vec<isize> {
+    use windows::core::BOOL;
+    use windows::Win32::Foundation::{HWND, LPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetParent};
+    unsafe extern "system" fn keep_direct(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let out = unsafe { &mut *(lparam.0 as *mut (HWND, Vec<isize>)) };
+        if unsafe { GetParent(hwnd) }.is_ok_and(|p| p == out.0) {
+            out.1.push(hwnd.0 as isize);
+        }
+        BOOL(1)
+    }
+    let parent = window_hwnd(hosts);
+    let mut acc: (HWND, Vec<isize>) = (parent, Vec::new());
+    unsafe {
+        let _ = EnumChildWindows(Some(parent), Some(keep_direct), LPARAM(&mut acc as *mut _ as isize));
+    }
+    acc.1
+}
+
+/// The add-on webview's builder: its own engine folder `dir` (one per add-on
+/// session, chosen by the host), and therefore NOT the shared environment, as
+/// the translator's. Never falls back to the browsing profile.
+///
+/// The `WebContext` is leaked, as the translator's is, because the builder
+/// must be `'static` here; one small context per add-on session.
+pub fn new_addon_webview_builder(dir: &Path) -> Result<WebViewBuilder<'static>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("add-on engine folder: {e}"))?;
+    // The tabs' hardened options (crash reports stay on this computer,
+    // extensions off) over this session's own folder. No fallback to wry's
+    // own environment: this window shows note text. One small path leaked
+    // per add-on window opened, as the environment wants a lasting one.
+    let dir: &'static Path = Box::leak(dir.to_path_buf().into_boxed_path());
+    let env = create_hardened_environment(Some(dir)).ok_or("the add-on's engine environment could not be created")?;
+    Ok(WebViewBuilder::new()
+        .with_environment(env.0)
+        .with_general_autofill_enabled(false))
+}
+
+/// A key pressed in the add-on's window is someone here, as in a tab
+/// (`connect_shortcuts`): the engine's native key event, which nothing the
+/// add-on's script does can produce. Throttled, and carrying nothing about
+/// which key. Unbound keys continue to the add-on.
+pub fn connect_addon_layout(_hosts: &Hosts, _proxy: &EventLoopProxy<UserEvent>) {}
+
+/// ESCAPE IS THE ADD-ON'S. It used to be handled here, natively, and marked
+/// handled -- so the add-on never saw it, and Escape in one of its own dialogs
+/// collapsed the window around a dialog that stayed open, with the expand
+/// button inert behind it (add-on hand test 2026-10-21, H-02). The add-on
+/// closes its dialog first and collapses itself otherwise. Ctrl+Shift+J stays
+/// native (`connect_shortcuts`), so a window can always be collapsed or
+/// expanded without the add-on's help.
+pub fn connect_addon_presence(webview: &WebView, proxy: &EventLoopProxy<UserEvent>) {
+    connect_shortcuts(webview, proxy);
+    connect_focus_tracking(webview, proxy, crate::state::FocusSurface::Addon);
+}
+
+/// Builds the add-on webview as a child of the main window, AFTER the chrome
+/// (whose translucent-overlay probe needs to be the only child at its own
+/// build time), captures its HWND for raising, arms the REQUEST WALL, and
+/// only THEN loads `url`.
+///
+/// The builder carries no URL: content loaded during the build would run
+/// before the wall exists. A view whose wall cannot be armed is dropped and
+/// the add-on does not open.
+pub fn build_addon(hosts: &Hosts, builder: WebViewBuilder<'_>, url: &str, origin_prefix: &str) -> Result<WebView, String> {
+    let before = direct_children(hosts);
+    let webview = without_default_context_menu(builder)
+        .build_as_child(&hosts.window)
+        .map_err(|e| e.to_string())?;
+    let _ = webview.set_visible(false);
+    note_running_environment(&webview);
+    let new: Vec<isize> = direct_children(hosts).into_iter().filter(|h| !before.contains(h)).collect();
+    match new.as_slice() {
+        [one] => ADDON_CHILD.store(*one, std::sync::atomic::Ordering::Relaxed),
+        // Not a safety failure: without the handle the window cannot be
+        // re-raised, so a new tab may cover it. Said, not hidden.
+        other => diag(&format!("addon: expected one new child window, found {}", other.len())),
+    }
+    if !connect_addon_request_wall(&webview, origin_prefix.to_string()) {
+        forget_addon_child();
+        return Err("the add-on request wall could not be armed".to_string());
+    }
+    webview.load_url(url).map_err(|e| e.to_string())?;
+    Ok(webview)
+}
+
+/// The add-on's window is gone: stop raising its old handle.
+pub fn forget_addon_child() {
+    ADDON_CHILD.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The add-on's REQUEST WALL. On WebView2 a refused navigation still SENDS
+/// its request (measured in the N0 spike, 2026-10-16: a `location.href` to a
+/// local endpoint reached it although the navigation handler refused it; the
+/// same thing `connect_request_interception` records for malicious hosts in
+/// tabs), and the CSP does not cover navigations. So every request the
+/// add-on webview makes that is not to its own origin is answered here with a
+/// 403 before it leaves. wry's own custom-protocol handler serves the
+/// add-on's origin. Returns whether the wall is in place.
+fn connect_addon_request_wall(webview: &WebView, origin_prefix: String) -> bool {
+    use webview2_com::take_pwstr;
+    use webview2_com::Microsoft::Web::WebView2::Win32::{
+        ICoreWebView2_22, COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+        COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+    };
+    use webview2_com::WebResourceRequestedEventHandler;
+    use windows::core::{Interface, HSTRING, PCWSTR, PWSTR};
+    use wry::WebViewExtWindows;
+    let core = webview.webview();
+    let environment = webview.environment();
+    unsafe {
+        let filter = HSTRING::from("*");
+        // Only the WithRequestSourceKinds overload covers every source (workers
+        // too); the older one covers documents only. A runtime without it gets
+        // no add-on window rather than a narrower wall.
+        let Ok(core22) = core.cast::<ICoreWebView2_22>() else {
+            diag("addon: this WebView2 runtime cannot filter every request source");
+            return false;
+        };
+        let added = core22.AddWebResourceRequestedFilterWithRequestSourceKinds(
+            PCWSTR(filter.as_ptr()),
+            COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL,
+            COREWEBVIEW2_WEB_RESOURCE_REQUEST_SOURCE_KINDS_ALL,
+        );
+        if added.is_err() {
+            diag("addon: request wall filter could not be added");
+            return false;
+        }
+        let mut token = Default::default();
+        core.add_WebResourceRequested(
+            &WebResourceRequestedEventHandler::create(Box::new(move |_sender, args| {
+                let Some(args) = args else { return Ok(()) };
+                let uri: Option<String> = args.Request().ok().and_then(|request| {
+                    let mut uri = PWSTR::null();
+                    request.Uri(&mut uri).ok().map(|()| take_pwstr(uri))
+                });
+                if uri.as_deref().is_some_and(|u| u.starts_with(&origin_prefix)) {
+                    return Ok(());
+                }
+                // An unreadable address is refused too: fail closed.
+                let text = HSTRING::from("Blocked by PATANYX");
+                let headers = HSTRING::from("");
+                let response = environment.CreateWebResourceResponse(
+                    None,
+                    403,
+                    PCWSTR(text.as_ptr()),
+                    PCWSTR(headers.as_ptr()),
+                )?;
+                args.SetResponse(&response)
+            })),
+            &mut token,
+        )
+        .is_ok()
+    }
+}
+
+/// The page area the add-on may occupy, in window coordinates (logical px):
+/// the active page's own bounds.
+pub fn addon_area(hosts: &Hosts, active: Option<&WebView>) -> (f64, f64, f64, f64) {
+    let scale = hosts.window.scale_factor();
+    if let Some(Ok(r)) = active.map(WebView::bounds) {
+        let p = r.position.to_logical::<f64>(scale);
+        let s = r.size.to_logical::<f64>(scale);
+        return (p.x, p.y, s.width, s.height);
+    }
+    let size = hosts.window.inner_size().to_logical::<f64>(scale);
+    (0.0, 0.0, size.width, size.height)
+}
+
+/// Places the add-on at `rect` (relative to the area's origin `area`) and
+/// raises it above every content webview, or hides it.
+pub fn place_addon_in(hosts: &Hosts, webview: &WebView, area: (f64, f64), rect: (f64, f64, f64, f64), visible: bool) {
+    if !visible {
+        let _ = webview.set_visible(false);
+        return;
+    }
+    let _ = webview.set_bounds(Rect {
+        position: LogicalPosition::new(super::addon_window_rect(area, rect).0, super::addon_window_rect(area, rect).1).into(),
+        size: LogicalSize::new(rect.2, rect.3).into(),
+    });
+    #[cfg(debug_assertions)]
+    crate::addon_window_timing::applied();
+    let _ = webview.set_visible(true);
+    raise_addon(hosts);
+}
+
+/// Lifts the add-on above every sibling. Content webviews are created later
+/// and draw over earlier siblings, so this runs after every tab build, tab
+/// show and layout, as the hover readout's does.
+pub fn raise_addon(_hosts: &Hosts) {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        SetWindowPos, HWND_TOP, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    };
+    let raw = ADDON_CHILD.load(std::sync::atomic::Ordering::Relaxed);
+    if raw == 0 {
+        return;
+    }
+    unsafe {
+        let _ = SetWindowPos(
+            HWND(raw as _),
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+        );
+    }
+}
+
+/// The add-on's view is being dropped: nothing to detach on this backend
+/// beyond forgetting its handle (wry destroys the controller on drop).
+pub fn destroy_addon(_hosts: &Hosts) {
+    forget_addon_child();
+}
+
 /// Debug-only sibling of unix's `build_probe`; see there for why it exists.
 /// Never compiled into a release binary.
 #[cfg(debug_assertions)]
@@ -2137,6 +2360,7 @@ pub fn build_content(
     // when it activates one, which is where the current insets are applied.
     let _ = webview.set_bounds(content_rect(&hosts.window, CHROME_HEIGHT_PX, 0, 0, 0));
 
+    let selection = crate::addon_selection::Capture::new(id);
     let state = Rc::new(RefCell::new(TabState::new(policy)));
     state.borrow_mut().profile = profile;
     // The kept profile's first tab this session: the stored permission
@@ -2170,7 +2394,7 @@ pub fn build_content(
         // that script registered.
         // Right-click menu. Its own registration, because a tab whose menu
         // failed to register is not a tab whose autofill failed.
-        connect_context_menu(&webview, proxy, window_hwnd(hosts));
+        connect_context_menu(&webview, proxy, window_hwnd(hosts), selection.clone());
         let content_messages = connect_content_messages(&webview, proxy, id, state.clone());
         st.content_script_registered = if content_messages {
             SettingState::Applied
@@ -2287,6 +2511,7 @@ pub fn build_content(
         TabView {
             state,
             proxy: proxy.clone(),
+            selection,
             deferred_interception: RefCell::new(deferred_interception),
         },
         true,
@@ -5677,6 +5902,7 @@ const LOCAL_CUT: u32 = 101;
 const LOCAL_COPY: u32 = 102;
 const LOCAL_PASTE: u32 = 103;
 const LOCAL_SELECT_ALL: u32 = 104;
+const LOCAL_SEND_SELECTION: u32 = 105;
 
 /// Registers the right-click handler on a content webview.
 ///
@@ -5687,9 +5913,10 @@ fn connect_context_menu(
     webview: &WebView,
     proxy: &EventLoopProxy<UserEvent>,
     parent: windows::Win32::Foundation::HWND,
+    selection: crate::addon_selection::SharedCapture,
 ) -> bool {
-    use webview2_com::ContextMenuRequestedEventHandler;
     use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_11;
+    use webview2_com::{ContextMenuRequestedEventHandler, NavigationStartingEventHandler};
     use windows::core::Interface as _;
     use wry::WebViewExtWindows;
 
@@ -5705,6 +5932,33 @@ fn connect_context_menu(
         return false;
     };
 
+    // Invalidate synchronously in the engine callback, before queued app
+    // events can activate a menu belonging to the previous document.
+    let navigation_capture = selection.clone();
+    let mut navigation_token = Default::default();
+    let top_navigation_ready = unsafe {
+        core.add_NavigationStarting(
+            &NavigationStartingEventHandler::create(Box::new(move |_, _| {
+                navigation_capture.borrow_mut().navigate();
+                Ok(())
+            })),
+            &mut navigation_token,
+        )
+        .is_ok()
+    };
+    let frame_capture = selection.clone();
+    let mut frame_navigation_token = Default::default();
+    let frame_navigation_ready = unsafe {
+        core.add_FrameNavigationStarting(
+            &NavigationStartingEventHandler::create(Box::new(move |_, _| {
+                frame_capture.borrow_mut().navigate();
+                Ok(())
+            })),
+            &mut frame_navigation_token,
+        )
+        .is_ok()
+    };
+    let selection_ready = top_navigation_ready && frame_navigation_ready;
     let proxy = proxy.clone();
     let mut token = Default::default();
     let result = unsafe {
@@ -5723,6 +5977,7 @@ fn connect_context_menu(
                     ));
                 }
 
+                selection.borrow_mut().invalidate();
                 let Ok(target) = args.ContextMenuTarget() else {
                     diag("context menu: ContextMenuTarget FAILED; no menu this click");
                     return Ok(());
@@ -5732,18 +5987,34 @@ fn connect_context_menu(
                     link: clicked.link.is_some(),
                     image: clicked.image.is_some(),
                     editable: clicked.editable,
-                    selection: clicked.selection,
+                    selection: clicked.has_selection,
                 };
-                let entries = menu_compose::compose(compose_target);
 
                 // The engine's own command ids for cut/copy/paste/select-all
                 // on THIS target. Only worth enumerating when an editing
                 // entry can appear at all.
-                let engine = if clicked.editable || clicked.selection {
+                let engine = if clicked.editable || compose_target.selection {
                     engine_commands(&args)
                 } else {
                     EngineCommands::default()
                 };
+
+                let offer = selection_ready
+                    .then(crate::addon_selection::menu_offer)
+                    .flatten();
+                // Send only what the engine itself would let the person copy:
+                // it disables Copy in a password field, and a selection it
+                // will not copy is not sent anywhere either.
+                let source = offer.as_ref().filter(|_| engine.copy.is_some()).and_then(|offer| {
+                    let text = clicked.selection.as_ref()?;
+                    let mut capture = selection.borrow_mut();
+                    let source = capture.begin(&offer.receiver)?;
+                    capture.accept(&source.request_id, text.clone()).then_some(source)
+                });
+                let entries = menu_compose::with_selection(
+                    menu_compose::compose(compose_target),
+                    source.is_some(),
+                );
 
                 // Where to open the menu, in SCREEN pixels. `Location` alone
                 // is webview-relative CSS pixels and TrackPopupMenu wants
@@ -5751,11 +6022,26 @@ fn connect_context_menu(
                 let parent = windows::Win32::Foundation::HWND(parent_ptr as *mut core::ffi::c_void);
                 let point = menu_screen_point(&args, &controller, parent);
 
-                let Some(chosen) = show_menu(point, parent, &entries, &engine) else {
+                let Some(chosen) = show_menu(
+                    point,
+                    parent,
+                    &entries,
+                    &engine,
+                    offer.as_ref().map(|o| o.label.as_str()),
+                ) else {
+                    selection.borrow_mut().invalidate();
                     return Ok(());
                 };
+                if chosen != LOCAL_SEND_SELECTION {
+                    selection.borrow_mut().invalidate();
+                }
 
                 match chosen {
+                    LOCAL_SEND_SELECTION => {
+                        if let Some(source) = source {
+                            let _ = proxy.send_event(UserEvent::SendSelection(source));
+                        }
+                    }
                     // Engine-local: reported to the engine, still inside the
                     // event, and NEVER sent to state.rs. With Handled set,
                     // WebView2 invokes SelectedCommandId instead of drawing a
@@ -5810,10 +6096,18 @@ fn connect_context_menu(
 /// `Location` reports the click in the WEBVIEW's own coordinate space in CSS
 /// pixels. The engine's documented custom-menu sample converts exactly this
 /// way: scale by the controller's `RasterizationScale`, offset by the
-/// controller's bounds inside the parent window, then client-to-screen
-/// through the parent. Any read failing falls back to the CURSOR, which for
-/// a mouse right-click is the click point (a keyboard-invoked menu then
+/// controller's bounds inside ITS parent window, then client-to-screen
+/// through that same window. Any read failing falls back to the CURSOR, which
+/// for a mouse right-click is the click point (a keyboard-invoked menu then
 /// opens at the pointer rather than the caret -- misplaced, not lost).
+///
+/// THE CONTROLLER'S PARENT, NOT THE MAIN WINDOW. A tab is built with
+/// `build_as_child`, and wry hosts a child webview in its own container
+/// window placed below the toolbar; the controller's bounds are relative to
+/// that container and start at 0. Converting through the main window dropped
+/// the container's offset, so every menu opened one toolbar-height above the
+/// pointer (add-on hand test 2026-10-21, H-03: clicks at y 396 and 518 gave
+/// menus at 248 and 370). `parent` is used only if the controller cannot say.
 fn menu_screen_point(
     args: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2ContextMenuRequestedEventArgs,
     controller: &webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Controller,
@@ -5839,8 +6133,14 @@ fn menu_screen_point(
                 // failed read must not zero the coordinates.
                 _ => 1.0,
             };
+            let mut host = windows::Win32::Foundation::HWND::default();
+            let host = if controller.ParentWindow(&mut host).is_ok() && !host.is_invalid() {
+                host
+            } else {
+                parent
+            };
             let mut origin = POINT { x: 0, y: 0 };
-            if ClientToScreen(parent, &mut origin).as_bool() {
+            if ClientToScreen(host, &mut origin).as_bool() {
                 return POINT {
                     x: origin.x + bounds.left + (f64::from(css.x) * scale) as i32,
                     y: origin.y + bounds.top + (f64::from(css.y) * scale) as i32,
@@ -5890,7 +6190,10 @@ struct ClickTarget {
     link: Option<String>,
     image: Option<String>,
     editable: bool,
-    selection: bool,
+    /// Any text is selected: the menu's own selection section.
+    has_selection: bool,
+    /// The selection, for Send only, when it is within Send's limit.
+    selection: Option<String>,
 }
 
 fn click_target_of(
@@ -5905,19 +6208,22 @@ fn click_target_of(
         let mut editable = Default::default();
         target.IsEditable(&mut editable).is_ok() && editable.as_bool()
     };
-    // SelectionText only decides whether a Copy/Select-all section appears;
-    // the copy itself is the engine's command, so the string is not kept.
-    let selection = unsafe {
+    // Retain the native click snapshot for Send; never read the clipboard
+    // or ask the subsequently active webview for its selection.
+    let text = unsafe {
         let mut raw = PWSTR::null();
         match target.SelectionText(&mut raw) {
-            Ok(()) => !take_pwstr(raw).is_empty(),
-            Err(_) => false,
+            Ok(()) => Some(take_pwstr(raw)),
+            Err(_) => None,
         }
     };
+    let has_selection = text.as_ref().is_some_and(|t| !t.is_empty());
+    let selection = text.filter(|t| t.len() <= crate::addon_selection::MAX_SELECTION_BYTES);
     ClickTarget {
         link,
         image,
         editable,
+        has_selection,
         selection,
     }
 }
@@ -6083,6 +6389,7 @@ fn show_menu(
     owner: windows::Win32::Foundation::HWND,
     entries: &[menu_compose::Entry],
     engine: &EngineCommands,
+    send_label: Option<&str>,
 ) -> Option<u32> {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreatePopupMenu, DestroyMenu, SetForegroundWindow, TrackPopupMenu,
@@ -6112,6 +6419,11 @@ fn show_menu(
         };
         for entry in entries {
             match entry {
+                menu_compose::Entry::SendSelection => {
+                    if let Some(label) = send_label {
+                        add(LOCAL_SEND_SELECTION, label);
+                    }
+                }
                 menu_compose::Entry::Separator => {
                     let _ = AppendMenuW(menu, MF_SEPARATOR, 0, windows::core::PCWSTR::null());
                 }
@@ -6391,6 +6703,20 @@ pub fn set_clipboard_text(text: &str) -> bool {
 /// Whether the user can be asked to choose a file.
 pub fn file_choice_supported() -> bool {
     true
+}
+
+pub fn pick_addon_export_folder(hosts: &Hosts, title: &str, _choose: &str, _cancel: &str) -> Option<std::path::PathBuf> {
+    use windows::core::HSTRING;
+    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::UI::Shell::{FileOpenDialog, IFileOpenDialog, FOS_PICKFOLDERS, FOS_FORCEFILESYSTEM, FOS_PATHMUSTEXIST};
+    unsafe {
+        let dialog: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER).ok()?;
+        dialog.SetTitle(&HSTRING::from(title)).ok()?;
+        let options = dialog.GetOptions().ok()?;
+        dialog.SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST).ok()?;
+        dialog.Show(Some(window_hwnd(hosts))).ok()?;
+        shell_item_path(&dialog.GetResult().ok()?)
+    }
 }
 
 pub fn pick_file_to_open(hosts: &Hosts, title: &str) -> Option<std::path::PathBuf> {

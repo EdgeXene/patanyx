@@ -364,7 +364,7 @@ fn emit_chrome_msg_keys() {
     // surfaces and a call naming a message no catalog carries fails the
     // build here rather than falling back at runtime.
     let mut js = String::new();
-    for name in ["chrome.js", "integrity.js", "update.js", "chat.js"] {
+    for name in ["chrome.js", "integrity.js", "update.js", "chat.js", "addons.js"] {
         let js_path = root.join("src/chrome").join(name);
         println!("cargo:rerun-if-changed={}", js_path.display());
         js.push_str(

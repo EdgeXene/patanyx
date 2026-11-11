@@ -13,10 +13,13 @@
 //! - an import interrupted at any step is finished, or undone, by the next
 //!   open, decided by the vault that is actually there;
 //! - a journal is untrusted: one naming anything but an import's own folders
-//!   is never acted on.
+//!   is never acted on;
+//! - add-on pages travel as data, under the imported Library's key, and
+//!   replace the live add-on folder with the rest of the Library; a Library
+//!   without any writes a backup an earlier PATANYX reads.
 
 use super::*;
-use patanyx_store::{DivergenceLevel, ShelfGroup, ShelfTab};
+use patanyx_store::{DivergenceLevel, ShelfGroup, ShelfTab, SiteChange};
 
 const PASS: &str = "vault passphrase";
 const EXPORT_PASS: &str = "export passphrase";
@@ -80,6 +83,7 @@ impl Profile {
             assert!(
                 !name.starts_with(STAGING_PREFIX)
                     && !name.starts_with(OLD_ARCHIVE_PREFIX)
+                    && !name.starts_with(OLD_ADDONS_PREFIX)
                     && !name.contains(".replace-journal"),
                 "left behind: {name}"
             );
@@ -139,7 +143,17 @@ fn fill(store: &mut Store) {
     store
         .record_download(DOWNLOAD_URL, "private-history.zip", 42, [7u8; 32])
         .unwrap();
+    // An add-on's pages: one saved twice and attached to a site, one empty.
+    let notes = store.addon_namespace("text-pages").unwrap();
+    let trip = notes.put(None, 0, "Trip notes", b"pack the charger", T0).unwrap();
+    notes
+        .put_with_site(Some(&trip.id), 1, "Trip notes", TRIP_NOTES.as_bytes(), SiteChange::Set("example.test".into()), T0 + 1)
+        .unwrap();
+    notes.put(None, 0, "Empty", b"", T0 + 2).unwrap();
 }
+
+const T0: u64 = 1_792_000_000_000;
+const TRIP_NOTES: &str = "pack the charger and the map \u{e9}";
 
 /// A source profile with a credential and a full Library, exported to a
 /// backup file outside every profile. Returns the source too, for comparing.
@@ -172,7 +186,19 @@ fn target() -> (Profile, Vault, Store) {
     library
         .record_download(LOCAL_DOWNLOAD_URL, "this-computer.zip", 7, [1u8; 32])
         .unwrap();
+    library
+        .addon_namespace("text-pages")
+        .unwrap()
+        .put(None, 0, "Old note", b"from before", T0)
+        .unwrap();
     (target, vault, library)
+}
+
+/// The target's own add-on page, still there and readable under its own key.
+fn assert_is_the_targets_addon_data(library: &Store) {
+    let pages = library.addon_namespace("text-pages").unwrap().list().unwrap();
+    assert_eq!(pages.len(), 1);
+    assert!(pages[0].readable && pages[0].meta.title == "Old note");
 }
 
 /// Stages, commits and opens, as the import arm and the next `open_store` do.
@@ -214,6 +240,15 @@ fn assert_is_the_source_library(library: &Store) {
     assert_eq!(snapshots.len(), 1);
     assert_eq!(&library.backup_picture(&snapshots[0].id).unwrap()[..], SNAPSHOT_PNG);
     assert_eq!(library.divergence_overrides().len(), 1);
+    // The add-on's pages, under this Library's key, and none of the target's.
+    let notes = library.addon_namespace("text-pages").unwrap();
+    let mut pages = notes.list().unwrap();
+    pages.sort_by(|a, b| a.meta.title.cmp(&b.meta.title));
+    let titles: Vec<&str> = pages.iter().map(|p| p.meta.title.as_str()).collect();
+    assert_eq!(titles, ["Empty", "Trip notes"]);
+    let (meta, body) = notes.get(&pages[1].meta.id).unwrap();
+    assert_eq!(body.as_slice(), TRIP_NOTES.as_bytes());
+    assert_eq!((meta.site.as_deref(), meta.revision), (Some("example.test"), 2));
 }
 
 // ---- the round trip ---------------------------------------------------------------
@@ -267,7 +302,7 @@ fn a_decrypted_backup_never_holds_a_download_address() {
             section.kind
         );
     }
-    assert_eq!(sections, 3, "the Library and two pictures");
+    assert_eq!(sections, 6, "the Library, two pictures, two add-on pages and their index");
     reader.finish().unwrap();
 }
 
@@ -635,6 +670,9 @@ fn committed_but_not_moved() -> Committed {
     }
 }
 
+/// The step of [`move_by_hand`] that records `swapped`: every move is done.
+const SWAPPED: usize = 6;
+
 /// Performs the first `steps` moves of the swap by hand, as a crash between
 /// them would leave them.
 fn move_by_hand(target: &Profile, journal: &Journal, steps: usize) {
@@ -648,9 +686,16 @@ fn move_by_hand(target: &Profile, journal: &Journal, steps: usize) {
         fs::rename(staging.join("archive"), dir.join("archive")).unwrap();
     }
     if steps >= 3 {
-        fs::rename(staging.join("store.rbs"), &target.store_path).unwrap();
+        // The target has add-on data of its own, so its folder exists.
+        fs::rename(dir.join("addons"), dir.join(journal.old_addons.as_ref().unwrap())).unwrap();
     }
     if steps >= 4 {
+        fs::rename(staging.join("addons"), dir.join("addons")).unwrap();
+    }
+    if steps >= 5 {
+        fs::rename(staging.join("store.rbs"), &target.store_path).unwrap();
+    }
+    if steps >= SWAPPED {
         let mut swapped = journal.clone();
         swapped.phase = Phase::Swapped;
         write_journal(&target.store_path, &swapped).unwrap();
@@ -659,7 +704,7 @@ fn move_by_hand(target: &Profile, journal: &Journal, steps: usize) {
 
 #[test]
 fn an_import_interrupted_after_the_vault_commit_is_finished_whatever_step_it_reached() {
-    for steps in 0..=4 {
+    for steps in 0..=SWAPPED {
         let Committed {
             target,
             vault,
@@ -681,7 +726,7 @@ fn an_import_interrupted_after_the_vault_commit_is_finished_whatever_step_it_rea
 /// goes only once the Library has been checked.
 #[test]
 fn a_crash_during_the_clean_up_is_finished_by_the_next_open() {
-    for done in 0..=3 {
+    for done in 0..=4 {
         let Committed {
             target,
             vault,
@@ -690,7 +735,7 @@ fn a_crash_during_the_clean_up_is_finished_by_the_next_open() {
         } = committed_but_not_moved();
         let marker = replace_marker(&target.store_path);
         fs::write(&marker, b"left by an older import\n").unwrap();
-        move_by_hand(&target, &journal, 4);
+        move_by_hand(&target, &journal, SWAPPED);
         let dir = target.dir.path();
         if done >= 1 {
             fs::remove_file(&marker).unwrap();
@@ -699,6 +744,9 @@ fn a_crash_during_the_clean_up_is_finished_by_the_next_open() {
             fs::remove_dir_all(dir.join(&journal.old_archive)).unwrap();
         }
         if done >= 3 {
+            fs::remove_dir_all(dir.join(journal.old_addons.as_ref().unwrap())).unwrap();
+        }
+        if done >= 4 {
             fs::remove_dir_all(dir.join(&journal.staging)).unwrap();
         }
         let key = vault.library_key().unwrap();
@@ -719,7 +767,7 @@ fn an_import_over_a_finished_but_unswept_one_keeps_it_until_it_completes() {
         journal,
         ..
     } = committed_but_not_moved();
-    move_by_hand(&target, &journal, 4);
+    move_by_hand(&target, &journal, SWAPPED);
     drop(vault);
     let swapped = fs::read(journal_path(&target.store_path)).unwrap();
     let (_second, second_backup, _) = source_backup();
@@ -772,6 +820,7 @@ fn an_import_killed_at_any_step_leaves_one_whole_profile() {
         } else {
             assert_eq!(library.bookmarks()[0].url, "https://old.example.test/", "step {at}");
             assert!(library.pictures_open());
+            assert_is_the_targets_addon_data(&library);
         }
         assert!(library.pictures_missing() == 0, "step {at}");
         target.assert_no_leftovers();
@@ -807,13 +856,17 @@ const WHOLE_IMPORT_STEPS: &[&str] = &[
     "journal-rename-next",
     "staging-folder-next",
     "archive-folder-next",
+    "addons-folder-next",
     "library-create-next",
     "library-created",
     "picture-written",
+    "addon-restored",
     "library-committed",
     "vault-committed",
     "live-archive-aside-next",
     "staged-archive-in-next",
+    "live-addons-aside-next",
+    "staged-addons-in-next",
     "staged-library-in-next",
     "marker-removal-next",
     "folder-removal-next",
@@ -826,6 +879,7 @@ const ROLLBACK_STEPS: &[&str] = &[
     "journal-rename-next",
     "staging-folder-next",
     "archive-folder-next",
+    "addons-folder-next",
     "library-create-next",
     "folder-removal-next",
 ];
@@ -989,6 +1043,7 @@ fn an_import_that_crashed_while_reading_is_undone_without_any_key() {
         phase: Phase::Preparing,
         staging: random_name(STAGING_PREFIX),
         old_archive: random_name(OLD_ARCHIVE_PREFIX),
+        old_addons: Some(random_name(OLD_ADDONS_PREFIX)),
         vault_check: None,
         source: "/backups/b.rbx".into(),
         superseded: None,
@@ -1053,6 +1108,7 @@ fn a_swapped_journal_for_another_vault_removes_no_protection() {
         phase: Phase::Swapped,
         staging: random_name(STAGING_PREFIX),
         old_archive: random_name(OLD_ARCHIVE_PREFIX),
+        old_addons: Some(random_name(OLD_ADDONS_PREFIX)),
         vault_check: Some("ab".repeat(32)),
         source: "x".into(),
         superseded: None,
@@ -1379,7 +1435,7 @@ fn a_linked_live_library_is_never_taken_as_in_place() {
         journal,
         ..
     } = committed_but_not_moved();
-    move_by_hand(&target, &journal, 4);
+    move_by_hand(&target, &journal, SWAPPED);
     let elsewhere = target.dir.path().join(&journal.staging).join("moved-library");
     fs::rename(&target.store_path, &elsewhere).unwrap();
     std::os::unix::fs::symlink(&elsewhere, &target.store_path).unwrap();
@@ -1409,32 +1465,384 @@ fn discard_removes_only_what_an_import_made() {
     assert!(!journal_exists(&target.store_path));
 }
 
-#[test]
-fn add_on_data_is_refused_as_coming_from_a_newer_patanyx() {
-    let source = Profile::new();
-    let vault = source.vault();
-    let backup = source.dir.path().join("with-addon.rbx");
+// ---- add-on pages (M10, M11) ------------------------------------------------------
+
+/// Writes a backup holding an empty Library and then `sections` as add-on
+/// sections, the way only a crafted file could arrange them.
+fn backup_with_addon_sections(dir: &Path, sections: &[(String, Vec<u8>)]) -> PathBuf {
+    let profile = Profile::new();
+    let vault = profile.vault();
+    let backup = dir.join("crafted.rbx");
     let records = serde_json::to_vec(&empty_backup()).unwrap();
-    let writer_limits = SectionLimits {
-        addon: 1024,
-        ..section_limits()
-    };
     vault
-        .export_backup(&backup, EXPORT_PASS, writer_limits, &mut |sink| {
+        .export_backup(&backup, EXPORT_PASS, section_limits(), &mut |sink| {
             sink.section(SectionKind::Library, "", &records)?;
-            sink.section(SectionKind::Addon, "notes/1", b"a page of notes")
+            for (name, body) in sections {
+                sink.section(SectionKind::Addon, name, body)?;
+            }
+            Ok(())
         })
         .unwrap();
-    let (target, _vault, library) = target();
-    let before = target.snapshot();
-    let refused = stage(&target.store_path, &backup, EXPORT_PASS, Some(&library));
-    assert!(matches!(
-        refused,
-        Err(ImportError::Backup(ExportError::UnreadableVersion(_)))
-    ));
-    assert_eq!(target.snapshot(), before);
+    backup
 }
 
+#[test]
+fn add_on_sections_out_of_order_or_unindexed_are_refused_with_nothing_live_changed() {
+    let page_id = "ab".repeat(16);
+    let page = format!("text-pages/p-{page_id}-1");
+    let index = serde_json::to_vec(&serde_json::json!({
+        "schema": 1,
+        "pages": [{
+            "id": page_id, "title": "t", "revision": 1, "created_at_ms": 1,
+            "updated_at_ms": 1, "body_bytes": 4, "version": format!("p-{page_id}-1"),
+        }],
+    }))
+    .unwrap();
+    let body = b"text".to_vec();
+    let at = |name: &str, bytes: &[u8]| (name.to_string(), bytes.to_vec());
+    let cases: Vec<(&str, Vec<(String, Vec<u8>)>)> = vec![
+        ("a name with no add-on", vec![at("notes", &body)]),
+        ("pages without their index", vec![at(&page, &body)]),
+        (
+            "an add-on in two places",
+            vec![at(&page, &body), at("text-pages/index", &index), at(&page, &body), at("text-pages/index", &index)],
+        ),
+        ("an index naming a page never written", vec![at("text-pages/index", &index)]),
+        (
+            "one add-on's pages cut off by another's",
+            vec![at(&page, &body), at(&format!("other/p-{page_id}-1"), &body)],
+        ),
+        ("an unusable add-on id", vec![at(&format!("../x/p-{page_id}-1"), &body)]),
+    ];
+    let (target, _vault, library) = target();
+    let before = target.snapshot();
+    for (what, sections) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let backup = backup_with_addon_sections(dir.path(), &sections);
+        assert!(stage(&target.store_path, &backup, EXPORT_PASS, Some(&library)).is_err(), "{what} was accepted");
+        assert!(target.snapshot() == before, "{what} changed a live file");
+    }
+    // The same pages in order, for contrast.
+    let dir = tempfile::tempdir().unwrap();
+    let backup = backup_with_addon_sections(dir.path(), &[at(&page, &body), at("text-pages/index", &index)]);
+    let staged = stage(&target.store_path, &backup, EXPORT_PASS, Some(&library)).unwrap();
+    assert_eq!(staged.addon_pages, 1);
+    staged.abandon().unwrap();
+    assert!(target.snapshot() == before);
+}
+
+#[test]
+fn a_library_without_add_on_pages_writes_a_backup_an_earlier_patanyx_reads() {
+    let source = Profile::new();
+    let vault = source.vault();
+    let mut library = source.library(&vault);
+    library.add_bookmark("https://a.example.test/", "A").unwrap();
+    // An add-on that once held a page: its folder and index are there, empty.
+    let notes = library.addon_namespace("text-pages").unwrap();
+    let page = notes.put(None, 0, "Gone", b"x", T0).unwrap();
+    notes.delete(&page.id, 1).unwrap();
+    let backup = source.dir.path().join("plain.rbx");
+    assert!(matches!(export(&vault, Some(&library), &backup, EXPORT_PASS).unwrap(), ExportOutcome::Written(_)));
+    // 1.0.7 reads no add-on section at all.
+    let earlier = SectionLimits {
+        addon: 0,
+        ..section_limits()
+    };
+    let mut reader = BackupReader::open(&backup, EXPORT_PASS, earlier).unwrap();
+    let mut kinds = Vec::new();
+    while let Some(section) = reader.next_section().unwrap() {
+        kinds.push(section.kind);
+    }
+    assert_eq!(kinds, [SectionKind::Library]);
+    reader.finish().unwrap();
+}
+
+#[test]
+fn add_on_pages_saved_or_deleted_during_an_export_go_as_they_are_then() {
+    let (_source, vault, library) = open_source();
+    let input = ExportInput::take(&vault, Some(&library)).unwrap();
+    let out = tempfile::tempdir().unwrap();
+    let dest = out.path().join("busy.rbx");
+    let mut changed = false;
+    let outcome = input
+        .write_watched(&dest, EXPORT_PASS, &BackupWatch::new(), &mut |_| {}, &mut |_| {
+            if changed {
+                return;
+            }
+            changed = true;
+            // Before the first page is read: one page saved again, one deleted.
+            let notes = library.addon_namespace("text-pages").unwrap();
+            for entry in notes.list().unwrap() {
+                match entry.meta.title.as_str() {
+                    "Trip notes" => {
+                        notes.put(Some(&entry.meta.id), entry.meta.revision, "Trip notes", b"later", T0 + 9).unwrap();
+                    }
+                    _ => notes.delete(&entry.meta.id, entry.meta.revision).unwrap(),
+                }
+            }
+        })
+        .unwrap();
+    assert!(matches!(outcome, ExportOutcome::Written(_)), "{outcome:?}");
+    drop(library);
+    let (target, vault, live) = target();
+    let staged = stage(&target.store_path, &dest, EXPORT_PASS, Some(&live)).unwrap();
+    assert_eq!(staged.addon_pages, 1);
+    drop((vault, live));
+    let (vault, _) = staged.install(&target.vault_path, NEW_PASS).unwrap();
+    let key = vault.library_key().unwrap();
+    recover(&target.store_path, &key).unwrap();
+    let restored = Store::open(&target.store_path, None, &key).unwrap();
+    let notes = restored.addon_namespace("text-pages").unwrap();
+    let pages = notes.list().unwrap();
+    assert_eq!(pages.len(), 1);
+    let (meta, body) = notes.get(&pages[0].meta.id).unwrap();
+    assert_eq!((meta.title.as_str(), body.as_slice(), meta.revision), ("Trip notes", &b"later"[..], 3));
+    assert_eq!(meta.site.as_deref(), Some("example.test"), "a save keeps the site");
+}
+
+#[test]
+fn an_add_on_page_that_cannot_be_read_refuses_the_export_by_its_title() {
+    let (source, vault, library) = open_source();
+    let notes = library.addon_namespace("text-pages").unwrap();
+    let trip = notes.list().unwrap().into_iter().find(|e| e.meta.title == "Trip notes").unwrap();
+    let file = patanyx_store::addons_dir(&source.store_path).join("text-pages").join(trip.meta.version());
+    fs::write(&file, b"not a page any more").unwrap();
+    let dest = source.dir.path().join("refused.rbx");
+    match export(&vault, Some(&library), &dest, EXPORT_PASS).unwrap() {
+        ExportOutcome::Refused(refusal) => {
+            assert_eq!(refusal.code, "export_addon_page_unreadable");
+            assert_eq!(refusal.item.as_deref(), Some("Trip notes"));
+        }
+        ExportOutcome::Written(_) => panic!("a backup without a page its index names was written"),
+    }
+    assert!(!dest.exists());
+}
+
+/// R-002 of the design: add-on data left under the replaced Library's key is
+/// never taken for the restored data, and keeps the import unfinished.
+#[test]
+fn add_on_data_left_under_the_old_key_keeps_the_import_unfinished() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let dir = target.dir.path();
+    let staging = dir.join(&journal.staging);
+    // Every move but the add-on folder's, and the staged one lost.
+    fs::rename(dir.join("archive"), dir.join(&journal.old_archive)).unwrap();
+    fs::rename(staging.join("archive"), dir.join("archive")).unwrap();
+    fs::rename(staging.join("store.rbs"), &target.store_path).unwrap();
+    fs::remove_dir_all(staging.join("addons")).unwrap();
+    let key = vault.library_key().unwrap();
+    assert_eq!(recover(&target.store_path, &key), Err(Unfinished));
+    assert!(journal_exists(&target.store_path), "the evidence was cleaned away");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_staged_add_on_folder_is_never_moved_into_place() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let outside = tempfile::tempdir().unwrap();
+    fs::write(outside.path().join("precious"), b"keep me").unwrap();
+    let staged = target.dir.path().join(&journal.staging).join("addons");
+    fs::remove_dir_all(&staged).unwrap();
+    std::os::unix::fs::symlink(outside.path(), &staged).unwrap();
+    let key = vault.library_key().unwrap();
+    assert_eq!(recover(&target.store_path, &key), Err(Unfinished));
+    let live = target.dir.path().join("addons");
+    assert!(!fs::symlink_metadata(&live).unwrap().file_type().is_symlink());
+    assert_eq!(fs::read(outside.path().join("precious")).unwrap(), b"keep me");
+}
+
+/// A journal written before add-on data travelled (1.0.7) still parses, and
+/// its import finishes without moving an add-on folder it never staged.
+#[test]
+fn a_journal_from_before_add_on_data_travelled_is_still_finished() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let dir = target.dir.path();
+    // As 1.0.7 left it: no add-on folder live or staged, no name for one.
+    fs::remove_dir_all(dir.join("addons")).unwrap();
+    fs::remove_dir_all(dir.join(&journal.staging).join("addons")).unwrap();
+    let mut value = serde_json::to_value(&journal).unwrap();
+    value.as_object_mut().unwrap().remove("old_addons");
+    write_journal_bytes(&target.store_path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(read_journal(&target.store_path).unwrap().unwrap().old_addons, None);
+    let key = vault.library_key().unwrap();
+    recover(&target.store_path, &key).unwrap();
+    let library = Store::open(&target.store_path, None, &key).unwrap();
+    assert_eq!(library.bookmarks().len(), 2);
+    assert!(!dir.join("addons").exists());
+    target.assert_no_leftovers();
+}
+
+#[test]
+fn an_older_imports_retirement_takes_the_add_on_folder_and_discard_sweeps_a_leftover() {
+    let (target, _vault, library) = target();
+    drop(library);
+    let dir = target.dir.path();
+    assert!(dir.join("addons").is_dir());
+    retire_addons(&target.store_path).unwrap();
+    assert!(!dir.join("addons").exists());
+    target.assert_no_leftovers();
+    // Nothing to retire is success.
+    retire_addons(&target.store_path).unwrap();
+    // One that could not be deleted at once goes with the next discard.
+    fs::create_dir(dir.join("addons.old-0123456789abcdef")).unwrap();
+    fs::create_dir(dir.join("addons.old-not-ours")).unwrap();
+    discard(&target.store_path).unwrap();
+    assert!(!dir.join("addons.old-0123456789abcdef").exists());
+    assert!(dir.join("addons.old-not-ours").exists());
+}
+
+#[test]
+fn an_export_stopped_during_the_add_on_pages_writes_nothing() {
+    let (source, vault, library) = open_source();
+    let out = tempfile::tempdir().unwrap();
+    let before = source.snapshot();
+    let dest = out.path().join("stopped.rbx");
+    let watch = BackupWatch::new();
+    let input = ExportInput::take(&vault, Some(&library)).unwrap();
+    let result = input.write_watched(&dest, EXPORT_PASS, &watch, &mut |_| {}, &mut |_| watch.stop());
+    assert!(matches!(result, Err(ExportError::Cancelled)), "{result:?}");
+    assert!(!dest.exists());
+    assert_eq!(export_leftovers(&dest), 0);
+    assert!(source.snapshot() == before);
+}
+
+/// Review R-002: add-on data the export cannot see is refused, never left
+/// out of a backup that then looks complete.
+#[test]
+fn an_add_on_index_that_cannot_be_read_refuses_the_export() {
+    let (source, vault, library) = open_source();
+    let index = patanyx_store::addons_dir(&source.store_path).join("text-pages").join("index");
+    fs::rename(&index, source.dir.path().join("index.kept")).unwrap();
+    fs::create_dir(&index).unwrap();
+    let dest = source.dir.path().join("refused.rbx");
+    match export(&vault, Some(&library), &dest, EXPORT_PASS).unwrap() {
+        ExportOutcome::Refused(refusal) => assert_eq!(refusal.code, "export_addon_unreadable"),
+        ExportOutcome::Written(_) => panic!("a backup without the add-on's pages was written"),
+    }
+    assert!(!dest.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn an_add_on_folder_that_is_a_link_refuses_the_export() {
+    let (source, vault, library) = open_source();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), patanyx_store::addons_dir(&source.store_path).join("linked")).unwrap();
+    let dest = source.dir.path().join("refused.rbx");
+    match export(&vault, Some(&library), &dest, EXPORT_PASS).unwrap() {
+        ExportOutcome::Refused(refusal) => assert_eq!(refusal.code, "export_addon_unreadable"),
+        ExportOutcome::Written(_) => panic!("a backup was written past a linked add-on folder"),
+    }
+}
+
+/// Review R-003: a staged add-on namespace replaced by a link is never moved
+/// into place, and nothing it points at is cleaned away.
+#[cfg(unix)]
+#[test]
+fn a_linked_staged_namespace_is_never_moved_into_place() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let staging = target.dir.path().join(&journal.staging);
+    let held = staging.join("held-pages");
+    fs::rename(staging.join("addons").join("text-pages"), &held).unwrap();
+    std::os::unix::fs::symlink(&held, staging.join("addons").join("text-pages")).unwrap();
+    let key = vault.library_key().unwrap();
+    assert_eq!(recover(&target.store_path, &key), Err(Unfinished));
+    assert!(held.join("index").exists(), "the restored pages were cleaned away");
+    assert!(journal_exists(&target.store_path));
+}
+
+/// Review R-005: a 1.0.7 journal never moved add-on data, so add-on data
+/// still there under the replaced Library's key does not keep the imported
+/// Library shut.
+#[test]
+fn a_journal_from_before_add_on_data_travelled_finishes_over_old_add_on_data() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let dir = target.dir.path();
+    fs::remove_dir_all(dir.join(&journal.staging).join("addons")).unwrap();
+    let mut value = serde_json::to_value(&journal).unwrap();
+    value.as_object_mut().unwrap().remove("old_addons");
+    write_journal_bytes(&target.store_path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    let key = vault.library_key().unwrap();
+    recover(&target.store_path, &key).unwrap();
+    let library = Store::open(&target.store_path, None, &key).unwrap();
+    assert_eq!(library.bookmarks().len(), 2);
+    // Left where it was, under the old key: never the import's to replace.
+    assert!(dir.join("addons").join("text-pages").is_dir());
+    target.assert_no_leftovers();
+}
+
+/// Review R-009 (round 2): the export's own add-on quota, reached with small
+/// pages through a lowered limit, refuses rather than write a backup the
+/// import would refuse; at exactly the room needed it writes.
+#[test]
+fn an_export_past_the_add_on_quota_is_refused() {
+    let (source, vault, library) = open_source();
+    let notes = library.addon_namespace("text-pages").unwrap();
+    let pages = notes.backup_pages().unwrap().unwrap();
+    let bodies: u64 = pages.iter().map(|p| patanyx_store::addon_stored_len(p.body_bytes as usize)).sum();
+    let index = patanyx_store::addon_backup_index(&pages).unwrap().len();
+    let need = bodies + patanyx_store::addon_stored_len(index);
+    let attempt = |quota: u64| {
+        TEST_ADDON_QUOTA.with(|q| q.set(quota));
+        let dest = source.dir.path().join(format!("quota-{quota}.rbx"));
+        let outcome = export(&vault, Some(&library), &dest, EXPORT_PASS).unwrap();
+        TEST_ADDON_QUOTA.with(|q| q.set(patanyx_store::ADDON_QUOTA_BYTES));
+        (outcome, dest)
+    };
+    for quota in [bodies - 1, need - 1] {
+        match attempt(quota) {
+            (ExportOutcome::Refused(refusal), dest) => {
+                assert_eq!(refusal.code, "export_library_over_limit", "quota {quota}");
+                assert!(!dest.exists());
+            }
+            (ExportOutcome::Written(_), _) => panic!("a backup past the add-on quota ({quota}) was written"),
+        }
+    }
+    assert!(matches!(attempt(need).0, ExportOutcome::Written(_)), "the add-on's exact room was refused");
+}
+
+/// Review R-005 (round 2): staged add-on data under a journal that names no
+/// aside folder is never installed and never cleaned away.
+#[test]
+fn staged_add_on_data_under_a_journal_naming_no_aside_folder_is_left_alone() {
+    let Committed {
+        target,
+        vault,
+        journal,
+        ..
+    } = committed_but_not_moved();
+    let mut value = serde_json::to_value(&journal).unwrap();
+    value.as_object_mut().unwrap().remove("old_addons");
+    write_journal_bytes(&target.store_path, &serde_json::to_vec(&value).unwrap()).unwrap();
+    let key = vault.library_key().unwrap();
+    assert_eq!(recover(&target.store_path, &key), Err(Unfinished));
+    assert!(target.dir.path().join(&journal.staging).join("addons").join("text-pages").join("index").exists());
+}
 
 // ---- stopping, and the import's second half (the worker steps) ------------------
 
@@ -1467,11 +1875,17 @@ fn an_export_stopped_before_any_picture_writes_nothing_and_changes_nothing() {
         let dest = out.path().join(format!("stopped-{stop_at}.rbx"));
         let watch = BackupWatch::new();
         let input = ExportInput::take(&vault, Some(&library)).unwrap();
-        let result = input.write_watched(&dest, EXPORT_PASS, &watch, &mut |index| {
-            if index == stop_at {
-                watch.stop();
-            }
-        });
+        let result = input.write_watched(
+            &dest,
+            EXPORT_PASS,
+            &watch,
+            &mut |index| {
+                if index == stop_at {
+                    watch.stop();
+                }
+            },
+            &mut |_| {},
+        );
         assert!(matches!(result, Err(ExportError::Cancelled)), "stop at picture {stop_at}: {result:?}");
         assert!(!dest.exists(), "stop at picture {stop_at} left a backup");
         assert_eq!(export_leftovers(&dest), 0, "stop at picture {stop_at} left a temporary file");
@@ -1525,8 +1939,9 @@ fn an_import_stopped_after_any_section_changes_nothing_live() {
     let (target, vault, library) = target();
     let before = target.snapshot();
     let kept = library.kept_downloads();
-    // The Library section, then each of the two pictures.
-    for stop_after in 0..3 {
+    // The Library section, each of the two pictures, the two add-on pages
+    // and their index: every section the backup holds.
+    for stop_after in 0..6 {
         let watch = BackupWatch::new();
         let result = stage_inner(&target.store_path, &backup, EXPORT_PASS, Some(&kept), &watch, &mut |n| {
             if n == stop_after {
@@ -1680,4 +2095,19 @@ fn an_undeletable_leftover_after_the_swap_does_not_keep_the_library_shut() {
     // Once it can be deleted, the next open finishes the clean-up.
     recover(&target.store_path, &key).unwrap();
     target.assert_no_leftovers();
+}
+
+/// QUALIFICATION, run by hand: writes a backup holding a vault with one
+/// credential and a full Library with add-on pages to PATANYX_QUAL_BACKUP,
+/// protected with the test EXPORT_PASS, for the import warning and the
+/// restored-page count to be checked by eye in a built browser.
+#[test]
+#[ignore]
+fn qualification_write_a_backup_with_add_on_pages() {
+    let dest = PathBuf::from(std::env::var("PATANYX_QUAL_BACKUP").expect("set PATANYX_QUAL_BACKUP"));
+    let (_source, vault, library) = open_source();
+    match export(&vault, Some(&library), &dest, EXPORT_PASS).unwrap() {
+        ExportOutcome::Written(summary) => eprintln!("wrote {}: {summary:?}", dest.display()),
+        ExportOutcome::Refused(refusal) => panic!("refused: {refusal:?}"),
+    }
 }

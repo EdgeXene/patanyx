@@ -20,7 +20,9 @@
 //!   download reads while the vault is locked.
 //!
 //! The two stores still never share a key. A version 3 Library's key is
-//! random, and reaches the file wrapped under a key the vault derives from
+//! random (a Library that moved from version 1 keeps its derived key only
+//! until `rekey.rs` renews it, normally in the same passphrase change), and
+//! reaches the file wrapped under a key the vault derives from
 //! its master for this purpose alone (`Vault::library_key`). A version 1
 //! Library's key is derived from the passphrase, pre-hashed with a
 //! store-specific domain label before Argon2id (see `crypto.rs`), so it is
@@ -67,6 +69,7 @@
 //! its owner's first passphrase change, opens with the vault instead of the
 //! passphrase; its layout is in `format.rs`.
 
+mod addon;
 mod blob;
 mod crypto;
 mod error;
@@ -78,13 +81,23 @@ mod library_backup_tests;
 mod library_key_tests;
 mod model;
 pub mod provenance;
+mod rekey;
+#[cfg(test)]
+mod rekey_tests;
 mod retire;
 #[cfg(test)]
 mod retire_tests;
 #[cfg(test)]
 mod writer_tests;
 
+pub use addon::{
+    addon_backup_index, addon_id_ok, addon_ids, addon_stored_len, addons_dir, valid_collection, valid_site, AddonLimits, AddonNamespace,
+    AddonNamespaceInput, AddonRestore, AddonRestorer, AddonWriteError, PageEntry, PageMeta, SiteChange,
+    ADDON_BACKUP_INDEX, ADDON_MAX_INDEX_BYTES, ADDON_MAX_PAGES, ADDON_MAX_PAGE_BYTES, ADDON_MAX_SITE_BYTES,
+    ADDON_MAX_TITLE_CHARS, ADDON_QUOTA_BYTES,
+};
 pub use error::StoreError;
+pub use rekey::{recover_rekey, rekey_journal_exists, RekeyError, RekeyReport, MAX_UNFINISHED_ATTEMPTS};
 pub use library_backup::{
     is_valid_blob_id, validate_backup, BackupError, BackupPictures, KeptDownloads, LibraryBackup,
     RestoreInProgress,
@@ -92,6 +105,7 @@ pub use library_backup::{
     MAX_BACKUP_PICTURE_BYTES, MAX_BOOKMARKS, MAX_SHELF_SEQ,
 };
 pub use model::{
+    Preserved,
     existing_folder_name, normalize_folder_name, ArchiveRecord, Bookmark, DivergenceLevel, DivergenceOverride,
     DownloadRecord, PageSnapshot, RecordedDigest, Shelf, ShelfGroup, ShelfTab, StoreData,
 };
@@ -114,9 +128,10 @@ pub struct Store {
     path: PathBuf,
     /// The Library's data key. A version 1 file derives it from the
     /// passphrase; a version 3 file carries it wrapped under the vault's
-    /// Library key. It never changes, not even when the Library moves from
-    /// version 1 to 3, which is what keeps every picture blob and every
-    /// provenance MAC valid.
+    /// Library key. The move from version 1 to 3 keeps it, which keeps every
+    /// picture blob and provenance MAC valid through the move; `rekey.rs` then
+    /// renews it once, re-encrypting all of them, so the passphrase the move
+    /// retired no longer derives it.
     key: Zeroizing<[u8; crypto::KEY_LEN]>,
     provenance_key: Zeroizing<[u8; crypto::KEY_LEN]>,
     envelope: Envelope,
@@ -500,6 +515,9 @@ impl Store {
     // and only then the vault. A failure before the vault moves leaves both
     // opening with the current passphrase, whatever the Library's version by
     // then: a version 3 Library opens through the vault's unchanged master.
+    // After the vault moves, the same change re-keys the Library (`rekey.rs`)
+    // so the retired passphrase no longer derives its key; a re-key that does
+    // not finish cleanly is tried again at the next unlock.
 
     /// 1 for a Library from before version 3 that has not moved yet, 3 for
     /// every other.
@@ -512,10 +530,13 @@ impl Store {
 
     /// Moves a version 1 Library into the vault: ONE atomic write of a
     /// version 3 file carrying the same data key, wrapped under
-    /// `library_key`, so no picture and no download record is re-keyed. The
-    /// version 1 salt is recorded inside the encrypted contents, never in a
-    /// header, so later changes still recognize that file's leftover copies.
-    /// A version 3 Library is left as it is.
+    /// `library_key`, so the move itself re-encrypts no picture and no
+    /// download record. That key is still the one the retired passphrase
+    /// derived, so the caller re-keys the Library next (`rekey`), which
+    /// `needs_rekey` reports until it is done. The version 1 salt is recorded
+    /// inside the encrypted contents, never in a header, so later changes
+    /// still recognize that file's leftover copies. A version 3 Library is
+    /// left as it is.
     ///
     /// A failure leaves file and memory as they were. The directory flush is
     /// best effort here; the change confirms it with `confirm_durable` before
@@ -1851,6 +1872,44 @@ mod tests {
         Store::create_with_params(path, passphrase, 8192, 1, 1).unwrap()
     }
 
+    // ---- Keys this build does not know --------------------------------------
+
+    /// A key written by another build (a newer one, or a Nabu-X build with
+    /// data this build has no field for) survives this build's saves,
+    /// unchanged, through an unrelated edit and a reopen (R-013).
+    #[test]
+    fn a_key_this_build_does_not_know_survives_its_saves() {
+        let path = test_path("unknown-key");
+        let mut store = make_store(&path, "pw");
+        let kept = serde_json::json!([{"id": "a1", "url": "https://example.com/", "history": [{"at_ms": 1, "n": 2.5}]}]);
+        store.data.other.insert("trackers".to_string(), model::Preserved(kept.clone()));
+        store.data.other.insert("game_hosts".to_string(), model::Preserved(serde_json::json!(["play.example"])));
+        store.save().unwrap();
+        let mut reopened = Store::unlock(&path, "pw").unwrap();
+        assert_eq!(reopened.data.other.get("trackers"), Some(&model::Preserved(kept.clone())));
+        // An unrelated edit saves the whole Library: both keys are still there.
+        reopened.add_bookmark("https://example.org/", "Example").unwrap();
+        let again = Store::unlock(&path, "pw").unwrap();
+        assert_eq!(again.data.other.get("trackers"), Some(&model::Preserved(kept)));
+        assert_eq!(again.data.other.get("game_hosts"), Some(&model::Preserved(serde_json::json!(["play.example"]))));
+        assert_eq!(again.bookmarks().len(), 1);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Keys this build knows never land in the map, and a Nabu-X build's
+    /// Game mode sites (no field here) do.
+    #[test]
+    fn known_keys_are_not_kept_twice() {
+        let data: StoreData =
+            serde_json::from_str(r#"{"schema":1,"bookmark_folders":["Work"],"game_hosts":["a.example"],"zzz_new":{"x":1}}"#).unwrap();
+        assert_eq!(data.bookmark_folders, ["Work"]);
+        assert_eq!(data.other.keys().collect::<Vec<_>>(), ["game_hosts", "zzz_new"]);
+        let written = serde_json::to_value(&data).unwrap();
+        assert_eq!(written["zzz_new"], serde_json::json!({"x": 1}));
+        assert_eq!(written["game_hosts"], serde_json::json!(["a.example"]));
+        assert!(!format!("{data:?}").contains("\"x\""), "Debug never prints a kept value");
+    }
+
     // ---- the archive ----------------------------------------------------
 
     /// The archive's blob directory sits beside the store file, so tests
@@ -2878,6 +2937,16 @@ pub const MAX_ARCHIVE_RECORDS: usize = 200;
 pub const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 
 impl Store {
+    /// The Library's data key, for keys derived from it (add-on namespaces).
+    pub(crate) fn data_key(&self) -> &[u8; crypto::KEY_LEN] {
+        &self.key
+    }
+
+    /// Where the store file lives.
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// The blob directory sits beside the store file. Opened on demand
     /// rather than held: it is a path plus a derived key, so constructing
     /// it costs one hash, and a store whose archive directory cannot be

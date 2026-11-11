@@ -60,4 +60,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
         -c rustfmt -c clippy \
     && chmod -R a+w "$RUSTUP_HOME" "$CARGO_HOME"
 
+# cargo-audit for the RustSec gate at the start of the build half of
+# scripts/ci-trixie.sh, which printed "SKIPPED (cargo-audit not installed)"
+# until 2026-11-03 and now fails without it. Pinned and --locked: this exact
+# crate set was first fetched through the host's Socket Firewall guard and
+# built in its sandbox. A docker build has no such guard, so the pin is what
+# keeps the two the same.
+RUN cargo install cargo-audit --version 0.22.2 --locked \
+    && rm -rf "$CARGO_HOME/registry" "$CARGO_HOME/git"
+
 WORKDIR /src

@@ -142,6 +142,33 @@ pub(crate) fn agent(timeout: Duration) -> Result<ureq::Agent, NetError> {
     agent_with_roots(timeout, Roots::Bundled, true)
 }
 
+/// The same strict agent for a request bound for `host` rather than the update
+/// host: bundled roots only, no redirects, the user's tunnel when there is one
+/// (fail closed), else the machine's proxy for THIS host. The add-on CDN uses
+/// it, so a NO_PROXY rule written for one host never decides the other's route.
+pub(crate) fn agent_for(host: &str, timeout: Duration) -> Result<ureq::Agent, NetError> {
+    let mut builder = ureq::AgentBuilder::new()
+        .tls_config(tls_config(Roots::Bundled))
+        .timeout_connect(CONNECT_TIMEOUT)
+        .timeout(timeout)
+        .redirects(0)
+        .user_agent("patanyx");
+    // The same egress rule as `agent_with_roots`: the user's tunnel is the way
+    // out, and one that cannot be expressed is an error, never a direct
+    // connection; with no tunnel, the machine's proxy for THIS host, else direct.
+    if let Some(port) = crate::tunnel_control::engine_proxy_port() {
+        match ureq::Proxy::new(format!("socks5://127.0.0.1:{port}")) {
+            Ok(proxy) => builder = builder.proxy(proxy),
+            Err(e) => return Err(NetError::ProxyUnavailable(e.to_string())),
+        }
+    } else if let Some(proxy_url) = proxy_from_env(host, |k| std::env::var(k).ok()).or_else(|| system_proxy(host)) {
+        if let Ok(proxy) = ureq::Proxy::new(&proxy_url) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    Ok(builder.build())
+}
+
 /// The same strict agent, but with the corporate proxy DELIBERATELY skipped:
 /// a plain direct connection. It exists for one job -- the fallback the
 /// activation caller takes when the configured proxy could not be reached, so a

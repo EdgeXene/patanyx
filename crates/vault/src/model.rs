@@ -109,8 +109,7 @@ pub struct VaultData {
     ///
     /// A plain array rather than `Zeroizing<[u8; 32]>` because `VaultData`
     /// derives `Serialize`/`Deserialize` and zeroize's serde feature is
-    /// deliberately not enabled; `Vault::drop` wipes it instead, exactly
-    /// like passwords and note bodies.
+    /// deliberately not enabled; `VaultData`'s own Drop wipes it instead.
     #[serde(default)]
     pub chat_identity: Option<[u8; 32]>,
     /// Relay configuration. Lives in the vault because it names an identity
@@ -370,13 +369,21 @@ impl VaultData {
     /// Contacts still appear, because the user's own notes about who a hash
     /// number belongs to are exactly the kind of thing an export exists to
     /// preserve — just without the secret.
-    pub fn to_plaintext_export(&self) -> serde_json::Value {
-        serde_json::json!({
+    ///
+    /// SELF-WIPING: this used to return a bare `serde_json::Value`, which held
+    /// its own copy of every password and note body and was dropped unwiped
+    /// once serialized (secscan S-308138676a3f). The value is kept -- its
+    /// sorted maps are what give the file its key order, so the file is byte
+    /// for byte what it was (pinned by a test) -- but wrapped, so every string
+    /// in it is wiped when it drops.
+    pub fn to_plaintext_export(&self) -> PlaintextExport {
+        PlaintextExport(serde_json::json!({
             "schema": self.schema,
             "credentials": self.credentials,
             "notes": self.notes,
             // `Contact`'s own Serialize skips `our_secret`; going through it
-            // rather than ContactBook is what keeps the keys out.
+            // rather than ContactBook is what keeps the keys out. The clones
+            // `list` makes wipe themselves (`Contact` implements Drop).
             "contacts": self.contacts.list(),
             // `tunnel` is not projected at all: its private and preshared
             // keys are key material exactly like the chat secrets.
@@ -388,7 +395,199 @@ impl VaultData {
             "omitted": "Chat and WireGuard tunnel private keys are deliberately \
         not included in a plaintext export. Without them this file cannot be used to \
         impersonate you.",
-        })
+        }))
+    }
+
+    /// Wipes the decrypted contents this data holds in memory: passwords,
+    /// credential usernames, sites and notes, note titles and bodies, the chat
+    /// identity, the tunnel's keys, the licence token and the activation
+    /// receipts. Contacts wipe their own key and note (`Contact` implements
+    /// Drop), and every entry type also wipes itself when dropped alone.
+    pub(crate) fn wipe_secrets(&mut self) {
+        for entry in &mut self.credentials {
+            entry.password.zeroize();
+            entry.note.zeroize();
+            entry.username.zeroize();
+            entry.site.zeroize();
+            if let Some(origin) = &mut entry.origin {
+                origin.zeroize();
+            }
+        }
+        for note in &mut self.notes {
+            note.body.zeroize();
+            note.title.zeroize();
+        }
+        // The identity secret is a plain array with no guard of its own.
+        if let Some(identity) = &mut self.chat_identity {
+            identity.zeroize();
+        }
+        // The tunnel's secret strings have no self-wiping guard either.
+        if let Some(tunnel) = &mut self.tunnel {
+            tunnel.private_key_b64.zeroize();
+            if let Some(preshared) = &mut tunnel.preshared_key_b64 {
+                preshared.zeroize();
+            }
+        }
+        // The licence token is a bearer credential with no guard.
+        if let Some(licence) = &mut self.licence {
+            licence.token_text.zeroize();
+        }
+        for record in &mut self.activation {
+            record.receipt_text.zeroize();
+        }
+    }
+}
+
+/// THE DATA WIPES ITSELF, wherever it is dropped. This used to be done only
+/// by `Vault::drop`, so every other holder of decrypted vault data -- the
+/// export payload's clone, an import still waiting to be installed, a backup
+/// reader dropped on a cancel or an error, an export's read-back -- dropped
+/// passwords and keys unwiped (secscan S-308138676a3f, S-fbff300de5e6). Now
+/// every copy, clone or not, wipes on its way out. Not wiped: serde_json's
+/// own scratch while it parses or grows a buffer, which this crate cannot reach.
+impl Drop for VaultData {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        let held = self.holds_secrets();
+        self.wipe_secrets();
+        // Counted only if the wipe actually left nothing behind, so a test
+        // that watches the count fails if the wipe stops working.
+        #[cfg(test)]
+        if held && !self.holds_secrets() {
+            drop_tests::note_wiped();
+        }
+    }
+}
+
+#[cfg(test)]
+impl VaultData {
+    /// Whether anything `wipe_secrets` wipes is non-empty.
+    pub(crate) fn holds_secrets(&self) -> bool {
+        self.credentials.iter().any(|c| {
+            !c.password.is_empty()
+                || !c.note.is_empty()
+                || !c.username.is_empty()
+                || !c.site.is_empty()
+                || c.origin.as_ref().is_some_and(|o| !o.is_empty())
+        }) || self.notes.iter().any(|n| !n.body.is_empty() || !n.title.is_empty())
+            || self.chat_identity.is_some_and(|k| k != [0u8; 32])
+            || self.tunnel.as_ref().is_some_and(|t| {
+                !t.private_key_b64.is_empty() || t.preshared_key_b64.as_ref().is_some_and(|p| !p.is_empty())
+            })
+            || self.licence.as_ref().is_some_and(|l| !l.token_text.is_empty())
+            || self.activation.iter().any(|r| !r.receipt_text.is_empty())
+    }
+}
+
+/// Counts, per thread, the VaultData values dropped while still holding a
+/// secret -- each of which `wipe_secrets` then wiped -- so a test can see that
+/// a path which used to drop decrypted data unwiped now goes through the wipe.
+#[cfg(test)]
+pub(crate) mod drop_tests {
+    use std::cell::Cell;
+    thread_local! {
+        static WIPED: Cell<usize> = const { Cell::new(0) };
+        static EXPORTS_WIPED: Cell<usize> = const { Cell::new(0) };
+    }
+    pub(crate) fn note_wiped() {
+        WIPED.with(|c| c.set(c.get() + 1));
+    }
+    pub(crate) fn note_export_wiped() {
+        EXPORTS_WIPED.with(|c| c.set(c.get() + 1));
+    }
+    /// How many plaintext exports were dropped and left with no text.
+    pub(crate) fn exports_wiped() -> usize {
+        EXPORTS_WIPED.with(Cell::get)
+    }
+    /// How many have been wiped on this thread so far.
+    pub(crate) fn wiped() -> usize {
+        WIPED.with(Cell::get)
+    }
+}
+
+/// What a plaintext export writes (see `VaultData::to_plaintext_export`):
+/// the JSON value, serialized as itself, with every string in it wiped when
+/// it drops.
+pub struct PlaintextExport(serde_json::Value);
+
+impl Serialize for PlaintextExport {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+impl Drop for PlaintextExport {
+    fn drop(&mut self) {
+        wipe_json(&mut self.0);
+        #[cfg(test)]
+        if !json_holds_text(&self.0) {
+            drop_tests::note_export_wiped();
+        }
+    }
+}
+
+#[cfg(test)]
+fn json_holds_text(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::String(text) => !text.is_empty(),
+        serde_json::Value::Array(items) => items.iter().any(json_holds_text),
+        serde_json::Value::Object(map) => map.values().any(json_holds_text),
+        _ => false,
+    }
+}
+
+// EVERY ENTRY WIPES ITSELF when it drops: a credential or note replaced,
+// deleted (`retain`), or cloned out to the app and dropped there, and an
+// activation receipt filtered away, used to leave the decrypted text in freed
+// memory (secscan S-308138676a3f, review R-001). `VaultData`'s own Drop
+// still wipes the chat identity, which is a plain array.
+impl Drop for CredentialEntry {
+    fn drop(&mut self) {
+        self.password.zeroize();
+        self.note.zeroize();
+        self.username.zeroize();
+        self.site.zeroize();
+        if let Some(origin) = &mut self.origin {
+            origin.zeroize();
+        }
+    }
+}
+
+impl Drop for SecretNote {
+    fn drop(&mut self) {
+        self.body.zeroize();
+        self.title.zeroize();
+    }
+}
+
+impl Drop for ActivationRecord {
+    fn drop(&mut self) {
+        self.receipt_text.zeroize();
+    }
+}
+
+impl Drop for LicenceRecord {
+    fn drop(&mut self) {
+        self.token_text.zeroize();
+    }
+}
+
+impl Drop for TunnelSettings {
+    fn drop(&mut self) {
+        self.private_key_b64.zeroize();
+        if let Some(preshared) = &mut self.preshared_key_b64 {
+            preshared.zeroize();
+        }
+    }
+}
+
+/// Zeroes every string in a JSON value, map keys aside (they are field names).
+fn wipe_json(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(wipe_json),
+        serde_json::Value::Object(map) => map.values_mut().for_each(wipe_json),
+        _ => {}
     }
 }
 
@@ -469,7 +668,9 @@ impl Drop for Contact {
         // A contact's secret is a private key. Wipe every copy — the stored
         // one, the clones `list_contacts` hands out, and the one `remove`
         // returns — not just whichever one the Vault happens to be holding.
+        // The note is the user's own words about the person: wiped too.
         self.our_secret.zeroize();
+        self.note.zeroize();
     }
 }
 
@@ -514,6 +715,15 @@ impl From<&Contact> for ContactRecord {
             created_at: contact.created_at,
             note: contact.note.clone(),
         }
+    }
+}
+
+/// The at-rest copy holds the private key and the note while a contact is
+/// saved or loaded; it wipes both when it drops, like `Contact` does.
+impl Drop for ContactRecord {
+    fn drop(&mut self) {
+        self.our_secret.zeroize();
+        self.note.zeroize();
     }
 }
 
@@ -583,6 +793,8 @@ impl ContactBook {
         match self.contacts.iter_mut().find(|c| c.id == id) {
             Some(contact) => {
                 let trimmed = note.trim();
+                // The old note is wiped before it is replaced.
+                contact.note.zeroize();
                 contact.note = trimmed.chars().take(MAX_NOTE_CHARS).collect();
                 true
             }
@@ -1004,7 +1216,7 @@ mod schema_guard_tests {
         });
         let data: VaultData = serde_json::from_value(json).expect("parses");
         assert_eq!(
-            data.tunnel.expect("tunnel present").address,
+            data.tunnel.as_ref().expect("tunnel present").address,
             Vec::<String>::new()
         );
     }
@@ -1053,5 +1265,108 @@ mod schema_guard_tests {
             !debugged.contains("wGpsk7"),
             "Debug output must never contain the tunnel preshared key"
         );
+    }
+
+    fn data_with_every_secret() -> VaultData {
+        let mut data = VaultData::default();
+        data.credentials.push(CredentialEntry {
+            id: "c1".to_string(),
+            site: "example.com".to_string(),
+            origin: Some("example.com".to_string()),
+            username: "alice".to_string(),
+            password: "hunter2-secret".to_string(),
+            note: "the credential note".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        });
+        data.notes.push(SecretNote {
+            id: "n1".to_string(),
+            title: "title".to_string(),
+            body: "the note body".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        });
+        data.chat_identity = Some([7u8; 32]);
+        data.tunnel = Some(sample_tunnel());
+        data.licence = Some(sample_licence());
+        data.activation.push(sample_activation());
+        data
+    }
+
+    /// Secscan S-308138676a3f / S-fbff300de5e6: the wipe that used to run
+    /// only for a `Vault` empties every secret field of the data itself.
+    #[test]
+    fn wipe_secrets_empties_every_secret_field() {
+        let mut data = data_with_every_secret();
+        assert!(data.holds_secrets());
+        data.wipe_secrets();
+        assert!(data.credentials[0].password.is_empty());
+        assert!(data.notes[0].body.is_empty());
+        assert_eq!(data.chat_identity, Some([0u8; 32]));
+        let tunnel = data.tunnel.as_ref().unwrap();
+        assert!(tunnel.private_key_b64.is_empty());
+        assert_eq!(tunnel.preshared_key_b64.as_deref(), Some(""));
+        assert!(data.licence.as_ref().unwrap().token_text.is_empty());
+        assert!(data.activation[0].receipt_text.is_empty());
+        assert!(!data.holds_secrets());
+        // The rest of the user's own text goes too (plan review finding 8);
+        // ids are not, so the entries can still be told apart.
+        assert!(data.credentials[0].username.is_empty() && data.credentials[0].site.is_empty());
+        assert!(data.credentials[0].note.is_empty());
+        assert_eq!(data.credentials[0].origin.as_deref(), Some(""));
+        assert!(data.notes[0].title.is_empty());
+        assert_eq!(data.credentials[0].id, "c1");
+    }
+
+    /// Every copy wipes as it drops, a clone included -- not only the copy
+    /// a `Vault` holds.
+    #[test]
+    fn every_copy_of_the_data_is_wiped_when_it_drops() {
+        let data = data_with_every_secret();
+        let before = drop_tests::wiped();
+        drop(data.clone());
+        assert_eq!(drop_tests::wiped(), before + 1, "a dropped clone was not wiped");
+        drop(data);
+        assert_eq!(drop_tests::wiped(), before + 2, "the dropped original was not wiped");
+    }
+
+    /// The plaintext export is borrowed now, but the file must not change:
+    /// same keys, same order, same bytes as the `serde_json::Value` it was.
+    #[test]
+    fn the_borrowed_plaintext_export_writes_the_same_bytes_as_before() {
+        let data = data_with_every_secret();
+        let before = serde_json::json!({
+            "schema": data.schema,
+            "credentials": data.credentials,
+            "notes": data.notes,
+            "contacts": data.contacts.list(),
+            "omitted": "Chat and WireGuard tunnel private keys are deliberately \
+        not included in a plaintext export. Without them this file cannot be used to \
+        impersonate you.",
+        });
+        assert_eq!(
+            serde_json::to_vec_pretty(&data.to_plaintext_export()).unwrap(),
+            serde_json::to_vec_pretty(&before).unwrap()
+        );
+        assert_eq!(
+            serde_json::to_vec(&data.to_plaintext_export()).unwrap(),
+            serde_json::to_vec(&before).unwrap()
+        );
+    }
+
+    /// The export's JSON value wipes every string in it, nested ones
+    /// included, and its Drop is what runs that wipe.
+    #[test]
+    fn the_plaintext_export_value_wipes_every_string() {
+        let data = data_with_every_secret();
+        let mut value = data.to_plaintext_export().0.clone();
+        assert!(value.to_string().contains("hunter2-secret"));
+        wipe_json(&mut value);
+        let wiped = value.to_string();
+        assert!(!wiped.contains("hunter2-secret") && !wiped.contains("the note body"), "{wiped}");
+
+        let before = drop_tests::exports_wiped();
+        drop(data.to_plaintext_export());
+        assert_eq!(drop_tests::exports_wiped(), before + 1, "a dropped export was not left empty");
     }
 }

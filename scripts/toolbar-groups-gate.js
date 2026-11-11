@@ -68,6 +68,26 @@ const PLANTS = {
     '    if (g && isFolded(g)) return $("group-" + g);\n',
     "",
   ],
+  // An add-on button (addons.js, runtime) is not found in its group, so a
+  // panel it opened from the folded Tools menu returns the keyboard to it.
+  "js-runtime-member-missed": [
+    "js",
+    "    for (const g of TOOLBAR_GROUP_IDS) if (membersOf(g).includes(id)) return g;\n",
+    "    for (const [g, members] of TOOLBAR_GROUPS) if (members.includes(id)) return g;\n",
+  ],
+  // An add-on button the user took off the toolbar is still drawn on it.
+  "css-hidden-addon-on-row": [
+    "css",
+    ".feature-btn[data-addon-button]:not([data-shown]) {\n  display: none !important;\n}\n",
+    "",
+  ],
+  // An add-on button stays on the row while Tools is folded (the rule the
+  // grouped default removed, 2026-10-22).
+  "css-addon-on-folded-row": [
+    "css",
+    ".feature-btn[data-addon-button]:not([data-shown]) {\n  display: none !important;\n}\n",
+    ".feature-btn[data-addon-button]:not([data-shown]) {\n  display: none !important;\n}\nhtml[data-folded~=\"tools\"] .feature-btn[data-group=\"tools\"][data-addon-button][data-shown]:not([hidden]) {\n  display: flex !important;\n}\n",
+  ],
   // The shield joins a group.
   "html-privacy-grouped": [
     "html",
@@ -384,6 +404,21 @@ check(
     }
   },
 );
+
+check("an add-on button is a Tools member: in its menu while Tools is folded, on the row only by choice", () => {
+  const css = cssSrc.replace(/\/\*[\s\S]*?\*\//g, "");
+  assert(
+    /\.feature-btn\[data-addon-button\]:not\(\[data-shown\]\) \{\s*display: none !important;/.test(css),
+    "an add-on button taken off the toolbar is still drawn on it",
+  );
+  // Since 2026-10-22 (the grouped default) nothing brings an add-on button
+  // back onto the row while Tools is folded: the folded-group rule hides it
+  // like Theme or Chat, and the Tools menu lists it.
+  assert(
+    !/html\[data-folded~="tools"\][^{]*\[data-addon-button\][^{]*\{\s*display: flex/.test(css),
+    "a folded Tools still draws an add-on button on the row",
+  );
+});
 
 // ---- chrome.js in the stub -------------------------------------------------
 //
@@ -1138,6 +1173,128 @@ check("About this site brings an open Tab Activity forward", async () => {
   await flush();
   assert(panel.hidden === false, "About this site closed the open Tab Activity panel");
   global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+});
+
+check("an add-on button is a Tools member: in its menu, its pill, and its focus", async () => {
+  const rb = global.window.__rb;
+  assert(rb.addGroupMember("network", "btn-addon-test-pages") === false, "an add-on joined a group other than Tools");
+  assert(rb.addGroupMember("tools", "btn-theme") === false, "a non-add-on id joined at runtime");
+  assert(rb.addGroupMember("tools", "btn-addon-Bad") === false, "an id outside the pattern joined");
+  const b = global.document.createElement("button");
+  b.id = "btn-addon-test-pages";
+  b.className = "feature-btn";
+  b.dataset.group = "tools";
+  b.setAttribute("data-addon-button", "");
+  b.hidden = false;
+  const label = global.document.createElement("span");
+  label.className = "feature-label";
+  label.textContent = "Test pages";
+  b.appendChild(label);
+  global.$("toolbar").appendChild(b);
+  assert(rb.addGroupMember("tools", b.id) === true, "the add-on button could not join Tools");
+  const section = global.document.createElement("section");
+  section.id = "addon-panel-test-pages";
+  global.document.body.appendChild(section);
+  rb.registerPanel("addon-test-pages", { el: section, button: b, heightPx: 400 });
+  // Fold Tools, through what Rust stores. The button is NOT kept on the
+  // toolbar (no data-shown): only the menu can reach it.
+  global.rbResolve.toolbar_folded_set = { groups: ["saved", "tools"] };
+  global.$("fold-tools").checked = true;
+  global.$("fold-tools")._fire("change");
+  await flush();
+  assert(html().folded === "saved tools", "setup: Tools did not fold: " + html().folded);
+  for (const id of ["btn-theme", "btn-ocr-region"]) global.$(id).hidden = false;
+  const pill = global.$("group-tools");
+  let focused = false;
+  pill.focus = () => {
+    focused = true;
+  };
+  pill._fire("click");
+  await flush();
+  const entries = Array.from(groupMenu().children || []);
+  const entry = entries.find((e) => (e.children || []).some((c) => c.textContent === "Test pages"));
+  assert(entry, "the folded Tools menu does not list the add-on");
+  entry._fire("click");
+  await flush();
+  assert(section.hidden === false, "the add-on's entry did not open its panel");
+  focused = false;
+  global.fireDocument("keydown", { key: "Escape" });
+  await flush();
+  assert(section.hidden === true, "Escape did not close the add-on's panel");
+  assert(focused, "focus did not return to the Tools pill; the add-on's button cannot be seen");
+  // The pill aggregates its members' standing state classes (is-active,
+  // is-warning), as for every built-in member; an open panel is shown by its
+  // button's aria-pressed, never on a pill. This proves the add-on member is
+  // read, not that opening sets the class (review R-007, rejected).
+  b.classList.add("is-active");
+  fireState();
+  assert(pill.classList.contains("is-active"), "the Tools pill does not show the add-on's state");
+  b.classList.remove("is-active");
+  fireState();
+  global.rbResolve.toolbar_folded_set = { groups: ["saved"] };
+  global.$("fold-tools").checked = false;
+  global.$("fold-tools")._fire("change");
+  await flush();
+});
+
+// Plan review 2026-10-22 (F2): where the keyboard goes when an add-on's panel
+// closes, for each place its button can be: on the row (Tools open, shown),
+// in the Tools menu (Tools folded, shown or not), nowhere on screen (Tools
+// open, taken off the row: only Menu > Add-ons reached it).
+check("an add-on's panel hands the keyboard back to what can be seen", async () => {
+  const b = global.$("btn-addon-test-pages");
+  const section = global.$("addon-panel-test-pages");
+  assert(b && section, "setup: the add-on button from the previous check is gone");
+  const watch = (id) => {
+    const el = global.$(id);
+    const box = { hit: false };
+    el.focus = () => {
+      box.hit = true;
+    };
+    return box;
+  };
+  const closeAndSee = async () => {
+    global.fireDocument("keydown", { key: "Escape" });
+    await flush();
+    assert(section.hidden === true, "Escape did not close the add-on's panel");
+  };
+  // Tools open, button shown on the row: back to the button itself.
+  assert(!/\btools\b/.test(html().folded || ""), "setup: Tools is still folded");
+  b.setAttribute("data-shown", "");
+  let own = { hit: false };
+  b.focus = () => {
+    own.hit = true;
+  };
+  global.window.__rb.openPanel ? global.window.__rb.openPanel("addon-test-pages") : b._fire("click");
+  await flush();
+  assert(section.hidden === false, "the add-on's button did not open its panel");
+  await closeAndSee();
+  assert(own.hit, "with Tools open, focus did not return to the add-on's own button");
+  // Tools open, button taken off the row: back to the Menu button.
+  b.removeAttribute("data-shown");
+  const menu = watch("btn-main-menu");
+  b._fire("click");
+  await flush();
+  assert(section.hidden === false, "setup: the panel did not open");
+  await closeAndSee();
+  assert(menu.hit, "a hidden add-on's panel did not return focus to the Menu button");
+  // Tools folded, button shown: off the row now, so back to the Tools pill.
+  b.setAttribute("data-shown", "");
+  global.rbResolve.toolbar_folded_set = { groups: ["tools"] };
+  global.$("fold-tools").checked = true;
+  global.$("fold-tools")._fire("change");
+  await flush();
+  const pill = watch("group-tools");
+  own = { hit: false };
+  b._fire("click");
+  await flush();
+  assert(section.hidden === false, "setup: the panel did not open while folded");
+  await closeAndSee();
+  assert(pill.hit && !own.hit, "with Tools folded, focus went to the add-on's button, which is off the row");
+  global.rbResolve.toolbar_folded_set = { groups: [] };
+  global.$("fold-tools").checked = false;
+  global.$("fold-tools")._fire("change");
   await flush();
 });
 

@@ -453,3 +453,30 @@ fn final_001_a_long_attribute_reopened_many_times_is_refused() {
     assert_eq!(extract(page.as_bytes()), Err(ReaderError::TooComplex));
     assert!(t.elapsed() < std::time::Duration::from_secs(20), "took {:?}", t.elapsed());
 }
+
+#[test]
+fn a_language_switcher_is_not_read_as_the_article() {
+    // Wikipedia's shape: the switcher, in a menu whose classes read as
+    // content, sits in the same container as the text (VM, 2026-10-22).
+    let langs: String = ["af", "ar", "az", "be", "bg", "ca", "cs", "da"]
+        .iter()
+        .map(|l| format!("<li class=\"interlanguage-link\"><a href=\"https://{l}.example.org/x\" hreflang=\"{l}\" lang=\"{l}\">Language {l}</a></li>"))
+        .collect();
+    let page = format!(
+        "<html><body><div id=\"content\" class=\"mw-body\"><h1>Rust</h1>\
+         <div class=\"vector-dropdown mw-portlet-lang\"><div class=\"vector-menu-content\">\
+         <ul class=\"vector-menu-content-list\">{langs}</ul></div>\
+         <div class=\"after-portlet\"><span><a href=\"/edit\">Edit links</a></span></div></div>\
+         <p>{LOREM}</p><p>{LOREM}</p>\
+         <ul><li>First point</li><li>Second point</li><li>Third point</li></ul>\
+         <ul><li><a href=\"/a\">See also one</a></li><li><a href=\"/b\">See also two</a></li><li><a href=\"/c\">See also three</a></li></ul>\
+         </div></body></html>"
+    );
+    let a = extract(page.as_bytes()).unwrap();
+    let t = texts(&a);
+    assert!(t.contains("committee met"), "the article is gone: {t}");
+    assert!(!t.contains("Language af"), "the language switcher was read: {t}");
+    assert!(!t.contains("Edit links"), "the switcher's menu was read: {t}");
+    assert!(t.contains("Third point"), "an ordinary list was dropped: {t}");
+    assert!(t.contains("See also three"), "a list of ordinary links was dropped: {t}");
+}

@@ -237,6 +237,29 @@ fn strip_non_content(doc: &Document) {
     for n in unlikely {
         n.remove_from_parent();
     }
+    // A language switcher: a list whose links are the same page in other
+    // languages (hreflang on nearly every item). Wikipedia's sits inside
+    // classes that read as content ("vector-menu-content"), so the hints
+    // above keep it, and Reader View opened on 59 language names before the
+    // article (VM, 2026-10-22). Only an item's own links are looked at, so
+    // this stays one pass however deeply lists nest.
+    let switchers: Vec<NodeRef> = doc
+        .select("ul, ol")
+        .nodes()
+        .iter()
+        .filter(|list| is_language_switcher(list))
+        .cloned()
+        .collect();
+    for n in switchers {
+        // The menu around it ("Edit links" and the like) goes too, when an
+        // ancestor close by names itself a language control.
+        let menu = n
+            .ancestors_it(Some(4))
+            .filter(|a| a.is_element())
+            .take_while(|a| !matches!(a.node_name().as_deref(), Some("body" | "main" | "article")))
+            .find(|a| hint_of(a).contains("lang"));
+        menu.unwrap_or(n).remove_from_parent();
+    }
     // Inline display:none is how many pages hide print-only or template
     // copies of the text.
     let hidden: Vec<NodeRef> = doc
@@ -258,6 +281,28 @@ fn strip_non_content(doc: &Document) {
     for n in hidden {
         n.remove_from_parent();
     }
+}
+
+/// At least three items, and at least four in five of them holding a link
+/// to another language version of the page.
+fn is_language_switcher(list: &NodeRef) -> bool {
+    let items: Vec<NodeRef> = list
+        .element_children()
+        .into_iter()
+        .filter(|c| c.node_name().as_deref() == Some("li"))
+        .collect();
+    if items.len() < 3 {
+        return false;
+    }
+    let translated = items
+        .iter()
+        .filter(|li| {
+            li.element_children()
+                .iter()
+                .any(|c| c.node_name().as_deref() == Some("a") && c.attr("hreflang").is_some())
+        })
+        .count();
+    translated * 5 >= items.len() * 4
 }
 
 fn hint_of(n: &NodeRef) -> String {

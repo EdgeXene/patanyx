@@ -658,6 +658,16 @@ html[data-folded~="tools"] .feature-btn[data-group="tools"] {
 html[data-folded~="tools"] .feature-btn.group-pill[data-group-pill="tools"] {
   display: flex !important;
 }
+/* Add-on buttons (addons.js builds them from signed data) are Tools members:
+   while Tools is folded (the default) they are in its menu like Theme or
+   Chat, and while Tools is open they sit on the row unless the user took one
+   off it (Customize). Its entry in the Tools menu does not depend on that
+   choice, because the menu lists every member that is not [hidden] and this
+   rule only takes it off the row. (Until 2026-10-22 a shown add-on stayed on
+   the row even with Tools folded; the grouped default puts it in Tools.) */
+.feature-btn[data-addon-button]:not([data-shown]) {
+  display: none !important;
+}
 .group-pill .chev {
   width: 10px;
   height: 10px;
@@ -1249,12 +1259,17 @@ body.loading #url {
    different program.
 
    z-index above the panels (which is what it asks about) and above the
-   scrim, but below nothing else here. Tokens only: three background themes
-   and nine accents render this. */
+   scrim, but below the menu layer, the toolbar while a menu is open and the
+   toasts. STRICTLY above .panel-modal (40): at an equal z-index the later
+   element in the document wins, and a panel built at run time (an add-on's
+   own panel) is appended after this overlay, so its Remove confirmation
+   opened behind the panel with only a sliver of its buttons showing (hand
+   test H-14). Tokens only: three background themes and nine accents render
+   this. */
 #confirm-overlay {
   position: absolute;
   inset: 0;
-  z-index: 40;
+  z-index: 41;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -2923,7 +2938,8 @@ textarea {
 
 /* The feature videos (1.0.5). Informational, in the update banner's
    palette: nothing is wrong, there is something new to see. */
-#tutorial-banner {
+#tutorial-banner,
+#addon-banner {
   display: flex;
   gap: 10px;
   align-items: flex-start;
@@ -2934,10 +2950,12 @@ textarea {
   font-size: 13px;
   line-height: 1.4;
 }
-#tutorial-banner[hidden] {
+#tutorial-banner[hidden],
+#addon-banner[hidden] {
   display: none;
 }
-#tutorial-banner .ico {
+#tutorial-banner .ico,
+#addon-banner .ico {
   flex: none;
   margin-top: 1px;
 }
@@ -5613,6 +5631,7 @@ html {
     #update-banner,
     #engine-floor-warning,
     #tutorial-banner,
+    #addon-banner,
     #resolver-warning,
     #save-password-banner,
     #lock-warning,
@@ -5629,6 +5648,7 @@ html {
     #update-banner,
     #engine-floor-warning,
     #tutorial-banner,
+    #addon-banner,
     #resolver-warning,
     #save-password-banner,
     #lock-warning,
@@ -6032,4 +6052,82 @@ body.page-covers-chrome #confirm-overlay {
 #tutorial-topics button[aria-pressed="true"] {
   border-color: var(--accent, #4f8cff);
   color: var(--tx);
+}
+
+/* The primary action in the Add-ons panel. */
+#addons-panel button.as-primary {
+  background: var(--accent-choice-bg);
+  border-color: var(--accent-choice-border);
+  color: var(--accent-choice-text);
+  font-weight: 600;
+}
+/* Add-on controls share the Vault's form spacing. */
+.addon-controls { border-block: 1px solid var(--border); margin-block: 1rem; padding-block: 1rem; }
+.addon-controls .form-buttons { flex-wrap: wrap; }
+.addon-controls dd, #addon-page-failures { overflow-wrap: anywhere; }
+#addon-manager[hidden] { display: none; }
+
+.addons-section, .addon-row {
+  border-top: 1px solid var(--ln-soft);
+  margin-top: 1rem;
+  padding-top: 1rem;
+}
+/* Add-on cards and each add-on's own panel (addons.js). Lean by design: a
+   name, a pitch line, one primary button, a short status line; the rest sits
+   under More and What's sent. */
+.addon-row-head, .addon-panel-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.addon-row-name {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--tx-bright);
+  cursor: pointer;
+  text-align: left;
+}
+.addon-row-name:hover { text-decoration: underline; }
+.addon-tag {
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid var(--ln-soft);
+  color: var(--tx-dim);
+  white-space: nowrap;
+}
+.addon-row-summary, .addon-panel-summary { margin: 4px 0 8px; color: var(--tx-dim); }
+.addon-row .form-buttons, .addon-panel .form-buttons { flex-wrap: wrap; margin-top: 4px; }
+.addon-row button.as-primary, .addon-panel button.as-primary {
+  background: var(--accent-choice-bg);
+  border-color: var(--accent-choice-border);
+  color: var(--accent-choice-text);
+  font-weight: 600;
+}
+.addon-panel h2 { margin: 0; }
+.addon-panel-state { margin: 4px 0; }
+.addon-panel-meta { margin: 6px 0 0; font-size: 12px; color: var(--tx-dim); }
+.addon-panel-more { margin-top: 14px; }
+.addon-panel-more > summary, .addon-whats-sent > summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: var(--tx-dim);
+}
+.addon-more-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+.addon-more-actions button { font-size: 12px; padding: 3px 9px; }
+.addon-whats-sent { margin-top: 10px; }
+.addon-whats-sent p { margin: 6px 0 0; font-size: 12px; color: var(--tx-dim); }
+.addon-panel h2, .addon-panel p, .addon-panel li, .addon-row p { overflow-wrap: anywhere; }
+#addon-orphans[hidden], #addon-toolbar-choices[hidden] { display: none; }
+.addon-row h4, .addon-row p, .addon-row dd {
+  overflow-wrap: anywhere;
 }

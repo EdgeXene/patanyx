@@ -193,6 +193,34 @@ fn the_version_1_salt_never_travels() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// A restore goes only into a new, empty Library, and a key another build
+/// left there counts: a restore can never replace data some other build
+/// keeps. A restore that does run leaves the kept keys empty (review R-003).
+#[test]
+fn a_restore_never_replaces_another_builds_data() {
+    let src_dir = scratch_dir("kept-keys-source");
+    let source = full_library(&src_dir);
+    let dir = scratch_dir("kept-keys-target");
+    let (mut to, key) = new_library_keyed(&dir);
+    to.data.other.insert("left_by_another_build".into(), crate::model::Preserved(serde_json::json!([1, 2])));
+    to.save().unwrap();
+    let refused = to.begin_restore(validate_backup(source.library_backup()).unwrap());
+    assert!(matches!(refused, Err(BackupError::Invalid(_))));
+    to.data.other.clear();
+    to.save().unwrap();
+    let mut restore = to.begin_restore(validate_backup(source.library_backup()).unwrap()).unwrap();
+    for id in source.backup_picture_ids() {
+        restore.put_picture(&id, &source.backup_picture(&id).unwrap()).unwrap();
+    }
+    restore.commit(Some(&source)).unwrap();
+    let reopened = Store::open(&dir.join("store.rbs"), None, &key).unwrap();
+    assert!(reopened.data.other.is_empty());
+    assert_eq!(reopened.bookmarks().len(), source.bookmarks().len());
+    drop((source, to, reopened));
+    let _ = fs::remove_dir_all(&src_dir);
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn a_restore_only_goes_into_an_empty_library() {
     let src_dir = scratch_dir("nonempty-src");
@@ -735,6 +763,34 @@ fn a_refused_backup_writes_nothing() {
     assert!(!dir.join("archive").exists(), "no picture directory was even created");
     drop(to);
     let _ = fs::remove_dir_all(&src);
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// A PATANYX Nabu-X backup can list sites in Game mode. This build has no
+/// Game mode: it imports such a backup without them, and never writes them.
+/// A PATANYX Nabu-X backup can carry the Assistant's trackers. This build
+/// has none: it imports such a backup without them, and never writes them.
+#[test]
+fn trackers_from_a_nabu_x_backup_are_read_and_not_kept() {
+    let (dir, backup) = valid_backup("nabu-x-trackers");
+    let mut value = serde_json::to_value(&backup).unwrap();
+    assert!(value.get("trackers").is_none(), "this build never writes them");
+    value["trackers"] = serde_json::json!([{"id": "0123456789abcdef0123456789abcdef", "kind": "page", "url": "https://example.com/"}]);
+    let read: LibraryBackup = serde_json::from_value(value).unwrap();
+    assert!(validate_backup(read.clone()).is_ok());
+    assert!(serde_json::to_value(&read).unwrap().get("trackers").is_none());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn game_mode_sites_from_a_nabu_x_backup_are_read_and_not_kept() {
+    let (dir, backup) = valid_backup("nabu-x");
+    let mut value = serde_json::to_value(&backup).unwrap();
+    assert!(value.get("game_hosts").is_none(), "this build never writes them");
+    value["game_hosts"] = serde_json::json!(["play.example.test"]);
+    let read: LibraryBackup = serde_json::from_value(value).unwrap();
+    assert!(validate_backup(read.clone()).is_ok());
+    assert!(serde_json::to_value(&read).unwrap().get("game_hosts").is_none());
     let _ = fs::remove_dir_all(&dir);
 }
 

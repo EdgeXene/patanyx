@@ -146,6 +146,26 @@ else
   echo "  (no DNS UI gate in this tree)"
 fi
 
+echo "=== gate 1c4: every block in the stylesheets is closed ==="
+# A lost closing brace makes the browser swallow every rule after it, silently:
+# the Assistant's rows rendered unstyled for a day because a merge dropped the
+# "}" of the rule before them. Comments and quoted strings are skipped.
+for css in "$CHROME"/*.css; do
+  node -e '
+    const src = require("fs").readFileSync(process.argv[1], "utf8")
+      .replace(/\/\*[\s\S]*?\*\//g, (c) => c.replace(/[^\n]/g, " "))
+      .replace(/"(?:[^"\\\n]|\\.)*"|\x27(?:[^\x27\\\n]|\\.)*\x27/g, (q) => q.replace(/[{}]/g, " "));
+    const open = [];
+    let line = 1;
+    for (const ch of src) {
+      if (ch === "\n") line++;
+      else if (ch === "{") open.push(line);
+      else if (ch === "}" && open.pop() === undefined) { console.error("GATE FAIL: " + process.argv[1] + ":" + line + ": a } with no block open"); process.exit(1); }
+    }
+    if (open.length) { console.error("GATE FAIL: " + process.argv[1] + ": block opened at line " + open.join(", ") + " is never closed"); process.exit(1); }
+    console.log("  ok  " + require("path").basename(process.argv[1]) + ": every block closed");
+  ' "$css"
+done
 # Site permissions. Same guard shape and the same reason: this gate is the only
 # check that the panel's controls are honest -- disabled where nothing enforces
 # them, frames named rather than passed off as the page, and a failed grant not
@@ -1259,9 +1279,9 @@ echo "=== gate 1v: the translation panel a user operates ==="
 # panel itself was untested, and both defects this pins were found by driving
 # it by hand rather than by any check.
 if [ -f scripts/translate-panel-gate.js ]; then
-  if ! grep -q 'id="translate-source"' "$CHROME/index.html"; then
+  if ! grep -q 'id="translate-source"' "$CHROME/index.html" || ! grep -q 'id="translate-manage"' "$CHROME/index.html" || ! grep -q 'id="translate-langs"' "$CHROME/index.html"; then
     echo "GATE FAIL: scripts/translate-panel-gate.js exists but index.html" >&2
-    echo "  has no #translate-source; the panel was removed and this gate" >&2
+    echo "  has no #translate-source, #translate-manage or #translate-langs; this gate" >&2
     echo "  would silently vanish" >&2
     exit 1
   fi
@@ -1379,6 +1399,12 @@ else
 fi
 
 echo
+if ! grep -q 'id="addons-panel"' "$CHROME/index.html" || ! grep -q 'id="addon-known-list"' "$CHROME/index.html"; then
+  echo "GATE FAIL: Add-ons panel or known add-on list is missing" >&2
+  exit 1
+fi
+node scripts/addon-manager-gate.js
+
 echo "CHROME JS OK"
 
 echo
