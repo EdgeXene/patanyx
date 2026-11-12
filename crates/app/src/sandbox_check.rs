@@ -449,7 +449,7 @@ mod tests {
     /// code (code review 2026-10-12, R-002).
     #[test]
     fn startup_runs_the_check_and_a_refusal_has_its_own_exit() {
-        let main = include_str!("main.rs");
+        let main = include_str!("lib.rs");
         let floor = main.find("    enforce_engine_floor();").expect("engine floor");
         // After a pending update has had its chance (release review
         // 2026-10-12, R-001), before the event loop and the first webview.

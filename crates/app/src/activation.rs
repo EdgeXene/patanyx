@@ -358,26 +358,45 @@ fn certificate_failure_kind(error: &rustls::Error) -> FailureKind {
 /// `(status, json)` pair or a typed `CallFailure`. Factored out so the caller
 /// can try one agent, read the FAILURE KIND, and decide whether a second agent
 /// is worth trying.
+///
+/// THE BODY IS SEALED (premium_seal.rs): the token and device id travel
+/// encrypted to the licence server's own key, and the answer (a receipt) comes
+/// back sealed to this call's one-time key. Nothing is ever sent in clear, and
+/// an answer that does not open is a failed call, never read as clear JSON.
 #[cfg(feature = "updater-net")]
 fn send_once(
     agent: &ureq::Agent,
     url: &str,
+    path: &str,
     body: &Value,
 ) -> Result<(u16, Value), CallFailure> {
+    use std::io::Read as _;
+    let clear = zeroize::Zeroizing::new(body.to_string());
+    let sealed = crate::premium_seal::seal(path, clear.as_bytes())
+        .map_err(|_| CallFailure::offline("could not seal the request"))?;
     let sent = agent
         .post(url)
         .set("Content-Type", "application/json")
-        .send_string(&body.to_string());
+        .send_bytes(&sealed.wire);
     let (status, response) = match sent {
         Ok(response) => (response.status(), response),
         Err(ureq::Error::Status(code, response)) => (code, response),
         Err(ureq::Error::Transport(t)) => return Err(CallFailure::from_transport(t)),
     };
-    let text = response
-        .into_string()
+    let mut wire = Vec::new();
+    response
+        .into_reader()
+        .take(crate::premium_seal::MAX_SEALED_RESPONSE as u64 + 1)
+        .read_to_end(&mut wire)
         .map_err(CallFailure::from_response_io)?;
+    if wire.len() > crate::premium_seal::MAX_SEALED_RESPONSE {
+        return Err(CallFailure::offline("answer too large"));
+    }
+    let opened = sealed
+        .open(status, &wire)
+        .map_err(|_| CallFailure::offline("the answer was not sealed by the licence server"))?;
     let value: Value =
-        serde_json::from_str(&text).map_err(|_| CallFailure::offline("non-JSON answer"))?;
+        serde_json::from_slice(&opened).map_err(|_| CallFailure::offline("non-JSON answer"))?;
     Ok((status, value))
 }
 
@@ -396,32 +415,34 @@ fn send_once(
 /// refusal (`Intercepted`/`OtherCertificate`) means the connection reached a
 /// proxy that re-signs TLS: retrying direct cannot help on that network, and
 /// more importantly the honest "something is inspecting this connection" answer
-/// must stand rather than being buried under a second failure. The token is
-/// never sent to such a proxy -- `Roots::Bundled` refused it -- and it is not
-/// sent direct either, because we stop.
+/// must stand rather than being buried under a second failure. Since 1.1.1 a
+/// proxy the machine trusts no longer refuses the call at all (the body is
+/// sealed, premium_seal.rs); this refusal is left for a certificate the machine
+/// itself does not trust, and the token is never sent in clear either way.
 ///
 /// The user-tunnel path takes no fallback at all: the tunnel is the chosen
 /// egress and bypassing it would defeat the privacy the user asked for.
 #[cfg(feature = "updater-net")]
 fn post_json_blocking(route: &str, body: &Value) -> Result<(u16, Value), CallFailure> {
     use std::time::Duration;
-    let url = format!("{}/premium/{route}", licence_origin());
+    let path = format!("/premium/{route}");
+    let url = format!("{}{path}", licence_origin());
     let timeout = Duration::from_secs(20);
 
     if crate::tunnel_control::engine_proxy_port().is_some() {
-        let agent = crate::net::agent(timeout).map_err(CallFailure::from_net_error)?;
-        return send_once(&agent, &url, body);
+        let agent = crate::net::sealed_premium_agent(timeout, false).map_err(CallFailure::from_net_error)?;
+        return send_once(&agent, &url, &path, body);
     }
 
-    let agent = crate::net::agent(timeout).map_err(CallFailure::from_net_error)?;
-    match send_once(&agent, &url, body) {
+    let agent = crate::net::sealed_premium_agent(timeout, false).map_err(CallFailure::from_net_error)?;
+    match send_once(&agent, &url, &path, body) {
         Err(why) if retry_direct_after(why.kind) => {
             // The first attempt could not connect. If a proxy was in play it may
             // be stale/unreachable; retry with the proxy deliberately skipped.
             // (When no proxy was configured this simply reattempts direct, which
             // is harmless -- it only happens on an already-failing call.)
-            let direct = crate::net::agent_direct(timeout).map_err(CallFailure::from_net_error)?;
-            send_once(&direct, &url, body)
+            let direct = crate::net::sealed_premium_agent(timeout, true).map_err(CallFailure::from_net_error)?;
+            send_once(&direct, &url, &path, body)
         }
         other => other,
     }
@@ -447,11 +468,12 @@ fn post_json_blocking(_route: &str, _body: &Value) -> Result<(u16, Value), CallF
 /// Which failed-call copy applies: the request's carrier could not reach the
 /// service, or TLS refused the peer certificate.
 ///
-/// The activation call accepts only the compiled-in roots (`net::agent`,
-/// `Roots::Bundled`) and deliberately never falls back to the operating
-/// system's store the way the signature-protected updater may. On a network
-/// that re-signs TLS with a private root -- an ordinary corporate proxy --
-/// the handshake therefore fails, and the old copy told the user PATANYX
+/// Before 1.1.1 the activation call accepted only the compiled-in roots and
+/// never the operating system's store; since 1.1.1 its body is sealed
+/// (premium_seal.rs) and it uses the OS store, so a certificate failure now
+/// means one the machine itself does not trust. On a network that re-signs
+/// TLS with a root the machine does not hold, the handshake fails, and the
+/// old copy told the user PATANYX
 /// "could not reach EdgeXene" and would try again. Both halves were wrong:
 /// EdgeXene was reachable, and retrying can never succeed, because nothing
 /// about a retry changes the trust decision. The user retries forever.
@@ -1115,46 +1137,37 @@ mod tests {
         assert_eq!(refusal_code("something_new"), "refused");
     }
 
-    /// ACTIVATION MUST NEVER ACCEPT AN INTERCEPTED CONNECTION.
+    /// ACTIVATION NEVER SENDS THE TOKEN IN CLEAR.
     ///
-    /// The update and blocklist channels may fall back to the OS trust store,
-    /// because their integrity rests on the compiled-in Ed25519 key rather
-    /// than on TLS (see `net::Roots`, security audit 2026-08-18, F21). This
-    /// request is the opposite case: it SENDS the licence token and this
-    /// install's device id, so TLS confidentiality is the whole protection
-    /// and no signature can recover a secret already handed to a proxy.
+    /// It sends the licence token and this install's device id. Until 1.1.1 it
+    /// kept them from a TLS-inspecting proxy by refusing every certificate but
+    /// the compiled-in roots, which also meant Premium could not activate on a
+    /// managed work network at all. Since 1.1.1 the body is SEALED to the
+    /// licence server's own key (premium_seal.rs), and only because of that it
+    /// may trust the machine's roots, so activation works on such a network
+    /// with nothing to set up.
     ///
-    /// Reading the source is the only way to state "this function is not
-    /// called here" as a test. Same idiom as privacy.rs's zero-channels
-    /// check. If activation ever legitimately needs the relaxed agent, that
-    /// is a decision to argue for in a commit message, not a line to slip in.
+    /// So the property is: every send in the shipped half goes through the
+    /// seal, and the relaxed signature-only agent (whose callers send nothing
+    /// secret) is never used here. Reading the source is the only way to state
+    /// "this is not called here" as a test (same idiom as privacy.rs).
     #[test]
-    fn activation_never_reaches_for_the_relaxed_agent() {
-        // ONLY THE SHIPPED HALF. The test module below necessarily names the
-        // function it is asserting the absence of, which would match itself --
-        // the same self-match the export guard avoids by excluding its own
-        // file. Everything above `#[cfg(test)]` is what is compiled into the
-        // binary, and that is what this is about.
+    fn activation_only_ever_sends_a_sealed_body() {
+        // ONLY THE SHIPPED HALF: the test module names what it forbids.
         let source = include_str!("activation.rs");
         let shipped = source
             .split_once("#[cfg(test)]")
             .map(|(before, _)| before)
             .unwrap_or(source);
-        let needle = concat!("agent_accepting", "_os_roots");
-        let calls: Vec<&str> = shipped
-            .lines()
-            .filter(|l| l.contains(needle))
-            .filter(|l| !l.trim_start().starts_with("//"))
-            .collect();
-        assert!(
-            calls.is_empty(),
-            "activation must use only the strict agent; found: {calls:?}"
-        );
-        // And it does still build one, or it would not be talking to anything.
-        assert!(
-            shipped.contains("crate::net::agent("),
-            "the activation call lost its agent entirely"
-        );
+        let code: Vec<&str> = shipped.lines().filter(|l| !l.trim_start().starts_with("//")).collect();
+        let has = |needle: &str| code.iter().any(|l| l.contains(needle));
+        assert!(!has(concat!("agent_accepting", "_os_roots")), "the signature-only agent is not for a token");
+        for clear in [concat!(".send_", "string("), concat!(".send_", "json("), concat!(".send_", "form(")] {
+            assert!(!has(clear), "a clear send ({clear}) is back in activation");
+        }
+        assert!(has("premium_seal::seal("), "activation stopped sealing its body");
+        assert!(has(".send_bytes(&sealed.wire)"), "activation sends something other than the sealed wire");
+        assert!(has("sealed_premium_agent("), "the activation call lost its agent");
     }
 
     /// Only certificate failures that fit re-signing may accuse the network.

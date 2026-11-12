@@ -46,7 +46,12 @@ const check = (name, condition, detail) => {
 };
 
 const windowsRs = stripComments(read("crates/app/src/platform/windows.rs"));
-const mainRs = stripComments(read("crates/app/src/main.rs"));
+// BOTH files: the app moved into lib.rs on 2026-10-30 and main.rs became a
+// launcher. A pin that FORBIDS something must read both, or the file it skips
+// is a place the forbidden call could hide.
+const mainRs = stripComments(
+  read("crates/app/src/lib.rs") + "\n" + read("crates/app/src/main.rs"),
+);
 const chromeJs = read("crates/app/src/chrome/chrome.js");
 
 check(
@@ -59,7 +64,7 @@ check(
 check(
   "no wry drag-drop handler",
   !/with_drag_drop_handler\s*\(/.test(mainRs),
-  "main.rs sets a wry drag-drop handler, which revokes the engine's own drop " +
+  "lib.rs or main.rs sets a wry drag-drop handler, which revokes the engine's own drop " +
     "target and kills in-page dragging.",
 );
 

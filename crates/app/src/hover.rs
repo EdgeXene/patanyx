@@ -13,7 +13,7 @@
 /// most needs -- the path they are about to open -- and a readout that always
 /// ends in "..." tells them the host they could already see and hides the bit
 /// they could not. Chosen to fit a narrow window without wrapping.
-const MAX_DISPLAY_CHARS: usize = 110;
+pub(crate) const MAX_DISPLAY_CHARS: usize = 110;
 
 /// Characters that can make a hostile URL read as a different site.
 ///

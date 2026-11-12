@@ -26,6 +26,7 @@ IMAGE="${IMAGE:-debian:13}"
 # separate data directories and therefore two separate vaults, which is a
 # much easier way to lose credentials than to gain anything.
 FEATURES="${FEATURES:-}"
+bash scripts/refuse-test-only-features.sh "$FEATURES"
 export FEATURES
 docker run --rm --privileged -v "$PWD":/src -e FEATURES "$IMAGE" bash -c '
   set -euo pipefail

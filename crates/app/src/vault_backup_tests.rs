@@ -941,7 +941,7 @@ fn a_failed_import_over_an_unfinished_one_killed_during_rollback_lets_it_finish(
 /// Round 3, R-005: the import killed at any step AND the recovery that
 /// follows killed at any of its own steps; a third open still leaves one
 /// whole profile. Re-runs the import once per pair of steps, so it is
-/// ignored in ordinary runs: `cargo test -p patanyx --bin patanyx --
+/// ignored in ordinary runs: `cargo test -p patanyx --lib --
 /// --ignored killed_twice`.
 #[test]
 #[ignore]
@@ -1161,7 +1161,7 @@ fn a_missing_staged_picture_folder_is_never_taken_as_already_moved() {
 /// R-004: the round-trip contract at the Deep Recall picture total. Pictures
 /// the store's own API accepts must export into a backup this build imports,
 /// or the export must refuse. About 256 MB of pictures, so it is ignored in
-/// ordinary runs: `cargo test -p patanyx --bin patanyx -- --ignored
+/// ordinary runs: `cargo test -p patanyx --lib -- --ignored
 /// at_the_picture_total`.
 #[test]
 #[ignore]

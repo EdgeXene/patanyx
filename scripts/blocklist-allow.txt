@@ -253,7 +253,7 @@ mail.com                # 4845  major free webmail provider. A mailbox host is
                         #       adjudication, 2026-08-14.
 
 # --- First-party hosts, 2026-08-15 -----------------------------------------
-# The browser opens patanyx.com on a plain launch (crates/app/src/main.rs,
+# The browser opens patanyx.com on a plain launch (crates/app/src/lib.rs,
 # HOME_URL) and links to patanyx.net from its own chrome. A feed that ever
 # reported either would make the browser refuse its own front page on every
 # start. Neither is phishing by construction: we operate both. Exact-match

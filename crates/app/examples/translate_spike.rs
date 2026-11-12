@@ -97,12 +97,12 @@ fn csp_header() -> Option<&'static str> {
 /// refuses to run on a tester's laptop because it cannot find main.rs
 /// would be a worse instrument than one that says what it could not check.
 fn check_csp_drift() -> &'static str {
-    match std::fs::read_to_string("crates/app/src/main.rs") {
+    match std::fs::read_to_string("crates/app/src/lib.rs") {
         Ok(src) => {
             if src.contains(PRODUCTION_CSP) {
-                "matches main.rs"
+                "matches lib.rs"
             } else {
-                "DRIFTED from main.rs"
+                "DRIFTED from lib.rs"
             }
         }
         Err(_) => "unchecked (source not present)",

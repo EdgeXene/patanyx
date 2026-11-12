@@ -9738,7 +9738,7 @@ mod tests {
     const UNIX: &str = include_str!("platform/unix.rs");
     const WINDOWS: &str = include_str!("platform/windows.rs");
     const STATE: &str = include_str!("state.rs");
-    const MAIN: &str = include_str!("main.rs");
+    const MAIN: &str = include_str!("lib.rs");
     const IPC: &str = include_str!("ipc.rs");
 
     /// The right-click menu converts through the window the controller's

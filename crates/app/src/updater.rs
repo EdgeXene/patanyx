@@ -2296,8 +2296,9 @@ pub(crate) mod net {
     /// SAFE FOR THIS FEED AND NO OTHER: manifests and payloads rest on the
     /// compiled-in Ed25519 key and a sha256 and length from the signed
     /// manifest, not on TLS -- a proxy that can read this connection still
-    /// cannot forge a pack that verifies. The activation call carries a licence
-    /// token, has no such signature, and keeps using `crate::net::agent` only.
+    /// cannot forge a pack that verifies. The Premium calls carry a licence
+    /// token and use their own sealed path instead (premium_seal.rs,
+    /// `net::sealed_premium_agent`), never this one.
     fn call_strict_then_os_roots(
         url: &str,
         timeout: Duration,

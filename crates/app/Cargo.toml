@@ -1,8 +1,18 @@
 [package]
 name = "patanyx"
-version = "1.1.0"
+version = "1.1.1"
 license = "Apache-2.0"
 edition = "2021"
+
+# The app is a library with a one-line launcher (src/main.rs) so the fuzz
+# workspace can reach its own parsers. Named apart from the `patanyx` binary so
+# the two outputs never collide. Doctests OFF, deliberately: the app's doc
+# comments are prose with code fences full of JSON, shell and logs, written when
+# nothing compiled them, and they are not examples to run.
+[lib]
+name = "patanyx_app"
+path = "src/lib.rs"
+doctest = false
 
 # Two builds from one source tree. The published browser is the default build
 # and does not contain the chat code at all — this is a compile-time feature,
@@ -70,6 +80,11 @@ updater-net = ["dep:ureq", "dep:rustls", "dep:rustls-native-certs", "dep:webpki-
 # 2.54.0, and warns with the engine banner in between. See
 # platform::COMPILED_WEBKITGTK_FLOOR. Never on by default, never on Windows.
 linux-bridge = []
+# The `fuzz_api` module (end of lib.rs): pass-throughs to the app's own parsers
+# for the fuzz workspace. A TEST SURFACE, like premium-unlocked: never in
+# `default`, never in a build offered to users. scripts/fuzz-api-gate.sh proves
+# the module is absent without this flag and that no release command enables it.
+fuzz-api = []
 
 [dependencies]
 wry = { version = "0.55", features = ["devtools"] }
@@ -130,6 +145,12 @@ zeroize = "1"
 # start (privacy.rs). Same version chacha20poly1305's OsRng already resolves
 # in Cargo.lock, so this adds a direct edge, not a new crate.
 getrandom = "0.2"
+# Sealed Premium calls (premium_seal.rs): the token and device id travel sealed
+# to the licence server's own key, so a TLS-inspecting network sees only
+# ciphertext. The same versions patanyx-chat already resolves in Cargo.lock.
+x25519-dalek = { version = "2", features = ["static_secrets", "zeroize"] }
+chacha20poly1305 = "0.10"
+hkdf = "0.12"
 patanyx-chat = { path = "../chat", optional = true }
 # The updater's HTTP GET, behind `updater-net`. default-features = false
 # drops gzip/cookies/json/charset; `tls` is ureq 2.x's rustls backend, and

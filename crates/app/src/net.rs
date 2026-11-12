@@ -83,12 +83,14 @@ impl std::fmt::Display for NetError {
 /// check happening -- which is exactly what it already does today by making
 /// the connection fail.
 ///
-/// THE ACTIVATION CALL MUST NEVER FALL BACK. It sends the licence token and
-/// this install's device id, and there TLS confidentiality is the whole
-/// protection: a proxy that terminates the connection reads a paying user's
-/// bearer token. No signature saves that, because the secret is in the
-/// request rather than the response. It is better for activation to fail on
-/// an intercepted network and be done at home.
+/// A CLEAR TOKEN NEVER FALLS BACK. A call that sends the licence token and
+/// this install's device id in clear relies on TLS confidentiality alone: a
+/// proxy that terminates the connection reads a paying user's bearer token,
+/// and no signature saves that, because the secret is in the request. So such
+/// a call keeps `Roots::Bundled`. Since 1.1.1 the Premium calls do not send it
+/// in clear: their bodies are sealed to the licence server's own key and their
+/// answers sealed back (premium_seal.rs), which is what lets them, and only
+/// them, use the OS store through `sealed_premium_agent`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Roots {
     /// Compiled-in Mozilla roots only.
@@ -142,13 +144,21 @@ pub(crate) fn agent(timeout: Duration) -> Result<ureq::Agent, NetError> {
     agent_with_roots(timeout, Roots::Bundled, true)
 }
 
-/// The same strict agent for a request bound for `host` rather than the update
-/// host: bundled roots only, no redirects, the user's tunnel when there is one
-/// (fail closed), else the machine's proxy for THIS host. The add-on CDN uses
-/// it, so a NO_PROXY rule written for one host never decides the other's route.
-pub(crate) fn agent_for(host: &str, timeout: Duration) -> Result<ureq::Agent, NetError> {
+/// The add-on CDN agent that also accepts the operating system's roots, so an
+/// add-on downloads on a network that re-signs TLS. What it carries is a
+/// short-lived download pass for one release, never the Premium token, and
+/// every file is checked against the Ed25519-signed index before use; the
+/// pass itself arrived sealed (premium_seal.rs).
+pub(crate) fn agent_for_accepting_os_roots(host: &str, timeout: Duration) -> Result<ureq::Agent, NetError> {
+    agent_for_with_roots(host, timeout, Roots::OperatingSystem)
+}
+
+/// No redirects, the user's tunnel when there is one (fail closed), else the
+/// machine's proxy for THIS host, so a NO_PROXY rule written for one host never
+/// decides another's route.
+fn agent_for_with_roots(host: &str, timeout: Duration, roots: Roots) -> Result<ureq::Agent, NetError> {
     let mut builder = ureq::AgentBuilder::new()
-        .tls_config(tls_config(Roots::Bundled))
+        .tls_config(tls_config(roots))
         .timeout_connect(CONNECT_TIMEOUT)
         .timeout(timeout)
         .redirects(0)
@@ -169,16 +179,16 @@ pub(crate) fn agent_for(host: &str, timeout: Duration) -> Result<ureq::Agent, Ne
     Ok(builder.build())
 }
 
-/// The same strict agent, but with the corporate proxy DELIBERATELY skipped:
-/// a plain direct connection. It exists for one job -- the fallback the
-/// activation caller takes when the configured proxy could not be reached, so a
-/// stale proxy setting (a Zscaler entry that lingers in the registry after the
-/// laptop moves onto a home network or a phone hotspot) can never strand a
-/// connection that would have worked direct. It keeps `Roots::Bundled`, so it
-/// is no weaker than the proxy path it backs up, and it is used ONLY when there
-/// is no user tunnel -- the tunnel's egress is never bypassed.
-pub(crate) fn agent_direct(timeout: Duration) -> Result<ureq::Agent, NetError> {
-    agent_with_roots(timeout, Roots::Bundled, false)
+/// The agent for a SEALED Premium call (premium_seal.rs): the operating
+/// system's roots and, unless `direct`, the machine's proxy. Its body is
+/// sealed to the licence server's own key and its answer sealed back to the
+/// call's one-time key, so a network that re-signs TLS (Zscaler) reads only
+/// ciphertext; that, and nothing weaker, is why these calls may trust what
+/// the machine trusts, so every Premium call works on such a network with
+/// nothing to set up. A caller that sends a
+/// Premium token or device id in clear must keep `agent`.
+pub(crate) fn sealed_premium_agent(timeout: Duration, direct: bool) -> Result<ureq::Agent, NetError> {
+    agent_with_roots(timeout, Roots::OperatingSystem, !direct)
 }
 
 /// The retry an intercepted network needs, for the signature-protected
@@ -219,14 +229,12 @@ fn agent_with_roots(
         // and activation reports `offline` forever; honoring the machine's own
         // proxy is what lets it REACH EdgeXene.
         //
-        // This does NOT weaken the token. Activation keeps `Roots::Bundled`, so
-        // the certificate is still judged against the compiled-in Mozilla roots
-        // END TO END. A proxy that merely forwards the TLS (CONNECT) passes it
-        // through untouched and EdgeXene's real chain validates; a proxy that
-        // terminates and re-signs is `UnknownIssuer` and refused, exactly as a
-        // direct intercepted connection is today -- the bearer token is never
-        // handed to the middle. The proxy learns only that this IP spoke to the
-        // licence host, which on a managed network it already sees.
+        // This does NOT weaken the token. With `Roots::Bundled` a proxy that
+        // terminates and re-signs TLS is `UnknownIssuer` and refused; with the
+        // OS store (the sealed Premium calls) it is accepted but reads only a
+        // body sealed to the licence server's own key. Either way the bearer
+        // token is never handed to the middle. The proxy learns that this IP
+        // spoke to the licence host, which on a managed network it already sees.
         //
         // An unparseable value falls through to direct rather than erroring:
         // unlike the tunnel above, this is a reachability aid, not a privacy

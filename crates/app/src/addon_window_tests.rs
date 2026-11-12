@@ -114,14 +114,14 @@ fn the_shortcut_reopens_only_the_debug_development_add_on() {
     assert!(!shortcut.contains("open(app"));
     let before = source.split("fn dev_open_bundle(").next().unwrap();
     assert!(before.trim_end().ends_with("#[cfg(debug_assertions)]"));
-    assert!(include_str!("main.rs").contains("Shortcut::ToggleAddon => addon_host::shortcut(&mut app)"));
+    assert!(include_str!("lib.rs").contains("Shortcut::ToggleAddon => addon_host::shortcut(&mut app)"));
 }
 
 #[test]
 fn the_site_check_runs_after_every_event_beside_the_premium_recheck() {
     // After every event, not per hook: closing the active tab reassigns
     // `active` without `set_active` (state.rs), so only this covers it.
-    let main = include_str!("main.rs");
+    let main = include_str!("lib.rs");
     assert!(main.contains("addon_host::site_check(&app);\n        addon_host::theme_check(&app);\n        // Live Premium"));
     // A theme change reaches an open window from both setters.
     let ipc = include_str!("ipc.rs");

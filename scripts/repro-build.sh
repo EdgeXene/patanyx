@@ -59,6 +59,7 @@ fi
 
 # --locked: the lockfile is an input to the binary. Resolving a fresh dependency
 # version mid-build would change the output while the source looked untouched.
+bash scripts/refuse-test-only-features.sh "$*"
 cargo build --release --locked "$@"
 
 # Honour CARGO_TARGET_DIR. Hardcoding target/release meant that when the caller

@@ -76,7 +76,7 @@ fn delete_waits_for_quiescence_without_blocking_the_caller() {
     ] {
         assert!(wait_for_quiescence(action, false));
     }
-    let source = include_str!("main.rs");
+    let source = include_str!("lib.rs");
     for event in [
         "AddonIpc {",
         "AddonStorageDone {",

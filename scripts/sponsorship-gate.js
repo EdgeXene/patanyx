@@ -18,7 +18,7 @@ const sponsorshipRs = fs.readFileSync(
   "utf8",
 );
 const ipcRs = fs.readFileSync(path.join(root, "crates/app/src/ipc.rs"), "utf8");
-const mainRs = fs.readFileSync(path.join(root, "crates/app/src/main.rs"), "utf8");
+const mainRs = fs.readFileSync(path.join(root, "crates/app/src/lib.rs"), "utf8");
 const licenceRs = fs.readFileSync(
   path.join(root, "crates/app/src/licence_control.rs"),
   "utf8",

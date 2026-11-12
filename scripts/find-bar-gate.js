@@ -93,7 +93,7 @@ check("Ctrl+F takes keyboard focus off the page, not just the caret", () => {
   // wiring: the shortcut must go through the state method that focuses the
   // chrome widget first, never a bare emit.
   const main = fs.readFileSync(
-    path.join(__dirname, "..", "crates/app/src/main.rs"),
+    path.join(__dirname, "..", "crates/app/src/lib.rs"),
     "utf8",
   );
   const arm = main.slice(

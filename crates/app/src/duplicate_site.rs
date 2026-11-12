@@ -931,7 +931,7 @@ mod tests {
 mod wiring {
     const STATE_RS: &str = include_str!("state.rs");
     const IPC_RS: &str = include_str!("ipc.rs");
-    const MAIN_RS: &str = include_str!("main.rs");
+    const MAIN_RS: &str = include_str!("lib.rs");
     const CHAT_PANEL_RS: &str = include_str!("chat_panel.rs");
 
     /// The code from `start` to the first `end` after it, comment lines

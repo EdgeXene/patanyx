@@ -117,6 +117,10 @@ if [ "$smoke_status" -ne 0 ]; then
   exit 1
 fi
 token="$(awk -F= '/^TOKEN_TEXT=/{print $2}' "$work/smoke.log")"
+# The throwaway server's sealed-request key: a debug app takes it in place of
+# the pinned production key (premium_seal.rs), so activation seals to it.
+seal_pub="$(awk -F= '/^SEAL_PUBKEY_HEX=/{print $2}' "$work/smoke.log")"
+[ ${#seal_pub} = 64 ] || { echo "PREMIUM E2E FAIL: the smoke printed no sealed-request key" >&2; exit 1; }
 [ "$(awk -F= '/^PUBKEY_HEX=/{print $2}' "$work/smoke.log")" = "$pubkey" ] || {
   echo "PREMIUM E2E FAIL: detached smoke used a different key" >&2; exit 1; }
 [ -n "$token" ] && [ ${#pubkey} = 64 ] || { echo "PREMIUM E2E FAIL: no token/pubkey from the smoke" >&2; exit 1; }
@@ -159,6 +163,7 @@ cargo build --quiet --manifest-path "$detached_browser/Cargo.toml" \
   --target-dir "$throwaway_target"
 throwaway_bin="$throwaway_target/debug/patanyx"
 if ! XDG_DATA_HOME="$data2" PATANYX_SMOKE_LICENCE_TOKEN="$token" PATANYX_LICENCE_ORIGIN="http://127.0.0.1:$smoke_port" \
+     PATANYX_SEAL_PUBLIC_KEY="$seal_pub" \
      xvfb-run -a --server-args="-screen 0 1280x900x24" "$throwaway_bin" --smoke-test > "$work/throwaway.log" 2>&1; then
   echo "PREMIUM E2E FAIL: smoke with the throwaway token on the throwaway ring" >&2; tail -20 "$work/throwaway.log" >&2; exit 1; fi
 grep -q "SMOKE OK" "$work/throwaway.log" || { echo "PREMIUM E2E FAIL: throwaway run did not print SMOKE OK" >&2; tail -20 "$work/throwaway.log" >&2; exit 1; }

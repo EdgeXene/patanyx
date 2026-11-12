@@ -309,14 +309,51 @@ struct Http {
 #[cfg(feature = "updater-net")]
 impl Http {
     fn new() -> Result<Self, DeliveryError> {
-        // No updater fallback: these requests carry a bearer credential or a pass.
+        // The licence calls carry the token and device id SEALED to the
+        // licence server's own key and get their answers sealed back
+        // (premium_seal.rs), so they may trust the machine's roots and work on
+        // a network that re-signs TLS. The CDN carries only a short-lived pass
+        // that arrived sealed, and every file is checked against the signed
+        // index. So every Premium call works on such a network.
         let cdn_host = crate::state::host_of(&addon_cdn_origin()).ok_or(DeliveryError::InvalidRequest)?;
         Ok(Self {
-            agent: crate::net::agent(REQUEST_TIMEOUT).map_err(|_| DeliveryError::Transport)?,
-            cdn: crate::net::agent_for(&cdn_host, REQUEST_TIMEOUT).map_err(|_| DeliveryError::Transport)?,
+            agent: crate::net::sealed_premium_agent(REQUEST_TIMEOUT, false).map_err(|_| DeliveryError::Transport)?,
+            cdn: crate::net::agent_for_accepting_os_roots(&cdn_host, REQUEST_TIMEOUT)
+                .map_err(|_| DeliveryError::Transport)?,
         })
     }
 }
+/// The licence server's sealed answer, opened. A front-server rate limit or
+/// unknown route (an HTML 429 or 404 from nginx, never sealed) keeps its plain
+/// body, which `receive` reads only as "rate limited" or "not found"; any other
+/// answer that does not open is a failed call, never read as clear JSON.
+#[cfg(feature = "updater-net")]
+fn open_sealed(sealed: &crate::premium_seal::Sealed, response: ureq::Response) -> Result<Response, DeliveryError> {
+    let status = response.status();
+    let retry_after = response.header("Retry-After").and_then(|s| s.parse().ok());
+    let mut wire = Vec::new();
+    response
+        .into_reader()
+        .take(crate::premium_seal::MAX_SEALED_RESPONSE as u64 + 1)
+        .read_to_end(&mut wire)
+        .map_err(|_| DeliveryError::Transport)?;
+    if wire.len() > crate::premium_seal::MAX_SEALED_RESPONSE {
+        return Err(DeliveryError::TooLarge);
+    }
+    let clear = match sealed.open(status, &wire) {
+        Ok(clear) => clear.to_vec(),
+        Err(_) if status == 429 || status == 404 => wire,
+        Err(_) => return Err(DeliveryError::Transport),
+    };
+    Ok(Response {
+        status,
+        length: Some(clear.len() as u64),
+        content_type: Some("application/json".to_string()),
+        retry_after,
+        reader: Box::new(std::io::Cursor::new(clear)),
+    })
+}
+
 #[cfg(feature = "updater-net")]
 fn into_response(response: ureq::Response) -> Result<Response, DeliveryError> {
     let length = response
@@ -340,18 +377,22 @@ impl Transport for Http {
         } else {
             "application/octet-stream, application/json"
         };
+        let path = url::Url::parse(&request.url)
+            .map(|u| u.path().to_string())
+            .map_err(|_| DeliveryError::InvalidRequest)?;
+        let sealed = crate::premium_seal::seal(&path, &request.body).map_err(|_| DeliveryError::InvalidRequest)?;
         let response = match self
             .agent
             .post(&request.url)
             .set("Content-Type", "application/json")
             .set("Accept", accept)
-            .send_bytes(&request.body)
+            .send_bytes(&sealed.wire)
         {
             Ok(r) => r,
             Err(ureq::Error::Status(_, r)) => r,
             Err(_) => return Err(DeliveryError::Transport),
         };
-        into_response(response)
+        open_sealed(&sealed, response)
     }
     fn get(&mut self, request: CdnRequest) -> Result<Response, DeliveryError> {
         let authorization = Zeroizing::new(format!("PATANYX-Grant {}", request.pass.as_str()));

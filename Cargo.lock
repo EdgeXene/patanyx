@@ -2389,9 +2389,10 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "patanyx"
-version = "1.1.0"
+version = "1.1.1"
 dependencies = [
  "bsdiff",
+ "chacha20poly1305",
  "ed25519-dalek",
  "fluent-bundle",
  "getrandom 0.2.17",
@@ -2399,6 +2400,7 @@ dependencies = [
  "glib-sys",
  "gobject-sys",
  "gtk",
+ "hkdf",
  "javascriptcore-rs",
  "javascriptcore-rs-sys",
  "libc",
@@ -2431,6 +2433,7 @@ dependencies = [
  "webview2-com",
  "windows",
  "wry",
+ "x25519-dalek",
  "zeroize",
 ]
 

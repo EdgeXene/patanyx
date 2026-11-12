@@ -102,7 +102,7 @@ fn every_exit_path_ends_the_session_first() {
     let deadline = body_of(state, "pub fn autolock_deadline(&self) -> Option<Instant> {");
     assert!(deadline.contains("crate::addon_session::lock_pending(self)"), "a held lock would spin the loop");
 
-    let main = include_str!("main.rs");
+    let main = include_str!("lib.rs");
     for arm in [
         "UserEvent::QuitForUpdate) => {",
         "UserEvent::QuitForRelaunch) => {",

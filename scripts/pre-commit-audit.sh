@@ -30,7 +30,9 @@ staged=$(git diff --cached --name-only)
 touches() { echo "$staged" | grep -qE "$1"; }
 
 I18N_SURFACE='^(crates/app/src/chrome/|crates/app/src/i18n\.rs|crates/app/build\.rs|scripts/i18n-|scripts/gen-pseudo-locale\.py|scripts/pseudo-locale-gate\.sh)'
-RUNTIME_SURFACE='^crates/app/src/(isolation_probe\.rs|translate_channel_probe\.rs|main\.rs|platform/)'
+# lib.rs since 2026-10-30: the app moved there and main.rs became a launcher,
+# so the chrome webview the isolation gate measures is built in lib.rs.
+RUNTIME_SURFACE='^crates/app/src/(isolation_probe\.rs|translate_channel_probe\.rs|main\.rs|lib\.rs|platform/)'
 DEPS_SURFACE='Cargo\.(toml|lock)$'
 ARTIFACT_SURFACE='^(models/|shipped-artifacts\.json|scripts/artifact-manifest-gate\.py)'
 
@@ -67,7 +69,9 @@ if full || touches "$I18N_SURFACE"; then
 fi
 
 if touches '\.(rs|ftl)$' || full; then
-  cargo test -p patanyx --quiet 2>&1 | tail -2
+  # EVERY result line, not the last one: since 2026-10-30 the app's tests run
+  # from the library, and the last line is the launcher's empty binary.
+  cargo test -p patanyx --quiet 2>&1 | grep -E '^(test result|error)'
 fi
 
 # The translator's isolation from the privileged UI only exists at RUNTIME:

@@ -127,6 +127,7 @@ export RUSTFLAGS="${RUSTFLAGS:-} $CFG_FLAGS $CRT_FLAGS $REMAP"
 echo "hardening: control-flow-guard on, vcruntime static (UCRT dynamic), build paths remapped"
 
 FEATURES="${FEATURES-}"
+bash scripts/refuse-test-only-features.sh "$FEATURES"
 if [ -n "$FEATURES" ]; then
   echo "=== windows build: --features $FEATURES ==="
   cargo xwin build --target x86_64-pc-windows-msvc --release --features "$FEATURES"

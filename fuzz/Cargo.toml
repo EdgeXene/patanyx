@@ -12,14 +12,22 @@
 #
 #     cargo +nightly fuzz run <target> -- -max_total_time=300
 #
-# WHAT IS AND IS NOT COVERED. Targets can only reach LIBRARY crates. The app
-# crate is a binary with no lib target, so its own parsers -- the hover
-# readout, the capture PNG header, the blocklist binary format, page
-# integrity, download compare -- are unreachable from here. Covering those
-# needs a lib target on crates/app, which is a structural decision, not a
-# fuzzing one. Until then this covers the crates a REMOTE party can reach:
-# the chat wire, the update and blocklist manifests, the delta decoder, and
-# the licence token and receipt parsers.
+# WHAT IS AND IS NOT COVERED. Targets can only reach LIBRARY crates. The
+# crates a REMOTE party can reach: the chat wire, the update and blocklist
+# manifests, the delta decoder, and the licence token and receipt parsers.
+#
+# Since 2026-10-30 the app crate is a library too (crates/app/src/lib.rs, with
+# a one-line launcher), and the app_* targets reach its own parsers through
+# `patanyx_app::fuzz_api`, which exists only under the `fuzz-api` feature: the
+# link readout, "Copy clean link", the stored snapshot picture and the
+# blocklist set. Page integrity and download compare are still NOT covered:
+# their entry points take the whole application state, and their byte-level
+# decoding is the chat wire's, which is covered above.
+#
+# THE SAME wry AS A RELEASE. This is its own workspace, so the root
+# [patch.crates-io] does not reach it; the patch is repeated below, and
+# Cargo.lock here is seeded from the root lock so every crate the two share
+# resolves to the version that ships (fuzz/README.md, "Same versions").
 #
 # `envelope::SessionEnvelope::decode` belongs on that list by reachability -- a
 # peer's inner message -- but `mod envelope` is private and it is not
@@ -40,6 +48,37 @@ patanyx-chat = { path = "../crates/chat" }
 patanyx-update = { path = "../crates/update" }
 patanyx-licence = { path = "../crates/licence" }
 patanyx-vault = { path = "../crates/vault" }
+# The app's default features, as shipped, plus the fuzz pass-throughs.
+patanyx = { path = "../crates/app", features = ["fuzz-api"] }
+
+[patch.crates-io]
+# The root workspace's patch, repeated because this workspace is separate: the
+# app must link the wry a release links.
+wry = { path = "../vendor/wry" }
+
+[[bin]]
+name = "app_hover_readout"
+path = "fuzz_targets/app_hover_readout.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "app_clean_link"
+path = "fuzz_targets/app_clean_link.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "app_bounded_picture"
+path = "fuzz_targets/app_bounded_picture.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "app_hostset"
+path = "fuzz_targets/app_hostset.rs"
+test = false
+doc = false
 
 [[bin]]
 name = "chat_wire_decode"

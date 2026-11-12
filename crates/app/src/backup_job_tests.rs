@@ -208,7 +208,7 @@ fn an_answer_or_a_download_arriving_mid_import_waits_for_the_right_vault() {
 
 #[test]
 fn the_window_asks_the_job_before_closing_and_before_the_end() {
-    let main = include_str!("main.rs");
+    let main = include_str!("lib.rs");
     assert_eq!(main.matches("if backup_job::hold_close(&mut app)").count(), 2, "both close paths ask the job");
     let destroyed = &main[main.find("Event::LoopDestroyed => {").unwrap()..];
     assert!(destroyed[..200].contains("backup_job::on_exit(&mut app);"));

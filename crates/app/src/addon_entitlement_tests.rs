@@ -68,7 +68,7 @@ fn the_next_boundary_is_the_coming_utc_midnight() {
 /// a unit test.
 #[test]
 fn the_live_decision_is_asked_on_every_write_every_event_and_at_midnight() {
-    let main = include_str!("main.rs");
+    let main = include_str!("lib.rs");
     let end = main.find("addon_selection::sync_menu(&app);\n    });").expect("the loop's end moved");
     assert!(main[..end].ends_with("addon_entitlement::recheck(&mut app);\n        "), "no recheck after every event");
     assert!(main.contains("addon_entitlement::deadline(&app)"), "no wake at the day boundary");

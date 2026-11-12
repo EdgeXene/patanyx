@@ -91,9 +91,11 @@ for (const platform of ["windows", "unix"]) {
   );
 }
 
-const main = read("crates/app/src/main.rs");
+// The app is a library since 2026-10-30: lib.rs holds what main.rs used to,
+// and `run` is what `fn main` was. main.rs is a one-line launcher.
+const main = read("crates/app/src/lib.rs");
 requireThat(
-  functionBody(main, "fn main()").includes(".with_ipc_handler("),
+  functionBody(main, "pub fn run()").includes(".with_ipc_handler("),
   "trusted chrome no longer installs its required IPC handler",
 );
 

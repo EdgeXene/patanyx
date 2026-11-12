@@ -48,6 +48,11 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.1.1" date="2026-11-11">
+      <description>
+        <p>Premium activation and device release now work on networks that inspect encrypted connections, such as many work networks. Your Premium token and this device's ID travel encrypted to EdgeXene, so such a network sees neither. Premium add-ons are still Windows only.</p>
+      </description>
+    </release>
     <release version="1.1.0" date="2026-11-06">
       <description>
         <p>Translator languages now live in the new Add-ons panel, in the Menu. Reader View no longer opens on a site's list of languages, and a blocked-site notice stays on its own tab. Premium add-ons are Windows only in this release.</p>

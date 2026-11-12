@@ -673,7 +673,9 @@ const PUBLIC_HTTP = {
   const read = (p) => fs.readFileSync(path.join(ROOT, p), "utf8");
   const windows = read("crates/app/src/platform/windows.rs");
   const unix = read("crates/app/src/platform/unix.rs");
-  const main = read("crates/app/src/main.rs");
+  // Both files: the chrome webview is built in lib.rs since 2026-10-30, and a
+  // pin that forbids something must also cover the main.rs launcher.
+  const main = read("crates/app/src/lib.rs") + "\n" + read("crates/app/src/main.rs");
   const privacy = read("crates/app/src/platform/privacy.rs");
   check(
     /LOCAL_NETWORK_GUARD_SCRIPT[^;]*include_str!\("\.\.\/content_scripts\/local_network_guard\.js"\)/.test(
