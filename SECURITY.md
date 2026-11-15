@@ -4,7 +4,7 @@
 
 If you believe you have found a security or privacy vulnerability in PATANYX,
 report it privately using the contact form at
-https://patanyx.edgexene.io/contact/ and choose the **Privacy question**
+https://patanyx.net/contact/ and choose the **Privacy question**
 category.
 
 Useful things to include, to the extent you have them:
@@ -38,7 +38,7 @@ deployment infrastructure are not part of this repository, but reports about
 them are still welcome through the same channel.
 
 Some limits are known and documented rather than treated as vulnerabilities. The
-["What it cannot hide"](https://patanyx.edgexene.io/about/#cannot-hide) section of
+["What it cannot hide"](https://patanyx.net/about/#cannot-hide) section of
 the About page states them in full. In particular, PATANYX is not an anonymity
 tool. Its anti-fingerprinting adds noise to some readouts and deliberately does
 not cover others -- workers and OffscreenCanvas, `readPixels`, screen size,
@@ -50,7 +50,7 @@ regressions.
 
 Released binaries are signed with [Sigstore](https://www.sigstore.dev/), and the
 signature is recorded in a public, append-only transparency log. The
-[About page](https://patanyx.edgexene.io/about/#verify) documents the
+[About page](https://patanyx.net/about/#verify) documents the
 `cosign verify-blob` invocation along with the signing identity and issuer.
 
 Update manifests and blocklists are separately signed with Ed25519 keys whose

@@ -109,7 +109,7 @@ Official Windows binaries are cross-compiled from Linux with `scripts/build-wind
 
 ## Downloads
 
-Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.edgexene.io/download/](https://patanyx.edgexene.io/download/).
+Prebuilt binaries are published on the [releases page](https://github.com/EdgeXene/patanyx/releases) and at [patanyx.net/download/](https://patanyx.net/download/).
 
 Every published binary carries a [Sigstore](https://www.sigstore.dev/) bundle. Verify a download before running it:
 
@@ -130,7 +130,7 @@ Run the tests with `cargo test --workspace`.
 
 ## Website
 
-https://patanyx.edgexene.io/
+https://patanyx.net/
 
 ## Contributing
 
@@ -164,7 +164,7 @@ them as a volunteer when time allows.
 
 ## Security
 
-If you believe you have found a security or privacy vulnerability, report it privately: use the contact form at https://patanyx.edgexene.io/contact/.
+If you believe you have found a security or privacy vulnerability, report it privately: use the contact form at https://patanyx.net/contact/.
 
 ## License
 
