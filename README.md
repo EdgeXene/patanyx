@@ -139,6 +139,29 @@ Bug reports, feature suggestions, and pull requests are welcome.
 feedback, and what a change has to satisfy to be accepted. Report vulnerabilities
 privately instead, by the process in [SECURITY.md](SECURITY.md).
 
+## macOS
+
+A community macOS port of PATANYX is available thanks to
+[jergensturdley](https://github.com/jergensturdley), who wrote the macOS backend
+and is the port's sole maintainer. It uses the system's WKWebView engine, and
+jergensturdley's releases are built for Apple Silicon Macs.
+
+I'm grateful to jergensturdley for the time, skill, and care that went into
+bringing PATANYX to macOS.
+
+The macOS port is unofficial, and jergensturdley has my written permission to use
+the PATANYX name for it. That permission covers this port only, and I can withdraw
+it at any time. EdgeXene LLC does not build, review, sign, test, or support macOS
+builds, does not publish macOS downloads, and does not deliver macOS updates. The
+macOS builds come from
+[jergensturdley's releases page](https://github.com/jergensturdley/patanyx/releases)
+and are not covered by the signatures or checks described under
+[Downloads](#downloads).
+
+Questions about the macOS port can be asked on this repository's
+[issues page](https://github.com/EdgeXene/patanyx/issues). jergensturdley answers
+them as a volunteer when time allows.
+
 ## Security
 
 If you believe you have found a security or privacy vulnerability, report it privately: use the contact form at https://patanyx.edgexene.io/contact/.
