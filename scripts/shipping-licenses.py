@@ -149,6 +149,16 @@ def metadata_index():
     return index
 
 
+def fileless_holders(register, pkg_name):
+    """Holder lines for a crate that ships no licence file, from the curated
+    register. A crate with no entry returns nothing and stays under NOT
+    RESOLVED LOCALLY; an entry is authoritative text kept word for word."""
+    entry = register.get(pkg_name)
+    if not entry:
+        return []
+    return list(entry.get("holders", []))
+
+
 def licence_texts(manifest_path):
     """Every licence file shipped in the crate source, as (filename, text)."""
     if not manifest_path:
@@ -194,6 +204,12 @@ def body_without_copyright(text):
 
 
 ARTIFACT_REGISTER = "shipped-artifacts.json"
+# Holder lines for crates that ship no licence file in the crate source. The
+# generator consults it instead of leaving those crates under NOT RESOLVED
+# LOCALLY. Entries are verbatim lines harvested from an authoritative upstream
+# source, with that source recorded beside them; a missing file here is a hard
+# failure in main(), like a missing artifact register.
+FILELESS_REGISTER = "fileless-crate-licences.json"
 
 
 def artifact_lines():
@@ -218,7 +234,7 @@ def artifact_lines():
     return out
 
 
-def build(name, target, features, title, index):
+def build(name, target, features, title, index, register):
     pkgs = sorted(shipping_packages(target, features))
     bodies = {}  # sha -> text
     body_users = {}  # sha -> [crate labels]
@@ -249,7 +265,9 @@ def build(name, target, features, title, index):
                 if label not in body_users[sha]:
                     body_users[sha].append(label)
         if not texts:
-            unresolved.append(f"{pkg_name} {version} ({spdx}, no licence file in crate)")
+            holders.extend(fileless_holders(register, pkg_name))
+            if not holders:
+                unresolved.append(f"{pkg_name} {version} ({spdx}, no licence file in crate)")
         rows.append((pkg_name, version, spdx, holders))
 
     lines = []
@@ -333,11 +351,13 @@ def build(name, target, features, title, index):
 
 
 def main():
+    with open(FILELESS_REGISTER, encoding="utf-8") as handle:
+        register = json.load(handle).get("entries", {})
     index = metadata_index()
     print(f"{len(index)} third-party packages known to cargo metadata")
     worst_unresolved = 0
     for name, target, features, title in CONFIGS:
-        n, b, u, size = build(name, target, features, title, index)
+        n, b, u, size = build(name, target, features, title, index, register)
         worst_unresolved = max(worst_unresolved, u)
         print(
             f"  {name:<13} {n:>4} packages  {b:>3} distinct licence texts  "
