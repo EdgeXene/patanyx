@@ -70,8 +70,10 @@ pub fn refuse_capture(url: &str) -> Option<&'static str> {
     let url = url.trim();
     // Prefix match, case-insensitive: "about:blank#x" and "ABOUT:BLANK" are
     // the same internal blank surface, and an exact-string check would let
-    // them through to produce a PNG of nothing.
-    if url.is_empty() || (url.len() >= 6 && url[..6].eq_ignore_ascii_case("about:")) {
+    // them through to produce a PNG of nothing. Compared as BYTES: a str
+    // slice at 6 panics when a multi-byte character straddles it, on the
+    // event loop (SecScan S-661794e44ba2, 2026-11-24).
+    if url.is_empty() || url.as_bytes().get(..6).is_some_and(|p| p.eq_ignore_ascii_case(b"about:")) {
         return Some("no_capture_page");
     }
     None
@@ -722,6 +724,15 @@ mod tests {
         assert_eq!(refuse_capture("about:blank#x"), Some("no_capture_page"));
         assert_eq!(refuse_capture("ABOUT:BLANK"), Some("no_capture_page"));
         assert_eq!(refuse_capture("https://example.com/"), None);
+    }
+
+    /// A multi-byte character across byte 6 must not panic.
+    #[test]
+    fn a_multibyte_character_at_the_prefix_boundary_does_not_panic() {
+        assert_eq!(refuse_capture("aaaaa\u{e9}"), None);
+        assert_eq!(refuse_capture("about\u{e9}"), None);
+        assert_eq!(refuse_capture("\u{65e5}\u{672c}"), None);
+        assert_eq!(refuse_capture("About:"), Some("no_capture_page"));
     }
 
     #[test]

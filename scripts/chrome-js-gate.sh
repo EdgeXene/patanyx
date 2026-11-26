@@ -858,6 +858,16 @@ echo "=== gate 1m2: the local-network boundary's WebSocket guard ==="
 node scripts/local-network-guard-gate.js
 
 echo
+echo "=== gate 1m2b: sockets to public hosts wait for the browser's verdict (1.1.2) ==="
+# The ad and tracker list never reached a WebSocket on Windows (measured on the
+# 1.1.1 release build). The guard now asks over chrome.webview first. Runs the
+# real script with a token against stub realms: the channel and degraded mode,
+# verdicts and acks, forged and stale replies, the token's capture, the
+# stand-in's shape and close rules, one-shot protocols, transactional install,
+# and WebSocketStream.
+node scripts/websocket-check-gate.js
+
+echo
 echo "=== gate 1m3: YouTube video ads script ==="
 # Edits replies the page asked for, in the page's own world, so the two
 # failures that matter are removing something that is not an ad and breaking
@@ -924,6 +934,10 @@ if [ -f scripts/adlist-banner-gate.js ]; then
 else
   echo "  (no adlist-banner gate in this tree)"
 fi
+
+echo
+echo "=== gate 1n2a: site and file names the chrome shows (SecScan run 88) ==="
+node scripts/display-names-gate.js
 
 echo
 echo "=== gate 1n2b: \"Allow ads and trackers on this tab\" ==="

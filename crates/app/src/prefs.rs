@@ -862,6 +862,12 @@ pub fn normalize_wipe_exempt_host(raw: &str) -> Option<String> {
 /// The same shape the blocklist demands of a rule, and for the same reason: a
 /// value the engine could never hand us is not protection, it is a lie in a
 /// list. Punycode only, no scheme, no path, no port, at least two labels.
+///
+/// And never a public suffix: an entry such as `co.uk` matched every site
+/// under it on a dot boundary, so all of them joined the kept profile and kept
+/// their cookies (SecScan S-09db503a0b2d, 2026-11-24). Screened against the
+/// suffix itself, not "has a registrable domain", so an address such as a
+/// router's 192.168.1.1 can still be kept.
 fn acceptable_wipe_exempt_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
@@ -873,6 +879,7 @@ fn acceptable_wipe_exempt_host(host: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.' || b == b'_')
         && host.split('.').all(|l| !l.is_empty() && l.len() <= 63)
+        && crate::psl::public_suffix(host) != host
 }
 
 /// Whether `host` is kept by `exempt`, matching on dot boundaries.
@@ -1741,6 +1748,21 @@ mod tests {
         ] {
             assert_eq!(normalize_wipe_exempt_host(bad), None, "accepted {bad:?}");
         }
+    }
+
+    /// SecScan S-09db503a0b2d: a public suffix is nobody's site, at add time
+    /// and when a settings file carries one.
+    #[test]
+    fn a_public_suffix_is_never_kept() {
+        for suffix in ["co.uk", "CO.UK.", "github.io", "com.au"] {
+            assert_eq!(normalize_wipe_exempt_host(suffix), None, "accepted {suffix:?}");
+        }
+        for kept in ["bbc.co.uk", "me.github.io", "192.168.1.1", "example.com"] {
+            assert!(normalize_wipe_exempt_host(kept).is_some(), "refused {kept:?}");
+        }
+        let p: Prefs =
+            serde_json::from_str(r#"{"wipe_exempt_hosts": ["co.uk", "bbc.co.uk"]}"#).unwrap();
+        assert_eq!(p.wipe_exempt_hosts, vec!["bbc.co.uk".to_string()]);
     }
 
     #[test]

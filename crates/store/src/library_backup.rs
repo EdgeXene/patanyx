@@ -501,11 +501,17 @@ impl Store {
 
     /// The download records an import keeps from this Library, taken now:
     /// the ones that still check under its key, and how many did not. See
-    /// [`RestoreInProgress::commit_keeping`].
+    /// [`RestoreInProgress::commit_keeping`]. With them goes the salt this
+    /// Library's version 1 leftovers carry ([`Store::v1_leftover_salt`]), for
+    /// the import to retire them once this Library is replaced.
     pub fn kept_downloads(&self) -> KeptDownloads {
         let records = self.verified_downloads();
         let dropped = self.data.downloads.len() - records.len();
-        KeptDownloads { records, dropped }
+        KeptDownloads {
+            records,
+            dropped,
+            v1_salt: self.v1_leftover_salt(),
+        }
     }
 
     /// Download records whose signature still checks under this Library's
@@ -773,12 +779,25 @@ impl std::fmt::Debug for BackupPictures {
 /// ([`Store::kept_downloads`]). They never travel in a backup; these are this
 /// computer's own, re-signed under the new Library's key at the commit.
 /// Prints counts only: a record is browsing history.
+///
+/// It is also everything else the import takes from the Library it replaces
+/// on the thread that holds it: the salt of that Library's version 1
+/// leftovers ([`KeptDownloads::replaced_v1_salt`]). Never printed.
 pub struct KeptDownloads {
     records: Vec<DownloadRecord>,
     dropped: usize,
+    v1_salt: Option<[u8; crate::crypto::SALT_LEN]>,
 }
 
 impl KeptDownloads {
+    /// The salt the version 1 leftovers of the Library being replaced carry
+    /// ([`Store::v1_leftover_salt`]), so the import can retire them once the
+    /// swap is done (`crate::retire_v1_leftovers_at`). `None` when that
+    /// Library never was version 1.
+    pub fn replaced_v1_salt(&self) -> Option<[u8; crate::crypto::SALT_LEN]> {
+        self.v1_salt
+    }
+
     pub fn len(&self) -> usize {
         self.records.len()
     }

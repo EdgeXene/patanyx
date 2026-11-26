@@ -481,3 +481,124 @@ fn the_boundaries_of_the_proof() {
     }
     fs::remove_dir_all(&dir).ok();
 }
+
+// ---- an import that replaces the Library (SecScan S-7eda1aa77b37) ----------
+//
+// The Library an import puts in place records no version 1 salt, so the
+// import takes the replaced Library's first and retires its copies itself,
+// with no Library open (`retire_v1_leftovers_at`).
+
+/// The salt an import takes is the one every copy of the version 1 file
+/// carries, whether the Library is still version 1, has moved, or is read
+/// shut from its header; a Library born in the vault has none.
+#[test]
+fn the_salt_an_import_takes_is_the_one_every_version_1_copy_carries() {
+    let dir = scratch_dir("salt");
+    let path = dir.join("store.rbs");
+    let key = vault_key();
+    let (mut store, v1) = v1_library(&path);
+    let header_salt: [u8; crypto::SALT_LEN] = v1[20..36].try_into().unwrap();
+    assert_eq!(store.v1_leftover_salt(), Some(header_salt));
+    assert_eq!(store.kept_downloads().replaced_v1_salt(), Some(header_salt));
+    assert_eq!(Store::v1_salt_on_disk(&path), Some(header_salt));
+
+    store.move_into_vault(&key).unwrap();
+    assert_eq!(store.v1_leftover_salt(), Some(header_salt), "the recorded salt");
+    assert_eq!(store.kept_downloads().replaced_v1_salt(), Some(header_salt));
+    // A version 3 file keeps it under its key, never in a header.
+    assert_eq!(Store::v1_salt_on_disk(&path), None);
+    drop(store);
+    let reopened = Store::open(&path, None, &key).unwrap();
+    assert_eq!(reopened.v1_leftover_salt(), Some(header_salt), "after a reopen");
+
+    let born = dir.join("born.rbs");
+    let store = Store::create_in_vault(&born, &key).unwrap();
+    assert_eq!(store.v1_leftover_salt(), None);
+    assert_eq!(store.kept_downloads().replaced_v1_salt(), None);
+    assert_eq!(Store::v1_salt_on_disk(&born), None);
+
+    // Nothing, something not this store's, and a header cut short.
+    let cut = dir.join("cut.rbs");
+    fs::write(&cut, &v1[..format::HEADER_LEN - 1]).unwrap();
+    let foreign = dir.join("foreign.rbs");
+    fs::write(&foreign, b"not a library at all, and long enough to hold a header .....").unwrap();
+    for file in [dir.join("missing.rbs"), cut, foreign] {
+        assert_eq!(Store::v1_salt_on_disk(&file), None, "{}", file.display());
+    }
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Read through the leftovers' own safe open: a link is not followed and a
+/// FIFO does not block.
+#[cfg(unix)]
+#[test]
+fn the_salt_on_disk_follows_no_link_and_does_not_block_on_a_fifo() {
+    let dir = scratch_dir("salt-unix");
+    let (_, v1) = v1_library(&dir.join("real.rbs"));
+    let link = dir.join("store.rbs");
+    std::os::unix::fs::symlink("real.rbs", &link).unwrap();
+    assert!(v1.len() > format::HEADER_LEN, "precondition");
+    assert_eq!(Store::v1_salt_on_disk(&link), None, "a link was followed");
+    let fifo = dir.join("fifo.rbs");
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status().unwrap();
+    assert!(made.success(), "precondition: mkfifo");
+    let (done, outcome) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(Store::v1_salt_on_disk(&fifo));
+    });
+    let read = outcome
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .expect("reading the salt blocked on a FIFO");
+    assert_eq!(read, None);
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// With no Library open, the copies the salt proves go, at the writer's two
+/// names; the file at the Library's own path is never one of them, and
+/// anything not proven ours stays, reported when it is shaped like a
+/// Library.
+#[test]
+fn retirement_by_salt_alone_removes_only_proven_copies_and_never_the_library() {
+    let dir = scratch_dir("at");
+    let path = dir.join("store.rbs");
+    let (store, v1) = v1_library(&path);
+    let salt = store.v1_leftover_salt().unwrap();
+    drop(store);
+
+    // The version 1 file itself is at the Library's path: it stays.
+    let early = plant(&dir, &v1);
+    retire_v1_leftovers_at(&path, &salt).unwrap();
+    assert!(!early.exists(), "a proven copy survived");
+    assert_eq!(fs::read(&path).unwrap(), v1, "the Library itself was touched");
+
+    // Replaced, as an import replaces it, by a Library under another key.
+    fs::remove_file(&path).unwrap();
+    let replacement = Store::create_in_vault(&path, &vault_key()).unwrap();
+    let whole = plant(&dir, &v1);
+    let cut = plant(&dir, &v1[..28]);
+    let legacy = dir.join("store.rbs.tmp");
+    fs::write(&legacy, &v1).unwrap();
+    let other = {
+        let other_dir = scratch_dir("at-other");
+        let (_, other) = v1_library(&other_dir.join("store.rbs"));
+        fs::remove_dir_all(&other_dir).ok();
+        other
+    };
+    let theirs = plant(&dir, &other);
+    let not_a_store = plant(&dir, b"someone's notes, not a Library");
+
+    let outcome = retire_v1_leftovers_at(&path, &salt);
+
+    assert!(
+        matches!(&outcome, Err(StoreError::LeftoversRetained(why)) if why.contains("1 file(s)")),
+        "{outcome:?}"
+    );
+    for file in [&whole, &cut, &legacy] {
+        assert!(!file.exists(), "{} survived", file.display());
+    }
+    assert_eq!(fs::read(&theirs).unwrap(), other, "another Library's copy was touched");
+    assert_eq!(fs::read(&not_a_store).unwrap(), b"someone's notes, not a Library");
+    drop(replacement);
+    assert!(Store::exists(&path), "the Library in place was removed");
+    fs::remove_dir_all(&dir).ok();
+}

@@ -1047,6 +1047,7 @@ fn an_import_that_crashed_while_reading_is_undone_without_any_key() {
         vault_check: None,
         source: "/backups/b.rbx".into(),
         superseded: None,
+        replaced_v1_salt: None,
     };
     write_journal(&target.store_path, &journal).unwrap();
     fs::create_dir(target.dir.path().join(&journal.staging)).unwrap();
@@ -1112,6 +1113,7 @@ fn a_swapped_journal_for_another_vault_removes_no_protection() {
         vault_check: Some("ab".repeat(32)),
         source: "x".into(),
         superseded: None,
+        replaced_v1_salt: None,
     };
     write_journal(&target.store_path, &forged).unwrap();
     assert_eq!(recover(&target.store_path, &vault.library_key().unwrap()), Err(Unfinished));
@@ -2095,6 +2097,264 @@ fn an_undeletable_leftover_after_the_swap_does_not_keep_the_library_shut() {
     // Once it can be deleted, the next open finishes the clean-up.
     recover(&target.store_path, &key).unwrap();
     target.assert_no_leftovers();
+}
+
+// ---- the replaced Library's version 1 leftovers (SecScan S-7eda1aa77b37) ---------
+//
+// A version 1 Library's crash leftovers still open with the passphrase they
+// were written under and read the Library as it was. The imported Library
+// records no version 1 salt, so the import retires them itself once the swap
+// is done, by the store's own proof, and keeps whatever it cannot prove.
+
+/// A target whose Library is from before version 3: still version 1, opening
+/// with the vault's passphrase, with a picture, add-on data and a download
+/// record of its own, as `target` has.
+fn v1_target() -> (Profile, Vault, Store) {
+    let target = Profile::new();
+    let vault = target.vault();
+    let mut library = Store::create_with_params(&target.store_path, PASS, 8192, 1, 1).unwrap();
+    library.add_bookmark("https://old.example.test/", "Old").unwrap();
+    library
+        .add_archive("https://old-page.example.test/", "Old page", "full page", "", Some(b"old pixels"))
+        .unwrap();
+    library
+        .record_download(LOCAL_DOWNLOAD_URL, "this-computer.zip", 7, [1u8; 32])
+        .unwrap();
+    library
+        .addon_namespace("text-pages")
+        .unwrap()
+        .put(None, 0, "Old note", b"from before", T0)
+        .unwrap();
+    assert_eq!(library.format_version(), 1, "precondition");
+    (target, vault, library)
+}
+
+/// Leftovers planted beside the target's Library: `ours` are copies of its
+/// version 1 file at the writer's two names, as a save that crashed before
+/// its rename leaves them; `kept` are files at the writer's names that are
+/// not proven ours, with their bytes.
+struct Planted {
+    ours: Vec<PathBuf>,
+    kept: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn plant_leftovers(target: &Profile) -> Planted {
+    let dir = target.dir.path();
+    let v1 = fs::read(&target.store_path).unwrap();
+    let ours = vec![
+        dir.join(format!(".tmp-{}", "0123456789abcdef".repeat(2))),
+        dir.join("store.rbs.tmp"),
+    ];
+    for path in &ours {
+        fs::write(path, &v1).unwrap();
+    }
+    // Another Library's version 1 file, under the same passphrase: another
+    // salt, so not proven ours.
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other = elsewhere.path().join("store.rbs");
+    drop(Store::create_with_params(&other, PASS, 8192, 1, 1).unwrap());
+    let kept = vec![
+        (dir.join(format!(".tmp-{}", "fedcba9876543210".repeat(2))), fs::read(&other).unwrap()),
+        (dir.join(format!(".tmp-{}", "00112233445566778899aabbccddeeff")), b"not a Library".to_vec()),
+    ];
+    for (path, bytes) in &kept {
+        fs::write(path, bytes).unwrap();
+    }
+    // What makes them matter: each still opens with the old passphrase.
+    for path in &ours {
+        assert_eq!(Store::unlock(path, PASS).unwrap().bookmarks().len(), 1, "precondition");
+    }
+    Planted { ours, kept }
+}
+
+fn assert_retired(planted: &Planted, context: &str) {
+    for path in &planted.ours {
+        assert!(!path.exists(), "{context}: {} still opens with the old passphrase", path.display());
+    }
+    for (path, bytes) in &planted.kept {
+        assert_eq!(&fs::read(path).unwrap(), bytes, "{context}: {} was not kept", path.display());
+    }
+}
+
+#[test]
+fn an_import_over_a_version_1_library_retires_the_copies_its_old_passphrase_opens() {
+    for case in ["open, version 1", "shut, version 1", "open, moved into the vault"] {
+        let (_source, backup, _) = source_backup();
+        let (target, vault, mut library) = v1_target();
+        let planted = plant_leftovers(&target);
+        if case == "open, moved into the vault" {
+            // A passphrase change moved it and could not remove the copies:
+            // the Library recorded their salt, and hands it on.
+            library.move_into_vault(&vault.library_key().unwrap()).unwrap();
+        }
+        // A shut Library still gives its salt from its version 1 header.
+        let live = (case != "shut, version 1").then_some(library);
+        let (_vault, imported, _) = import_into(&target, &backup, live, Some(vault));
+        assert_is_the_source_library(&imported);
+        assert_retired(&planted, case);
+        target.assert_no_leftovers();
+    }
+}
+
+/// The same through the import job's own entry points, with the records and
+/// the salt taken on the thread that holds the Library.
+#[test]
+fn the_jobs_own_entry_points_retire_the_version_1_copies_too() {
+    let (_source, backup, _) = source_backup();
+    let (target, vault, library) = v1_target();
+    let planted = plant_leftovers(&target);
+    let kept = library.kept_downloads();
+    let staged = stage_with(&target.store_path, &backup, EXPORT_PASS, Some(&kept), &BackupWatch::new()).unwrap();
+    drop((vault, library));
+    let super::Committed { library, .. } = commit(staged, &target.vault_path, NEW_PASS).unwrap();
+    match library {
+        ImportedLibrary::Opened { store, cleanup_pending } => {
+            assert!(!cleanup_pending);
+            assert_is_the_source_library(&store);
+        }
+        other => panic!("not opened: {other:?}"),
+    }
+    assert_retired(&planted, "the job's entry points");
+    target.assert_no_leftovers();
+}
+
+/// A Library born in the vault never had a version 1 file: its import
+/// records no salt, writes the journal exactly as before, and removes no
+/// file it did not make, a version 1 file at the writer's name included.
+#[test]
+fn an_import_over_a_library_born_in_the_vault_retires_nothing() {
+    let (_source, backup, _) = source_backup();
+    let (target, vault, library) = target();
+    let elsewhere = tempfile::tempdir().unwrap();
+    let other = elsewhere.path().join("store.rbs");
+    drop(Store::create_with_params(&other, PASS, 8192, 1, 1).unwrap());
+    let stray = target.dir.path().join(format!(".tmp-{}", "0123456789abcdef".repeat(2)));
+    fs::copy(&other, &stray).unwrap();
+    let staged = stage(&target.store_path, &backup, EXPORT_PASS, Some(&library)).unwrap();
+    assert_eq!(staged.journal.replaced_v1_salt, None);
+    let written = fs::read_to_string(journal_path(&target.store_path)).unwrap();
+    assert!(!written.contains("replaced_v1_salt"), "{written}");
+    drop((vault, library));
+    let (vault, _) = staged.install(&target.vault_path, NEW_PASS).unwrap();
+    let key = vault.library_key().unwrap();
+    recover(&target.store_path, &key).unwrap();
+    assert_is_the_source_library(&Store::open(&target.store_path, None, &key).unwrap());
+    assert_eq!(fs::read(&stray).unwrap(), fs::read(&other).unwrap());
+    target.assert_no_leftovers();
+}
+
+/// A journal as 1.1.1 and earlier wrote it, with no salt, still decodes and
+/// is written back exactly as it was; a salt is only ever 32 lowercase hex
+/// digits beside a vault check.
+#[test]
+fn a_journal_without_the_replaced_salt_decodes_as_before_and_a_bad_one_is_refused() {
+    let old = serde_json::json!({
+        "phase": "swapped",
+        "staging": random_name(STAGING_PREFIX),
+        "old_archive": random_name(OLD_ARCHIVE_PREFIX),
+        "old_addons": random_name(OLD_ADDONS_PREFIX),
+        "vault_check": "ab".repeat(32),
+        "source": "/backups/b.rbx",
+        "superseded": null,
+    });
+    let journal = parse_journal(old.to_string().as_bytes()).expect("a 1.1.1 journal no longer decodes");
+    assert_eq!(journal.replaced_v1_salt, None);
+    assert_eq!(serde_json::to_value(&journal).unwrap(), old, "not written back as 1.1.1 wrote it");
+
+    let mut with = old.clone();
+    with["replaced_v1_salt"] = serde_json::json!("0f".repeat(16));
+    let journal = parse_journal(with.to_string().as_bytes()).expect("a journal with a salt does not decode");
+    assert_eq!(journal.replaced_v1_salt.as_deref(), Some("0f".repeat(16).as_str()));
+
+    for bad in [
+        serde_json::json!("0f".repeat(15)),
+        serde_json::json!("0f".repeat(17)),
+        serde_json::json!("0F".repeat(16)),
+        serde_json::json!("zz".repeat(16)),
+        serde_json::json!(""),
+        serde_json::json!(16),
+    ] {
+        let mut forged = old.clone();
+        forged["replaced_v1_salt"] = bad.clone();
+        assert_eq!(parse_journal(forged.to_string().as_bytes()), None, "{bad} was accepted");
+    }
+    // None before `staged`: the mask needs the imported vault's key.
+    let mut preparing = with.clone();
+    preparing["phase"] = serde_json::json!("preparing");
+    preparing["vault_check"] = serde_json::Value::Null;
+    assert_eq!(parse_journal(preparing.to_string().as_bytes()), None);
+}
+
+/// The salt is in the journal from `staged` on, never readable as itself,
+/// and the next open retires the copies whichever step of the swap the
+/// import reached before it stopped.
+#[test]
+fn recovery_after_the_vault_commit_retires_the_copies_whatever_step_was_reached() {
+    for steps in 0..=SWAPPED {
+        let (_source, backup, _) = source_backup();
+        let (target, vault, library) = v1_target();
+        let planted = plant_leftovers(&target);
+        let salt = library.v1_leftover_salt().unwrap();
+        let staged = stage(&target.store_path, &backup, EXPORT_PASS, Some(&library)).unwrap();
+        drop((vault, library));
+        let (vault, _) = staged.install(&target.vault_path, NEW_PASS).unwrap();
+        let key = vault.library_key().unwrap();
+        let journal = read_journal(&target.store_path).unwrap().unwrap();
+        assert_eq!(journal.phase, Phase::VaultCommitted);
+        let recorded = journal.replaced_v1_salt.clone().expect("no salt in the journal");
+        assert_ne!(recorded, hex(&salt), "the journal holds the salt as itself");
+        assert_eq!(unmasked_salt(&journal, &key), Some(salt));
+        assert_ne!(unmasked_salt(&journal, &[7u8; 32]), Some(salt), "another key unmasks it");
+        move_by_hand(&target, &journal, steps);
+        assert!(planted.ours.iter().all(|path| path.exists()), "step {steps}: precondition");
+        recover(&target.store_path, &key).unwrap_or_else(|_| panic!("step {steps}"));
+        assert_is_the_source_library(&Store::open(&target.store_path, None, &key).unwrap());
+        assert_retired(&planted, &format!("step {steps}"));
+        target.assert_no_leftovers();
+    }
+}
+
+/// Killed at every step that changes the disk, the retirement among them:
+/// once the next open has run, an imported profile has none of the copies
+/// left, and one that was not imported still has its Library and every copy
+/// untouched.
+#[test]
+fn an_import_over_a_version_1_library_killed_at_any_step_still_retires_its_copies() {
+    fn run(arm: Option<usize>) -> (Profile, Planted, usize, bool) {
+        let (source, backup, _) = source_backup();
+        let (target, vault, library) = v1_target();
+        let planted = plant_leftovers(&target);
+        let mut live = Some((vault, library));
+        let (finished, reached) = with_crash_at(arm, || {
+            let staged = stage(&target.store_path, &backup, EXPORT_PASS, live.as_ref().map(|l| &l.1)).unwrap();
+            live = None;
+            let (vault, _) = staged.install(&target.vault_path, NEW_PASS).unwrap();
+            recover(&target.store_path, &vault.library_key().unwrap()).unwrap();
+        });
+        drop((live, source));
+        (target, planted, reached, finished)
+    }
+
+    let (_, _, steps, finished) = run(None);
+    assert_baseline(finished, &["vault-committed", "marker-removal-next", "v1-leftovers-next", "journal-removal-next"]);
+    for at in 0..steps {
+        let (target, planted, _, _) = run(Some(at));
+        let (vault, imported) = match Vault::unlock(&target.vault_path, NEW_PASS) {
+            Ok(vault) => (vault, true),
+            Err(_) => (Vault::unlock(&target.vault_path, PASS).unwrap(), false),
+        };
+        let key = vault.library_key().unwrap();
+        recover(&target.store_path, &key).unwrap_or_else(|_| panic!("killed at step {at}"));
+        if imported {
+            assert_is_the_source_library(&Store::open(&target.store_path, None, &key).unwrap());
+            assert_retired(&planted, &format!("killed at step {at}"));
+        } else {
+            let library = Store::open(&target.store_path, Some(PASS), &key).unwrap();
+            assert_eq!(library.bookmarks()[0].url, "https://old.example.test/", "step {at}");
+            assert!(planted.ours.iter().all(|path| path.exists()), "step {at}: a copy went without an import");
+        }
+        target.assert_no_leftovers();
+    }
 }
 
 /// QUALIFICATION, run by hand: writes a backup holding a vault with one

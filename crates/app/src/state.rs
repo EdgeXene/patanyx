@@ -2230,7 +2230,14 @@ fn build_tab_as(
         })
         .with_download_started_handler(move |url, destination| {
             *destination = unique_download_path(&url, destination);
-            let _ = download_start_proxy.send_event(UserEvent::DownloadStarted(url));
+            // The name the file is SAVED under, for the start notice: the
+            // URL's last segment can say invoice.pdf while the server's
+            // Content-Disposition names invoice.pdf.exe (SecScan S-ef8b1eff7640).
+            let name = destination
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let _ = download_start_proxy.send_event(UserEvent::DownloadStarted { url, name });
             true
         })
         .with_download_completed_handler(move |url, path, success| {
@@ -2384,24 +2391,127 @@ fn unique_download_path(url: &str, suggested: &Path) -> PathBuf {
         })
         .unwrap_or_else(|| "download".to_string());
     let name = sanitize_filename(&raw);
-    let dir = download_dir();
-    let candidate = dir.join(&name);
-    if !candidate.exists() {
-        return candidate;
+    unique_path_in(&download_dir(), &name, url)
+}
+
+/// Destinations handed out this run whose file may not exist yet.
+///
+/// `exists()` alone let two downloads started in one turn of the event loop
+/// get the same name, because the engine creates the file later, and the
+/// second overwrote the first (SecScan S-8dbae96b7d0b, 2026-11-24). A name
+/// stays reserved until its download finishes, keyed as the file system
+/// compares names and remembering the URL it was chosen for.
+fn reserved_download_paths() -> &'static std::sync::Mutex<std::collections::HashMap<PathBuf, String>> {
+    static RESERVED: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<PathBuf, String>>> =
+        std::sync::OnceLock::new();
+    RESERVED.get_or_init(Default::default)
+}
+
+/// The reservation key: a Windows download folder does not tell
+/// "Report.pdf" from "report.pdf", so neither may the reservations (security
+/// review 2026-11-24, R-005).
+fn reservation_key(path: &Path, fold_case: bool) -> PathBuf {
+    if fold_case {
+        // Upper case, as NTFS compares names: lowercasing is context
+        // sensitive ("Σ" at a word's end becomes "ς", elsewhere "σ") and
+        // would key one file twice (round 2, R-007).
+        PathBuf::from(path.to_string_lossy().to_uppercase())
+    } else {
+        path.to_path_buf()
     }
-    // Collision: insert " (n)" before the (last) extension.
-    let (stem, ext) = match name.rfind('.') {
-        Some(pos) if pos > 0 => (&name[..pos], &name[pos..]),
-        _ => (&name[..], ""),
-    };
-    let mut n = 1u32;
-    loop {
-        let candidate = dir.join(format!("{stem} ({n}){ext}"));
-        if !candidate.exists() {
-            return candidate;
+}
+
+/// A finished download's name may be handed out again.
+pub(crate) fn release_download_path(path: &str) {
+    if let Ok(mut reserved) = reserved_download_paths().lock() {
+        reserved.remove(&reservation_key(Path::new(path), cfg!(windows)));
+    }
+}
+
+/// A download that ended without a path (the engines report none for a
+/// failure) releases one name chosen for its URL, so a retry is not
+/// renamed "(1)" (security review 2026-11-24, R-010).
+///
+/// Only when exactly one name is reserved for that URL: with two downloads
+/// of one URL in flight, the failed one cannot be told from the other, and
+/// freeing the wrong name would let a retry overwrite a file still being
+/// written (round 2, R-001). Both stay reserved; a retry is then renamed.
+pub(crate) fn release_download_url(url: &str) {
+    if let Ok(mut reserved) = reserved_download_paths().lock() {
+        let mut matching = reserved.iter().filter(|(_, u)| u.as_str() == url).map(|(k, _)| k.clone());
+        if let (Some(key), None) = (matching.next(), matching.next()) {
+            reserved.remove(&key);
         }
-        n += 1;
     }
+}
+
+/// The first free `name` in `dir`, inserting " (n)" before the last
+/// extension on a collision, and reserving it.
+///
+/// Taken means anything is at the path, a dangling symbolic link included
+/// (`exists()` follows links and says false for one, and the later write
+/// would follow it too), or another download reserved it.
+fn unique_path_in(dir: &Path, name: &str, url: &str) -> PathBuf {
+    let mut reserved = reserved_download_paths()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let free = |p: &Path| {
+        p.symlink_metadata().is_err() && !reserved.contains_key(&reservation_key(p, cfg!(windows)))
+    };
+    let candidate = dir.join(name);
+    let chosen = if free(&candidate) {
+        candidate
+    } else {
+        let (stem, ext) = match name.rfind('.') {
+            Some(pos) if pos > 0 => (&name[..pos], &name[pos..]),
+            _ => (name, ""),
+        };
+        let mut n = 1u32;
+        loop {
+            let candidate = dir.join(format!("{stem} ({n}){ext}"));
+            if free(&candidate) {
+                break candidate;
+            }
+            n += 1;
+        }
+    };
+    reserved.insert(reservation_key(&chosen, cfg!(windows)), url.to_string());
+    chosen
+}
+
+/// Whether a file NAME's stem is a Windows device, which Win32 opens instead
+/// of a file in every directory and with any extension.
+///
+/// The first list had 22 entries. Win32 also reserves COM0 and LPT0, the
+/// superscript ports COM¹ COM² COM³ LPT¹ LPT² LPT³, and the console names
+/// CONIN$ and CONOUT$, and it ignores spaces around the stem ("NUL .txt",
+/// " CON.txt") (SecScan S-55db81b8f7cf, 2026-11-24). Platform-free so the
+/// Linux test run proves it.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_windows_device_stem(stem: &str) -> bool {
+    let stem = stem.trim_matches(|c| c == ' ' || c == '.').to_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$") {
+        return true;
+    }
+    let port = stem.strip_prefix("COM").or_else(|| stem.strip_prefix("LPT"));
+    matches!(port, Some(n) if matches!(n, "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "\u{b9}" | "\u{b2}" | "\u{b3}"))
+}
+
+/// Every non-ASCII space becomes a plain one, and a run of spaces becomes one.
+///
+/// A long blank run between `invoice.pdf` and `.exe` pushes the real
+/// extension out of the column a file manager shows (SecScan S-57c229d929b0,
+/// 2026-11-24); a single space is all a real name needs.
+fn collapse_blank_runs(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        let c = if c.is_whitespace() && !c.is_control() { ' ' } else { c };
+        if c == ' ' && out.ends_with(' ') {
+            continue;
+        }
+        out.push(c);
+    }
+    out
 }
 
 // Filename sanitization is platform-aware: a hostile Content-Disposition
@@ -2423,6 +2533,7 @@ fn sanitize_filename(name: &str) -> String {
         .filter(|c| !crate::hover::is_deceptive(*c))
         .filter(|c| *c != '/' && *c != '\\')
         .collect();
+    let stripped = collapse_blank_runs(&stripped);
     let stripped = stripped.trim_start_matches('.');
     if stripped.is_empty() {
         "download".to_string()
@@ -2449,6 +2560,7 @@ fn sanitize_filename(name: &str) -> String {
             c => c,
         })
         .collect();
+    let mapped = collapse_blank_runs(&mapped);
     // Leading dots hide files (same as unix); trailing dots/spaces are
     // silently stripped by Win32, which would change the name AFTER the
     // collision check in unique_download_path ran.
@@ -2457,14 +2569,10 @@ fn sanitize_filename(name: &str) -> String {
         .trim_end_matches(|c| c == '.' || c == ' ');
     // DOS device names are reserved in every directory, with any extension
     // (CON.txt still opens the console), so neutralize them by prefix.
-    const DEVICES: [&str; 22] = [
-        "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-        "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-    ];
     let stem = trimmed.split('.').next().unwrap_or_default();
     if trimmed.is_empty() {
         "download".to_string()
-    } else if DEVICES.iter().any(|dev| stem.eq_ignore_ascii_case(dev)) {
+    } else if is_windows_device_stem(stem) {
         format!("_{trimmed}")
     } else {
         trimmed.to_string()
@@ -7452,6 +7560,7 @@ impl AppState {
 
     /// The engine finished (or failed) a PDF render.
     pub fn on_pdf_saved(&mut self, path: &str, success: bool) {
+        release_download_path(path);
         let Some(source_url) = self.pending_pdf.remove(path) else {
             return; // not ours, or already handled
         };
@@ -10148,6 +10257,86 @@ mod tests {
         // Trailing dots/spaces would be silently stripped by Win32.
         assert_eq!(sanitize_filename("file."), "file");
         assert_eq!(sanitize_filename("file "), "file");
+    }
+
+    /// SecScan S-55db81b8f7cf: the device names Win32 also opens. Platform-
+    /// free, so it runs on the Linux suite too.
+    #[test]
+    fn every_windows_device_stem_is_recognised() {
+        use super::is_windows_device_stem as dev;
+        for stem in [
+            "CON", "con", "PRN", "AUX", "NUL", "NUL ", " CON", "CONIN$", "conout$", "COM0", "COM9",
+            "LPT0", "lpt5", "COM\u{b9}", "COM\u{b2}", "COM\u{b3}", "LPT\u{b9}", "LPT\u{b3}",
+        ] {
+            assert!(dev(stem), "{stem:?}");
+        }
+        for stem in ["COM10", "COMX", "CONSOLE", "company", "NULL", "LPT", "COM\u{2074}", ""] {
+            assert!(!dev(stem), "{stem:?}");
+        }
+    }
+
+    /// SecScan S-57c229d929b0: a blank run cannot push the extension away.
+    #[test]
+    fn blank_padding_collapses_in_a_file_name() {
+        use super::collapse_blank_runs;
+        let pad = "\u{3164}".repeat(20);
+        let out = sanitize_filename(&format!("invoice.pdf{pad}.exe"));
+        assert_eq!(out, "invoice.pdf.exe");
+        let out = sanitize_filename(&format!("invoice.pdf{}.exe", "\u{00A0}".repeat(30)));
+        assert_eq!(out, "invoice.pdf .exe");
+        assert_eq!(collapse_blank_runs("a \u{3000}\u{2003} b"), "a b");
+        // A variation selector between spaces used to keep the run from
+        // collapsing (compliance audit 2026-11-24, item 5).
+        let out = sanitize_filename(&format!("invoice.pdf{}.exe", " \u{FE0F}".repeat(20)));
+        assert_eq!(out, "invoice.pdf .exe");
+        assert_eq!(collapse_blank_runs("two words.txt"), "two words.txt");
+    }
+
+    /// SecScan S-8dbae96b7d0b: two downloads of one name before either file
+    /// exists get different destinations; a dangling link counts as taken.
+    #[test]
+    fn concurrent_downloads_never_share_a_destination() {
+        use super::{release_download_path, release_download_url, reservation_key, unique_path_in};
+        let dir = std::env::temp_dir().join(format!("patanyx-unique-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let u = "https://example.org/report.pdf";
+        let first = unique_path_in(&dir, "report.pdf", u);
+        let second = unique_path_in(&dir, "report.pdf", u);
+        assert_ne!(first, second, "neither file exists yet; they must still differ");
+        assert_eq!(second, dir.join("report (1).pdf"));
+        release_download_path(&first.to_string_lossy());
+        assert_eq!(unique_path_in(&dir, "report.pdf", u), first, "a released name is free again");
+        // A failed download reports no path: its URL releases one name (R-010).
+        let failed = unique_path_in(&dir, "retry.zip", "https://example.org/retry.zip");
+        release_download_url("https://example.org/retry.zip");
+        assert_eq!(unique_path_in(&dir, "retry.zip", "https://example.org/retry.zip"), failed);
+        // Windows keys fold case, so Report.pdf and report.pdf collide (R-005).
+        assert_eq!(
+            reservation_key(&dir.join("Report.PDF"), true),
+            reservation_key(&dir.join("report.pdf"), true)
+        );
+        assert_ne!(
+            reservation_key(&dir.join("Report.PDF"), false),
+            reservation_key(&dir.join("report.pdf"), false)
+        );
+        assert_eq!(
+            reservation_key(&dir.join("\u{394}\u{3A3}_2026.csv"), true),
+            reservation_key(&dir.join("\u{3B4}\u{3C3}_2026.csv"), true),
+            "final sigma folds like any sigma"
+        );
+        // Two in flight for one URL: a pathless failure frees neither (R-001).
+        let same = "https://example.org/export";
+        let a = unique_path_in(&dir, "export.csv", same);
+        let b = unique_path_in(&dir, "export.csv", same);
+        release_download_url(same);
+        let c = unique_path_in(&dir, "export.csv", same);
+        assert!(c != a && c != b, "neither in-flight name may be handed out again");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(dir.join("nowhere"), dir.join("linked.txt")).unwrap();
+            assert_eq!(unique_path_in(&dir, "linked.txt", u), dir.join("linked (1).txt"));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[cfg(windows)]

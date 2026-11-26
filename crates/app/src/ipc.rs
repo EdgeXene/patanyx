@@ -553,7 +553,11 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
     let rest = url
         .strip_prefix("https://")
         .or_else(|| url.strip_prefix("http://"))?;
-    let (authority, after) = match rest.find(['/', '?', '#']) {
+    // A backslash ends the authority like a slash: that is how a browser
+    // reads an http(s) URL, so "https://evil.example\@google.com/" goes to
+    // evil.example and must not be taken for a Google wrapper (host_of in
+    // privacy.rs follows the same rule).
+    let (authority, after) = match rest.find(['/', '\\', '?', '#']) {
         Some(at) => (&rest[..at], &rest[at..]),
         None => (rest, ""),
     };
@@ -567,16 +571,17 @@ fn split_url(url: &str) -> Option<(String, String, String)> {
     if host.is_empty() {
         return None;
     }
-    let (path, query) = match after.find('?') {
-        Some(at) => (
-            &after[..at],
-            after[at + 1..].split('#').next().unwrap_or(""),
-        ),
-        None => (after.split('#').next().unwrap_or(""), ""),
-    };
+    // The fragment is cut off FIRST: a "?" after "#" is fragment text the
+    // redirector never receives, not a query carrying a destination.
+    let before_fragment = after.split('#').next().unwrap_or("");
+    let (path, query) = before_fragment
+        .split_once('?')
+        .unwrap_or((before_fragment, ""));
+    // In an http(s) path a backslash IS a slash to the browser, so the path
+    // is matched against the wrappers' "/url"-style prefixes as one.
     Some((
         host.to_ascii_lowercase(),
-        path.to_string(),
+        path.replace('\\', "/"),
         query.to_string(),
     ))
 }
@@ -616,27 +621,50 @@ fn is_acceptable_destination(candidate: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
 }
 
-/// Percent-decodes `s`. Returns None on a malformed escape rather than
-/// guessing, and never expands the string.
-fn percent_decode(s: &str) -> Option<String> {
+/// Percent-decodes `s` the way the URL standard does: a "%" not followed by
+/// two hex digits stays a literal "%" (one stray "%" must not stop "%23" in
+/// the same value from decoding). `plus_is_space` reads "+" as a space, as a
+/// form-encoded query does. None only when the bytes are not UTF-8. Never
+/// expands the string.
+fn percent_decode(s: &str, plus_is_space: bool) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' {
-            if i + 2 >= bytes.len() {
-                return None;
+        let hex = |b: Option<&u8>| b.and_then(|b| (*b as char).to_digit(16));
+        match (bytes[i], hex(bytes.get(i + 1)), hex(bytes.get(i + 2))) {
+            (b'%', Some(hi), Some(lo)) => {
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
             }
-            let hi = (bytes[i + 1] as char).to_digit(16)?;
-            let lo = (bytes[i + 2] as char).to_digit(16)?;
-            out.push((hi * 16 + lo) as u8);
-            i += 3;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
+            (b'+', _, _) if plus_is_space => {
+                out.push(b' ');
+                i += 1;
+            }
+            (b, _, _) => {
+                out.push(b);
+                i += 1;
+            }
         }
     }
     String::from_utf8(out).ok()
+}
+
+/// A decoded destination as a link again: spaces, controls and every
+/// non-ASCII byte are percent-encoded, so "Board Minutes.pdf" stays one
+/// usable link and a decoded right-to-left override never reaches the
+/// clipboard as an active character. "#", "?", "&" and "%" are left as the
+/// decoding made them.
+fn reencode_unsafe(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b <= b' ' || b >= 0x7f {
+            out.push_str(&format!("%{b:02X}"));
+        } else {
+            out.push(b as char);
+        }
+    }
+    out
 }
 
 /// Decodes base64url without padding. None on any invalid byte.
@@ -672,32 +700,44 @@ fn base64url_decode(s: &str) -> Option<String> {
 /// that wrapper, never generally: stripping two leading characters from an
 /// arbitrary value would corrupt it.
 fn decode_candidate(raw: &str, marker_prefix: bool) -> Option<String> {
-    if is_acceptable_destination(raw) {
-        return Some(raw.to_string());
-    }
-    if let Some(decoded) = percent_decode(raw) {
-        if is_acceptable_destination(&decoded) {
-            return Some(decoded);
+    // Decoded FIRST: the redirector form-decodes its query once before it
+    // redirects, so "q=https://example.org/guide%23install" sends the browser
+    // to /guide#install. Taking the raw value because it already looks like a
+    // URL copied /guide%23install, a different path that hands the fragment
+    // (sometimes a share key) to the server. What the decoding leaves unsafe
+    // in a link (a space, a control, non-ASCII) is encoded again.
+    if let Some(decoded) = percent_decode(raw, true) {
+        let once = reencode_unsafe(&decoded);
+        if is_acceptable_destination(&once) {
+            return Some(once);
         }
         // A doubly-encoded carrier is common enough to be worth one more pass,
-        // and the acceptance gate still stands behind it.
-        if let Some(twice) = percent_decode(&decoded) {
+        // and the acceptance gate still stands behind it. Its "+" was a
+        // literal "+" by the time it was encoded the second time.
+        if let Some(twice) = percent_decode(&decoded, false) {
+            let twice = reencode_unsafe(&twice);
             if is_acceptable_destination(&twice) {
                 return Some(twice);
             }
         }
+    }
+    // A carrier that does not decode is not taken as it is: its "%23" would
+    // stay in the path and send a share key to the server (security review
+    // 2026-11-24, round 2, R-002). The link is then left unchanged.
+    // Base64url is Bing's encoding and nobody else's: Google's /url does not
+    // decode "q=aHR0cHM6...", so decoding it here copied a destination a
+    // click never reaches (SecScan S-532601bb8b53, 2026-11-24).
+    if !marker_prefix {
+        return None;
     }
     // `get`, never `&raw[2..]`: the marker is two ASCII characters only in a
     // real Bing URL. A carrier that starts with a multi-byte character puts
     // byte 2 inside it, and slicing there panicked on the event-loop thread
     // (found by fuzzing, 2026-10-30). Such a carrier is no Bing payload, so
     // it is tried as it is and fails the acceptance gate like any other.
-    let b64_input = if marker_prefix && raw.len() > 2 {
-        raw.get(2..).unwrap_or(raw)
-    } else {
-        raw
-    };
+    let b64_input = if raw.len() > 2 { raw.get(2..).unwrap_or(raw) } else { raw };
     if let Some(decoded) = base64url_decode(b64_input) {
+        let decoded = reencode_unsafe(&decoded);
         if is_acceptable_destination(&decoded) {
             return Some(decoded);
         }
@@ -712,14 +752,32 @@ fn unwrap_once(url: &str) -> Option<String> {
     if query.is_empty() {
         return None;
     }
+    // A "." or ".." segment (also percent-encoded) moves the path the browser
+    // actually requests: "/l/../?uddg=..." opens "/", which redirects nowhere.
+    // Such a link is left as it is rather than matched before resolving.
+    if path.split('/').any(|seg| matches!(seg.to_ascii_lowercase().replace("%2e", ".").as_str(), "." | "..")) {
+        return None;
+    }
     for (suffix, path_prefix, carriers) in REDIRECT_WRAPPERS {
         if !host_matches(&host, suffix) {
             continue;
         }
-        if !path_prefix.is_empty() && !path.starts_with(path_prefix) {
+        // A prefix ending in "/" names a directory; any other names one
+        // endpoint exactly, so a Cloud Storage bucket "/url-exports/..." on a
+        // google.com host is not Google's "/url" redirector.
+        let path_ok = path_prefix.is_empty()
+            || if path_prefix.ends_with('/') { path.starts_with(path_prefix) } else { path == *path_prefix };
+        if !path_ok {
             continue;
         }
         let bing = *suffix == "bing.com";
+        // The copy must be where the click goes, so the carrier is read the
+        // way the redirector reads it (SecScan S-532601bb8b53, 2026-11-24):
+        // the name matched exactly ("UDDG" is not DuckDuckGo's "uddg"), and
+        // when two carriers are present they must agree. One that names
+        // somewhere else, or that does not decode, makes the link ambiguous,
+        // and an ambiguous link is left as it is rather than guessed at.
+        let mut agreed: Option<String> = None;
         for pair in query.split('&') {
             // A pair with no `=` is skipped, never fatal: every live Bing
             // result link starts `ck/a?!&&p=...&u=...`, and giving up on the
@@ -727,16 +785,25 @@ fn unwrap_once(url: &str) -> Option<String> {
             let Some((name, value)) = pair.split_once('=') else {
                 continue;
             };
-            if value.is_empty() {
+            // Empty carriers are skipped: a real Google result link carries
+            // "q=" empty beside its "url=".
+            // Names are compared decoded, as a form parser reads them:
+            // "%75ddg" is a second "uddg" (round 2, R-003).
+            let Some(name) = percent_decode(name, true) else {
+                continue;
+            };
+            if value.is_empty() || !carriers.contains(&name.as_str()) {
                 continue;
             }
-            let lower = name.to_ascii_lowercase();
-            if !carriers.iter().any(|c| *c == lower) {
-                continue;
+            let dest = decode_candidate(value, bing)?;
+            match &agreed {
+                Some(seen) if *seen != dest => return None,
+                Some(_) => {}
+                None => agreed = Some(dest),
             }
-            if let Some(dest) = decode_candidate(value, bing) {
-                return Some(dest);
-            }
+        }
+        if agreed.is_some() {
+            return agreed;
         }
     }
     None
@@ -2461,6 +2528,15 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
             // Read before the closure below drops a live vault: both outcomes
             // owe that vault's session an ending.
             let had_live_vault = state.vault.is_some();
+            // The replaced Library's version 1 salt, read now: the closure
+            // below detaches the Library, and a migrated (version 3) one keeps
+            // that salt only inside its encrypted contents (security review
+            // 2026-11-24, R-002).
+            let replaced_v1_salt = state
+                .store
+                .as_ref()
+                .and_then(|store| store.v1_leftover_salt())
+                .or_else(|| patanyx_store::Store::v1_salt_on_disk(&state.store_path));
             let mut import_started = false;
             let imported = replace_library(&marker, || {
                 import_started = true;
@@ -2519,7 +2595,7 @@ fn handle(state: &mut AppState, cmd: &str, args: &Value) -> Result<Value, &'stat
                 state.end_vault_session();
             }
             state.vault = Some(vault);
-            let library = finish_library_replacement(state, new_passphrase);
+            let library = finish_library_replacement(state, new_passphrase, replaced_v1_salt);
             let restored = restore_bookmarks(state, carried.as_deref());
             // Import mints a fresh recovery key — like creation, it is
             // returned exactly once so the UI can show it and then it is gone.
@@ -7457,7 +7533,15 @@ pub(crate) fn import_code(error: crate::vault_backup::ImportError) -> &'static s
 /// Complete the Library half after the imported vault has committed. The
 /// marker remains in place until the previous Store is durably absent; a
 /// removal failure therefore blocks that Store across unlock and restart.
-fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'static str {
+/// `replaced_v1_salt` is the replaced Library's version 1 salt, read by the
+/// caller before it detached that Library: its writer's crash leftovers still
+/// open with the old passphrase, so they go with it, as they do after a
+/// whole-Library import (SecScan S-7eda1aa77b37, 2026-11-24).
+fn finish_library_replacement(
+    state: &mut AppState,
+    passphrase: &str,
+    replaced_v1_salt: Option<[u8; 16]>,
+) -> &'static str {
     state.store = None;
     let marker = state.library_replace_marker();
     match std::fs::remove_file(&state.store_path) {
@@ -7489,6 +7573,13 @@ fn finish_library_replacement(state: &mut AppState, passphrase: &str) -> &'stati
     // Library shut. If it cannot be removed, the open below stays shut
     // (`library_import_unfinished`) rather than guessing.
     let _ = crate::vault_backup::discard(&state.store_path);
+    // After the Library itself is gone, so retirement can never take it. A
+    // failure is reported and never undoes the replacement.
+    if let Some(salt) = replaced_v1_salt {
+        if let Err(error) = patanyx_store::retire_v1_leftovers_at(&state.store_path, &salt) {
+            eprintln!("patanyx library: the import is complete, but {error}");
+        }
+    }
     state.open_store(Some(passphrase));
     if state.store.is_some() {
         "replaced"
@@ -9773,7 +9864,7 @@ mod tests {
 
 #[cfg(test)]
 mod unwrap_redirect_tests {
-    use super::{clean_link, is_acceptable_destination, strip_tracking_params, unwrap_redirect, LinkChange};
+    use super::{clean_link, decode_candidate, is_acceptable_destination, split_url, strip_tracking_params, unwrap_redirect, LinkChange};
 
     /// The bug this pins is a CRASH, not a wrong answer. An earlier draft
     /// validated candidates with `candidate[..7]` after a byte-length check,
@@ -9791,6 +9882,41 @@ mod unwrap_redirect_tests {
         for value in ["éééé", "🙂", "ééééééééé"] {
             assert!(!is_acceptable_destination(value));
         }
+    }
+
+    /// SecScan S-532601bb8b53: the copy must be where a click goes. Both
+    /// triggers from the finding, and the real Google shape that must keep
+    /// working.
+    #[test]
+    fn a_carrier_the_redirector_would_not_read_never_wins() {
+        // DuckDuckGo reads "uddg"; "UDDG" is not its carrier.
+        let ddg = "https://duckduckgo.com/l/?UDDG=https%3A%2F%2Fattacker.example%2F&uddg=https%3A%2F%2Fbenign.example%2F";
+        assert_eq!(unwrap_redirect(ddg), "https://benign.example/");
+        // Google does not base64-decode q; with url= beside it the link is
+        // ambiguous and left alone.
+        let google = "https://www.google.com/url?q=aHR0cHM6Ly9hdHRhY2tlci5leGFtcGxlLw&url=https://benign.example/";
+        assert_eq!(unwrap_redirect(google), google);
+        // Two carriers naming different places: left alone.
+        let two = "https://www.google.com/url?q=https://a.example/&url=https://b.example/";
+        assert_eq!(unwrap_redirect(two), two);
+        // Two carriers that agree, and the real result-link shape with an
+        // empty q, still unwrap.
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?q=https://a.example/&url=https://a.example/"),
+            "https://a.example/"
+        );
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?sa=t&q=&esrc=s&url=https%3A%2F%2Freal.example%2Fp&usg=x"),
+            "https://real.example/p"
+        );
+        // An encoded spelling of the carrier's name is the same carrier
+        // (round 2, R-003): two that disagree leave the link alone.
+        let encoded = "https://duckduckgo.com/l/?%75ddg=https%3A%2F%2Fevil.example%2F&uddg=https%3A%2F%2Fbenign.example%2F";
+        assert_eq!(unwrap_redirect(encoded), encoded);
+        // A carrier that does not decode (a non-UTF-8 byte) is not copied
+        // raw with its encoded "#" still in the path (round 2, R-002).
+        let legacy = "https://www.google.com/url?q=https://files.example/r%E9sum%E9.pdf%23share-key";
+        assert_eq!(unwrap_redirect(legacy), legacy);
     }
 
     #[test]
@@ -9839,6 +9965,118 @@ mod unwrap_redirect_tests {
         ] {
             assert_eq!(unwrap_redirect(url), url, "must not unwrap: {url}");
         }
+    }
+
+    /// A fragment is not a query: a carrier that appears after `#` was never
+    /// sent to the redirector, so it is not the link's destination.
+    #[test]
+    fn a_carrier_in_the_fragment_is_not_unwrapped() {
+        for url in [
+            "https://www.google.com/url#view?url=https://attacker.example/",
+            "https://www.google.com/url?x=1#&url=https://attacker.example/",
+            "https://safelinks.protection.outlook.com/#?url=https%3A%2F%2Fattacker.example%2F",
+        ] {
+            assert_eq!(unwrap_redirect(url), url, "must not unwrap: {url}");
+        }
+        // A real query before a fragment still unwraps.
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?url=https://real.example/#top"),
+            "https://real.example/"
+        );
+    }
+
+    /// A backslash ends the authority, as it does in the browser for http(s):
+    /// "https://evil.example\@google.com/..." goes to evil.example, so it is
+    /// not a Google wrapper to unwrap a second time.
+    #[test]
+    fn a_backslash_authority_is_not_read_as_a_known_wrapper_host() {
+        let url = "https://safelinks.protection.outlook.com/?url=https%3A%2F%2Fevil.example%5C%40google.com%2Furl%3Furl%3Dhttps%3A%2F%2Fother.example%2F";
+        let out = unwrap_redirect(url);
+        assert_eq!(out, "https://evil.example\\@google.com/url?url=https://other.example/");
+        assert_ne!(out, "https://other.example/");
+        assert_eq!(split_url(&out).map(|(host, _, _)| host).as_deref(), Some("evil.example"));
+        // And directly.
+        let direct = "https://evil.example\\@google.com/url?url=https://other.example/";
+        assert_eq!(unwrap_redirect(direct), direct);
+    }
+
+    /// In an http(s) path a backslash is a slash, so a Google wrapper written
+    /// "\url" is still the /url wrapper and is unwrapped.
+    #[test]
+    fn a_backslash_in_the_path_reads_as_a_slash() {
+        assert_eq!(
+            unwrap_redirect("https://www.google.com\\url?url=https://real.example/"),
+            "https://real.example/"
+        );
+        // A nested one, as a decoded carrier would hold it.
+        let nested = "https://safelinks.protection.outlook.com/?url=https%3A%2F%2Fwww.google.com%5Curl%3Furl%3Dhttps%3A%2F%2Freal.example%2F";
+        assert_eq!(unwrap_redirect(nested), "https://real.example/");
+    }
+
+    /// A dot segment moves the path the browser requests ("/l/../" is "/"),
+    /// so the link is not a wrapper, however the dots are spelled.
+    #[test]
+    fn a_dot_segment_path_is_not_unwrapped() {
+        for url in [
+            "https://duckduckgo.com/l/../?uddg=https://attacker.example/",
+            "https://duckduckgo.com/l\\../?uddg=https://attacker.example/",
+            "https://duckduckgo.com/l/%2E%2e/?uddg=https://attacker.example/",
+            "https://www.google.com/./url?q=https://attacker.example/",
+        ] {
+            assert_eq!(unwrap_redirect(url), url, "must not unwrap: {url}");
+        }
+        // The nested form the review named: decoded, its path is "/l\../".
+        let nested = "https://safelinks.protection.outlook.com/?url=https%3A%2F%2Fduckduckgo.com%2Fl%5C..%2F%3Fuddg%3Dhttps%253A%252F%252Fattacker.example%252F";
+        assert_eq!(unwrap_redirect(nested), "https://duckduckgo.com/l\\../?uddg=https%3A%2F%2Fattacker.example%2F");
+    }
+
+    /// The carrier is decoded once, as the redirector decodes it, so an
+    /// encoded "#", "?" or "&" in the destination arrives as itself.
+    #[test]
+    fn an_encoded_carrier_is_decoded_before_it_is_copied() {
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?q=https://example.org/guide%23install"),
+            "https://example.org/guide#install"
+        );
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?q=https://example.org/p%3Fid%3D5%26t%3D2"),
+            "https://example.org/p?id=5&t=2"
+        );
+        // A stray "%" stays literal, and does not stop "%23" beside it decoding.
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?q=https://example.org/100%"),
+            "https://example.org/100%"
+        );
+        assert_eq!(
+            unwrap_redirect("https://www.google.com/url?q=https://files.example/100%-done%23share-key"),
+            "https://files.example/100%-done#share-key"
+        );
+        // A space stays encoded, in either spelling, so the copy is one link
+        // to the file and not the wrapper again.
+        for q in ["Board%20Minutes.pdf", "Board+Minutes.pdf"] {
+            assert_eq!(
+                unwrap_redirect(&format!("https://www.google.com/url?q=https://files.example/{q}")),
+                "https://files.example/Board%20Minutes.pdf"
+            );
+        }
+        // A decoded right-to-left override is encoded again, never active
+        // text, from a form-encoded carrier and from Bing's base64 one.
+        for url in [
+            "https://www.google.com/url?q=https://files.example/invoice%E2%80%AEfdp.exe",
+            "https://www.bing.com/ck/a?!&&p=x&u=a1aHR0cHM6Ly9maWxlcy5leGFtcGxlL2ludm9pY2XigK5mZHAuZXhl&ntb=1",
+        ] {
+            assert_eq!(unwrap_redirect(url), "https://files.example/invoice%E2%80%AEfdp.exe", "{url}");
+        }
+    }
+
+    /// A prefix without a trailing slash names one endpoint, not every path
+    /// that starts with its letters.
+    #[test]
+    fn a_path_that_only_starts_with_the_endpoint_is_untouched() {
+        let url = "https://storage.cloud.google.com/url-exports/report.pdf?q=https://attacker.example/";
+        assert_eq!(unwrap_redirect(url), url);
+        let url = "https://www.facebook.com/l.phpx?u=https://attacker.example/";
+        assert_eq!(unwrap_redirect(url), url);
     }
 
     /// Recognition is host AND path. The right host on the wrong path is not
@@ -9991,9 +10229,15 @@ mod unwrap_redirect_tests {
         let encoded: String = inner.bytes().map(|b| format!("%{b:02X}")).collect();
         let outer = format!("https://www.google.com/url?q={encoded}");
         assert!(outer.is_ascii(), "the engine's form of the link is ASCII");
-        assert_eq!(unwrap_redirect(&outer), inner, "one level unwraps, the bad carrier stops");
+        // The decoded character is encoded again (reencode_unsafe), so the
+        // copy is ASCII too.
+        let copied = "https://www.bing.com/ck/a?u=a%D4%9EHR0cHM6Ly9leGFtcGxlLm9yZy8&ntb=1";
+        assert_eq!(unwrap_redirect(&outer), copied, "one level unwraps, the bad carrier stops");
         let (cleaned, _) = clean_link(&outer);
-        assert_eq!(cleaned, inner);
+        assert_eq!(cleaned, copied);
+        // The slice that panicked, reached directly now that the nested path
+        // hands it ASCII: a raw carrier starting with a multi-byte character.
+        assert_eq!(decode_candidate("a\u{051E}HR0cHM6Ly9leGFtcGxlLm9yZy8", true), None);
     }
 
     /// The shape every live Bing result link has (sampled 2026-11-02): a bare

@@ -138,6 +138,23 @@ const SETUP = `
   Object.defineProperty(HTMLIFrameElement.prototype, "contentDocument", { get: function () { return this.__child ? this.__child.document : null; }, configurable: true });
   function HTMLFrameElement() {}
   function HTMLObjectElement() {}
+
+  // The engine's RTCPeerConnection, recording the configuration it receives.
+  function RTCPeerConnection(config) {
+    if (new.target === undefined) {
+      throw new TypeError("Failed to construct 'RTCPeerConnection': call it with new.");
+    }
+    __made[__made.length] = { rtc: true, config: config };
+  }
+  RTCPeerConnection.prototype.setConfiguration = function (config) {
+    __made[__made.length] = { rtc: true, set: true, config: config };
+  };
+  RTCPeerConnection.generateCertificate = function () { return "certificate"; };
+  Object.setPrototypeOf(RTCPeerConnection, EventTarget);
+  Object.defineProperty(globalThis, "RTCPeerConnection", { value: RTCPeerConnection, writable: true, configurable: true });
+  if (__env.webkitAlias) {
+    Object.defineProperty(globalThis, "webkitRTCPeerConnection", { value: RTCPeerConnection, writable: true, configurable: true });
+  }
 `;
 
 function realm(env) {
@@ -775,6 +792,86 @@ const PUBLIC_HTTP = {
   check(
     /TcpListener/.test(chat) && /tungstenite/.test(chat),
     "Chat and Relay are still native Rust sockets, outside every page",
+  );
+}
+
+// --- WebRTC ICE servers (SecScan S-97924597b810, 2026-11-24) -------------
+// A STUN or TURN server is a connection the page names; Chromium reached a
+// local port through one from a plain-HTTP page before this. Same rule as a
+// socket, configuration read once.
+{
+  const rtc = (env) => {
+    const ctx = realm(Object.assign({}, PUBLIC_HTTP, env || {}));
+    install(ctx);
+    return ctx;
+  };
+  const refused = (r) => !r.ok && r.name === "SecurityError" && r.made.length === 0;
+  let ctx = rtc();
+  for (const url of [
+    "turn:127.0.0.1:3478?transport=tcp",
+    "turns:localhost:5349",
+    "stun:192.168.1.1",
+    "stun:[::1]:3478",
+    "TURN:10.0.0.8",
+    "turn:127.1:3478",
+    "stun:2130706433",
+    "turn:0x7f.1",
+    "turn:evil@127.0.0.1",
+    "foo:127.0.0.1",
+  ]) {
+    check(
+      refused(open(ctx, `new RTCPeerConnection({ iceServers: [{ urls: ${JSON.stringify(url)} }] })`)),
+      `a plain-HTTP page may not name ICE server ${url}`,
+    );
+  }
+  check(
+    refused(open(ctx, `new RTCPeerConnection({ iceServers: [{ urls: ["stun:stun.example.com", "turn:127.0.0.1:3478"] }] })`)),
+    "one private address in a list of urls refuses the configuration",
+  );
+  let r = open(ctx, `new RTCPeerConnection({ iceServers: [{ urls: "turn:203.0.113.7:3478?transport=tcp", username: "u", credential: "c" }], bundlePolicy: "max-bundle" })`);
+  check(
+    r.ok && r.made.length === 1 && r.made[0].config.iceServers[0].urls[0] === "turn:203.0.113.7:3478?transport=tcp" &&
+      r.made[0].config.iceServers[0].username === "u" && r.made[0].config.bundlePolicy === "max-bundle",
+    "a public ICE server is allowed, with its credentials and the other options",
+  );
+  check(
+    refused(open(ctx, `(function () { var pc = new RTCPeerConnection(); __made.length = 0; pc.setConfiguration({ iceServers: [{ urls: "turn:127.0.0.1:3478" }] }); return pc; })()`)),
+    "setConfiguration is held to the same rule",
+  );
+  r = open(ctx, `(function () { var n = 0; var s = { get urls() { n++; return n === 1 ? "turn:203.0.113.7:3478" : "turn:127.0.0.1:3478"; } }; var pc = new RTCPeerConnection({ iceServers: [s] }); __made[__made.length - 1].reads = n; return pc; })()`);
+  check(
+    r.ok && r.made[0].config.iceServers[0].urls[0] === "turn:203.0.113.7:3478" && r.made[0].reads === 1,
+    "urls is read once and the engine receives what was checked",
+  );
+  r = open(ctx, `[RTCPeerConnection.prototype.constructor === RTCPeerConnection, typeof RTCPeerConnection.generateCertificate, new RTCPeerConnection() instanceof RTCPeerConnection].join()`);
+  check(r.ok && r.ws === "true,function,true", "RTCPeerConnection keeps its shape: " + r.ws);
+  r = open(ctx, `(function () { var n = 0; var real = [{ urls: "turn:127.0.0.1:3478" }]; var servers = {}; Object.defineProperty(servers, Symbol.iterator, { get: function () { n++; return n === 1 ? undefined : function () { return real[Symbol.iterator](); }; } }); return new RTCPeerConnection({ iceServers: servers }); })()`);
+  check(!r.ok && r.name === "TypeError" && r.made.length === 0, "a server list with no iterator on the first read is refused, never forwarded (R-001)");
+  check(
+    refused(open(ctx, `new RTCPeerConnection({ iceServers: [{ url: "turn:127.0.0.1:3478" }] })`)),
+    "the singular legacy url is checked too",
+  );
+  r = open(ctx, `new RTCPeerConnection({ alwaysNegotiateDataChannels: true })`);
+  check(r.ok && r.made[0].config.alwaysNegotiateDataChannels === true, "alwaysNegotiateDataChannels survives the copy");
+  r = open(ctx, `new RTCPeerConnection({ encodedInsertableStreams: true, sdpSemantics: "unified-plan", iceServers: [{ url: "stun:stun.example.com", credentialType: "password" }] })`);
+  check(
+    r.ok && r.made[0].config.encodedInsertableStreams === true && r.made[0].config.sdpSemantics === "unified-plan" &&
+      r.made[0].config.iceServers[0].url === "stun:stun.example.com" && r.made[0].config.iceServers[0].credentialType === "password",
+    "a plain-HTTP copy keeps every member an engine reads (R-004)",
+  );
+  ctx = rtc({ href: "https://news.example/", origin: "https://news.example" });
+  check(
+    open(ctx, `new RTCPeerConnection({ iceServers: [{ urls: "turn:127.0.0.1:3478" }] })`).ok,
+    "an HTTPS page is outside the boundary, as for sockets",
+  );
+  r = open(ctx, `(function () { var c = { encodedInsertableStreams: true, iceServers: [{ url: "stun:stun.example.com" }] }; var pc = new RTCPeerConnection(c); __made[__made.length - 1].same = __made[__made.length - 1].config === c; return pc; })()`);
+  check(r.ok && r.made[0].same === true, "an HTTPS page's configuration reaches the engine untouched (R-004)");
+  ctx = rtc({ webkitAlias: true });
+  r = open(ctx, `[webkitRTCPeerConnection === RTCPeerConnection, RTCPeerConnection.prototype.constructor === RTCPeerConnection].join()`);
+  check(r.ok && r.ws === "true,true", "the legacy alias is the same wrapper: " + r.ws);
+  check(
+    refused(open(ctx, `new webkitRTCPeerConnection({ iceServers: [{ urls: "turn:127.0.0.1:3478" }] })`)),
+    "the legacy alias is checked too",
   );
 }
 

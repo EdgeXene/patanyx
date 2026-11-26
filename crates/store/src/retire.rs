@@ -13,6 +13,9 @@
 //! one that nothing overwrites, named `.tmp-<32 lowercase hex>`, or
 //! `<library name>.tmp` from builds up to 1.0.2. A passphrase change removes
 //! every one it can prove is a copy of this Library, and reports the rest.
+//! So does an import that replaces the Library (`retire_v1_leftovers_at`),
+//! since the Library it puts in place records no version 1 salt and no later
+//! change could prove them ours.
 //!
 //! # What is removed
 //!
@@ -251,6 +254,20 @@ fn classify_v3(
         }
         _ => Leftover::Foreign,
     })
+}
+
+/// The salt in the header of the version 1 Library file at `path`, read
+/// without its passphrase through the same safe open as a leftover
+/// (`Store::v1_salt_on_disk`). `None` for anything else: another version, a
+/// file that is not this store's or stops inside its header, a link, a FIFO,
+/// or nothing there.
+pub(crate) fn v1_salt_of(path: &Path) -> Option<[u8; SALT_LEN]> {
+    let file = open_leftover(path).ok()??;
+    let mut head = Vec::with_capacity(format::HEADER_LEN);
+    file.take(format::HEADER_LEN as u64)
+        .read_to_end(&mut head)
+        .ok()?;
+    format::decode_header(&head).ok().map(|header| header.salt)
 }
 
 /// Reads as much of an entry named like a leftover as its judgment needs.

@@ -118,7 +118,7 @@ NOTICE, not here.
 | `combine` | 4.6.7 | MIT |
 | `const-oid` | 0.10.2 | Apache-2.0 OR MIT |
 | `const-oid` | 0.9.6 | Apache-2.0 OR MIT |
-| `cookie` | 0.18.1 | MIT OR Apache-2.0 |
+| `cookie` | 0.18.3 | MIT OR Apache-2.0 |
 | `core-foundation` | 0.10.1 | MIT OR Apache-2.0 |
 | `core-foundation-sys` | 0.8.7 | MIT OR Apache-2.0 |
 | `core-graphics` | 0.25.0 | MIT OR Apache-2.0 |
@@ -183,7 +183,7 @@ NOTICE, not here.
 | `foreign-types` | 0.5.0 | MIT/Apache-2.0 |
 | `foreign-types-macros` | 0.2.4 | MIT/Apache-2.0 |
 | `foreign-types-shared` | 0.3.1 | MIT/Apache-2.0 |
-| `form_urlencoded` | 1.2.2 | MIT OR Apache-2.0 |
+| `form_urlencoded` | 1.2.3 | MIT OR Apache-2.0 |
 | `futures-channel` | 0.3.33 | MIT OR Apache-2.0 |
 | `futures-core` | 0.3.33 | MIT OR Apache-2.0 |
 | `futures-executor` | 0.3.33 | MIT OR Apache-2.0 |
@@ -463,7 +463,7 @@ NOTICE, not here.
 | `universal-hash` | 0.5.1 | MIT OR Apache-2.0 |
 | `untrusted` | 0.9.0 | ISC |
 | `ureq` | 2.12.1 | MIT OR Apache-2.0 |
-| `url` | 2.5.8 | MIT OR Apache-2.0 |
+| `url` | 2.5.9 | MIT OR Apache-2.0 |
 | `utf8_iter` | 1.0.4 | Apache-2.0 OR MIT |
 | `version-compare` | 0.2.1 | MIT |
 | `version_check` | 0.9.5 | MIT/Apache-2.0 |

@@ -31,6 +31,7 @@ mod backup_v4;
 /// the only thing that actually makes it one.
 pub mod lock;
 mod recovery;
+mod sealed_json;
 mod model;
 #[cfg(test)]
 mod writer_tests;
@@ -747,10 +748,9 @@ impl Vault {
         // with the same key would break AEAD security.
         let nonce: [u8; crypto::NONCE_LEN] = crypto::random_bytes();
         let header = format::encode_header(&self.params, &nonce, &self.slots);
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(&self.data)
-                .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?,
-        );
+        // One exactly sized buffer: see sealed_json.rs.
+        let plaintext = sealed_json::to_vec(&self.data, false)
+            .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?;
         // AAD is the whole header INCLUDING every slot, so a slot cannot be
         // added, removed or reordered without the contents failing to open.
         let ciphertext = crypto::encrypt(&self.master, &nonce, &header, &plaintext)?;

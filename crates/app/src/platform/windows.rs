@@ -2281,6 +2281,8 @@ pub fn build_content(
     // Built to receive a page's held new-window request (new_window.rs).
     adopting: bool,
 ) -> Result<(WebView, TabView, bool), wry::Error> {
+    // The WebSocket guard's frame channel reads the same allowances.
+    let malicious_override_frames = malicious_override.clone();
     // ENGINE-OWNED ZOOM HOTKEYS, on content tabs only.
     //
     // Measured 2026-07-28: WebView2 never delivers keypad keys to
@@ -2395,7 +2397,8 @@ pub fn build_content(
         // Right-click menu. Its own registration, because a tab whose menu
         // failed to register is not a tab whose autofill failed.
         connect_context_menu(&webview, proxy, window_hwnd(hosts), selection.clone());
-        let content_messages = connect_content_messages(&webview, proxy, id, state.clone());
+        let content_messages =
+            connect_content_messages(&webview, proxy, id, state.clone(), malicious_override.clone());
         st.content_script_registered = if content_messages {
             SettingState::Applied
         } else {
@@ -2449,6 +2452,10 @@ pub fn build_content(
     // chrome webview, and Chat and Relay themselves are native Rust sockets
     // that no page script can see (the guard's gate pins all three).
     install_local_network_guard(&webview, &state, proxy, id);
+    // Its channel in iframes: WebView2 raises an iframe's postMessage on that
+    // FRAME's WebMessageReceived, and only that frame's PostWebMessageAsJson
+    // reaches it back (1.1.2).
+    connect_ws_guard_frames(&webview, state.clone(), malicious_override_frames.clone());
     // The page-scrollbar courtesy: same registration category, same
     // all-frames path, same place in the order so the first document
     // already has it.
@@ -2554,6 +2561,172 @@ pub fn build_content(
 /// refused it can have a plain-HTTP page open a WebSocket into the user's
 /// network. A failed call is Failed at once; the completion callback records
 /// Applied or Failed.
+/// One turn of the WebSocket guard's channel (crate::ws_guard): parse,
+/// decide, and return the reply to post back to the sending frame. Not the
+/// guard's message (no "pws" kind, no or wrong token): None, and nothing was
+/// done. The tab's state is borrowed only for the decision, never across the
+/// caller's post.
+fn ws_guard_turn(
+    state: &Rc<RefCell<TabState>>,
+    malicious_override: &Rc<RefCell<std::collections::BTreeSet<String>>>,
+    frame: u64,
+    text: &str,
+) -> Option<String> {
+    let msg: serde_json::Value = serde_json::from_str(text).ok()?;
+    if msg.get("k").and_then(|v| v.as_str()) != Some("pws") {
+        return None;
+    }
+    let mut st = state.borrow_mut();
+    let mut guard = st.ws_guard.take()?;
+    let override_host = st.adlist_override_host();
+    let allowed = malicious_override.borrow();
+    let malicious =
+        |host: &str| !allowed.contains(host) && crate::blocklist::matched_rule(host).is_some();
+    let outcome = guard.handle(
+        frame,
+        &msg,
+        &mut st,
+        privacy::bundled_rules(),
+        Instant::now(),
+        override_host.as_deref(),
+        &malicious,
+    );
+    drop(allowed);
+    st.ws_guard = Some(guard);
+    match outcome {
+        crate::ws_guard::Outcome::Reply(reply) => Some(reply),
+        _ => None,
+    }
+}
+
+/// A reply the engine would not post: the guard will time the check out and
+/// refuse the socket. Logged without the host (the diagnostic export must not
+/// carry browsing history).
+fn ws_guard_reply_failed(state: &Rc<RefCell<TabState>>) {
+    if let Some(g) = state.borrow_mut().ws_guard.as_mut() {
+        g.note_reply_failed();
+    }
+    diag("websocket guard: a verdict could not be posted to the page; its socket will be refused on timeout");
+}
+
+/// Gives every iframe, at every depth, the guard's channel: WebView2 raises
+/// an iframe's chrome.webview.postMessage on THAT frame's WebMessageReceived
+/// (ICoreWebView2Frame2), and only that frame's PostWebMessageAsJson reaches
+/// it back. Each frame gets its own key, so a generation one frame announced
+/// cannot be used from another (crate::ws_guard). WHAT A FAILURE HERE MEANS:
+/// an iframe whose guard gets no "ready" within 1.5 s falls back to the 1.1.1
+/// behaviour for that document's life, so its sockets to public hosts open
+/// WITHOUT a verdict (the private-address rule still applies). The diag lines
+/// below say so; release text must not claim every socket is checked.
+fn connect_ws_guard_frames(
+    webview: &WebView,
+    state: Rc<RefCell<TabState>>,
+    malicious_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
+) {
+    use webview2_com::FrameCreatedEventHandler;
+    use webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2_4;
+    use windows::core::Interface;
+    use wry::WebViewExtWindows;
+
+    let core = webview.webview();
+    let Ok(core4) = core.cast::<ICoreWebView2_4>() else {
+        diag("websocket guard: this engine has no FrameCreated; iframes' sockets open as in 1.1.1");
+        return;
+    };
+    let next = Rc::new(std::cell::Cell::new(1u64));
+    let handler = FrameCreatedEventHandler::create(Box::new(move |_sender, args| {
+        if let Some(args) = args {
+            if let Ok(frame) = unsafe { args.Frame() } {
+                attach_ws_guard_frame(frame, &state, &malicious_override, &next);
+            }
+        }
+        Ok(())
+    }));
+    let mut token = Default::default();
+    if unsafe { core4.add_FrameCreated(&handler, &mut token) }.is_err() {
+        diag("websocket guard: FrameCreated registration failed; iframes' sockets open as in 1.1.1");
+    }
+}
+
+fn attach_ws_guard_frame(
+    frame: webview2_com::Microsoft::Web::WebView2::Win32::ICoreWebView2Frame,
+    state: &Rc<RefCell<TabState>>,
+    malicious_override: &Rc<RefCell<std::collections::BTreeSet<String>>>,
+    next: &Rc<std::cell::Cell<u64>>,
+) {
+    use webview2_com::Microsoft::Web::WebView2::Win32::{ICoreWebView2Frame2, ICoreWebView2Frame7};
+    use webview2_com::{
+        take_pwstr, FrameChildFrameCreatedEventHandler, FrameDestroyedEventHandler,
+        FrameWebMessageReceivedEventHandler,
+    };
+    use windows::core::{Interface, PWSTR};
+
+    let key = next.get();
+    next.set(key + 1);
+    if let Ok(frame2) = frame.cast::<ICoreWebView2Frame2>() {
+        let reply_frame = frame2.clone();
+        let st = state.clone();
+        let allow = malicious_override.clone();
+        let handler = FrameWebMessageReceivedEventHandler::create(Box::new(move |_sender, args| {
+            let Some(args) = args else {
+                return Ok(());
+            };
+            let mut json = PWSTR::null();
+            if unsafe { args.WebMessageAsJson(&mut json) }.is_ok() {
+                let text = take_pwstr(json);
+                if let Some(answer) = ws_guard_turn(&st, &allow, key, &text) {
+                    let wide: Vec<u16> = answer.encode_utf16().chain(std::iter::once(0)).collect();
+                    if unsafe { reply_frame.PostWebMessageAsJson(windows::core::PCWSTR(wide.as_ptr())) }.is_err() {
+                        ws_guard_reply_failed(&st);
+                    }
+                }
+            }
+            Ok(())
+        }));
+        let mut token = Default::default();
+        if unsafe { frame2.add_WebMessageReceived(&handler, &mut token) }.is_err() {
+            diag("websocket guard: an iframe's WebMessageReceived registration failed");
+        }
+    } else if !NO_FRAME2_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // A runtime fact, true of every frame: said once, not per frame, so
+        // it cannot push other lines out of the capped diagnostic log.
+        diag("websocket guard: this runtime has no ICoreWebView2Frame2; iframes' sockets open as in 1.1.1");
+    }
+    let gone_state = state.clone();
+    let destroyed = FrameDestroyedEventHandler::create(Box::new(move |_sender, _args| {
+        if let Some(g) = gone_state.borrow_mut().ws_guard.as_mut() {
+            g.frame_gone(key);
+        }
+        Ok(())
+    }));
+    let mut token = Default::default();
+    if unsafe { frame.add_Destroyed(&destroyed, &mut token) }.is_err() {
+        diag("websocket guard: an iframe's Destroyed registration failed");
+    }
+    if let Ok(frame7) = frame.cast::<ICoreWebView2Frame7>() {
+        let st = state.clone();
+        let allow = malicious_override.clone();
+        let counter = next.clone();
+        let child = FrameChildFrameCreatedEventHandler::create(Box::new(move |_sender, args| {
+            if let Some(args) = args {
+                if let Ok(child) = unsafe { args.Frame() } {
+                    attach_ws_guard_frame(child, &st, &allow, &counter);
+                }
+            }
+            Ok(())
+        }));
+        let mut token = Default::default();
+        if unsafe { frame7.add_FrameCreated(&child, &mut token) }.is_err() {
+            diag("websocket guard: a nested FrameCreated registration failed; nested iframes' sockets open as in 1.1.1");
+        }
+    } else if !NO_FRAME7_NOTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        diag("websocket guard: this runtime has no ICoreWebView2Frame7; nested iframes' sockets open as in 1.1.1");
+    }
+}
+
+static NO_FRAME2_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static NO_FRAME7_NOTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn install_local_network_guard(
     webview: &WebView,
     state: &Rc<RefCell<TabState>>,
@@ -2564,7 +2737,24 @@ fn install_local_network_guard(
     use wry::WebViewExtWindows;
 
     let core = webview.webview();
-    let source: Vec<u16> = privacy::LOCAL_NETWORK_GUARD_SCRIPT
+    // 1.1.2: the guard asks this tab before every socket to a public host
+    // (crate::ws_guard), authenticated by a per-webview token written into
+    // the script here. With no token (no OS randomness), the guard is
+    // registered as it is and runs exactly as in 1.1.1.
+    let guard = crate::ws_guard::WsGuard::new();
+    let script = guard
+        .as_ref()
+        .and_then(|g| g.script(privacy::LOCAL_NETWORK_GUARD_SCRIPT));
+    let source_text = match &script {
+        Some(s) => s.as_str(),
+        None => privacy::LOCAL_NETWORK_GUARD_SCRIPT,
+    };
+    if script.is_some() {
+        state.borrow_mut().ws_guard = guard;
+    } else {
+        diag("websocket guard: no token; sockets to public hosts open as in 1.1.1 in this tab");
+    }
+    let source: Vec<u16> = source_text
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect();
@@ -2816,6 +3006,9 @@ fn connect_content_messages(
     // thread, so Rc/RefCell is correct here for the same reason it is for
     // every other per-tab handler in this file.
     ready_state: Rc<RefCell<TabState>>,
+    // For the WebSocket guard's checks: the user's per-tab malicious-site
+    // allowances, read exactly as the request handler reads them.
+    malicious_override: Rc<RefCell<std::collections::BTreeSet<String>>>,
 ) -> bool {
     use webview2_com::{take_pwstr, WebMessageReceivedEventHandler};
     use windows::core::PWSTR;
@@ -2823,6 +3016,7 @@ fn connect_content_messages(
 
     let proxy = proxy.clone();
     let core = webview.webview();
+    let reply_core = core.clone();
     let mut token = Default::default();
     let result = unsafe {
         core.add_WebMessageReceived(
@@ -2837,6 +3031,19 @@ fn connect_content_messages(
                 // not what `serde_json::from_str` below expects.
                 let mut raw = PWSTR::null();
                 if args.TryGetWebMessageAsString(&mut raw).is_err() {
+                    // NOT A STRING: the WebSocket guard posts an object
+                    // (1.1.2), so it arrives as JSON. The top document is
+                    // frame 0; iframes come through connect_ws_guard_frames.
+                    let mut json = PWSTR::null();
+                    if args.WebMessageAsJson(&mut json).is_ok() {
+                        let text = take_pwstr(json);
+                        if let Some(answer) = ws_guard_turn(&ready_state, &malicious_override, 0, &text) {
+                            let wide: Vec<u16> = answer.encode_utf16().chain(std::iter::once(0)).collect();
+                            if unsafe { reply_core.PostWebMessageAsJson(windows::core::PCWSTR(wide.as_ptr())) }.is_err() {
+                                ws_guard_reply_failed(&ready_state);
+                            }
+                        }
+                    }
                     return Ok(());
                 }
                 let text = take_pwstr(raw);

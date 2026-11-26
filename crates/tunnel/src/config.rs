@@ -168,10 +168,14 @@ pub fn parse(text: &str) -> Result<TunnelConfig, ConfigError> {
 
     let mut section = String::new();
     let (mut seen_interface, mut seen_peer) = (false, false);
-    let mut private_key = None;
+    // The two secrets are held wiped-on-drop from the moment they are read:
+    // every error return below (a refused directive, a malformed field)
+    // used to free plain Strings with the key text in them (SecScan
+    // S-64fd0ba1fb13, 2026-11-24). The caller wipes its own copy of `text`.
+    let mut private_key: Option<zeroize::Zeroizing<String>> = None;
     let mut peer_public = None;
     let mut endpoint = None;
-    let mut preshared = None;
+    let mut preshared: Option<zeroize::Zeroizing<String>> = None;
     let mut keepalive = None;
     let mut allowed_ips = Vec::new();
     let mut dns = Vec::new();
@@ -207,7 +211,7 @@ pub fn parse(text: &str) -> Result<TunnelConfig, ConfigError> {
         }
 
         match (section.as_str(), key.as_str()) {
-            ("interface", "privatekey") => private_key = Some(value.to_string()),
+            ("interface", "privatekey") => private_key = Some(zeroize::Zeroizing::new(value.to_string())),
             ("interface", "address") => {
                 address = value.split(',').map(|s| s.trim().to_string()).collect();
             }
@@ -215,7 +219,7 @@ pub fn parse(text: &str) -> Result<TunnelConfig, ConfigError> {
                 dns = value.split(',').map(|s| s.trim().to_string()).collect();
             }
             ("peer", "publickey") => peer_public = Some(value.to_string()),
-            ("peer", "presharedkey") => preshared = Some(value.to_string()),
+            ("peer", "presharedkey") => preshared = Some(zeroize::Zeroizing::new(value.to_string())),
             ("peer", "endpoint") => endpoint = Some(value.to_string()),
             ("peer", "allowedips") => {
                 allowed_ips = value.split(',').map(|s| s.trim().to_string()).collect();
@@ -238,11 +242,11 @@ pub fn parse(text: &str) -> Result<TunnelConfig, ConfigError> {
         return Err(ConfigError::MissingSection("Peer"));
     }
 
-    let private_key_b64 = private_key.ok_or(ConfigError::Missing("PrivateKey"))?;
+    let mut private_key = private_key.ok_or(ConfigError::Missing("PrivateKey"))?;
     let peer_public_key_b64 = peer_public.ok_or(ConfigError::Missing("PublicKey"))?;
     let endpoint = endpoint.ok_or(ConfigError::Missing("Endpoint"))?;
 
-    if !looks_like_key(&private_key_b64) {
+    if !looks_like_key(&private_key) {
         return Err(ConfigError::Malformed("PrivateKey"));
     }
     if !looks_like_key(&peer_public_key_b64) {
@@ -257,11 +261,13 @@ pub fn parse(text: &str) -> Result<TunnelConfig, ConfigError> {
         return Err(ConfigError::Malformed("Endpoint"));
     }
 
+    // Moved out only on success, into a TunnelConfig that wipes on drop;
+    // the emptied wrappers wipe nothing.
     Ok(TunnelConfig {
-        private_key_b64,
+        private_key_b64: std::mem::take(&mut *private_key),
         peer_public_key_b64,
         endpoint,
-        preshared_key_b64: preshared,
+        preshared_key_b64: preshared.map(|mut psk| std::mem::take(&mut *psk)),
         keepalive_secs: keepalive,
         allowed_ips,
         dns,

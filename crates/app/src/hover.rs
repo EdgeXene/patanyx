@@ -25,6 +25,11 @@ pub(crate) const MAX_DISPLAY_CHARS: usize = 110;
 /// Shared with `state::sanitize_filename`: a downloaded file's NAME is a
 /// display surface too, and the same characters that let a link text lie
 /// about where it points let a file name lie about what it is.
+///
+/// The second group draws as nothing, or as blank space, in common fonts
+/// (SecScan S-57c229d929b0, 2026-11-24): a run of Hangul fillers between
+/// `invoice.pdf` and `.exe` pushes the real extension out of sight, and the
+/// Arabic letter mark is a bidi control like the ones above.
 pub(crate) fn is_deceptive(c: char) -> bool {
     matches!(
         c,
@@ -34,6 +39,18 @@ pub(crate) fn is_deceptive(c: char) -> bool {
             | '\u{2028}' | '\u{2029}' // line/paragraph separators
             | '\u{00AD}'              // soft hyphen
             | '\u{FEFF}'              // zero-width no-break space
+            | '\u{061C}'              // Arabic letter mark
+            | '\u{2060}'..='\u{206F}' // word joiner, invisible math characters, other format controls
+            | '\u{180B}'..='\u{180F}' // Mongolian variation selectors and vowel separator
+            | '\u{17B4}' | '\u{17B5}' // Khmer inherent vowels
+            | '\u{034F}'              // combining grapheme joiner
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers
+            | '\u{2800}'              // braille blank
+            | '\u{FE00}'..='\u{FE0F}' // variation selectors
+            | '\u{FFF0}'..='\u{FFF8}' // unassigned specials
+            | '\u{1BCA0}'..='\u{1BCA3}' // shorthand format controls
+            | '\u{1D173}'..='\u{1D17A}' // musical format controls
+            | '\u{E0000}'..='\u{E0FFF}' // tags and supplementary variation selectors
     )
 }
 
@@ -67,7 +84,52 @@ pub fn readout_for(raw: &str) -> Option<String> {
         return None;
     }
 
-    Some(elide_middle(&cleaned, MAX_DISPLAY_CHARS))
+    Some(shorten_keeping_host(&cleaned, MAX_DISPLAY_CHARS))
+}
+
+/// Shortens a web URL without ever cutting into its host.
+///
+/// Plain middle elision kept the first 55 characters, so a host like
+/// `accounts.google.com.<60 letters>.evil.example` lost its real ending and
+/// read as Google (SecScan S-3864551c2478, 2026-11-24). The host is the one
+/// part that says where the link goes: only the path is elided, and a host
+/// too long to fit keeps its END, where the registrable domain is.
+///
+/// Userinfo is dropped for the same reason: `https://accounts.google.com@evil.example/`
+/// goes to evil.example, and the readout says so.
+fn shorten_keeping_host(url: &str, max: usize) -> String {
+    let Some(scheme_end) = url.find("://").map(|i| i + 3) else {
+        return elide_middle(url, max);
+    };
+    let (scheme, after) = url.split_at(scheme_end);
+    // The authority ends where a web browser ends it, backslash included.
+    let authority_end = after
+        .find(|c| matches!(c, '/' | '?' | '#' | '\\'))
+        .unwrap_or(after.len());
+    let (authority, rest) = after.split_at(authority_end);
+    let host = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+
+    let shown = format!("{scheme}{host}{rest}");
+    let total = shown.chars().count();
+    if total <= max {
+        return shown;
+    }
+    let lead = scheme.chars().count() + host.chars().count();
+    // Room for the host plus a short elided path: elide the path only.
+    if lead + 8 <= max {
+        let rest_budget = max - lead;
+        return format!("{scheme}{host}{}", elide_middle(rest, rest_budget));
+    }
+    // The host alone does not fit: keep its end, mark both cuts.
+    let marks = if rest.is_empty() { 1 } else { 2 };
+    let host_budget = max.saturating_sub(scheme.chars().count() + marks);
+    let host_chars: Vec<char> = host.chars().collect();
+    let tail: String = host_chars[host_chars.len().saturating_sub(host_budget)..].iter().collect();
+    let mut out = format!("{scheme}\u{2026}{tail}");
+    if !rest.is_empty() {
+        out.push('\u{2026}');
+    }
+    out
 }
 
 /// Shortens by removing the MIDDLE, keeping both ends.
@@ -174,6 +236,64 @@ mod tests {
         let url = format!("https://example.com/{}", "a".repeat(80));
         assert!(url.chars().count() < MAX_DISPLAY_CHARS);
         assert_eq!(readout_for(&url).as_deref(), Some(url.as_str()));
+    }
+
+    /// SecScan S-3864551c2478: the old middle cut kept a trusted-looking
+    /// prefix and dropped the real host.
+    #[test]
+    fn a_long_host_is_never_cut_to_a_trusted_looking_prefix() {
+        let url = format!(
+            "https://accounts.google.com.{}.evil.example/{}",
+            "a".repeat(60),
+            "b".repeat(60)
+        );
+        let shown = readout_for(&url).unwrap();
+        assert!(shown.chars().count() <= MAX_DISPLAY_CHARS, "{shown}");
+        assert!(shown.contains(".evil.example/"), "the real host must stay: {shown}");
+        assert!(shown.ends_with("bbbb"), "the path tail stays too: {shown}");
+
+        // A host longer than the whole readout keeps its END.
+        let huge = format!("https://accounts.google.com.{}.evil.example/x", "a".repeat(200));
+        let shown = readout_for(&huge).unwrap();
+        assert!(shown.chars().count() <= MAX_DISPLAY_CHARS, "{shown}");
+        assert!(shown.contains("evil.example"), "{shown}");
+        assert!(!shown.contains("accounts.google.com"), "{shown}");
+        assert!(shown.starts_with("https://\u{2026}"), "{shown}");
+    }
+
+    /// Userinfo is not where a link goes; the host after the last @ is.
+    #[test]
+    fn userinfo_is_dropped_from_the_readout() {
+        assert_eq!(
+            readout_for("https://accounts.google.com@evil.example/login").as_deref(),
+            Some("https://evil.example/login")
+        );
+        assert_eq!(
+            readout_for("http://user:pw@a.example@b.example:8080/?q=1").as_deref(),
+            Some("http://b.example:8080/?q=1")
+        );
+        // An @ in the path is not userinfo.
+        assert_eq!(
+            readout_for("https://example.com/@someone").as_deref(),
+            Some("https://example.com/@someone")
+        );
+    }
+
+    /// SecScan S-57c229d929b0: blank-rendering and bidi characters the first
+    /// list missed.
+    #[test]
+    fn blank_rendering_characters_are_deceptive() {
+        for c in [
+            '\u{061C}', '\u{2060}', '\u{2064}', '\u{180E}', '\u{034F}', '\u{115F}', '\u{1160}',
+            '\u{3164}', '\u{FFA0}', '\u{2800}', '\u{E0020}', '\u{E007F}', '\u{FE0F}',
+            '\u{E0100}', '\u{180B}', '\u{17B4}', '\u{206A}', '\u{FFF0}', '\u{1BCA0}',
+            '\u{1D173}',
+        ] {
+            assert!(is_deceptive(c), "U+{:04X}", c as u32);
+        }
+        for c in ['a', ' ', '.', 'é', '日', '\u{00A0}'] {
+            assert!(!is_deceptive(c), "U+{:04X}", c as u32);
+        }
     }
 
     #[test]

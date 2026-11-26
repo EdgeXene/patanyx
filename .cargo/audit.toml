@@ -4,7 +4,8 @@
 ignore = [
   # RUSTSEC-2026-0009: `time` 0.3.6..0.3.46 stack exhaustion when the RFC 2822
   # parser (well_known::Rfc2822) is fed deprecated obs- constructs. Assessed
-  # 2026-09-16 for 1.0.0: `time` reaches the binary through cookie 0.18.1 <- wry,
+  # 2026-09-16 for 1.0.0 (re-checked 2026-11-24 on cookie 0.18.3: still four fixed
+  # formats, no RFC 2822 parser): `time` reaches the binary through cookie <- wry,
   # which parses Expires with four FIXED format descriptions (cookie
   # src/parse.rs FMT1..FMT4) and never the RFC 2822 parser; on Windows wry
   # never parses raw Set-Cookie text at all (cookie_from_win32 builds from the

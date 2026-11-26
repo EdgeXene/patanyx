@@ -75,6 +75,9 @@ mod crypto;
 mod error;
 mod format;
 mod library_backup;
+mod sealed_json;
+/// Secret data as JSON in one exactly sized, wiped buffer (see sealed_json.rs).
+pub use sealed_json::to_vec as sealed_json_to_vec;
 #[cfg(test)]
 mod library_backup_tests;
 #[cfg(test)]
@@ -475,10 +478,9 @@ impl Store {
                 wrapped,
             } => format::encode_header_v3(wrap_nonce, wrapped, &nonce).to_vec(),
         };
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(&self.data)
-                .map_err(|e| StoreError::Crypto(format!("json encode: {e}")))?,
-        );
+        // One exactly sized buffer: see sealed_json.rs.
+        let plaintext = sealed_json::to_vec(&self.data, false)
+            .map_err(|e| StoreError::Crypto(format!("json encode: {e}")))?;
         let ciphertext = crypto::encrypt(&self.key, &nonce, &header, &plaintext)?;
         let mut out = Vec::with_capacity(header.len() + ciphertext.len());
         out.extend_from_slice(&header);
@@ -572,6 +574,30 @@ impl Store {
             return Ok(());
         };
         retire::retire_leftovers(&self.path, &salt.0, || retire::flush_dir(&self.path))
+    }
+
+    /// The salt every leftover copy of this Library's version 1 file carries
+    /// (`retire.rs`): a version 1 Library's own, from its header, or the one
+    /// a version 3 Library recorded when it moved into the vault. `None` for
+    /// a Library that never was version 1, which has no such copies. An
+    /// import that replaces this Library takes it first
+    /// (`retire_v1_leftovers_at`).
+    pub fn v1_leftover_salt(&self) -> Option<[u8; crypto::SALT_LEN]> {
+        match &self.envelope {
+            Envelope::V1 { salt, .. } => Some(*salt),
+            Envelope::V3 { .. } => self.data.v1_salt.map(|recorded| recorded.0),
+        }
+    }
+
+    /// [`Store::v1_leftover_salt`] for a Library that is not open: the salt
+    /// in the header of the version 1 file at `path`, read without its
+    /// passphrase. `None` for a file of any other version, one that is not
+    /// this store's, or none. A version 3 Library keeps its version 1 salt
+    /// inside its encrypted contents, so only the open Library can give that
+    /// one. The header is not authenticated until the passphrase opens the
+    /// file; the salt is only ever used to recognize copies of that very file.
+    pub fn v1_salt_on_disk(path: &Path) -> Option<[u8; crypto::SALT_LEN]> {
+        retire::v1_salt_of(path)
     }
 
     /// Confirms the Library's directory entry is on disk, strictly: what a
@@ -1601,6 +1627,23 @@ impl Store {
     }
 }
 
+/// Removes the leftover copies of the version 1 Library file whose salt was
+/// `v1_salt` from beside `store_path`, with no Library open: for an import
+/// that has just put a new Library at `store_path` in place of that one. The
+/// new Library records no version 1 salt, so no later passphrase change
+/// could prove those copies ours, and each would go on opening with the
+/// passphrase it was written under. The same rule as
+/// `Store::retire_v1_leftovers` (`retire.rs`): only the writer's two names,
+/// only copies the salt proves, never the file at `store_path` itself, and
+/// anything else shaped like a Library kept and reported.
+/// `LeftoversRetained` when one could not be confirmed gone.
+pub fn retire_v1_leftovers_at(
+    store_path: &Path,
+    v1_salt: &[u8; crypto::SALT_LEN],
+) -> Result<(), StoreError> {
+    retire::retire_leftovers(store_path, v1_salt, || retire::flush_dir(store_path))
+}
+
 // No manual Drop impl: both keys wipe themselves via Zeroizing, and — by
 // the tiered-sensitivity design above — bookmark/provenance entries are not
 // treated as in-memory secrets the way vault passwords are.
@@ -1724,9 +1767,10 @@ enum Fault {
 /// rename) stays where it is: it holds only ciphertext under the Library's
 /// key, mode 0600, and nothing ever reads it. Removing such files at unlock
 /// was considered and dropped (plan review, 2026-09-27): deleting stored
-/// ciphertext would be a retention change of its own. The one exception is a
-/// passphrase change, which removes the leftover copies of a version 1 file,
-/// since those would still open with the old passphrase (`retire.rs`).
+/// ciphertext would be a retention change of its own. The exceptions are a
+/// passphrase change and an import that replaces the Library, which remove
+/// the leftover copies of a version 1 file, since those would still open with
+/// the old passphrase (`retire.rs`).
 fn atomic_replace(path: &Path, bytes: &[u8], fault: Fault) -> Result<(), StoreError> {
     let dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {

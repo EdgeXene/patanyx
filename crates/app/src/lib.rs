@@ -66,6 +66,9 @@ mod addon_protocol;
 mod addon_testkit;
 mod adlist_consent;
 mod toplevel_request;
+// The browser half of the WebSocket guard's channel (1.1.2); see the module.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod ws_guard;
 /// Searching the personal archive: which archived pages answer a query, and
 /// what each row shows. Pure logic over records the store owns.
 mod archive;
@@ -295,7 +298,8 @@ enum UserEvent {
     PageClosedTab(u64),
     /// The behavioural blocking probe has had long enough to load.
     ProbeDone,
-    DownloadStarted(String),
+    /// `name` is the file name the download is saved under.
+    DownloadStarted { url: String, name: String },
     DownloadDone {
         url: String,
         path: Option<String>,
@@ -2123,14 +2127,18 @@ pub fn run() {
                     let _ = app.open_page_tab(opener, &url, front);
                 }
             }
-            Event::UserEvent(UserEvent::DownloadStarted(url)) => {
-                app.emit("download_started", json!({ "url": url }));
+            Event::UserEvent(UserEvent::DownloadStarted { url, name }) => {
+                app.emit("download_started", json!({ "url": url, "name": name }));
             }
             Event::UserEvent(UserEvent::DownloadDone {
                 url,
                 path,
                 success,
             }) => {
+                match path.as_deref() {
+                    Some(p) => state::release_download_path(p),
+                    None => state::release_download_url(&url),
+                }
                 // Provenance BEFORE the toast: the downloads view refreshes
                 // off `download_finished`, and that refresh must already see
                 // this file's fingerprint record — or the explicit

@@ -1068,10 +1068,8 @@ impl Vault {
             vault: self.data_ref(),
             extra,
         };
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec(&payload)
-                .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?,
-        );
+        let plaintext = crate::sealed_json::to_vec(&payload, false)
+            .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?;
         let ciphertext = crypto::encrypt(&key, &nonce, &header, &plaintext[..])?;
         let mut out = Vec::with_capacity(header.len() + ciphertext.len());
         out.extend_from_slice(&header);
@@ -1215,10 +1213,8 @@ impl Vault {
         // mentions chat keys, and a file that hands over the ability to
         // impersonate someone to all their contacts is not what "readable
         // passwords" means.
-        let plaintext = Zeroizing::new(
-            serde_json::to_vec_pretty(&self.data_ref().to_plaintext_export())
-                .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?,
-        );
+        let plaintext = crate::sealed_json::to_vec(&self.data_ref().to_plaintext_export(), true)
+            .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?;
         write_plaintext_export(dest, self.path(), &plaintext[..], hooks)?;
         // `plaintext` wipes itself on drop.
         Ok(())

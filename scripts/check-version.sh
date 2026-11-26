@@ -72,12 +72,23 @@ fi
 
 echo "  version ok: $cargo_version (expected == Cargo.toml == metainfo)"
 
-# Negative control. A gate that has never been observed to fail is a gate
-# nobody has tested, and this one is two greps that could each silently
-# return empty. Plant a mismatch in a COPY and require the failure.
+# The newest release's text is what a software centre shows. 1.1.2 carried a
+# DRAFT placeholder there while it was built, written so the version could be
+# bumped before the copy existed; it must never ship.
+newest_release="$(awk '/<release[ \t]/ { on = 1 } on { print } on && /<\/release>/ { exit }' "$META")"
+if printf '%s\n' "$newest_release" | grep -q 'DRAFT'; then
+  echo "GATE FAIL: the newest <release> entry in $META still says DRAFT" >&2
+  exit 1
+fi
+echo "  release text ok: no DRAFT in the $meta_version entry"
+
+# Negative controls. A gate that has never been observed to fail is a gate
+# nobody has tested, and this one is greps that could each silently return
+# empty. Plant each failure in a COPY and require it.
 if [ "${PATANYX_VERSION_GATE_CONTROL:-}" != "1" ]; then
   probe="$(mktemp -d)"
-  trap 'rm -rf "$probe"' EXIT
+  probe2="$(mktemp -d)"
+  trap 'rm -rf "$probe" "$probe2"' EXIT
   mkdir -p "$probe/crates/app" "$probe/packaging/flatpak" "$probe/scripts"
   sed 's/^version = .*/version = "0.0.0-planted"/' "$CARGO" \
     > "$probe/$CARGO"
@@ -90,4 +101,19 @@ if [ "${PATANYX_VERSION_GATE_CONTROL:-}" != "1" ]; then
     exit 1
   fi
   echo "  (detector verified against a planted mismatch)"
+  mkdir -p "$probe2/crates/app" "$probe2/packaging/flatpak" "$probe2/scripts"
+  cp "$CARGO" "$probe2/$CARGO"
+  # Inside the newest <release>, not the first <p> of the file (that one is
+  # the app's own description).
+  awk '/<release[ \t]/ { in_rel = 1 }
+       in_rel && !done && /<p>/ { sub(/<p>/, "<p>DRAFT: planted. "); done = 1 }
+       { print }' "$META" > "$probe2/$META"
+  cp "$0" "$probe2/scripts/check-version.sh"
+  if EXPECTED_VERSION="$EXPECTED_VERSION" PATANYX_VERSION_GATE_CONTROL=1 \
+      bash "$probe2/scripts/check-version.sh" \
+      >/dev/null 2>&1; then
+    echo "GATE FAIL: a planted DRAFT release text was not detected" >&2
+    exit 1
+  fi
+  echo "  (detector verified against a planted DRAFT)"
 fi

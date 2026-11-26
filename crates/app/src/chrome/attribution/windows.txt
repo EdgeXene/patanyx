@@ -113,7 +113,7 @@ PACKAGES
       Copyright (c) 2019 The RustCrypto Project Developers
   cipher 0.4.4 -- MIT OR Apache-2.0
       Copyright (c) 2016-2020 RustCrypto Developers
-  cookie 0.18.1 -- MIT OR Apache-2.0
+  cookie 0.18.3 -- MIT OR Apache-2.0
       Copyright 2017 Sergio Benitez
       Copyright 2014 Alex Chricton
       Copyright (c) 2017 Sergio Benitez
@@ -183,7 +183,7 @@ PACKAGES
       Copyright 2017 Mozilla
   foldhash 0.2.0 -- Zlib
       Copyright (c) 2024 Orson Peters
-  form_urlencoded 1.2.2 -- MIT OR Apache-2.0
+  form_urlencoded 1.2.3 -- MIT OR Apache-2.0
       Copyright (c) 2013-2016 The rust-url developers
   generic-array 0.14.7 -- MIT
       Copyright (c) 2015 Bartłomiej Kamiński
@@ -517,7 +517,7 @@ PACKAGES
   untrusted 0.9.0 -- ISC
   ureq 2.12.1 -- MIT OR Apache-2.0
       Copyright (c) 2019 Martin Algesten
-  url 2.5.8 -- MIT OR Apache-2.0
+  url 2.5.9 -- MIT OR Apache-2.0
       Copyright (c) 2013-2025 The rust-url developers
   utf8_iter 1.0.4 -- Apache-2.0 OR MIT
       Copyright Mozilla Foundation
@@ -2130,7 +2130,7 @@ LICENCE TEXTS
 
      END OF TERMS AND CONDITIONS
 
-  --- used by 7 package(s): cookie 0.18.1, ed25519 2.2.3, http 1.4.2, memmap2 0.9.11, rustls-pki-types 1.15.1, transpose 0.2.3, typenum 1.20.1
+  --- used by 7 package(s): cookie 0.18.3, ed25519 2.2.3, http 1.4.2, memmap2 0.9.11, rustls-pki-types 1.15.1, transpose 0.2.3, typenum 1.20.1
 
   Apache License
                           Version 2.0, January 2004

@@ -66,6 +66,8 @@
   }
   var urlHref = getterOf(NativeURL.prototype, "href");
   var urlHostname = getterOf(NativeURL.prototype, "hostname");
+  var urlProtocol = getterOf(NativeURL.prototype, "protocol");
+  var iteratorSymbol = typeof Symbol === "function" ? Symbol.iterator : undefined;
   var nodeBaseURI = getterOf(Node.prototype, "baseURI");
   var documentDefaultView = getterOf(Document.prototype, "defaultView");
   // Location's members are unforgeable: own accessors on each Location
@@ -407,6 +409,271 @@
     }
   }
 
+  // --- the policy channel (1.1.2) ----------------------------------------
+  //
+  // WHY. A socket to a PUBLIC host was never checked: WebView2 does not show
+  // the handshake to the request filter, so the ad and tracker list never
+  // applied (measured 2026-11-14 on the 1.1.1 release build: an image and a
+  // fetch to a listed tracker were blocked, a socket to it connected). Every
+  // socket that the private-address rule above does not refuse now waits
+  // for the browser's verdict, asked over window.chrome.webview.
+  //
+  // WHO MAY ASK. The browser writes a per-webview token into this script's
+  // text before registering it (TOKEN below). Page code cannot read an
+  // injected script's text or this closure, and every native this channel
+  // uses is captured here, before any page script runs, so a page that later
+  // replaces postMessage, JSON or a getter never sees the token. Each
+  // document draws its own GENERATION; a reply is accepted only for the
+  // current generation, a live check id and that request's NONCE.
+  //
+  // NOT isTrusted. WebView2 hands the browser's messages to page script as
+  // a plain Event with isTrusted FALSE and an own `data` property (measured
+  // 2026-11-14 on WebView2 155), so a trusted-event test refused every
+  // genuine reply. What a page cannot forge is the nonce: drawn here per
+  // request, sent only to the browser, echoed in its reply, and used up by
+  // this listener (registered before any page script) before a page
+  // listener can see it.
+  //
+  // WHEN THE CHANNEL IS NOT THERE. No token (this script was not registered
+  // by the browser that knows the protocol), no chrome.webview, or no
+  // "ready" within READY_MS: DEGRADED, which is exactly the pre-1.1.2
+  // behaviour (private-address rule only, native socket). After "ready", a
+  // check with no verdict within VERDICT_MS is refused.
+  var TOKEN = "__PATANYX_WS_TOKEN__";
+  var READY_MS = 1500;
+  var VERDICT_MS = 5000;
+  var tokenSet = TOKEN.length === 32 && TOKEN[0] !== "_";
+  var NativeWeakMap = WeakMap;
+  var weakMapGet = WeakMap.prototype.get;
+  var weakMapSet = WeakMap.prototype.set;
+  var weakMapHas = WeakMap.prototype.has;
+  var weakMapDelete = WeakMap.prototype["delete"];
+  var nativeSetTimeout = window.setTimeout;
+  var nativeClearTimeout = window.clearTimeout;
+  var NativeUint8Array = Uint8Array;
+  var perfObject = window.performance;
+  var perfNow = perfObject && typeof perfObject.now === "function" ? perfObject.now : null;
+  function clock() {
+    return perfNow ? apply(perfNow, perfObject, []) : 0;
+  }
+  var cryptoObject = window.crypto;
+  var getRandomValues = cryptoObject ? cryptoObject.getRandomValues : null;
+  var webview = null;
+  var webviewPost = null;
+  var webviewListen = null;
+  try {
+    var chromeObject = window.chrome;
+    webview = chromeObject ? chromeObject.webview : null;
+    if (webview) {
+      webviewPost = webview.postMessage;
+      webviewListen = webview.addEventListener;
+    }
+  } catch (e) {
+    webview = null;
+  }
+
+  function hex128() {
+    var bytes = new NativeUint8Array(16);
+    apply(getRandomValues, cryptoObject, [bytes]);
+    var digits = "0123456789abcdef";
+    var out = "";
+    for (var i = 0; i < 16; i++) {
+      out += digits[bytes[i] >> 4] + digits[bytes[i] & 15];
+    }
+    return out;
+  }
+
+  // "unavailable" | "pending" | "ready" | "degraded"
+  var channelState = "unavailable";
+  var generation = "";
+  var helloNonce = "";
+  var nextCheck = 0;
+  // Live checks, keyed by id. A plain object with no prototype, indexed by
+  // a string id that never names an inherited property.
+  var checks = createObject(null);
+  // Checks made before "ready", in order. Indexed writes only.
+  var waiting = createObject(null);
+  var waitingCount = 0;
+
+  function sendToBrowser(op, nonce, id, url, outcome) {
+    var m = createObject(null);
+    m.k = "pws";
+    m.t = TOKEN;
+    m.g = generation;
+    m.op = op;
+    if (nonce !== undefined) {
+      m.n = nonce;
+    }
+    if (id !== undefined) {
+      m.id = id;
+    }
+    if (url !== undefined) {
+      m.url = url;
+    }
+    if (outcome !== undefined) {
+      m.outcome = outcome;
+    }
+    try {
+      apply(webviewPost, webview, [m]);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // An own data property of a browser-made reply, never an inherited one: a
+  // page that put `allow` on Object.prototype must not answer for the
+  // browser.
+  function ownValue(o, key) {
+    var d = getOwnDescriptor(o, key);
+    return d === undefined ? undefined : ownField(d, "value");
+  }
+
+  // The browser's `data` is an own property of the event. A page may
+  // dispatch look-alike events; what they carry is checked against the
+  // nonces below, never trusted for its shape.
+  function eventData(event) {
+    var own = getOwnDescriptor(event, "data");
+    if (own === undefined) {
+      return undefined;
+    }
+    var get = ownField(own, "get");
+    return typeof get === "function" ? apply(get, event, []) : ownField(own, "value");
+  }
+
+  function onBrowserMessage(event) {
+    var d;
+    var n;
+    try {
+      d = eventData(event);
+      if (!d || typeof d !== "object" || ownValue(d, "k") !== "pws" || ownValue(d, "g") !== generation) {
+        return;
+      }
+      n = ownValue(d, "n");
+    } catch (e) {
+      return;
+    }
+    if (typeof n !== "string" || n.length !== 32) {
+      return;
+    }
+    var op = ownValue(d, "op");
+    if (op === "ready") {
+      if (channelState === "pending" && n === helloNonce) {
+        channelState = "ready";
+        for (var i = 0; i < waitingCount; i++) {
+          sendCheck(waiting[i]);
+          waiting[i] = undefined;
+        }
+        waitingCount = 0;
+      }
+      return;
+    }
+    if (op === "verdict") {
+      var id = ownValue(d, "id");
+      if (typeof id !== "string") {
+        return;
+      }
+      var check = checks[id];
+      if (check === undefined || n !== check.nonce) {
+        return; // unknown, answered, timed out, or not from the browser
+      }
+      checks[id] = undefined;
+      apply(nativeClearTimeout, window, [check.timer]);
+      // A verdict handled after VERDICT_MS (the page's thread was stalled,
+      // so the timer could not run first) is refused as a timeout: the
+      // browser may already have recorded this socket as blocked.
+      if (clock() - check.sentAt >= VERDICT_MS) {
+        check.answer(false, "timed-out");
+        return;
+      }
+      check.answer(ownValue(d, "allow") === true, "verdict");
+    }
+  }
+
+  function sendCheck(check) {
+    check.sent = true;
+    check.sentAt = clock();
+    checks[check.id] = check;
+    check.timer = apply(nativeSetTimeout, window, [
+      function () {
+        if (checks[check.id] === check) {
+          checks[check.id] = undefined;
+          check.answer(false, "timed-out");
+        }
+      },
+      VERDICT_MS,
+    ]);
+    check.nonce = hex128();
+    if (!sendToBrowser("check", check.nonce, check.id, check.url)) {
+      checks[check.id] = undefined;
+      apply(nativeClearTimeout, window, [check.timer]);
+      // Never synchronously: the page has not had the socket back yet.
+      apply(nativeSetTimeout, window, [function () { check.answer(false, "unsent"); }, 0]);
+    }
+  }
+
+  // Asks the browser about `url`; `answer(allow, how)` is called exactly
+  // once. Returns false when the channel is not in use (DEGRADED): the
+  // caller then opens the socket natively, as before 1.1.2.
+  function askBrowser(url, answer) {
+    if (channelState !== "ready" && channelState !== "pending") {
+      return false;
+    }
+    var check = createObject(null);
+    check.id = "c" + nextCheck++;
+    check.url = url;
+    check.answer = answer;
+    check.sent = false;
+    if (channelState === "ready") {
+      sendCheck(check);
+    } else {
+      waiting[waitingCount++] = check;
+    }
+    return check.id;
+  }
+
+  function startChannel() {
+    if (!tokenSet || !webview || typeof webviewPost !== "function" ||
+        typeof webviewListen !== "function" || typeof getRandomValues !== "function") {
+      return; // "unavailable": the pre-1.1.2 behaviour
+    }
+    try {
+      generation = hex128();
+      helloNonce = hex128();
+      // A CAPTURE listener, registered before any page script. WebView2 155
+      // runs chrome.webview listeners in registration order and ignores the
+      // flag (measured 2026-11-14), so this listener is first today. Under
+      // standard EventTarget dispatch a page's later capture listener would
+      // run before a non-capture one and could take the nonce first; as the
+      // first CAPTURE listener this one stays first either way.
+      apply(webviewListen, webview, ["message", onBrowserMessage, true]);
+    } catch (e) {
+      return;
+    }
+    channelState = "pending";
+    if (!sendToBrowser("hello", helloNonce)) {
+      channelState = "degraded";
+      return;
+    }
+    apply(nativeSetTimeout, window, [
+      function () {
+        if (channelState !== "pending") {
+          return;
+        }
+        // No browser answered: DEGRADED. Sockets that waited are opened
+        // natively, exactly as they would have been before 1.1.2.
+        channelState = "degraded";
+        for (var i = 0; i < waitingCount; i++) {
+          var check = waiting[i];
+          waiting[i] = undefined;
+          check.answer(true, "degraded");
+        }
+        waitingCount = 0;
+      },
+      READY_MS,
+    ]);
+  }
+
   // --- the wrapper ---------------------------------------------------------
 
   // Property descriptors without a prototype. Reflect.defineProperty reads a
@@ -465,11 +732,738 @@
       return (
         wrapConstructor(win, "WebSocket", true) &&
         wrapConstructor(win, "WebSocketStream", false) &&
+        guardPeerConnection(win) &&
         hookFrames(win)
       );
     } catch (e) {
       return false;
     }
+  }
+
+  // --- the checked socket (1.1.2) ----------------------------------------
+  //
+  // While the browser decides, the page holds a STAND-IN: a real EventTarget
+  // (so addEventListener, removeEventListener and dispatchEvent are native)
+  // whose prototype is the realm's WebSocket.prototype (so instanceof,
+  // subclassing and prototype.constructor hold). The prototype's accessors
+  // and methods are replaced, once per realm, by ones that serve a stand-in
+  // from its record and hand everything else to the captured native, so a
+  // real WebSocket and the engine's own brand errors are unchanged.
+  //
+  // On allow, the native socket is constructed with the CHECKED absolute URL
+  // and the protocol SNAPSHOT, and its events are re-dispatched on the
+  // stand-in. One difference is unavoidable and stated: a re-dispatched
+  // event has isTrusted === false. On a refusal, or no verdict in time, the
+  // stand-in fails exactly like a refused connection: "error", then "close"
+  // with code 1006 and wasClean false. close() before the verdict is final:
+  // a later allow never opens a socket.
+  var standins = new NativeWeakMap();
+  function recordOf(o) {
+    return (typeof o === "object" || typeof o === "function") && o !== null
+      ? apply(weakMapGet, standins, [o])
+      : undefined;
+  }
+
+  var SOCKET_ACCESSORS = ["url", "readyState", "bufferedAmount", "extensions", "protocol",
+                          "binaryType", "onopen", "onerror", "onclose", "onmessage"];
+  var realms = new NativeWeakMap(); // Native constructor -> realm support, or null
+
+  function makeDict() {
+    return createObject(null);
+  }
+
+  // Replaces WebSocket.prototype's accessors and send/close for one realm,
+  // all or nothing: every original is read and checked first, and if any
+  // definition fails every one already made is put back (R-126). Returns
+  // the realm's support record, or null (the realm then opens sockets
+  // natively, as before 1.1.2).
+  function realmSupport(win, Native) {
+    if (apply(weakMapHas, realms, [Native])) {
+      return apply(weakMapGet, realms, [Native]);
+    }
+    var support = null;
+    try {
+      support = buildSupport(win, Native);
+    } catch (e) {
+      support = null;
+    }
+    apply(weakMapSet, realms, [Native, support]);
+    return support;
+  }
+
+  function buildSupport(win, Native) {
+    var proto = Native.prototype;
+    var ET = win.EventTarget;
+    if (typeof ET !== "function" || typeof win.Event !== "function" ||
+        typeof win.MessageEvent !== "function" || typeof win.CloseEvent !== "function") {
+      return null;
+    }
+    var etProto = ET.prototype;
+    var s = makeDict();
+    s.ET = ET;
+    s.Event = win.Event;
+    s.MessageEvent = win.MessageEvent;
+    s.CloseEvent = win.CloseEvent;
+    s.DOMException = win.DOMException || NativeDOMException;
+    s.addListener = etProto.addEventListener;
+    s.removeListener = etProto.removeEventListener;
+    s.dispatch = etProto.dispatchEvent;
+    s.msgData = getterOf(win.MessageEvent.prototype, "data");
+    s.msgOrigin = getterOf(win.MessageEvent.prototype, "origin");
+    s.msgLastEventId = getterOf(win.MessageEvent.prototype, "lastEventId");
+    s.closeCode = getterOf(win.CloseEvent.prototype, "code");
+    s.closeReason = getterOf(win.CloseEvent.prototype, "reason");
+    s.closeClean = getterOf(win.CloseEvent.prototype, "wasClean");
+    s.setTimeout = win.setTimeout;
+    if (typeof s.addListener !== "function" || typeof s.removeListener !== "function" ||
+        typeof s.dispatch !== "function" || !s.msgData || !s.closeCode) {
+      return null;
+    }
+    // Preflight: every original exists and can be replaced.
+    var originals = makeDict();
+    var names = SOCKET_ACCESSORS;
+    for (var i = 0; i < names.length; i++) {
+      var d = getOwnDescriptor(proto, names[i]);
+      if (d === undefined || ownField(d, "configurable") !== true || typeof ownField(d, "get") !== "function") {
+        return null;
+      }
+      originals[names[i]] = d;
+    }
+    var methods = ["send", "close"];
+    for (var m = 0; m < methods.length; m++) {
+      var md = getOwnDescriptor(proto, methods[m]);
+      if (md === undefined || ownField(md, "configurable") !== true || typeof ownField(md, "value") !== "function") {
+        return null;
+      }
+      originals[methods[m]] = md;
+    }
+    s.get = makeDict();
+    s.set = makeDict();
+    for (var g = 0; g < names.length; g++) {
+      s.get[names[g]] = ownField(originals[names[g]], "get");
+      s.set[names[g]] = ownField(originals[names[g]], "set");
+    }
+    s.send = ownField(originals.send, "value");
+    s.close = ownField(originals.close, "value");
+    s.CONNECTING = Native.CONNECTING;
+    // Build every replacement, then define them; undo on any failure.
+    var replacements = makeDict();
+    for (var r = 0; r < names.length; r++) {
+      replacements[names[r]] = accessorReplacement(names[r], originals[names[r]]);
+    }
+    replacements.send = dataDescriptor(sendReplacement(s), ownField(originals.send, "writable"),
+                                       ownField(originals.send, "enumerable"), true);
+    replacements.close = dataDescriptor(closeReplacement(s), ownField(originals.close, "writable"),
+                                        ownField(originals.close, "enumerable"), true);
+    var done = makeDict();
+    var doneCount = 0;
+    var keys = makeDict();
+    var kc = 0;
+    for (var a = 0; a < names.length; a++) {
+      keys[kc++] = names[a];
+    }
+    keys[kc++] = "send";
+    keys[kc++] = "close";
+    for (var k = 0; k < kc; k++) {
+      if (!defineProperty(proto, keys[k], replacements[keys[k]])) {
+        for (var u = 0; u < doneCount; u++) {
+          defineProperty(proto, done[u], originals[done[u]]);
+        }
+        return null;
+      }
+      done[doneCount++] = keys[k];
+    }
+    return s;
+  }
+
+  function accessorReplacement(name, original) {
+    var holder = {
+      get [name]() {
+        var rec = recordOf(this);
+        if (rec === undefined) {
+          return apply(ownField(original, "get"), this, []);
+        }
+        return standinGet(rec, name);
+      },
+      set [name](value) {
+        var rec = recordOf(this);
+        if (rec === undefined) {
+          var setter = ownField(original, "set");
+          if (typeof setter !== "function") {
+            return; // a read-only attribute: assignment is a no-op, as natively
+          }
+          apply(setter, this, [value]);
+          return;
+        }
+        standinSet(rec, name, value);
+      },
+    };
+    var own = getOwnDescriptor(holder, name);
+    var get = ownField(own, "get");
+    var set = typeof ownField(original, "set") === "function" ? ownField(own, "set") : undefined;
+    apply(weakSetAdd, ours, [get]);
+    if (set) {
+      apply(weakSetAdd, ours, [set]);
+    }
+    return accessorDescriptor(get, set, ownField(original, "enumerable"), true);
+  }
+
+  function standinGet(rec, name) {
+    var support = rec.support;
+    if (rec.native !== null && name !== "onopen" && name !== "onerror" &&
+        name !== "onclose" && name !== "onmessage") {
+      return apply(support.get[name], rec.native, []);
+    }
+    if (name === "url") return rec.url;
+    if (name === "readyState") return rec.readyState;
+    if (name === "bufferedAmount") return 0;
+    if (name === "extensions" || name === "protocol") return "";
+    if (name === "binaryType") return rec.binaryType;
+    var h = rec.handlers[name];
+    return h === undefined ? null : h;
+  }
+
+  function standinSet(rec, name, value) {
+    if (name === "binaryType") {
+      var v = NativeString(value); // converted once
+      if (v !== "blob" && v !== "arraybuffer") {
+        return; // an invalid value is ignored, as natively
+      }
+      rec.binaryType = v;
+      if (rec.native !== null) {
+        apply(rec.support.set.binaryType, rec.native, [v]);
+      }
+      return;
+    }
+    if (name === "onopen" || name === "onerror" || name === "onclose" || name === "onmessage") {
+      var h = typeof value === "function" || (typeof value === "object" && value !== null) ? value : null;
+      rec.handlers[name] = h;
+      // As natively: a handler attribute's listener joins the list when it
+      // is first set, so `addEventListener("open", a); onopen = b` runs a
+      // first; setting null takes it out, and setting again re-adds it last.
+      var type = slice(name, 2, name.length);
+      if (h !== null && !rec.active[name]) {
+        rec.active[name] = true;
+        apply(rec.support.addListener, rec.socket, [type, rec.handlerListener[name]]);
+      } else if (h === null && rec.active[name]) {
+        rec.active[name] = false;
+        apply(rec.support.removeListener, rec.socket, [type, rec.handlerListener[name]]);
+      }
+    }
+    // url, readyState, bufferedAmount, extensions, protocol: read-only.
+  }
+
+  function sendReplacement(support) {
+    var holder = {
+      send(data) {
+        var rec = recordOf(this);
+        if (rec === undefined) {
+          return apply(support.send, this, arguments);
+        }
+        if (rec.native !== null && apply(support.get.readyState, rec.native, []) !== support.CONNECTING) {
+          return apply(support.send, rec.native, arguments);
+        }
+        if (rec.readyState >= 2) {
+          return undefined; // closing or closed: dropped, as natively
+        }
+        throw new support.DOMException(
+          "Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.",
+          "InvalidStateError",
+        );
+      },
+    };
+    var f = ownField(getOwnDescriptor(holder, "send"), "value");
+    apply(weakSetAdd, ours, [f]);
+    return f;
+  }
+
+  function closeReplacement(support) {
+    var holder = {
+      close(code, reason) {
+        var rec = recordOf(this);
+        if (rec === undefined || rec.native !== null) {
+          return apply(support.close, rec === undefined ? this : rec.native, arguments);
+        }
+        if (code !== undefined) {
+          var c = +code;
+          c = c !== c ? 0 : c < 0 ? 0 : c > 65535 ? 65535 : c - (c % 1);
+          if (c !== 1000 && !(c >= 3000 && c <= 4999)) {
+            throw new support.DOMException(
+              "Failed to execute 'close' on 'WebSocket': The close code must be either 1000, or between 3000 and 4999. " + c + " is neither.",
+              "InvalidAccessError",
+            );
+          }
+        }
+        if (reason !== undefined && utf8Length(NativeString(reason)) > 123) {
+          throw new support.DOMException(
+            "Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.",
+            "SyntaxError",
+          );
+        }
+        if (rec.readyState >= 2) {
+          return undefined;
+        }
+        // Closing before the verdict FAILS the connection, as natively for
+        // a socket still CONNECTING, and is final (R-128).
+        rec.closedByPage = true;
+        rec.readyState = 2;
+        apply(support.setTimeout, rec.win, [function () { failStandin(rec); }, 0]);
+        return undefined;
+      },
+    };
+    var f = ownField(getOwnDescriptor(holder, "close"), "value");
+    apply(weakSetAdd, ours, [f]);
+    return f;
+  }
+
+  function utf8Length(s) {
+    var n = 0;
+    for (var i = 0; i < s.length; i++) {
+      var u = codeUnit(s, i);
+      if (u < 0x80) n += 1;
+      else if (u < 0x800) n += 2;
+      else if (u >= 0xd800 && u <= 0xdbff && i + 1 < s.length) { n += 4; i++; }
+      else n += 3;
+    }
+    return n;
+  }
+  var nativeCharCodeAt = String.prototype.charCodeAt;
+  function codeUnit(s, i) {
+    return apply(nativeCharCodeAt, s, [i]);
+  }
+
+  function fire(rec, type, init) {
+    var support = rec.support;
+    var event;
+    if (type === "message") {
+      event = new support.MessageEvent("message", init);
+    } else if (type === "close") {
+      event = new support.CloseEvent("close", init);
+    } else {
+      event = new support.Event(type);
+    }
+    apply(support.dispatch, rec.socket, [event]);
+  }
+
+  function failStandin(rec) {
+    if (rec.readyState === 3) {
+      return;
+    }
+    rec.readyState = 3;
+    fire(rec, "error");
+    var init = makeDict();
+    init.code = 1006;
+    init.reason = "";
+    init.wasClean = false;
+    fire(rec, "close", init);
+  }
+
+  // Binds the native socket and re-dispatches its events on the stand-in.
+  function bindNative(rec, native) {
+    var support = rec.support;
+    rec.native = native;
+    if (rec.binaryType !== "blob") {
+      apply(support.set.binaryType, native, [rec.binaryType]);
+    }
+    apply(support.addListener, native, ["open", function () { fire(rec, "open"); }]);
+    apply(support.addListener, native, ["error", function () { fire(rec, "error"); }]);
+    apply(support.addListener, native, ["message", function (e) {
+      var init = makeDict();
+      init.data = apply(support.msgData, e, []);
+      init.origin = apply(support.msgOrigin, e, []);
+      init.lastEventId = apply(support.msgLastEventId, e, []);
+      fire(rec, "message", init);
+    }]);
+    apply(support.addListener, native, ["close", function (e) {
+      var init = makeDict();
+      init.code = apply(support.closeCode, e, []);
+      init.reason = apply(support.closeReason, e, []);
+      init.wasClean = apply(support.closeClean, e, []);
+      fire(rec, "close", init);
+    }]);
+  }
+
+  // Returns a stand-in, or undefined when the channel is not in use (the
+  // caller then constructs natively, as before 1.1.2).
+  function checkedSocket(win, Native, newTarget, href, args) {
+    var support = realmSupport(win, Native);
+    if (!support) {
+      return undefined;
+    }
+    var rec = makeDict();
+    rec.support = support;
+    rec.win = win;
+    rec.url = socketUrl(href);
+    rec.readyState = 0;
+    rec.binaryType = "blob";
+    rec.native = null;
+    rec.closedByPage = false;
+    rec.handlers = makeDict();
+    rec.active = makeDict();
+    rec.handlerListener = makeDict();
+    var socket = construct(support.ET, [], newTarget);
+    rec.socket = socket;
+    var answered = false;
+    var asked = askBrowser(href, function (allow, how) {
+      if (answered) {
+        return;
+      }
+      answered = true;
+      if (rec.closedByPage) {
+        if (allow && how === "verdict") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "cancelled");
+        }
+        return;
+      }
+      if (!allow) {
+        if (how === "timed-out") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "timed-out");
+        }
+        failStandin(rec);
+        return;
+      }
+      var native;
+      try {
+        native = construct(Native, args, Native);
+      } catch (e) {
+        if (how === "verdict") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "failed");
+        }
+        failStandin(rec);
+        return;
+      }
+      if (how === "verdict") {
+        sendToBrowser("ack", undefined, rec.checkId, undefined, "constructed");
+      }
+      bindNative(rec, native);
+    });
+    if (asked === false) {
+      return undefined;
+    }
+    rec.checkId = asked;
+    apply(weakMapSet, standins, [socket, rec]);
+    // Handler attributes: one listener per type, registered only when the
+    // attribute is first set (standinSet).
+    var types = ["open", "error", "close", "message"];
+    for (var i = 0; i < 4; i++) {
+      (function (type) {
+        rec.handlerListener["on" + type] = function (event) {
+          var h = rec.handlers["on" + type];
+          if (typeof h === "function") {
+            apply(h, socket, [event]);
+          }
+        };
+      })(types[i]);
+    }
+    return socket;
+  }
+
+  // The URL a native WebSocket reports: http(s) is shown as ws(s).
+  function socketUrl(href) {
+    if (slice(href, 0, 8) === "https://") return "wss://" + slice(href, 8, href.length);
+    if (slice(href, 0, 7) === "http://") return "ws://" + slice(href, 7, href.length);
+    return href;
+  }
+
+  // --- validation the stand-in must do itself (1.1.2) ---------------------
+  //
+  // A native constructor throws these synchronously; a stand-in is returned
+  // before any native exists, so it throws them here, with the engine's
+  // names and messages (pinned against the engine by the gate).
+
+  function snapshotList(values) {
+    var list = [];
+    for (var i = 0; i < values.count; i++) {
+      // defineProperty, not assignment: an index setter on Array.prototype
+      // must not see the values.
+      defineProperty(list, NativeString(i), dataDescriptor(values[i], true, true, true));
+    }
+    return list;
+  }
+
+  // (DOMString or sequence<DOMString>), converted ONCE (R-114): a string, or
+  // one pass of the iterator with each element converted once.
+  function snapshotProtocols(value) {
+    var values = createObject(null);
+    values.count = 0;
+    var method = (typeof value === "object" || typeof value === "function") && value !== null &&
+      iteratorSymbol !== undefined ? value[iteratorSymbol] : undefined;
+    if (typeof method === "function") {
+      var iterator = apply(method, value, []);
+      var next = iterator.next;
+      for (;;) {
+        var step = apply(next, iterator, []);
+        if (step.done) {
+          break;
+        }
+        values[values.count++] = NativeString(step.value);
+      }
+    } else {
+      values[values.count++] = NativeString(value);
+    }
+    return snapshotList(values);
+  }
+
+  function isTokenChar(c) {
+    return (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") ||
+      c === "!" || c === "#" || c === "$" || c === "%" || c === "&" || c === "'" || c === "*" ||
+      c === "+" || c === "-" || c === "." || c === "^" || c === "_" || c === "`" || c === "|" || c === "~";
+  }
+
+  function validateForStandin(parsed, protocols, name) {
+    var scheme = apply(urlProtocol, parsed, []);
+    if (scheme !== "ws:" && scheme !== "wss:" && scheme !== "http:" && scheme !== "https:") {
+      throw new NativeDOMException(
+        "Failed to construct '" + name + "': The URL's scheme must be either 'http', 'https', 'ws', or 'wss'. '" +
+          slice(scheme, 0, scheme.length - 1) + "' is not allowed.",
+        "SyntaxError",
+      );
+    }
+    // Any fragment, an EMPTY one included ("wss://host/#"): URL.hash reads
+    // "" for both, so the serialized URL is what tells them apart.
+    var href = apply(urlHref, parsed, []);
+    var mark = indexOf(href, "#");
+    if (mark !== -1) {
+      var fragment = slice(href, mark + 1, href.length);
+      throw new NativeDOMException(
+        "Failed to construct '" + name + "': The URL contains a fragment identifier ('" + fragment +
+          "'). Fragment identifiers are not allowed in WebSocket URLs.",
+        "SyntaxError",
+      );
+    }
+    if (protocols === undefined) {
+      return;
+    }
+    var seen = createObject(null);
+    for (var i = 0; i < protocols.length; i++) {
+      var p = protocols[i];
+      var ok = p.length > 0;
+      for (var j = 0; ok && j < p.length; j++) {
+        ok = isTokenChar(p[j]);
+      }
+      if (!ok) {
+        throw new NativeDOMException(
+          "Failed to construct '" + name + "': The subprotocol '" + p + "' is invalid.",
+          "SyntaxError",
+        );
+      }
+      if (seen["$" + p] === true) {
+        throw new NativeDOMException(
+          "Failed to construct '" + name + "': The subprotocol '" + p + "' is duplicated.",
+          "SyntaxError",
+        );
+      }
+      seen["$" + p] = true;
+    }
+  }
+
+  function channelInUse() {
+    return channelState === "ready" || channelState === "pending";
+  }
+
+  // WebSocketStream's options, read ONCE: { protocols, signal }.
+  function snapshotStreamOptions(options) {
+    if (options === undefined || options === null) {
+      return undefined;
+    }
+    var o = createObject(null);
+    var protocols = options.protocols;
+    if (protocols !== undefined) {
+      o.protocols = snapshotProtocols(protocols);
+    }
+    var signal = options.signal;
+    if (signal !== undefined) {
+      o.signal = signal;
+    }
+    return o;
+  }
+
+  // --- the checked stream (1.1.2) ------------------------------------------
+  //
+  // WebSocketStream opens the same handshake and is as blind to the request
+  // filter, so it waits for the same verdict. Its stand-in carries the url
+  // and the two promises; on allow they follow the native stream's, on a
+  // refusal both reject as for a refused connection.
+  var streamRealms = new NativeWeakMap();
+
+  function streamSupport(win, Native) {
+    if (apply(weakMapHas, streamRealms, [Native])) {
+      return apply(weakMapGet, streamRealms, [Native]);
+    }
+    var support = null;
+    try {
+      support = buildStreamSupport(win, Native);
+    } catch (e) {
+      support = null;
+    }
+    apply(weakMapSet, streamRealms, [Native, support]);
+    return support;
+  }
+
+  function buildStreamSupport(win, Native) {
+    var proto = Native.prototype;
+    if (typeof win.Promise !== "function") {
+      return null;
+    }
+    var s = makeDict();
+    s.Promise = win.Promise;
+    s.then = win.Promise.prototype.then;
+    s.DOMException = win.DOMException || NativeDOMException;
+    s.WebSocketError = typeof win.WebSocketError === "function" ? win.WebSocketError : null;
+    var getters = ["url", "opened", "closed"];
+    var originals = makeDict();
+    for (var i = 0; i < 3; i++) {
+      var d = getOwnDescriptor(proto, getters[i]);
+      if (d === undefined || ownField(d, "configurable") !== true || typeof ownField(d, "get") !== "function") {
+        return null;
+      }
+      originals[getters[i]] = d;
+    }
+    var cd = getOwnDescriptor(proto, "close");
+    if (cd === undefined || ownField(cd, "configurable") !== true || typeof ownField(cd, "value") !== "function") {
+      return null;
+    }
+    s.get = makeDict();
+    for (var g = 0; g < 3; g++) {
+      s.get[getters[g]] = ownField(originals[getters[g]], "get");
+    }
+    s.close = ownField(cd, "value");
+    var replacements = makeDict();
+    for (var r = 0; r < 3; r++) {
+      replacements[getters[r]] = streamGetter(getters[r], s);
+    }
+    var closeHolder = {
+      close(closeInfo) {
+        var rec = recordOf(this);
+        if (rec === undefined || rec.native !== null) {
+          return apply(s.close, rec === undefined ? this : rec.native, arguments);
+        }
+        if (!rec.settled) {
+          rec.closedByPage = true;
+          rejectStream(rec);
+        }
+        return undefined;
+      },
+    };
+    var closeFn = ownField(getOwnDescriptor(closeHolder, "close"), "value");
+    apply(weakSetAdd, ours, [closeFn]);
+    replacements.close = dataDescriptor(closeFn, ownField(cd, "writable"), ownField(cd, "enumerable"), true);
+    originals.close = cd;
+    var keys = ["url", "opened", "closed", "close"];
+    var done = 0;
+    for (var k = 0; k < 4; k++) {
+      if (!defineProperty(proto, keys[k], replacements[keys[k]])) {
+        for (var u = 0; u < done; u++) {
+          defineProperty(proto, keys[u], originals[keys[u]]);
+        }
+        return null;
+      }
+      done++;
+    }
+    return s;
+  }
+
+  function streamGetter(name, support) {
+    var holder = {
+      get [name]() {
+        var rec = recordOf(this);
+        if (rec === undefined) {
+          return apply(support.get[name], this, []);
+        }
+        if (name === "url") return rec.url;
+        return name === "opened" ? rec.opened : rec.closedPromise;
+      },
+    };
+    var f = ownField(getOwnDescriptor(holder, name), "get");
+    apply(weakSetAdd, ours, [f]);
+    return accessorDescriptor(f, undefined, false, true);
+  }
+
+  function rejectStream(rec) {
+    if (rec.settled) {
+      return;
+    }
+    rec.settled = true;
+    var support = rec.support;
+    var error;
+    if (support.WebSocketError) {
+      var init = makeDict();
+      init.closeCode = 1006;
+      error = new support.WebSocketError("WebSocket connection failed", init);
+    } else {
+      error = new support.DOMException("WebSocket connection failed", "NetworkError");
+    }
+    rec.rejectOpened(error);
+    rec.rejectClosed(error);
+  }
+
+  function checkedStream(win, Native, newTarget, href, args) {
+    var support = streamSupport(win, Native);
+    if (!support) {
+      return undefined;
+    }
+    var proto = newTarget.prototype;
+    if ((typeof proto !== "object" && typeof proto !== "function") || proto === null) {
+      proto = Native.prototype;
+    }
+    var stream = createObject(proto);
+    var rec = makeDict();
+    rec.support = support;
+    rec.url = socketUrl(href);
+    rec.native = null;
+    rec.settled = false;
+    rec.closedByPage = false;
+    rec.opened = new support.Promise(function (resolve, reject) {
+      rec.resolveOpened = resolve;
+      rec.rejectOpened = reject;
+    });
+    rec.closedPromise = new support.Promise(function (resolve, reject) {
+      rec.resolveClosed = resolve;
+      rec.rejectClosed = reject;
+    });
+    // Marked handled, so a refusal the page never awaits does not add an
+    // unhandled-rejection report; a page's own handlers still run.
+    var ignore = function () {};
+    apply(support.then, rec.opened, [undefined, ignore]);
+    apply(support.then, rec.closedPromise, [undefined, ignore]);
+    var asked = askBrowser(href, function (allow, how) {
+      if (rec.closedByPage) {
+        if (allow && how === "verdict") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "cancelled");
+        }
+        return;
+      }
+      if (!allow) {
+        if (how === "timed-out") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "timed-out");
+        }
+        rejectStream(rec);
+        return;
+      }
+      var native;
+      try {
+        native = construct(Native, args, Native);
+      } catch (e) {
+        if (how === "verdict") {
+          sendToBrowser("ack", undefined, rec.checkId, undefined, "failed");
+        }
+        rejectStream(rec);
+        return;
+      }
+      if (how === "verdict") {
+        sendToBrowser("ack", undefined, rec.checkId, undefined, "constructed");
+      }
+      rec.native = native;
+      rec.settled = true;
+      apply(support.then, apply(support.get.opened, native, []), [rec.resolveOpened, rec.rejectOpened]);
+      apply(support.then, apply(support.get.closed, native, []), [rec.resolveClosed, rec.rejectClosed]);
+    });
+    if (asked === false) {
+      return undefined;
+    }
+    rec.checkId = asked;
+    apply(weakMapSet, standins, [stream, rec]);
+    return stream;
   }
 
   function wrapConstructor(win, name, hasConstants) {
@@ -504,11 +1498,29 @@
         );
       }
       var href = apply(urlHref, parsed, []);
-      return construct(
-        Native,
-        arguments.length > 1 ? [href, second] : [href],
-        new.target,
-      );
+      if (name === "WebSocket") {
+        var protocols =
+          arguments.length > 1 && second !== undefined ? snapshotProtocols(second) : undefined;
+        var args = protocols === undefined ? [href] : [href, protocols];
+        if (channelInUse()) {
+          validateForStandin(parsed, protocols, name);
+          var socket = checkedSocket(win, Native, new.target, href, args);
+          if (socket !== undefined) {
+            return socket;
+          }
+        }
+        return construct(Native, args, new.target);
+      }
+      var options = arguments.length > 1 ? snapshotStreamOptions(second) : undefined;
+      var streamArgs = options === undefined ? [href] : [href, options];
+      if (channelInUse()) {
+        validateForStandin(parsed, options === undefined ? undefined : options.protocols, name);
+        var stream = checkedStream(win, Native, new.target, href, streamArgs);
+        if (stream !== undefined) {
+          return stream;
+        }
+      }
+      return construct(Native, streamArgs, new.target);
     };
     defineProperty(Wrapped, "name", dataDescriptor(name, false, false, true));
     defineProperty(Wrapped, "length", dataDescriptor(1, false, false, true));
@@ -609,5 +1621,257 @@
     );
   }
 
+  // --- WebRTC ICE servers (SecScan S-97924597b810, 2026-11-24) -----------
+  //
+  // A STUN or TURN server is a connection the page names, and the request
+  // handler never sees it. Measured in Chromium on 2026-11-24 with this script
+  // injected as WebView2 injects it: a plain-HTTP page reached a local TCP
+  // port through "turn:127.0.0.1:PORT?transport=tcp", given to the
+  // constructor or to setConfiguration. Every ICE server address now meets
+  // the same rule as a socket. The configuration is read ONCE into a copy,
+  // and the native receives the copy: a getter that answers differently the
+  // second time cannot pass the check with one address and use another.
+  //
+  // NOT covered, stated rather than implied: a REMOTE candidate the page
+  // supplies (in a description or through addIceCandidate) is still checked
+  // by the engine alone, and a server NAME that resolves to a private address
+  // is not one this classifier can see, exactly as for sockets.
+  // Every RTCConfiguration and RTCIceServer member an engine reads, so a
+  // checked copy loses none of them (security review 2026-11-24, R-004:
+  // encodedInsertableStreams holds an encrypted call's media until its
+  // transforms are ready, and the singular "url" is still accepted).
+  var ICE_KEYS = ["alwaysNegotiateDataChannels", "bundlePolicy", "certificates", "encodedInsertableStreams", "iceCandidatePoolSize",
+    "iceTransportPolicy", "peerIdentity", "rtcpMuxPolicy", "sdpSemantics"];
+  var ICE_SERVER_KEYS = ["username", "credential", "credentialType"];
+  var NativeTypeError = TypeError;
+
+  // Whether this page is inside the boundary at all: a plain-HTTP top, or
+  // one whose standing cannot be read, exactly as refuses() decides.
+  function boundaryApplies(win) {
+    var top = topOrigin(win);
+    if (top === null || lower(top) === "null") {
+      return true;
+    }
+    return slice(lower(top), 0, 5) === "http:";
+  }
+
+  function refuseIceAddresses(win, addresses, name) {
+    for (var j = 0; j < addresses.length; j++) {
+      var host = canonicalHost(iceHost(addresses[j]));
+      // An address this cannot read is refused wherever a readable one
+      // to this machine would be: "localhost" stands in for it.
+      if (refuses(win, host === null ? "localhost" : host)) {
+        throw new NativeDOMException(
+          "Failed to construct '" + name + "': A page served over plain HTTP may not connect to the local network.",
+          "SecurityError",
+        );
+      }
+    }
+  }
+
+  // The host of a stun:, stuns:, turn: or turns: URI (RFC 7064, RFC 7065),
+  // or null when it is not one this can read.
+  function iceHost(url) {
+    var colon = indexOf(url, ":", 0);
+    if (colon < 0) {
+      return null;
+    }
+    var scheme = lower(slice(url, 0, colon));
+    if (scheme !== "stun" && scheme !== "stuns" && scheme !== "turn" && scheme !== "turns") {
+      return null;
+    }
+    var rest = slice(url, colon + 1, url.length);
+    var query = indexOf(rest, "?", 0);
+    if (query >= 0) {
+      rest = slice(rest, 0, query);
+    }
+    if (rest.length > 0 && rest[0] === "[") {
+      var close = indexOf(rest, "]", 0);
+      return close < 0 ? null : slice(rest, 0, close + 1);
+    }
+    var port = indexOf(rest, ":", 0);
+    if (port >= 0) {
+      if (indexOf(rest, ":", port + 1) >= 0) {
+        return null;
+      }
+      rest = slice(rest, 0, port);
+    }
+    return rest.length > 0 ? rest : null;
+  }
+
+  // The host as the engine resolves it: "127.1" and "2130706433" are
+  // 127.0.0.1 to a URL parser, and the classifier reads only canonical forms
+  // (compliance audit 2026-11-24, A3). Null when it is not a host.
+  function canonicalHost(host) {
+    if (host === null) {
+      return null;
+    }
+    try {
+      return apply(urlHostname, new NativeURL("http://" + host + "/"), []);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // One pass of an iterable, values kept as they are; undefined when the
+  // value is not iterable (the engine then throws its own TypeError).
+  function snapshotSequence(value) {
+    var method = (typeof value === "object" || typeof value === "function") && value !== null &&
+      iteratorSymbol !== undefined ? value[iteratorSymbol] : undefined;
+    if (typeof method !== "function") {
+      return undefined;
+    }
+    var values = createObject(null);
+    values.count = 0;
+    var iterator = apply(method, value, []);
+    var next = iterator.next;
+    for (;;) {
+      var step = apply(next, iterator, []);
+      if (step.done) {
+        break;
+      }
+      values[values.count++] = step.value;
+    }
+    return snapshotList(values);
+  }
+
+  function setField(target, key, value) {
+    defineProperty(target, key, dataDescriptor(value, true, true, true));
+  }
+
+  function checkedIceConfig(win, config, name) {
+    if (config === undefined || config === null || (typeof config !== "object" && typeof config !== "function")) {
+      return config; // nothing to check, or the engine's own TypeError
+    }
+    // Outside the boundary nothing is refused, so the engine gets the page's
+    // own configuration, untouched.
+    if (!boundaryApplies(win)) {
+      return config;
+    }
+    var copy = createObject(null);
+    for (var k = 0; k < ICE_KEYS.length; k++) {
+      var v = config[ICE_KEYS[k]];
+      if (v !== undefined) {
+        setField(copy, ICE_KEYS[k], v);
+      }
+    }
+    var servers = config.iceServers;
+    if (servers === undefined) {
+      return copy;
+    }
+    var list = snapshotSequence(servers);
+    if (list === undefined) {
+      // Refused here, never forwarded: the engine would ask the object for
+      // its iterator again, and a getter could then hand it servers this
+      // never saw (security review 2026-11-24, R-001).
+      throw new NativeTypeError(
+        "Failed to construct '" + name + "': The provided value cannot be converted to a sequence.",
+      );
+    }
+    var checked = [];
+    for (var i = 0; i < list.length; i++) {
+      var server = list[i];
+      if (server === null || (typeof server !== "object" && typeof server !== "function")) {
+        setField(checked, NativeString(i), server);
+        continue;
+      }
+      var entry = createObject(null);
+      var urls = server.urls;
+      var legacy = server.url;
+      if (urls !== undefined) {
+        var addresses = snapshotProtocols(urls);
+        refuseIceAddresses(win, addresses, name);
+        setField(entry, "urls", addresses);
+      }
+      if (legacy !== undefined) {
+        var single = NativeString(legacy);
+        refuseIceAddresses(win, [single], name);
+        setField(entry, "url", single);
+      }
+      for (var f = 0; f < ICE_SERVER_KEYS.length; f++) {
+        var field = server[ICE_SERVER_KEYS[f]];
+        if (field !== undefined) {
+          setField(entry, ICE_SERVER_KEYS[f], field);
+        }
+      }
+      setField(checked, NativeString(i), entry);
+    }
+    setField(copy, "iceServers", checked);
+    return copy;
+  }
+
+  function guardPeerConnection(win) {
+    var Native = win.RTCPeerConnection;
+    var alias = win.webkitRTCPeerConnection;
+    if (!wrapPeerConnection(win, "RTCPeerConnection")) {
+      return false;
+    }
+    // The legacy name is the SAME constructor where an engine still has it:
+    // it gets the same wrapper, so prototype.constructor stays the
+    // RTCPeerConnection the page sees, and the native is not reachable
+    // through the old name.
+    if (typeof alias === "function" && alias === Native) {
+      return defineProperty(win, "webkitRTCPeerConnection", dataDescriptor(win.RTCPeerConnection, true, false, true));
+    }
+    return wrapPeerConnection(win, "webkitRTCPeerConnection");
+  }
+
+  function wrapPeerConnection(win, name) {
+    var Native = win[name];
+    if (typeof Native !== "function") {
+      return true; // this engine has no such constructor
+    }
+    if (isOurs(Native)) {
+      return true;
+    }
+    var proto = Native.prototype;
+    var d = getOwnDescriptor(proto, "setConfiguration");
+    var original = d === undefined ? undefined : ownField(d, "value");
+    if (typeof original === "function" && !isOurs(original)) {
+      var hooked = {
+        setConfiguration(config) {
+          if (arguments.length === 0) {
+            return apply(original, this, []); // the engine's own TypeError
+          }
+          return apply(original, this, [checkedIceConfig(win, config, name)]);
+        },
+      }.setConfiguration;
+      apply(weakSetAdd, ours, [hooked]);
+      if (
+        !defineProperty(
+          proto,
+          "setConfiguration",
+          dataDescriptor(hooked, ownField(d, "writable"), ownField(d, "enumerable"), ownField(d, "configurable")),
+        )
+      ) {
+        return false;
+      }
+    }
+    var Wrapped = function (config) {
+      if (new.target === undefined) {
+        return apply(Native, this, arguments); // the engine's own TypeError
+      }
+      var args = [];
+      for (var a = 0; a < arguments.length; a++) {
+        setField(args, NativeString(a), a === 0 ? checkedIceConfig(win, config, name) : arguments[a]);
+      }
+      return construct(Native, args, new.target);
+    };
+    defineProperty(Wrapped, "name", dataDescriptor(name, false, false, true));
+    defineProperty(Wrapped, "length", dataDescriptor(0, false, false, true));
+    Wrapped.prototype = proto;
+    if (!defineProperty(proto, "constructor", dataDescriptor(Wrapped, true, false, true))) {
+      return false;
+    }
+    var generate = getOwnDescriptor(Native, "generateCertificate");
+    if (generate !== undefined) {
+      defineProperty(Wrapped, "generateCertificate", generate);
+    }
+    setPrototypeOf(Wrapped, getPrototypeOf(Native));
+    apply(weakSetAdd, ours, [Wrapped]);
+    return defineProperty(win, name, dataDescriptor(Wrapped, true, false, true));
+  }
+
+  startChannel();
   guard(window);
 })();

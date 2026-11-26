@@ -128,7 +128,7 @@ PACKAGES
       Copyright (c) 2016-2020 RustCrypto Developers
   const-oid 0.10.2 -- Apache-2.0 OR MIT
       Copyright (c) 2020-2026 The RustCrypto Project Developers
-  cookie 0.18.1 -- MIT OR Apache-2.0
+  cookie 0.18.3 -- MIT OR Apache-2.0
       Copyright 2017 Sergio Benitez
       Copyright 2014 Alex Chricton
       Copyright (c) 2017 Sergio Benitez
@@ -220,7 +220,7 @@ PACKAGES
   flume 0.12.0 -- Apache-2.0/MIT
   foldhash 0.2.0 -- Zlib
       Copyright (c) 2024 Orson Peters
-  form_urlencoded 1.2.2 -- MIT OR Apache-2.0
+  form_urlencoded 1.2.3 -- MIT OR Apache-2.0
       Copyright (c) 2013-2016 The rust-url developers
   futures-channel 0.3.33 -- MIT OR Apache-2.0
       Copyright (c) 2016 Alex Crichton
@@ -674,7 +674,7 @@ PACKAGES
   untrusted 0.9.0 -- ISC
   ureq 2.12.1 -- MIT OR Apache-2.0
       Copyright (c) 2019 Martin Algesten
-  url 2.5.8 -- MIT OR Apache-2.0
+  url 2.5.9 -- MIT OR Apache-2.0
       Copyright (c) 2013-2025 The rust-url developers
   utf8_iter 1.0.4 -- Apache-2.0 OR MIT
       Copyright Mozilla Foundation
@@ -1434,7 +1434,7 @@ LICENCE TEXTS
   Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
   ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation and others.
 
-  --- used by 15 package(s): cookie 0.18.1, ed25519 2.2.3, futures-channel 0.3.33, futures-core 0.3.33, futures-executor 0.3.33, futures-io 0.3.33, futures-sink 0.3.33, futures-task 0.3.33, and 7 more
+  --- used by 15 package(s): cookie 0.18.3, ed25519 2.2.3, futures-channel 0.3.33, futures-core 0.3.33, futures-executor 0.3.33, futures-io 0.3.33, futures-sink 0.3.33, futures-task 0.3.33, and 7 more
 
   Apache License
                           Version 2.0, January 2004

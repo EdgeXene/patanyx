@@ -305,7 +305,8 @@ impl AddonNamespace {
     /// the caller then deletes no version, since either index may be the one
     /// a crash leaves behind, and `recover` settles it at the next open.
     fn write_index(&self, index: &Index) -> Result<bool, AddonWriteError> {
-        let json = Zeroizing::new(serde_json::to_vec(index).map_err(|e| StoreError::BadFormat(e.to_string()))?);
+        // One exactly sized buffer: see sealed_json.rs (security review 2026-11-24, R-009).
+        let json = crate::sealed_json::to_vec(index, false).map_err(|e| StoreError::BadFormat(e.to_string()))?;
         if json.len() > ADDON_MAX_INDEX_BYTES {
             return Err(AddonWriteError::QuotaExceeded);
         }
@@ -467,7 +468,7 @@ impl AddonNamespace {
         };
         index.pages.retain(|p| p.id != page_id);
         index.pages.push(meta.clone());
-        let index_len = Zeroizing::new(serde_json::to_vec(&index).map_err(|e| StoreError::BadFormat(e.to_string()))?).len();
+        let index_len = crate::sealed_json::to_vec(&index, false).map_err(|e| StoreError::BadFormat(e.to_string()))?.len();
         if index_len > ADDON_MAX_INDEX_BYTES {
             return Err(AddonWriteError::QuotaExceeded);
         }
@@ -631,7 +632,7 @@ pub fn addon_stored_len(plaintext_len: usize) -> u64 {
 /// The index a backup carries for `pages`: what [`AddonRestore::finish`] reads.
 pub fn addon_backup_index(pages: &[PageMeta]) -> Result<Zeroizing<Vec<u8>>, StoreError> {
     let index = Index { schema: 1, pages: pages.to_vec() };
-    Ok(Zeroizing::new(serde_json::to_vec(&index).map_err(|e| StoreError::BadFormat(e.to_string()))?))
+    crate::sealed_json::to_vec(&index, false).map_err(|e| StoreError::BadFormat(e.to_string()))
 }
 
 impl PageMeta {

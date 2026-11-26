@@ -31,7 +31,9 @@
 //! 4. The staged Library moves into place: the live picture folder aside, the
 //!    staged one in, the live add-on folder aside, the staged one in, the
 //!    staged Library file over the live one. `swapped`.
-//! 5. Leftovers are deleted and the journal goes.
+//! 5. Leftovers are deleted, among them the copies of the replaced Library's
+//!    version 1 file that would still open with its old passphrase, and the
+//!    journal goes.
 //!
 //! The Library is only ever opened through `AppState::open_store`, which runs
 //! [`recover`] first whenever a journal exists. Recovery needs the vault that
@@ -257,10 +259,11 @@ impl ExportInput {
                 item: None,
             }));
         };
-        let records = Zeroizing::new(
-            serde_json::to_vec(&backup)
-                .map_err(|e| ExportError::BadExport(format!("library encode: {e}")))?,
-        );
+        // One exactly sized buffer, as for every other secret encoding
+        // (SecScan S-5db9b51b6852): the Library section is bookmarks, saved
+        // page text and snapshots.
+        let records = patanyx_store::sealed_json_to_vec(&backup, false)
+            .map_err(|e| ExportError::BadExport(format!("library encode: {e}")))?;
         if records.len() as u64 > MAX_LIBRARY_SECTION {
             return Ok(ExportOutcome::Refused(ExportRefusal {
                 code: "export_library_too_large",
@@ -684,6 +687,22 @@ fn stage_inner(
     after_section: &mut dyn FnMut(usize),
 ) -> Result<Staged, ImportError> {
     let superseded = settle(store_path)?;
+    // SecScan S-7eda1aa77b37, 2026-11-24: the Library this import replaces
+    // may have been version 1, whose writer's crash leftovers are copies of
+    // it that still open with the passphrase they were written under. The
+    // Library the import puts in its place records no version 1 salt, so no
+    // later passphrase change could ever prove them ours, and they would go
+    // on reading the replaced Library's bookmarks, pages and download
+    // records under a passphrase its owner believes retired. So the salt is
+    // taken now, while the replaced Library is still here, carried in the
+    // journal, and its proven copies are retired once the swap is done
+    // ([`clean_up`]). An open Library gives it whatever its version; a closed
+    // one only from a version 1 header, since a version 3 Library keeps its
+    // salt under its key.
+    let replaced_v1_salt = match keep {
+        Some(kept) => kept.replaced_v1_salt(),
+        None => Store::v1_salt_on_disk(store_path),
+    };
     let mut journal = Journal {
         phase: Phase::Preparing,
         staging: random_name(STAGING_PREFIX),
@@ -692,6 +711,7 @@ fn stage_inner(
         vault_check: None,
         source: src.to_string_lossy().into_owned(),
         superseded,
+        replaced_v1_salt: None,
     };
     // Written before the staging folder exists, so a crash at any point after
     // leaves a journal that names it.
@@ -702,10 +722,11 @@ fn stage_inner(
         src,
         passphrase,
         keep,
+        replaced_v1_salt.as_ref(),
         watch,
         after_section,
     );
-    let (pending, summary, library_included, check, addon_pages) = match built {
+    let (pending, summary, library_included, check, addon_pages, masked_salt) = match built {
         Ok(built) => built,
         Err(error) => {
             let cleaned = undo(store_path, &journal);
@@ -714,6 +735,7 @@ fn stage_inner(
     };
     journal.phase = Phase::Staged;
     journal.vault_check = Some(check);
+    journal.replaced_v1_salt = masked_salt;
     if let Err(error) = write_journal(store_path, &journal) {
         let cleaned = undo(store_path, &journal);
         return Err(stopped_or(error.into(), cleaned));
@@ -728,7 +750,11 @@ fn stage_inner(
     })
 }
 
-type Built = (PendingImport, RestoreSummary, bool, String, usize);
+/// What [`build`] hands back: the pending vault, the restore's counts,
+/// whether the backup held a Library, the imported vault's check value, the
+/// add-on pages restored, and the replaced Library's version 1 salt as the
+/// journal records it ([`masked_salt`]).
+type Built = (PendingImport, RestoreSummary, bool, String, usize, Option<String>);
 
 /// A stop is only reported as clean when everything it built aside is gone;
 /// otherwise the person is told some files remain until the next open. Any
@@ -748,6 +774,7 @@ fn build(
     src: &Path,
     passphrase: &str,
     keep: Option<&KeptDownloads>,
+    replaced_v1_salt: Option<&[u8; 16]>,
     watch: &BackupWatch,
     after_section: &mut dyn FnMut(usize),
 ) -> Result<Built, ImportError> {
@@ -857,7 +884,8 @@ fn build(
     sync_dir(&staging.join("archive"))?;
     sync_dir(&staging.join("addons"))?;
     sync_dir(&staging)?;
-    Ok((pending, summary, library_included, check_value(&key), addon_pages))
+    let masked = replaced_v1_salt.map(|salt| masked_salt(salt, &key, staging_name));
+    Ok((pending, summary, library_included, check_value(&key), addon_pages, masked))
 }
 
 fn empty_backup() -> LibraryBackup {
@@ -1080,7 +1108,7 @@ pub fn recover(store_path: &Path, library_key: &[u8; 32]) -> Result<(), Unfinish
                 // holds open) does not keep it shut. It is retried at the next
                 // open, unless the marker that would keep this Library shut is
                 // among what could not go (security pass, F-101).
-                match clean_up(store_path, &journal) {
+                match clean_up(store_path, &journal, library_key) {
                     Err(_) if !replace_marker(store_path).exists() => return Ok(()),
                     other => other,
                 }
@@ -1277,7 +1305,7 @@ fn finish(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> Resul
     // The Library is in place. Leftovers that cannot be deleted now are
     // retried the next time the Library opens, unless the marker that would
     // keep the new Library shut is among them.
-    match clean_up(store_path, &swapped) {
+    match clean_up(store_path, &swapped, library_key) {
         Ok(()) => Ok(()),
         Err(_) if replace_marker(store_path).exists() => Err(Unfinished),
         Err(_) => Ok(()),
@@ -1297,12 +1325,13 @@ fn undo(store_path: &Path, journal: &Journal) -> std::io::Result<()> {
     }
 }
 
-/// After the swap: the old pictures, the empty staging folder and every
-/// folder an earlier, superseded import made go, then the journal. The
-/// earlier ones are swept by name rather than read from the journals kept
-/// inside this one, which may be unreadable: everything they held has now
-/// been replaced.
-fn clean_up(store_path: &Path, journal: &Journal) -> std::io::Result<()> {
+/// After the swap: the replaced Library's version 1 leftovers, the old
+/// pictures, the empty staging folder and every folder an earlier,
+/// superseded import made go, then the journal. The earlier ones are swept by
+/// name rather than read from the journals kept inside this one, which may be
+/// unreadable: everything they held has now been replaced. `library_key` is
+/// the imported vault's, which the caller has already matched to the journal.
+fn clean_up(store_path: &Path, journal: &Journal, library_key: &[u8; 32]) -> std::io::Result<()> {
     // First: the marker an older import may have left to keep the Library it
     // could not delete shut. That Library has now been replaced, and the
     // marker left in place would keep the new one shut instead.
@@ -1311,6 +1340,21 @@ fn clean_up(store_path: &Path, journal: &Journal) -> std::io::Result<()> {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
+    }
+    // Then the replaced Library's version 1 leftovers (see `stage_inner`):
+    // that Library is gone and the one in place records no salt, so this is
+    // the last moment anything can prove them its copies. The store's own
+    // rule decides, as at a passphrase change: only the writer's two names,
+    // only what the salt proves, anything else shaped like a Library kept.
+    // Before the journal goes, so a crash here retries at the next open. A
+    // leftover kept or not confirmed gone does not undo or hold the import,
+    // which is complete; it is logged, as the replaced Library no longer
+    // records anything a later change could retry with.
+    if let Some(salt) = unmasked_salt(journal, library_key) {
+        crash::point("v1-leftovers-next");
+        if let Err(error) = patanyx_store::retire_v1_leftovers_at(store_path, &salt) {
+            eprintln!("patanyx library: the import is complete, but {error}");
+        }
     }
     let dir = library_dir(store_path);
     remove_folder(dir, &journal.old_archive)?;
@@ -1388,6 +1432,13 @@ struct Journal {
     /// The exact bytes, hex-encoded, of the journal of an earlier import that
     /// was unresolved when this one began, put back if this one fails.
     superseded: Option<String>,
+    /// The version 1 salt of the Library this import replaces, masked
+    /// ([`masked_salt`]), from `staged` on: 32 lowercase hex digits. Absent
+    /// when that Library never was version 1, and from every journal written
+    /// before it was recorded (1.1.1), which decodes as before; and left out
+    /// when absent, so such a journal is still one those builds read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    replaced_v1_salt: Option<String>,
 }
 
 impl Journal {
@@ -1404,6 +1455,10 @@ impl Journal {
             && valid_name(&self.old_archive, OLD_ARCHIVE_PREFIX)
             && self.old_addons.as_deref().is_none_or(|name| valid_name(name, OLD_ADDONS_PREFIX))
             && self.superseded.as_deref().is_none_or(|kept| unhex(kept).is_some())
+            // Only beside a vault check: the mask needs the imported key.
+            && self.replaced_v1_salt.as_deref().is_none_or(|salt| {
+                self.vault_check.is_some() && salt.len() == 32 && unhex(salt).is_some()
+            })
     }
 }
 
@@ -1448,6 +1503,43 @@ fn check_value(library_key: &[u8; 32]) -> String {
     hasher.update(b"patanyx/import-journal/v1\0");
     hasher.update(library_key);
     hex(&hasher.finalize())
+}
+
+/// The replaced Library's version 1 salt as the journal records it: XORed
+/// with a mask only the imported vault's Library key derives, under a label
+/// of its own and this import's random staging name, so no two imports share
+/// one. A version 3 Library keeps that salt inside its encrypted contents,
+/// never in a header, since with an old passphrase it derives an old key; the
+/// journal is a plain file beside the Library, and the mask keeps it from
+/// saying more than the Library did. A forged value only names another salt:
+/// retirement then removes copies that salt proves, at the writer's two
+/// names, which whoever can write the journal could delete anyway.
+fn masked_salt(salt: &[u8; 16], library_key: &[u8; 32], staging: &str) -> String {
+    let mask = salt_mask(library_key, staging);
+    let masked: Vec<u8> = salt.iter().zip(mask).map(|(byte, pad)| byte ^ pad).collect();
+    hex(&masked)
+}
+
+/// The salt [`masked_salt`] recorded, for the vault that recorded it.
+fn unmasked_salt(journal: &Journal, library_key: &[u8; 32]) -> Option<[u8; 16]> {
+    let masked: [u8; 16] = unhex(journal.replaced_v1_salt.as_deref()?)?.try_into().ok()?;
+    let mask = salt_mask(library_key, &journal.staging);
+    let mut salt = [0u8; 16];
+    for ((out, byte), pad) in salt.iter_mut().zip(masked).zip(mask) {
+        *out = byte ^ pad;
+    }
+    Some(salt)
+}
+
+fn salt_mask(library_key: &[u8; 32], staging: &str) -> [u8; 16] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"patanyx/import-journal/v1-salt\0");
+    hasher.update(library_key);
+    hasher.update(staging.as_bytes());
+    let digest = hasher.finalize();
+    let mut mask = [0u8; 16];
+    mask.copy_from_slice(&digest[..16]);
+    mask
 }
 
 fn journal_path(store_path: &Path) -> PathBuf {

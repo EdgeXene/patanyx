@@ -623,10 +623,8 @@ impl std::fmt::Debug for BackupSource {
 impl Vault {
     /// What [`BackupSource::write`] needs, taken now.
     pub fn backup_source(&self) -> Result<BackupSource, ExportError> {
-        let vault_json = Zeroizing::new(
-            serde_json::to_vec(self.data_ref())
-                .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?,
-        );
+        let vault_json = crate::sealed_json::to_vec(self.data_ref(), false)
+            .map_err(|e| VaultError::Crypto(format!("json encode: {e}")))?;
         Ok(BackupSource {
             vault_path: self.path().to_path_buf(),
             params: self.kdf_params(),

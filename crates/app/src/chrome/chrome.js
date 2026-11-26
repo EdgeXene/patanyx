@@ -795,7 +795,9 @@
         );
         break;
       case "download_started": {
-        const name = fileNameFromUrl(msg.data && msg.data.url);
+        // The saved name, not the URL's last segment: a server's
+        // Content-Disposition can turn invoice.pdf into invoice.pdf.exe.
+        const name = (msg.data && msg.data.name) || fileNameFromUrl(msg.data && msg.data.url);
         i18nResolve(
           "chrome-js-toast-downloading",
           { name },
@@ -1422,9 +1424,15 @@
     rb("tab_new").catch(() => {});
   });
 
+  // The site a URL goes to: the authority without its userinfo.
+  // "https://github.com@evil.example/tool.exe" goes to evil.example, and
+  // showing "github.com@evil.example" as its site let the page choose the
+  // first words the user reads (SecScan S-71e4148a2960, 2026-11-24).
   function hostOf(url) {
-    const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#]+)/.exec(url);
-    return match ? match[1] : url;
+    const match = /^[a-zA-Z][a-zA-Z0-9+.-]*:\/\/([^/?#\\]+)/.exec(url);
+    if (!match) return url;
+    const authority = match[1];
+    return authority.slice(authority.lastIndexOf("@") + 1);
   }
 
   function chipLabel(tab) {
@@ -5749,12 +5757,21 @@
       hideSavePasswordBanner();
       return;
     }
+    // The site first, and the username last, quoted and capped: the page
+    // chooses the username, and leading with it let a name such as
+    // "alice on https://accounts.google.com" make the banner seem to name
+    // another site (SecScan S-0bde5b62f5ef, 2026-11-24).
+    const rawUser = String(pending.username || "").replace(
+      /[\u202A-\u202E\u2066-\u2069\u200B-\u200F\u061C\u2028\u2029\u201C\u201D]/g,
+      "",
+    );
+    const user = rawUser.length > 64 ? rawUser.slice(0, 63) + "\u2026" : rawUser;
     $("save-password-body").textContent =
-      "Save the password for " +
-      pending.username +
-      " on " +
+      "Save the password on " +
       pending.origin +
-      "?";
+      " for \u201C" +
+      user +
+      "\u201D?";
     if (banner.hidden) {
       banner.hidden = false;
       syncChromeInsets();

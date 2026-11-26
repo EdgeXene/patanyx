@@ -48,6 +48,12 @@
        still has Windows at Preview and chat at Beta, and a 1.0 would read as
        a claim neither supports yet. -->
   <releases>
+    <release version="1.1.2" date="2026-11-24">
+      <description>
+        <p>The Block ads and trackers setting now also blocks the live connections (WebSockets) a web page opens to hosts on its list. Chat, live updates, and some tracking scripts use these connections. Before 1.1.2, a page could open one to a listed host even with the setting on, although images and other requests to that host were already blocked. This setting does not affect WebSockets to hosts that are not on its list.</p>
+        <p>This release also fixes security issues involving the link address shown when you point at a link, site and download names, the Copy link without known redirects or tracking parameters command, Private Tunnel status, backup import, and how the Vault and the Library are saved.</p>
+      </description>
+    </release>
     <release version="1.1.1" date="2026-11-11">
       <description>
         <p>Premium activation and device release now work on networks that inspect encrypted connections, such as many work networks. Your Premium token and this device's ID travel encrypted to EdgeXene, so such a network sees neither. Premium add-ons are still Windows only.</p>

@@ -312,7 +312,20 @@ impl Session {
     ) {
         let mut dst = [0u8; DECAP_BUF];
         match self.tunn.decapsulate(None, datagram, &mut dst) {
-            TunnResult::Done => self.note_valid_inbound(events),
+            // Done is a keepalive on a live session, but also a cookie reply,
+            // which anyone on the path can forge from the server's PUBLIC key
+            // (SecScan S-9e260a5b3df8, 2026-11-24). Only a session boringtun
+            // actually established makes it proof that the peer is there.
+            // A data message (type 4, an empty one is a keepalive) on an
+            // established session, and nothing else: a cookie reply also ends
+            // Done, and during a live session would otherwise keep counting
+            // (compliance audit 2026-11-24, A2).
+            TunnResult::Done
+                if datagram.first() == Some(&4) && self.tunn.time_since_last_handshake().is_some() =>
+            {
+                self.note_valid_inbound(events)
+            }
+            TunnResult::Done => {}
             TunnResult::WriteToNetwork(packet) => {
                 self.note_valid_inbound(events);
                 self.send_raw(packet, events);
@@ -590,6 +603,45 @@ mod tests {
             assert!(Instant::now() < deadline, "no HandshakeFailed within the bound");
             thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// SecScan S-9e260a5b3df8. A cookie reply is authenticated only by values
+    /// anyone on the path has: the server's PUBLIC key, the sender index and
+    /// the last mac1. The forger below is boringtun's own rate limiter given
+    /// only that public key, answering every handshake with a cookie reply.
+    /// No handshake completes, so the tunnel must never report itself up.
+    #[test]
+    fn a_forged_cookie_reply_never_marks_the_tunnel_up() {
+        use boringtun::noise::rate_limiter::RateLimiter;
+        let fake = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        fake.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let port = fake.local_addr().unwrap().port();
+        let mut session =
+            Session::start(&client_session_config(format!("127.0.0.1:{port}"))).unwrap();
+        let forger = RateLimiter::new(&PublicKey::from(public_of(&SERVER_PRIV)), 0);
+        let mut inbound = VecDeque::new();
+        let mut events = Vec::new();
+        let mut buf = [0u8; 2048];
+        let mut forged = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while forged < 2 && Instant::now() < deadline {
+            session.tick_timers(&mut events);
+            let Ok((n, from)) = fake.recv_from(&mut buf) else {
+                continue;
+            };
+            let mut out = [0u8; 256];
+            if let Err(TunnResult::WriteToNetwork(reply)) =
+                forger.verify_packet(Some(from.ip()), &buf[..n], &mut out)
+            {
+                fake.send_to(reply, from).unwrap();
+                forged += 1;
+                thread::sleep(Duration::from_millis(50));
+                session.poll(&mut inbound, &mut events);
+            }
+        }
+        assert!(forged > 0, "the forger never saw a handshake to answer");
+        assert!(!session.is_up(), "a cookie reply alone marked the tunnel up");
+        assert!(!events.contains(&TunnelEvent::Up), "{events:?}");
     }
 
     // A `key_material_is_zeroized_after_the_tunn_is_built` test lived here

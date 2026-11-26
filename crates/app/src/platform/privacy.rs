@@ -399,6 +399,39 @@ impl Ledger {
         }
     }
 
+    /// Takes back one ALLOWED count, for a socket the guard was allowed to
+    /// open but the page closed first: nothing was contacted, so the row
+    /// must not claim a contact. A row left at zero is removed.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn retract_allowed(&mut self, host: &str) {
+        let empty = match self.hosts.get_mut(host) {
+            Some(entry) if entry.0 > 0 => {
+                entry.0 -= 1;
+                entry.0 == 0 && entry.1 == 0
+            }
+            _ => false,
+        };
+        if empty {
+            self.hosts.remove(host);
+        }
+    }
+
+    /// Moves one request from allowed to blocked: the inverse of
+    /// `correct_block_to_allowed`.
+    ///
+    /// For a WebSocket the guard asked about and was allowed, but never
+    /// opened: the reply did not reach it in time, or the page closed the
+    /// socket first. Nothing left the browser, and the row must say so.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn correct_allowed_to_blocked(&mut self, host: &str) {
+        if let Some(entry) = self.hosts.get_mut(host) {
+            if entry.0 > 0 {
+                entry.0 -= 1;
+                entry.1 += 1;
+            }
+        }
+    }
+
     /// How many requests this tab has had BLOCKED, across every host.
     ///
     /// Separate from `snapshot` because it rides on `tab_status`, which is
@@ -1454,6 +1487,11 @@ pub struct TabState {
     /// WebSocket into the user's network, which is diagnosed and recorded
     /// here rather than left for the copy to cover.
     pub local_network_guard: SettingState,
+    /// The browser half of the guard's WebSocket channel (1.1.2,
+    /// crate::ws_guard). None until the guard is registered with a token,
+    /// and then for a tab whose guard runs without one (the 1.1.1 behaviour).
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub ws_guard: Option<crate::ws_guard::WsGuard>,
     /// This tab's first navigation waits for the once-per-process session
     /// wipe. WINDOWS ONLY; see `initial_navigation_ready`.
     pub waiting_for_wipe: bool,
@@ -1794,6 +1832,7 @@ impl TabState {
             translate_page_ready: false,
             fingerprint_probe_reporting: SettingState::NotAttempted,
             local_network_guard: SettingState::NotAttempted,
+            ws_guard: None,
             waiting_for_wipe: false,
             bundled_filters_loading: 0,
             profile: crate::kept_profile::ProfileKind::Main,
@@ -2638,6 +2677,87 @@ impl TabState {
         self.last_hop_reaches_private = top_level.as_ref().is_some_and(|hop| hop.reaches_private);
         let decision = self.decide_request(uri, websocket, rules, now, override_host, role);
         (decision, top_level.map(|hop| hop.url))
+    }
+
+    /// The Windows WebSocket guard's question (1.1.2): may a page in this tab
+    /// open a socket to `uri`?
+    ///
+    /// WHY A SEPARATE ENTRY POINT. WebView2 never raises WebResourceRequested
+    /// for a WebSocket handshake (content_scripts/local_network_guard.js,
+    /// measured 2026-09-24), and `decide_inner`'s socket branch deliberately
+    /// skips the ad rules. Measured 2026-11-14 on the 1.1.1 release build: an
+    /// image and a fetch to a listed tracker were blocked, a socket to the same
+    /// host connected. The guard script now asks here before every socket.
+    ///
+    /// ORDER, the same as `decide_request` for a request that is not the
+    /// tab's own document: the local-network boundary FIRST and before any
+    /// state change (a private-host check must not inhibit auto-freeze), then
+    /// the socket's auto-freeze inhibition, then the reserved chrome origin,
+    /// freeze and the ad rules with the tab's one-host override.
+    ///
+    /// NOT an engine event: `handler_events` is not touched, because this call
+    /// proves only that the guard asked, not that the engine delivered a
+    /// request (see `decide_intercepted`). The ledger records the decision
+    /// once; the caller corrects an Allow the guard never acted on with
+    /// `Ledger::correct_allowed_to_blocked`, so Page Connections describes
+    /// what happened rather than what was decided.
+    ///
+    /// The malicious-site list is applied by the caller, above this function,
+    /// exactly as for ordinary requests.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub fn decide_websocket_check(
+        &mut self,
+        uri: &str,
+        rules: &RuleSet,
+        now: Instant,
+        override_host: Option<&str>,
+    ) -> RequestDecision {
+        let class = classify_uri(uri);
+        if let UriClass::Network(host) = &class {
+            if is_private_host(host) {
+                let refuse = match &self.committed {
+                    Some(standing) => {
+                        standing.insecure && standing.own_host.as_deref() != Some(host.as_str())
+                    }
+                    None => self.page_insecure,
+                };
+                if refuse {
+                    self.ledger.record(host, true);
+                    return RequestDecision::Block(BlockReason::LocalNetwork);
+                }
+            }
+        }
+        // A socket inhibits AUTO-freeze until the next navigation, allowed or
+        // not, as the engine's own socket branch does.
+        self.freeze.note_live_channel();
+        match class {
+            UriClass::Network(host) => {
+                if host == super::CHROME_RESERVED_HOST {
+                    self.ledger.record(&host, true);
+                    return RequestDecision::Block(BlockReason::ReservedOrigin);
+                }
+                let overridden = override_host.is_some_and(|allowed| allowed == host);
+                let ads = self.policy.block_ads && !overridden && rules.blocks_host(&host);
+                let frozen = self.freeze.should_block(&host, now);
+                self.ledger.record(&host, ads || frozen);
+                if frozen {
+                    RequestDecision::Block(BlockReason::Freeze)
+                } else if ads {
+                    RequestDecision::Block(BlockReason::AdRule)
+                } else {
+                    RequestDecision::Allow
+                }
+            }
+            // A socket URL the guard could not attribute to a host: closed
+            // while frozen, allowed otherwise, as on the engine path.
+            UriClass::NetworkOpaque | UriClass::Local => {
+                if self.freeze.should_block_unattributable(now) {
+                    RequestDecision::Block(BlockReason::FrozenOpaque)
+                } else {
+                    RequestDecision::Allow
+                }
+            }
+        }
     }
 
     fn decide_inner(
@@ -4473,6 +4593,17 @@ fn escape_host_for_filter(host: &str) -> String {
 /// A `url-filter` regex matching `host` and any subdomain of it, anchored at
 /// the scheme so it can only match the REQUEST's host — never a path segment
 /// or query parameter that happens to contain the name.
+///
+/// ANY SCHEME, NOT `https?`. Until 1.1.2 this was anchored `^https?://`, so a
+/// WebSocket (`ws://`, `wss://`) to a listed tracker never matched and
+/// connected: measured 2026-11-14 on WebKitGTK 2.54.0 with the 1.1.1 release
+/// build, where an image and a fetch to the host were blocked and the
+/// socket's upgrade reached the server. WebKit's url-filter has no
+/// alternation, so `^(https?|wss?)` is not available; `[a-z]+` is inside the
+/// supported subset, compiled on 2.54.0, and blocked the socket in the same
+/// test. Matching every scheme is right for a tracker list: no scheme to a
+/// listed host is wanted. (Freeze EXCEPTIONS keep their two exact patterns,
+/// see exact_host_url_filters: there a wider scheme would widen an allow.)
 fn host_url_filter(host: &str) -> String {
     // Trailing `[:/]` rather than an `([:/]|$)` alternation: WebKit's content
     // blocker accepts only a subset of regex and rejects the whole rule list
@@ -4480,7 +4611,7 @@ fn host_url_filter(host: &str) -> String {
     // at all. A request URL always has a path or port after the authority
     // (engines normalise `https://host` to `https://host/`), so requiring one
     // costs nothing and keeps the pattern inside the supported subset.
-    format!("^https?://([^/]+\\.)?{}[:/]", escape_host_for_filter(host))
+    format!("^[a-z]+://([^/]+\\.)?{}[:/]", escape_host_for_filter(host))
 }
 
 /// Serializes network rules to WebKit content-blocker JSON.
@@ -5124,21 +5255,31 @@ mod tests {
         assert!(!re(filter, "https://example.com/doubleclick.net"));
         assert!(!re(filter, "https://notdoubleclick.net/x"));
         assert!(!re(filter, "https://doubleclickXnet/x"));
+
+        // WebSockets: the 1.1.1 pattern (`^https?://`) let these through.
+        assert!(re(filter, "ws://doubleclick.net/socket"));
+        assert!(re(filter, "wss://ws.doubleclick.net:8443/socket"));
+        assert!(!re(filter, "wss://example.com/doubleclick.net"));
+        assert!(
+            filter.starts_with("^[a-z]+://"),
+            "the ad-list pattern must match every scheme, ws and wss included: {filter}"
+        );
     }
 
     /// Tiny anchored matcher covering the exact regex shape `host_url_filter`
     /// emits, so the semantic test above needs no regex dependency.
     fn regex_lite_match(filter: &str, url: &str) -> bool {
         let host = filter
-            .trim_start_matches("^https?://([^/]+\\.)?")
+            .trim_start_matches("^[a-z]+://([^/]+\\.)?")
             .trim_end_matches("[:/]")
             .replace("\\", "");
-        let Some(rest) = url
-            .strip_prefix("https://")
-            .or_else(|| url.strip_prefix("http://"))
-        else {
+        // `^[a-z]+://`: a lowercase-letter scheme, then "://".
+        let Some((scheme, rest)) = url.split_once("://") else {
             return false;
         };
+        if scheme.is_empty() || !scheme.bytes().all(|b| b.is_ascii_lowercase()) {
+            return false;
+        }
         let authority = rest.split('/').next().unwrap_or("");
         let bare = authority.split(':').next().unwrap_or("");
         bare == host || bare.ends_with(&format!(".{host}"))
@@ -6874,6 +7015,89 @@ mod request_decision_tests {
             "failed"
         );
     }
+    // --- the WebSocket guard's check (1.1.2) ----------------------------------
+
+    fn ws_row(st: &TabState, host: &str) -> Option<(u64, u64)> {
+        st.ledger.snapshot().into_iter().find(|r| r.host == host).map(|r| (r.allowed, r.blocked))
+    }
+
+    #[test]
+    fn websocket_check_blocks_a_listed_tracker_and_ledgers_it_once() {
+        let mut st = registered_tab(blocking_policy());
+        let events = st.handler_events;
+        let d = st.decide_websocket_check("wss://tracker.example/socket", &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Block(BlockReason::AdRule));
+        assert_eq!(ws_row(&st, "tracker.example"), Some((0, 1)));
+        assert_eq!(st.handler_events, events, "a guard check is not an engine event");
+        // A subdomain of a listed host is listed too, ws:// as much as wss://.
+        let d = st.decide_websocket_check("ws://a.tracker.example:8080/s", &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Block(BlockReason::AdRule));
+    }
+
+    #[test]
+    fn websocket_check_allows_an_unlisted_host_and_ledgers_it_once() {
+        let mut st = registered_tab(blocking_policy());
+        let d = st.decide_websocket_check("wss://chat.example/socket", &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Allow);
+        assert_eq!(ws_row(&st, "chat.example"), Some((1, 0)));
+    }
+
+    #[test]
+    fn websocket_check_honours_the_tab_override_and_the_ads_switch() {
+        let mut st = registered_tab(blocking_policy());
+        let d = st.decide_websocket_check("wss://tracker.example/s", &rules(), Instant::now(), Some("tracker.example"));
+        assert_eq!(d, RequestDecision::Allow, "the one-host override lifts the ad rule");
+        // Exact host only: the override for tracker.example does not cover a subdomain.
+        let d = st.decide_websocket_check("wss://x.tracker.example/s", &rules(), Instant::now(), Some("tracker.example"));
+        assert_eq!(d, RequestDecision::Block(BlockReason::AdRule));
+        let mut off = registered_tab(TabPolicy { block_ads: false, ..TabPolicy::default() });
+        let d = off.decide_websocket_check("wss://tracker.example/s", &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Allow, "blocking switched off allows the socket");
+    }
+
+    #[test]
+    fn websocket_check_respects_a_manual_freeze_and_the_reserved_origin() {
+        let mut st = registered_tab(blocking_policy());
+        st.freeze.freeze();
+        let d = st.decide_websocket_check("wss://chat.example/s", &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Block(BlockReason::Freeze));
+        let mut st = registered_tab(blocking_policy());
+        let uri = format!("wss://{}/s", super::super::CHROME_RESERVED_HOST);
+        let d = st.decide_websocket_check(&uri, &rules(), Instant::now(), None);
+        assert_eq!(d, RequestDecision::Block(BlockReason::ReservedOrigin));
+    }
+
+    #[test]
+    fn websocket_check_refuses_the_local_network_first_without_touching_freeze() {
+        let t0 = Instant::now();
+        let mut st = TabState::new(&TabPolicy { freeze_after_load: true, ..TabPolicy::default() });
+        st.on_load_started(Some("http://news.example/article"));
+        st.freeze.on_load_finished(t0);
+        let d = st.decide_websocket_check("ws://127.0.0.1:9/x", &RuleSet::default(), t0, None);
+        assert_eq!(d, RequestDecision::Block(BlockReason::LocalNetwork));
+        assert!(
+            st.freeze.should_auto_freeze(t0 + FREEZE_GRACE * 10),
+            "a refused private-host check must not inhibit auto-freeze"
+        );
+        // A public socket check DOES inhibit it, as the engine's socket branch does.
+        let d = st.decide_websocket_check("wss://chat.example/s", &RuleSet::default(), t0, None);
+        assert_eq!(d, RequestDecision::Allow);
+        assert!(!st.freeze.should_auto_freeze(t0 + FREEZE_GRACE * 10));
+    }
+
+    #[test]
+    fn an_allowed_socket_that_never_opened_is_corrected_to_blocked() {
+        let mut st = registered_tab(blocking_policy());
+        st.decide_websocket_check("wss://chat.example/s", &rules(), Instant::now(), None);
+        st.ledger.correct_allowed_to_blocked("chat.example");
+        assert_eq!(ws_row(&st, "chat.example"), Some((0, 1)));
+        // Never below zero, and a host with no row stays absent.
+        st.ledger.correct_allowed_to_blocked("chat.example");
+        assert_eq!(ws_row(&st, "chat.example"), Some((0, 1)));
+        st.ledger.correct_allowed_to_blocked("never.example");
+        assert_eq!(ws_row(&st, "never.example"), None);
+    }
+
 }
 
 #[cfg(test)]
